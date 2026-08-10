@@ -241,7 +241,8 @@
     <text x="90" y="277" font-size="13" fill="#8b949e">• 双节点自动管理,一个挂了另一个接管</text>
     <text x="90" y="301" font-size="13" fill="#8b949e">• 缓存可以丢——丢了从 BOS 重建</text>
     <text x="90" y="330" font-size="12" fill="#7d8590" font-family="monospace">定位:本地加速 · 可替换 · 非权威</text>
-    <text x="90" y="352" font-size="12" fill="#7d8590" font-family="monospace">存:最近对话(截断 200 字符)</text>
+    <text x="90" y="352" font-size="12" fill="#7d8590" font-family="monospace">存:最近对话(截断 200 字符,见下方说明)</text>
+    <text x="90" y="374" font-size="11.5" fill="#7d8590">自带 S3 客户端(内置 object_store 库)— 直连 BOS,不调外部工具</text>
 
     <!-- BOS 框 -->
     <rect x="560" y="190" width="490" height="190" rx="16" fill="#12161f" stroke="#d29922"/>
@@ -345,6 +346,11 @@
     <div class="dataflow-note" style="margin-top:8px">
       <b>不存什么:</b> 不存你的项目文件、不存工具产生的文件内容本身 — 只存<b>对话记录</b>(谁说了什么、调了哪些工具、结果摘要)。
       写入的 msg 形如:<code style="color:var(--blue)">"分析一下… [工具调用: bash(&#34;ls&#34;)] [工具结果: bash: src bin docs…"</code>
+    </div>
+    <div class="dataflow-note" style="margin-top:6px">
+      <b>为什么 worker 缓存截断 200 字符?</b> 缓存写入走 HTTP GET,msg 作为 URL 参数传递 —
+      URL 长度受限,且中文经 URL 编码后膨胀约 3 倍(200 中文字符 → 约 1080 字符 URL)。
+      截断是安全的:worker 只是缓存(丢了可从 BOS 重建),<b>BOS 权威源永远存完整内容</b>。
     </div>
   </div>
 
