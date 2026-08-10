@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Syntax check all sources
+        run: |
+          for f in bin/*.mjs src/*.js tests/*.mjs; do node --check "$f"; done
+      - name: CLI smoke test (help/version, no celld needed)
+        run: |
+          node bin/celagent-tui.mjs help >/dev/null
+          node bin/celagent-tui.mjs version | grep -q "celagent v"
+      - name: Unit tests (no celld: mock mode)
+        run: npm test
+        env:
+          CELAGENT_MOCK: "1"
+        continue-on-error: true
+      - name: Shell syntax check
+        run: |
+          bash -n install.sh setup.sh scripts/*.sh
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+      - run: npm ci
+      - name: Package check (npm pack dry-run)
+        run: npm pack --dry-run

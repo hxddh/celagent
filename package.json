@@ -1,0 +1,45 @@
+{
+  "name": "celagent",
+  "version": "0.2.0",
+  "description": "独立开源 agent — Pi TUI + Celld/BOS RPO=0 持久化，崩溃/换机器/节点故障会话不丢",
+  "type": "module",
+  "bin": {
+    "celagent": "./bin/celagent-tui.mjs"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./llm": "./src/llm.js",
+    "./storage": "./src/storage.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/celagent-tui.mjs",
+    "test": "node --test tests/core.test.mjs",
+    "doctor": "node bin/celagent-tui.mjs doctor",
+    "list": "node bin/celagent-tui.mjs list"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "agent",
+    "cli",
+    "llm",
+    "durable",
+    "rpo0",
+    "celld",
+    "bos"
+  ],
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.84.1",
+    "@earendil-works/pi-ai": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.84.1"
+  },
+  "license": "MIT"
+}
