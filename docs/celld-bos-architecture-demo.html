@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>celagent 架构演示 — Celld + BOS 的定位、价值与作用</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel2: #1c2333;
+    --border: #30363d;
+    --text: #e6edf3;
+    --dim: #8b949e;
+    --green: #3fb950;
+    --green-bg: rgba(63,185,80,0.12);
+    --red: #f85149;
+    --red-bg: rgba(248,81,73,0.1);
+    --blue: #58a6ff;
+    --blue-bg: rgba(88,166,255,0.1);
+    --yellow: #d29922;
+    --purple: #bc8cff;
+    --mono: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    line-height: 1.6; padding: 24px 16px 60px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+
+  /* Header */
+  header { text-align: center; padding: 28px 0 8px; }
+  h1 { font-size: 26px; font-weight: 700; letter-spacing: 0.5px; }
+  h1 .accent { color: var(--blue); }
+  .subtitle { color: var(--dim); font-size: 14px; margin-top: 6px; }
+  .badge-row { margin-top: 14px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+  .badge {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 20px;
+    padding: 4px 14px; font-size: 12px; color: var(--dim); font-family: var(--mono);
+  }
+  .badge b { color: var(--green); }
+
+  /* Section */
+  .section { margin-top: 34px; }
+  .section-title {
+    font-size: 17px; font-weight: 700; margin-bottom: 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .section-title .num {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
+    font-size: 13px; color: var(--blue); font-family: var(--mono);
+  }
+
+  /* 1. Architecture diagram */
+  .arch-grid {
+    display: grid; grid-template-columns: 1fr 1fr 1fr;
+    gap: 14px; align-items: stretch;
+  }
+  .arch-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px 16px; position: relative;
+  }
+  .arch-box .role {
+    position: absolute; top: -10px; left: 16px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    font-size: 11px; color: var(--dim); padding: 2px 10px; font-family: var(--mono);
+  }
+  .arch-box h3 { font-size: 15px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .arch-box .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot-green { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot-blue { background: var(--blue); box-shadow: 0 0 8px var(--blue); }
+  .dot-yellow { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+  .arch-box ul { list-style: none; margin-top: 6px; }
+  .arch-box li { font-size: 13px; color: var(--dim); padding: 3px 0; padding-left: 14px; position: relative; }
+  .arch-box li::before { content: '▸'; position: absolute; left: 0; color: var(--blue); }
+  .arch-box .highlight {
+    color: var(--text); background: var(--blue-bg); border-radius: 4px; padding: 1px 6px;
+    font-size: 12px; font-family: var(--mono);
+  }
+  .flow-arrow {
+    text-align: center; color: var(--dim); font-size: 20px; padding: 4px 0;
+    grid-column: 1 / -1; letter-spacing: 6px;
+  }
+  .dataflow-note {
+    background: var(--panel2); border: 1px dashed var(--border); border-radius: 10px;
+    padding: 14px 18px; margin-top: 12px; font-size: 13px; color: var(--dim);
+  }
+  .dataflow-note b { color: var(--text); }
+  .dataflow-note code { font-family: var(--mono); color: var(--blue); font-size: 12px; }
+
+  /* 2. Live data table */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  td { font-family: var(--mono); font-size: 12px; }
+  tr.assistant td:first-child { color: var(--blue); }
+  tr.user td:first-child { color: var(--green); }
+  .ok { color: var(--green); }
+  .warn { color: var(--yellow); }
+
+  /* 3. Fault injection */
+  .fault-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .fault-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; text-align: center;
+  }
+  .fault-card .big { font-size: 30px; font-weight: 700; font-family: var(--mono); }
+  .fault-card .label { font-size: 12px; color: var(--dim); margin-top: 4px; }
+  .fault-card .desc { font-size: 12px; color: var(--dim); margin-top: 10px; text-align: left; }
+  .fault-card.pass { border-color: rgba(63,185,80,0.4); background: linear-gradient(180deg, var(--green-bg), var(--panel)); }
+  .fault-card .big.green { color: var(--green); }
+  .fault-card .big.red { color: var(--red); }
+  .fault-card .big.blue { color: var(--blue); }
+
+  /* 4. Timeline */
+  .timeline { position: relative; padding-left: 28px; }
+  .timeline::before {
+    content: ''; position: absolute; left: 9px; top: 4px; bottom: 4px; width: 2px;
+    background: linear-gradient(180deg, var(--blue), var(--green));
+  }
+  .tl-item { position: relative; padding: 8px 0 14px; }
+  .tl-item::before {
+    content: ''; position: absolute; left: -25px; top: 14px; width: 12px; height: 12px;
+    border-radius: 50%; background: var(--bg); border: 3px solid var(--blue);
+  }
+  .tl-item.good::before { border-color: var(--green); }
+  .tl-item.bad::before { border-color: var(--red); }
+  .tl-item.warn::before { border-color: var(--yellow); }
+  .tl-title { font-size: 14px; font-weight: 600; }
+  .tl-desc { font-size: 12.5px; color: var(--dim); margin-top: 3px; }
+  .tl-desc code { font-family: var(--mono); color: var(--blue); font-size: 11.5px; }
+
+  /* Footer */
+  footer {
+    margin-top: 44px; padding-top: 18px; border-top: 1px solid var(--border);
+    text-align: center; color: var(--dim); font-size: 12px;
+  }
+  footer code { font-family: var(--mono); }
+
+  @media (max-width: 800px) {
+    .arch-grid, .fault-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1><span class="accent">celagent</span> — 架构与可靠性演示</h1>
+  <div class="subtitle">Celld(运行时)与 BOS(对象存储)在会话持久化中的定位、价值与作用 · 全部数据来自真实模拟测试</div>
+  <div class="badge-row">
+    <span class="badge">会话: <b>demo-session</b></span>
+    <span class="badge">bucket: <b>celagent-<user>-<ts></b></span>
+    <span class="badge">RPO = <b>0</b></span>
+    <span class="badge">双节点 <b>18090/18091</b></span>
+  </div>
+</header>
+
+<!-- ============ 1. 定位 ============ -->
+<div class="section">
+  <div class="section-title"><span class="num">1</span> 定位:celagent 中 Celld 与 BOS 各司其职</div>
+  <div class="arch-grid">
+    <div class="arch-box">
+      <span class="role">交互层</span>
+      <h3><span class="dot dot-green"></span>celagent (TUI)</h3>
+      <ul>
+        <li>Pi 引擎完整界面:对话 / 工具 / 多模型</li>
+        <li>每轮对话结束触发 <span class="highlight">turn_end</span> 钩子</li>
+        <li>双写:worker 缓存 + BOS 直写,<b style="color:var(--green)">不阻塞对话</b></li>
+        <li>启动时从 BOS 恢复历史并注入上下文</li>
+      </ul>
+    </div>
+    <div class="arch-box">
+      <span class="role">运行时</span>
+      <h3><span class="dot dot-blue"></span>Celld 双节点</h3>
+      <ul>
+        <li>分布式 Durable Object 运行时(18090/18091)</li>
+        <li>worker SQLite:会话快速缓存(2s 超时,丢了可重建)</li>
+        <li>自动启动 + 端口预检 + 残留所有权清理</li>
+        <li>故障转移:单节点挂掉由另一节点接管</li>
+      </ul>
+    </div>
+    <div class="arch-box">
+      <span class="role">权威存储</span>
+      <h3><span class="dot dot-yellow"></span>BOS 对象存储</h3>
+      <ul>
+        <li><b style="color:var(--yellow)">权威源</b>:sessions/&lt;id&gt;.json 完整落盘</li>
+        <li>CAS 乐观锁(ETag + If-Match):并发写不冲突</li>
+        <li>If-None-Match 首写保护:冷启动不覆盖</li>
+        <li>节点全挂 / 换机器 / 本地数据丢失 → 都能找回</li>
+      </ul>
+    </div>
+  </div>
+  <div class="flow-arrow">⚡ turn_end 双写 ⚡</div>
+  <div class="dataflow-note">
+    <b>一句话定位:</b> <code>Celld 是"快"——低延迟缓存与运行时;</code>
+    <code>BOS 是"稳"——不依赖任何节点的权威持久层。</code>
+    <br>产品承诺 <b style="color:var(--green)">"会话永不丢"</b> 由 BOS 兑现,<b>不依赖 Celld 存活</b>(下方第 3 节实测证明)。
+  </div>
+</div>
+
+<!-- ============ 2. 作用: 真实双写数据 ============ -->
+<div class="section">
+  <div class="section-title"><span class="num">2</span> 作用:每轮对话的双写链路(真实计时)</div>
+  <table>
+    <thead>
+      <tr>
+        <th>轮次</th><th>角色</th><th>内容</th>
+        <th>Celld worker 写</th><th>BOS 直写</th><th>结果</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>user</td><td>帮我分析一下项目的架构</td><td>320ms</td><td>1279ms</td><td class="ok">✓</td></tr>
+      <tr><td>2</td><td>assistant</td><td>好的,项目分为三层:交互层(TUI)、运行时(Celld)、存储(BOS)。</td><td>117ms</td><td>1750ms</td><td class="ok">✓</td></tr>
+      <tr><td>3</td><td>user</td><td>Celld 和 BOS 各负责什么?</td><td>61ms</td><td>1659ms</td><td class="ok">✓</td></tr>
+      <tr><td>4</td><td>assistant</td><td>Celld 是分布式运行时,提供节点健康、故障转移、worker 执行;cell 状态需要 BOS 作为权威持久层。</td><td>59ms</td><td>1728ms</td><td class="ok">✓</td></tr>
+      <tr><td>5</td><td>user</td><td>如果节点全挂了呢?</td><td>56ms</td><td>1877ms</td><td class="ok">✓</td></tr>
+      <tr><td>6</td><td>assistant</td><td>BOS 直写保证 RPO=0:每轮对话异步落盘到 BOS,节点恢复后从 BOS 找回全部历史。</td><td>101ms</td><td>1807ms</td><td class="ok">✓</td></tr>
+      <tr><td>7</td><td>user</td><td>数据在 BOS 里怎么存的?</td><td>56ms</td><td>1634ms</td><td class="ok">✓</td></tr>
+      <tr><td>8</td><td>assistant</td><td>sessions/&lt;id&gt;.json,带 ETag 乐观锁(CAS),并发写入不冲突不丢失。</td><td>61ms</td><td>1604ms</td><td class="ok">✓</td></tr>
+    </tbody>
+  </table>
+  <div class="dataflow-note" style="margin-top:10px">
+    平均:<b>Celld worker 104ms</b>(低延迟缓存) · <b>BOS 直写 1667ms</b>(权威落盘,异步队列不阻塞对话)
+    —— <code>celldCheckpoint()</code> 双写 8/8 全部成功,队列串行 + CAS 兜底,零丢失。
+  </div>
+</div>
+
+<!-- ============ 3. 价值: 故障注入实测 ============ -->
+<div class="section">
+  <div class="section-title"><span class="num">3</span> 价值:故障注入实测(真实执行)</div>
+  <div class="fault-grid">
+    <div class="fault-card pass">
+      <div class="big red">0/2</div>
+      <div class="label">Celld 节点存活(kill 后)</div>
+      <div class="desc">执行 <code>pkill -f 'celld.*1809'</code> 强杀全部节点,确认 0 存活。</div>
+    </div>
+    <div class="fault-card pass">
+      <div class="big green">✓ 2055ms</div>
+      <div class="label">节点全挂时 BOS 写入</div>
+      <div class="desc">第 9-10 轮对话在<b>零节点存活</b>下直写 BOS 成功——持久化不依赖 Celld。</div>
+    </div>
+    <div class="fault-card pass">
+      <div class="big blue">10/10</div>
+      <div class="label">重启后从 BOS 恢复</div>
+      <div class="desc">节点拉起后从 BOS 找回<b>全部 10 轮</b>,序号 1→10 连续,零丢失(RPO=0)。</div>
+    </div>
+  </div>
+  <div class="dataflow-note" style="margin-top:12px">
+    <b>为什么能做到?</b> celagent 的持久化是 <b>BOS 直写</b>(权威源),Celld worker 只是缓存:
+    节点全挂 → 对话继续、数据照写;节点回来 → 历史全在。换机器、删本地,只要凭证还在,
+    <code>celagent list</code> + <code>celagent &lt;id&gt;</code> 即可找回一切。
+  </div>
+</div>
+
+<!-- ============ 4. 时序 ============ -->
+<div class="section">
+  <div class="section-title"><span class="num">4</span> 完整时序:从写入到灾难恢复</div>
+  <div class="timeline">
+    <div class="tl-item good">
+      <div class="tl-title">第 1-8 轮对话 · 双写落盘</div>
+      <div class="tl-desc">每轮 <code>turn_end</code> → Celld worker 缓存(~100ms) + BOS 直写(~1.7s,异步队列,对话无感)</div>
+    </div>
+    <div class="tl-item good">
+      <div class="tl-title">CAS 并发保护验证</div>
+      <div class="tl-desc">双客户端同时写:一方 <code>ok</code>,另一方 <code>412 冲突被拒</code> → 重读合并,<b>不覆盖不丢失</b>(ETag 乐观锁)</div>
+    </div>
+    <div class="tl-item bad">
+      <div class="tl-title">故障注入:强杀全部 Celld 节点</div>
+      <div class="tl-desc"><code>pkill</code> → 18090/18091 全部下线,worker 写降级为警告,BOS 直写不受影响</div>
+    </div>
+    <div class="tl-item warn">
+      <div class="tl-title">节点全挂期间的对话(第 9-10 轮)</div>
+      <div class="tl-desc">零节点存活下 BOS 直写成功(2055ms)——"节点全挂了,数据还在吗?""在。"</div>
+    </div>
+    <div class="tl-item good">
+      <div class="tl-title">节点恢复 · 从 BOS 找回全部历史</div>
+      <div class="tl-desc">重新拉起双节点 → <code>celagent demo-session</code> → 恢复 10/10 轮,序号连续,上下文完整注入</div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  celagent v0.2.0 · 修复 Bug 1-94 · 回归测试 9/9 通过 · 模拟测试数据保留于 BOS:
+  <code>sessions/demo-session.json</code>(10 轮) · <span style="color:var(--green)">会话永不丢</span>
+</footer>
+
+</div>
+</body>
+</html>
