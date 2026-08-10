@@ -350,21 +350,31 @@
       每轮对话结束,celagent 把<b style="color:var(--text)">这一轮的对话记录</b>(不是文件、不是工作区)打包成一条 JSON 写入两处。
       以下为结构示例(字段结构真实,内容为演示):
     </div>
-    <div class="json-block"><span class="c">// Celld worker 缓存 (session:demo-session) — msg 截断 200 字符</span>
+    <div class="json-block"><span class="c">// 实测: Celld worker 缓存 (session:demo-session, 节点 18090) — msg 截断 200 字符, 无 role
 {
   <span class="k">"id"</span>: <span class="s">"demo-session"</span>,
   <span class="k">"turns"</span>: [
     { <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"msg"</span>: <span class="s">"帮我分析一下项目的架构"</span>, <span class="k">"ts"</span>: <span class="n">1786343709247</span> }
   ],
-  <span class="k">"updatedAt"</span>: <span class="n">1786343728171</span>
+  <span class="k">"updatedAt"</span>: <span class="n">1786343740759</span>  <span class="c">// 实测值 (2026-08-10 采集)</span>
 }
 
-<span class="c">// BOS 权威源 (sessions/demo-session.json) — msg 完整不截断, 多一个 role 字段</span>
-<span class="c">// (示例中 role=user 为演示脚本; 真实产品 turn_end 钩子只写 assistant 轮)</span>
+<span class="c">// 实测: BOS 权威源 (sessions/demo-session.json) — 完整记忆方案 A 已实施</span>
+<span class="c">// turn1 为演示脚本 (真实产品 turn_end 只写 assistant 轮); content/toolResults 为方案 A 新增完整字段</span>
 {
   <span class="k">"id"</span>: <span class="s">"demo-session"</span>,
   <span class="k">"turns"</span>: [
-    { <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"role"</span>: <span class="s">"user"</span>, <span class="k">"msg"</span>: <span class="s">"帮我分析一下项目的架构"</span>, <span class="k">"ts"</span>: <span class="n">1786343710345</span> }
+    {
+      <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"role"</span>: <span class="s">"user"</span>,
+      <span class="k">"msg"</span>: <span class="s">"帮我分析一下项目的架构"</span>, <span class="k">"ts"</span>: <span class="n">1786343710345</span>,
+      <span class="k">"content"</span>: [ <span class="c">// 方案A: 完整内容块 (thinking/text/toolCall 全量)</span>
+        { <span class="k">"type"</span>: <span class="s">"thinking"</span>, <span class="k">"thinking"</span>: <span class="s">"完整推理过程…"</span> },
+        { <span class="k">"type"</span>: <span class="s">"toolCall"</span>, <span class="k">"name"</span>: <span class="s">"bash"</span>, <span class="k">"arguments"</span>: { <span class="k">"command"</span>: <span class="s">"ls"</span> } }
+      ],
+      <span class="k">"toolResults"</span>: [ <span class="c">// 方案A: 完整工具结果</span>
+        { <span class="k">"toolName"</span>: <span class="s">"bash"</span>, <span class="k">"content"</span>: [{ <span class="k">"type"</span>: <span class="s">"text"</span>, <span class="k">"text"</span>: <span class="s">"src\nbin"</span> }] }
+      ]
+    }
   ]
 }</div>
 
@@ -373,7 +383,9 @@
       <tbody>
         <tr><td><code>turn</code></td><td>轮次序号(1,2,3…)</td><td>✓</td><td>✓</td></tr>
         <tr><td><code>role</code></td><td>发言角色:user / assistant</td><td style="color:#8b949e">✗ 不存</td><td>✓</td></tr>
-        <tr><td><code>msg</code></td><td>回复文本 + 工具调用摘要 + 工具结果摘要(各带长度上限,见下方说明)</td><td style="color:#d29922">截断 200 字符</td><td style="color:#3fb950">完整保存</td></tr>
+        <tr><td><code>msg</code></td><td>摘要文本(供恢复注入与 worker 缓存,各段带长度上限)</td><td style="color:#d29922">截断 200 字符</td><td style="color:#3fb950">完整保存</td></tr>
+        <tr><td><code>content</code></td><td>完整内容块:thinking / text / toolCall(方案 A 新增)</td><td style="color:#8b949e">✗ 不存</td><td style="color:#3fb950">✅ 完整</td></tr>
+        <tr><td><code>toolResults</code></td><td>完整工具结果(方案 A 新增;本地 JSONL 也不存)</td><td style="color:#8b949e">✗ 不存</td><td style="color:#3fb950">✅ 完整</td></tr>
         <tr><td><code>ts</code></td><td>时间戳(ms)</td><td>✓</td><td>✓</td></tr>
         <tr><td><code>updatedAt</code></td><td>会话最后更新时间</td><td>✓</td><td style="color:#8b949e">—</td></tr>
       </tbody>
