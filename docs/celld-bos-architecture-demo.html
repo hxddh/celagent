@@ -159,25 +159,17 @@
     <text x="75" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">task:·cron:·kv:·ledger(测试语义)</text>
 
     <!-- 节点 B -->
-    <rect x="390" y="205" width="300" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
+    <rect x="390" y="205" width="420" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
     <circle cx="415" cy="222" r="5" fill="#3fb950"/>
     <text x="430" y="226" font-size="12.5" font-weight="600" fill="#e6edf3">celld · 18091 (节点 B)</text>
-    <text x="405" y="248" font-size="11" fill="#8b949e">与 A 同构 · 故障转移备节点</text>
-    <text x="405" y="268" font-size="11" fill="#8b949e">A 挂掉时接管 worker 写入</text>
-    <text x="405" y="288" font-size="11" fill="#8b949e">自动启动 + 端口预检 + 所有权清理</text>
-    <text x="405" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">同一 BOS bucket · 同一 worker 版本</text>
+    <text x="405" y="248" font-size="11" fill="#8b949e">与 A 同构 · 故障转移备节点 · A 挂掉时接管 worker 写入</text>
+    <text x="405" y="268" font-size="11" fill="#8b949e">自动启动 + 端口预检 + 残留所有权清理</text>
+    <text x="405" y="288" font-size="11" fill="#8b949e">同一 BOS bucket · 同一 worker 版本 · 缓存可丢(从 BOS 重建)</text>
+    <text x="405" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">定位="快":低延迟缓存 ~100ms · 替代常驻 DB/内存状态机</text>
 
     <!-- 节点间同步 -->
     <line x1="360" y1="267" x2="390" y2="267" stroke="#58a6ff" stroke-dasharray="4 3" stroke-width="1.5"/>
     <text x="362" y="258" font-size="10" fill="#7d8590">failover</text>
-
-    <!-- 右侧: 定位说明 -->
-    <rect x="720" y="205" width="310" height="125" rx="10" fill="#181e2b" stroke="#30363d"/>
-    <text x="740" y="226" font-size="12" font-weight="600" fill="#e6edf3">Celld 的定位 = "快"</text>
-    <text x="740" y="248" font-size="11" fill="#8b949e">低延迟会话缓存(~100ms)</text>
-    <text x="740" y="268" font-size="11" fill="#8b949e">分布式运行时(节点/故障转移/worker)</text>
-    <text x="740" y="288" font-size="11" fill="#8b949e">⚠ 缓存可丢 — 丢了从 BOS 重建</text>
-    <text x="740" y="308" font-size="10.5" fill="#7d8590">替代:常驻 DB 服务器 / 内存状态机</text>
 
     <!-- ===== 层 3: 存储层 ===== -->
     <rect x="30" y="370" width="1020" height="230" rx="14" fill="#12161f" stroke="#d29922" stroke-dasharray="6 4"/>
@@ -220,9 +212,9 @@
     <!-- TUI → BOS (权威直写) -->
     <path d="M 520 140 C 520 250, 560 380, 600 415" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
     <text x="540" y="290" font-size="10.5" fill="#d29922" font-family="monospace">② BOS直写(CAS+ETag)</text>
-    <!-- BOS → TUI (恢复, 从 sessions 权威区) -->
-    <path d="M 240 415 C 180 320, 120 250, 260 140" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrG)"/>
-    <text x="60" y="290" font-size="10.5" fill="#3fb950" font-family="monospace">③ 启动时从 sessions 恢复→注入上下文</text>
+    <!-- BOS → TUI (恢复, 从 sessions 权威区, 走最右侧专用通道) -->
+    <path d="M 955 415 C 1040 330, 1050 250, 920 140" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrG)"/>
+    <text x="988" y="300" font-size="10.5" fill="#3fb950" font-family="monospace" text-anchor="end">③ 启动恢复历史→注入上下文</text>
     <!-- Celld → BOS (cell 状态) -->
     <path d="M 690 267 C 780 300, 800 380, 780 415" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
     <text x="800" y="360" font-size="10" fill="#58a6ff" font-family="monospace">④ cell状态(LTX/own)</text>
