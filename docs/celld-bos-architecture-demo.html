@@ -168,7 +168,7 @@
   footer { margin-top:18px; text-align:center; color:var(--dim); font-size:11.5px; font-family:var(--mono); }
 
   /* 锚点目标避开悬浮条 */
-  #arch, #process, #monitor, #value, #paths, #payload { scroll-margin-top: 130px; }
+  #arch, #process, #monitor, #value, #paths, #payload, #faq { scroll-margin-top: 130px; }
 
   /* 悬浮操作条: 滚动时始终可见 */
   .sticky-bar {
@@ -232,9 +232,10 @@
     <a href="#arch">1 架构图</a>
     <a href="#paths">2 三条路径</a>
     <a href="#payload">3 写入的数据</a>
-    <a href="#process">4 运行过程</a>
-    <a href="#monitor">5 BOS 监控</a>
-    <a href="#value">6 价值评估</a>
+    <a href="#faq">4 常见问题</a>
+    <a href="#process">5 运行过程</a>
+    <a href="#monitor">6 BOS 监控</a>
+    <a href="#value">7 价值评估</a>
   </div>
   <div class="sticky-hint">↓ 滚动页面时本操作条固定于顶部 · 自动播放中可随时点击「故障注入」观察降级</div>
 </div></header>
@@ -390,6 +391,61 @@
     </div>
   </div>
 
+  <!-- 常见问题解答 (存什么/性能/之前在哪) -->
+  <div class="panel" style="margin-top:24px" id="faq">
+    <div class="panel-title">④ 常见问题 — 存什么 · 性能 · 之前在哪</div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q1: 写到 BOS 的是 agent 会话的"所有内容"吗?</div>
+      <div style="font-size:13px;color:var(--dim);line-height:1.8">
+        <b style="color:var(--text)">不是。BOS 存的是"摘要级记忆"</b>,不是完整会话(完整逐轮记录在本地 pi JSONL):
+      </div>
+      <table class="obj-table" style="margin-top:8px">
+        <thead><tr><th>内容</th><th>是否写入 BOS</th></tr></thead>
+        <tbody>
+          <tr><td>assistant 回复文本</td><td style="color:var(--green)">✅ 完整写入</td></tr>
+          <tr><td>工具调用摘要(工具名+参数)</td><td style="color:var(--yellow)">⚠ 拼接后截断 ≤100 字符</td></tr>
+          <tr><td>工具结果摘要</td><td style="color:var(--yellow)">⚠ 每个结果取前 120 字符,汇总 ≤300 字符</td></tr>
+          <tr><td>user 输入</td><td style="color:var(--red)">❌ 不写(turn_end 钩子只存 assistant 轮)</td></tr>
+          <tr><td>完整工具参数/输出、项目文件内容、agent 推理过程</td><td style="color:var(--red)">❌ 不写</td></tr>
+        </tbody>
+      </table>
+      <div style="font-size:12.5px;color:var(--dim);margin-top:6px">
+        设计意图:BOS 存"重启后恢复对话所需的最小记忆"——之前聊了什么、调过哪些工具、大概结果;不是逐字节完整会话。
+      </div>
+    </div>
+
+    <div style="margin-bottom:18px">
+      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q2: BOS 写一次要 ~1.7 秒,性能问题怎么解决?</div>
+      <div style="font-size:13px;color:var(--dim);line-height:1.8">
+        <b style="color:var(--text)">写延迟被完全挡在对话之外</b> — 对话轮结束,turn_end 钩子毫秒级返回,不等待 BOS:
+      </div>
+      <table class="obj-table" style="margin-top:8px">
+        <thead><tr><th>机制</th><th>作用</th></tr></thead>
+        <tbody>
+          <tr><td>异步 fire-and-forget 队列</td><td>写 BOS 不阻塞对话,用户无感知</td></tr>
+          <tr><td>串行队列 + 限长 50</td><td>防堆积;队列过长丢最旧并警告</td></tr>
+          <tr><td>CAS 冲突重试(3 次,退避)</td><td>网络抖动/并发时不丢数据</td></tr>
+          <tr><td>20s 超时</td><td>防网络黑洞卡死队列</td></tr>
+          <tr><td>退出时 flush</td><td>关程序前等队列写完,最后几轮不丢</td></tr>
+          <tr><td>Celld 本地缓存(~100ms)</td><td>快路径立即可读;BOS 是慢但稳的权威源</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div>
+      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q3: 没有 Celld/BOS 之前,agent 会话存在哪?</div>
+      <div style="font-size:13px;color:var(--dim);line-height:1.9">
+        <b style="color:var(--text)">纯本地文件系统。</b>pi 原生(以及传统 CLI agent)把会话写成本地 JSONL 文件
+        (<code>~/.pi/agent/sessions/.../*.jsonl</code>),每轮 append 一行;恢复 = 读本地文件。<br>
+        <b style="color:var(--red)">本地即全部</b>:换电脑 / 删目录 / 磁盘损坏 = 会话永久丢失。<br><br>
+        celagent 的增量不是"不用本地了",而是<b style="color:var(--green)">加了一层云端权威副本</b>:
+        <code>本地 JSONL(pi 引擎运行时态) + Celld 缓存 + BOS(权威副本)</code> —
+        BOS 解决本地单点故障(换机/丢失/节点挂),代价是 1.7s 延迟,用异步队列隐藏。
+      </div>
+    </div>
+  </div>
+
   <!-- 定位一句话 + 价值分层表 -->
 
 
@@ -397,7 +453,7 @@
   <!-- ===== 左: 运行过程 ===== -->
   <div id="process">
     <div class="panel">
-      <div class="panel-title"><span class="live">● LIVE</span> ④ 运行过程(点击"运行一轮"或自动播放 — 每轮展示双写全过程)</div>
+      <div class="panel-title"><span class="live">● LIVE</span> ⑤ 运行过程(点击"运行一轮"或自动播放 — 每轮展示双写全过程)</div>
       <div style="font-size:11px;color:var(--dim);margin-bottom:10px">⚠ 对话内容为演示脚本(展示双写流程);追踪表与监控中的延迟/ETag/大小均为真实采集值</div>
 
       <!-- Celld 节点 -->
@@ -439,7 +495,7 @@
   <!-- ===== 右: BOS 监控 ===== -->
   <div id="monitor">
     <div class="panel">
-      <div class="panel-title">⑤ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
+      <div class="panel-title">⑥ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
 
       <div class="mon-grid">
         <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">230</div><div class="m-sub">sessions 35 · cells 176 · deploy 10 · celld 状态 9</div></div>
@@ -470,7 +526,7 @@
 </div>
 
   <div class="panel" style="margin-top:24px" id="value">
-    <div class="panel-title">⑥ 价值评估 — 一句话定位 + 诚实评估</div>
+    <div class="panel-title">⑦ 价值评估 — 一句话定位 + 诚实评估</div>
     <div class="dataflow-note">
     <b>一句话定位:</b> <code>BOS = 核心价值(权威持久层,跨机器防丢失)</code> ·
     <code>Celld = 本地加速(缓存,可替换)</code> —
