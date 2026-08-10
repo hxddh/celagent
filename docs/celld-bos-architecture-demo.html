@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>celagent 运行过程演示 — Celld × BOS 实时交互与监控</title>
+<meta name="description" content="celagent 架构演示: Celld 分布式执行层 × BOS 对象存储权威持久化, 60 轮真实采集数据回放">
+<title>celagent 架构演示 — Celld × BOS 持久化(60 轮真实数据回放)</title>
 <style>
   :root {
     --bg: #0b0e14; --panel: #12161f; --panel2: #181e2b; --border: #262d3d;
@@ -975,9 +976,17 @@ $("btnKill").onclick = () => {
 };
 $("btnFast").onclick = () => {
   // 快进: 一次推进 10 轮 (用真实记录更新状态, 不逐轮动画)
+  // 缺陷修复: 自动播放中点击快进 → 先暂停自动 (避免与异步循环并发改 state)
+  if (state.running) {
+    state.auto = false;
+    $("btnAuto").textContent = "⏵ 自动播放";
+    state.running = false;
+    $("btnRun").disabled = false;
+  }
   const target = Math.min(state.turn + 10, TURNS.length);
   for (let i = state.turn; i < target; i++) {
     const rec = REAL_RECORDS[i];
+    const turn = TURNS[i];
     state.reads++; state.writes++;
     state.readLats.push(rec.readMs);
     state.writeLats.push(rec.writeMs);
@@ -986,15 +995,24 @@ $("btnFast").onclick = () => {
     state.workerLat = rec.workerMs;
     state.etag = rec.etag;
     state.bytes = rec.size;
+    // 缺陷修复: 快进也补聊天区 (显示被推进轮次的对话)
+    if (turn) {
+      const d = document.createElement("div");
+      d.className = "msg " + turn.role;
+      d.innerHTML = `<span class="tag">${turn.role === "user" ? "👤 user" : "🤖 assistant"} · turn ${turn.turn}</span>${turn.msg.replace(/\n/g, "<br>").slice(0, 150)}${turn.msg.length > 150 ? "…" : ""}`;
+      chatEl.prepend(d);
+    }
   }
   state.turn = target;
-  // 批量补追踪摘要 (只显示每批最后一条)
+  // 节点卡片延迟更新 (缺陷修复)
   const lastRec = REAL_RECORDS[target - 1];
+  nodeLat(target % 2, lastRec.workerMs);
+  // 批量补追踪摘要 (只显示每批最后一条)
   const tr = document.createElement("div");
   tr.className = "trace-row new";
   tr.innerHTML = `
-    <div class="trace-cell celld-c"><span class="tt">Celld · 快进至 turn ${target}</span><span class="kv">批量推进 10 轮</span><br><span class="change">✓ worker 缓存已更新 (${lastRec.workerMs}ms)</span></div>
-    <div class="trace-cell bos-c"><span class="tt">BOS · turn ${target}</span><span class="kv">CAS 写 ×10 完成</span><br><span class="change">✓ ETag "${lastRec.etag}" · ${lastRec.size}B</span></div>`;
+    <div class="trace-cell celld-c"><span class="tt">Celld · 快进至 turn ${target}</span><span class="kv">批量推进 ${target - (target - 10) >= 0 ? 10 : target} 轮</span><br><span class="change">✓ worker 缓存已更新 (${lastRec.workerMs}ms)</span></div>
+    <div class="trace-cell bos-c"><span class="tt">BOS · turn ${target}</span><span class="kv">CAS 写 ×${Math.min(10, target)} 完成</span><br><span class="change">✓ ETag "${lastRec.etag}" · ${lastRec.size}B</span></div>`;
   $("traceBody").prepend(tr);
   logFlow(`⏩ 快进 10 轮 → turn ${target} (ETag "${lastRec.etag}", ${lastRec.size}B)`, "op-ok");
   updateMetrics();
