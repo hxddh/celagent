@@ -457,10 +457,23 @@ async function configCommand(args) {
 async function doctorCommand() {
   console.log("celagent doctor — 自检\n");
   let ok = true;
+  // 0. pi-runtime 前置依赖 (Bug 89: models.json/auth.json/settings.json 是 TUI 启动前提,
+  //    缺失/损坏时 TUI 直接崩, 但旧 doctor 不检查 → 误报"全部正常")
+  const piDir = join(homedir(), ".config", "celagent", "pi-runtime");
+  const piFiles = ["settings.json", "models.json", "auth.json"];
+  const piStates = piFiles.map(f => {
+    const p = join(piDir, f);
+    if (!existsSync(p)) return { f, state: "缺缺失" };
+    try { JSON.parse(readFileSync(p, "utf8")); return { f, state: "✓" }; }
+    catch (e) { return { f, state: "损坏" }; }
+  });
+  const piOk = piStates.every(s => s.state === "✓");
+  console.log(`[0/5] pi-runtime: ${piStates.map(s => `${s.f}${s.state === "✓" ? "" : " " + s.state}`).join(", ")} ${piOk ? "" : "✗ (TUI 无法启动!)"}`);
+  if (!piOk) ok = false;
   // 1. 配置
   const cfg = loadConfig();
   const bucket = cfg.persistence?.bucket;
-  console.log(`[1/4] 配置: ${bucket ? "✓ bucket=" + bucket : "✗ 缺 persistence.bucket (运行 setup.sh 或 config set)"}`);
+  console.log(`[1/5] 配置: ${bucket ? "✓ bucket=" + bucket : "✗ 缺 persistence.bucket (运行 setup.sh 或 config set)"}`);
   if (!bucket) ok = false;
   // 2. BOS 凭证
   const { execFile } = await import("node:child_process");
@@ -468,7 +481,7 @@ async function doctorCommand() {
     execFile("aws", ["configure", "get", "aws_access_key_id", "--profile", "bos"], { timeout: 10000, encoding: "utf8" }, (err, stdout) => resolve(err ? null : (stdout || "").trim()));
   });
   const hasEnv = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
-  console.log(`[2/4] 凭证: ${(cred || hasEnv) ? "✓ [bos] profile" + (hasEnv ? " (env)" : "") : "✗ 无凭证 (需 ~/.aws/credentials [bos] 或环境变量)"}`);
+  console.log(`[2/5] 凭证: ${(cred || hasEnv) ? "✓ [bos] profile" + (hasEnv ? " (env)" : "") : "✗ 无凭证 (需 ~/.aws/credentials [bos] 或环境变量)"}`);
   if (!cred && !hasEnv) ok = false;
   // 3. Celld 节点
   const nodes = [];
@@ -478,13 +491,13 @@ async function doctorCommand() {
       if (r.ok) nodes.push(base);
     } catch (e) { /* down */ }
   }
-  console.log(`[3/4] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "✗ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
+  console.log(`[3/5] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "✗ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
   // 4. BOS 连通
   if (bucket) {
     const probe = await new Promise((resolve) => {
       execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com", "--query", "Contents[].Key", "--output", "json"], { env: { ...process.env, AWS_PROFILE: "bos" }, timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
     });
-    console.log(`[4/4] BOS 连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
+    console.log(`[4/5] BOS 连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
     if (!probe) ok = false;
   }
   console.log(`\n结论: ${ok ? "✓ 全部正常" : "✗ 存在异常, 按上面 ✗ 项处理"}`);
