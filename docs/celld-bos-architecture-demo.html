@@ -270,11 +270,11 @@
 
     <!-- Celld 框 -->
     <rect x="60" y="190" width="460" height="190" rx="16" fill="var(--svg-panel2)" stroke="#58a6ff"/>
-    <text x="90" y="225" font-size="16" font-weight="700" fill="#58a6ff">② Celld — 本地缓存(快)</text>
-    <text x="90" y="253" font-size="13" fill="var(--svg-dim)">• 本机运行,写入约 100ms,对话无感</text>
-    <text x="90" y="277" font-size="13" fill="var(--svg-dim)">• 双节点自动管理,一个挂了另一个接管</text>
-    <text x="90" y="301" font-size="13" fill="var(--svg-dim)">• 缓存可以丢——丢了从 BOS 重建</text>
-    <text x="90" y="330" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:本地加速 · 可替换 · 非权威</text>
+    <text x="90" y="225" font-size="16" font-weight="700" fill="#58a6ff">② Celld — 分布式执行层</text>
+    <text x="90" y="253" font-size="13" fill="var(--svg-dim)">• 节点发现/状态迁移(多机经 BOS 注册)</text>
+    <text x="90" y="277" font-size="13" fill="var(--svg-dim)">• 会话即 cell:休眠唤醒、跨节点访问</text>
+    <text x="90" y="301" font-size="13" fill="var(--svg-dim)">• 任务状态机 + 缓存快路径(P0-P2 已启用)</text>
+    <text x="90" y="330" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:执行层 · 多机核心 · 单机价值有限</text>
     <text x="90" y="352" font-size="12" fill="var(--svg-dim)" font-family="monospace">存:最近对话(截断 200 字符,见下方说明)</text>
     <text x="90" y="374" font-size="11.5" fill="var(--svg-dim)">自带 S3 客户端(内置 object_store 库)— 直连 BOS,不调外部工具</text>
 
@@ -528,9 +528,9 @@
   <div class="panel" style="margin-top:24px" id="value">
     <div class="panel-title">⑦ 价值评估 — 一句话定位 + 诚实评估</div>
     <div class="dataflow-note">
-    <b>一句话定位:</b> <code>BOS = 核心价值(权威持久层,跨机器防丢失)</code> ·
-    <code>Celld = 本地加速(缓存,可替换)</code> —
-    把"会话永不丢"交给 BOS(真实需求,已验证),Celld 提供低延迟本地缓存与节点自动管理。
+    <b>一句话定位:</b> <code>BOS = 保数据(权威持久层,跨机器防丢失)</code> ·
+    <code>Celld = 保执行(分布式运行时)</code> —
+    "会话永不丢"由 BOS 兑现(真实需求,已验证);Celld 提供节点发现/休眠唤醒/任务状态机(多机场景核心,P0-P2 已启用)。
   </div>
 
   <table class="obj-table" style="margin-top:10px">
@@ -546,7 +546,7 @@
         <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
         <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、cell 状态(LTX/own 经 BOS)、deploy 里的 worker 执行环境</td>
         <td>低延迟本地缓存(~100ms)、节点自动拉起/故障转移、worker 执行器</td>
-        <td style="color:var(--yellow)"><b>⚠ 边际价值:缓存可丢(BOS 重建);独有能力(休眠/epoch/委托)未启用</b> — 研究驱动遗留,非需求驱动</td>
+        <td style="color:var(--blue)"><b>✅ 执行层价值:节点发现/状态迁移/休眠唤醒/任务状态机</b> — 多机场景核心组件(P0-P2 已启用:读快路径、休眠、任务、跨节点访问);单机场景价值有限</td>
       </tr>
       <tr>
         <td style="color:#3fb950;font-weight:600">celagent (TUI)</td>
@@ -560,8 +560,9 @@
 </div>
 
 <footer>
-  <b>核心结论:</b> BOS 是 celagent 的核心价值(会话跨机器/防丢失,RPO=0,故障注入实测恢复 10/10 轮);
-  Celld 提供本地缓存加速(可替换)。⚠️ 本页为<b>演示 + 真实数据混合</b>:对话脚本为演示用途;
+  <b>架构结论:</b> <b style="color:var(--yellow)">BOS 保数据(权威,跨机器/防丢失,RPO=0)</b> ·
+  <b style="color:var(--blue)">Celld 保执行(分布式运行时:节点发现/休眠唤醒/任务状态机)</b> —
+  分层并存:数据层与执行层分离。⚠️ 本页为<b>演示 + 真实数据混合</b>:对话脚本为演示用途;
   延迟/ETag/对象大小等数字来自 2026-08-10 对真实 BOS 的一次完整重建采集,自动播放按序回放,不重复访问 BOS;
   数据保存在 <code>sessions/demo-session.json</code> (bucket <code>celagent-<user>-<ts></code>)
 </footer>
