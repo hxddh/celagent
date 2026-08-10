@@ -534,7 +534,7 @@
       <div class="panel-title">⑦ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
 
       <div class="mon-grid">
-        <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">270</div><div class="m-sub">sessions 35 · cells 210 · deploy 16 · celld 状态 9</div></div>
+        <div class="metric"><div class="m-label">对象总数 (bucket, 随运行增长)</div><div class="m-value blue" id="mObjects">270</div><div class="m-sub">sessions 覆盖写不新增;celld 状态 cells/ 每轮写 LTX (~1.5 个/轮, 实测)</div></div>
         <div class="metric"><div class="m-label">demo-large-session 大小</div><div class="m-value" id="mBytes">173 B</div><div class="m-sub">本轮写入后对象大小</div></div>
         <div class="metric"><div class="m-label">读次数 (演示)</div><div class="m-value green" id="mReads">0</div><div class="m-sub">GET / head-object (ETag)</div></div>
         <div class="metric"><div class="m-label">写次数 (演示)</div><div class="m-value yellow" id="mWrites">0</div><div class="m-sub">PUT (If-Match CAS)</div></div>
@@ -860,9 +860,9 @@ async function runOneTurn() {
   const i = state.turn;
   const rec = REAL_RECORDS[i];
   state.turn++;
-  // 对象总数不变 (demo-large-session 是覆盖同一 key, 不新增对象);
-  // demo-large-session 大小按真实采集递增 (173B → 80879B)
-  state.objects = BASELINE_OBJECTS;
+  // 对象总数随运行增长: sessions 覆盖写不新增, 但 celld 的 cells/ 状态
+  // 每轮写入 LTX (实测约 1.5 个/轮) — 真实运行中对象数持续增加
+  state.objects = BASELINE_OBJECTS + state.turn + Math.floor(state.turn / 2);
   state.bytes = rec.size;
 
   // 1. 对话消息 (typing 效果)
@@ -1008,6 +1008,8 @@ $("btnFast").onclick = () => {
     }
   }
   state.turn = target;
+  // 对象总数随运行增长 (与逐轮一致: BASELINE + turn + floor(turn/2))
+  state.objects = BASELINE_OBJECTS + state.turn + Math.floor(state.turn / 2);
   // 节点卡片延迟更新 (缺陷修复)
   const lastRec = REAL_RECORDS[target - 1];
   nodeLat(target % 2, lastRec.workerMs);
