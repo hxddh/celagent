@@ -235,7 +235,13 @@ export class AgentRuntime {
       case 'checkpoint': {
         // 每轮对话后, 客户端把完整会话状态写到这里 (RPO=0)
         const sessionId = url.searchParams.get('session') || 'default';
-        const turn = parseInt(url.searchParams.get('turn') || '0');
+        // Bug 91: turn 必须校验 — 非数字/负数/NaN 会写入脏数据,
+        // 导致恢复时 Math.max(...turns) = NaN 序号链断裂
+        const rawTurn = url.searchParams.get('turn') || '0';
+        const turn = Number.parseInt(rawTurn, 10);
+        if (!Number.isFinite(turn) || turn < 0) {
+          return new Response(JSON.stringify({ ok: false, error: 'invalid-turn', turn: rawTurn }), { status: 400 });
+        }
         const msg = url.searchParams.get('msg') || '';
         const key = `session:${sessionId}`;
         const existing = await this.state.storage.get(key) || { id: sessionId, turns: [] };

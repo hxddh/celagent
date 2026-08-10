@@ -9,12 +9,12 @@ CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
 VERSION="0.1.0"
 echo "=== celagent v${VERSION} 一键安装 (Celld + BOS) ==="
 
-# 1. 前置检查
-echo "[1/5] 检查依赖..."
-for cmd in node curl aws; do
-  command -v $cmd >/dev/null 2>&1 || { echo "  需要 $cmd"; exit 1; }
+# 1. 前置检查 — Bug 90: jq 是 bucket 复用逻辑的依赖, 缺失时静默新建 bucket
+#    覆盖 settings.json (数据丢失风险) — 必须显式检查
+for cmd in node curl aws jq; do
+  command -v $cmd >/dev/null 2>&1 || { echo "  需要 $cmd (brew install jq)"; exit 1; }
 done
-echo "  ✓ node/curl/aws 就绪"
+echo "  ✓ node/curl/aws/jq 就绪"
 
 # 2. 安装 celagent CLI
 # Bug 58/66: 正式模式支持从 git 仓库/npm 包安装, 不再强制要求 CELAGENT_SRC
@@ -38,7 +38,9 @@ rm -rf "${CELAGENT_ROOT}/celagent/bin" "${CELAGENT_ROOT}/celagent/src"
 cp -r "${CELAGENT_SRC}/bin" "${CELAGENT_SRC}/src" "${CELAGENT_ROOT}/celagent/"
 # 依赖安装: TUI 运行时 import @earendil-works/pi-coding-agent (Bug 58: 之前只拷 bin,
 # 安装后启动即崩 — 找不到 pi 包)
-if [ ! -d "${CELAGENT_ROOT}/celagent/node_modules/@earendil-works/pi-coding-agent" ]; then
+if [ ! -d "${CELAGENT_ROOT}/celagent/node_modules/@earendil-works/pi-coding-agent" ] || [ ! -x "${CELAGENT_ROOT}/celagent/node_modules/.bin/esbuild" ]; then
+  # Bug 92: esbuild 缺失也必须重装 — 旧安装目录的 package.json 可能没有 esbuild,
+  # 导致 worker 部署静默失败
   echo "  安装依赖 (npm install)..."
   cp "${CELAGENT_SRC}/package.json" "${CELAGENT_SRC}/package-lock.json" "${CELAGENT_ROOT}/celagent/" 2>/dev/null || true
   (cd "${CELAGENT_ROOT}/celagent" && npm install --no-audit --no-fund) || {
@@ -47,11 +49,19 @@ if [ ! -d "${CELAGENT_ROOT}/celagent/node_modules/@earendil-works/pi-coding-agen
   }
 fi
 # 链接 celagent 命令 (Bug H: 用 TUI 版, 与默认一致)
-# Bug 67: 开发模式 (CELAGENT_SRC 指向本机源码) 时软链直接指向源码 —
-# 改源码即生效 (Bug 47 修复), 避免 install.sh 重跑后回归成“跑安装副本旧版”。
-if [ -f "${CELAGENT_SRC}/bin/celagent-tui.mjs" ] && [ -d "${CELAGENT_SRC}/.git" ]; then
-  ln -sf "${CELAGENT_SRC}/bin/celagent-tui.mjs" "${CELAGENT_ROOT}/bin/celagent"
-  echo "  ✓ celagent 已安装 (开发模式软链→源码: ${CELAGENT_SRC}/bin/celagent-tui.mjs)"
+# Bug 67/92: 开发模式 (CELAGENT_SRC 指向本机源码) 时软链直接指向源码 —
+# 改源码即生效 (Bug 47 修复)。但 git clone 的临时目录 (mktemp/正式安装)
+# 也有 .git, 不能判为开发模式 — 只有 CELAGENT_SRC 是用户显式指定的
+# 源码目录 (含 src/ 且有 package.json 且不在 /tmp) 才走开发模式
+DEV_SRC=""
+if [ -f "${CELAGENT_SRC}/bin/celagent-tui.mjs" ] && [ -d "${CELAGENT_SRC}/.git" ] \
+   && [ -d "${CELAGENT_SRC}/src" ] && [ -f "${CELAGENT_SRC}/package.json" ] \
+   && [ "${CELAGENT_SRC}" != "${TMP_SRC:-}" ] && [[ "${CELAGENT_SRC}" != /tmp/* ]]; then
+  DEV_SRC="$CELAGENT_SRC"
+fi
+if [ -n "$DEV_SRC" ]; then
+  ln -sf "${DEV_SRC}/bin/celagent-tui.mjs" "${CELAGENT_ROOT}/bin/celagent"
+  echo "  ✓ celagent 已安装 (开发模式软链→源码: ${DEV_SRC}/bin/celagent-tui.mjs)"
 else
   ln -sf "${CELAGENT_ROOT}/celagent/bin/celagent-tui.mjs" "${CELAGENT_ROOT}/bin/celagent"
   echo "  ✓ celagent 已安装到 ${CELAGENT_ROOT}/bin/celagent"

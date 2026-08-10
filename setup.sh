@@ -7,6 +7,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 echo "=== celagent 一键部署 (Celld + BOS 对象存储) ==="
 
+# Bug 90: jq 是 bucket 复用逻辑的依赖, 缺失时静默新建 bucket 覆盖配置
+command -v jq >/dev/null 2>&1 || { echo "  ✗ 需要 jq (brew install jq)"; exit 1; }
+
 # 1. 检测 BOS 凭证
 echo "[1/4] 检测 BOS 凭证..."
 AK=$(aws configure get aws_access_key_id --profile bos 2>/dev/null || true)
