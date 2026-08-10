@@ -273,7 +273,7 @@
     <text x="90" y="225" font-size="16" font-weight="700" fill="#58a6ff">② Celld — 分布式执行层</text>
     <text x="90" y="253" font-size="13" fill="var(--svg-dim)">• 节点发现/状态迁移(多机经 BOS 注册)</text>
     <text x="90" y="277" font-size="13" fill="var(--svg-dim)">• 会话即 cell:休眠唤醒、跨节点访问</text>
-    <text x="90" y="301" font-size="13" fill="var(--svg-dim)">• 任务状态机 + 缓存快路径(P0-P2 已启用)</text>
+    <text x="90" y="301" font-size="13" fill="var(--svg-dim)">• 任务状态机 + 缓存快路径</text>
     <text x="90" y="330" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:执行层 · 多机核心 · 单机价值有限</text>
     <text x="90" y="352" font-size="12" fill="var(--svg-dim)" font-family="monospace">存:最近对话(截断 200 字符,见下方说明)</text>
     <text x="90" y="374" font-size="11.5" fill="var(--svg-dim)">自带 S3 客户端(内置 object_store 库)— 直连 BOS,不调外部工具</text>
@@ -359,19 +359,19 @@
   <span class="k">"updatedAt"</span>: <span class="n">1786343740759</span>  <span class="c">// 实测值 (2026-08-10 采集)</span>
 }
 
-<span class="c">// 实测: BOS 权威源 (sessions/demo-session.json) — 完整记忆方案 A 已实施</span>
-<span class="c">// turn1 为演示脚本 (真实产品 turn_end 只写 assistant 轮); content/toolResults 为方案 A 新增完整字段</span>
+<span class="c">// 实测: BOS 权威源 (sessions/demo-session.json) — 完整记忆</span>
+<span class="c">// turn1 为演示脚本 (真实产品 turn_end 只写 assistant 轮); content/toolResults 为完整字段</span>
 {
   <span class="k">"id"</span>: <span class="s">"demo-session"</span>,
   <span class="k">"turns"</span>: [
     {
       <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"role"</span>: <span class="s">"user"</span>,
       <span class="k">"msg"</span>: <span class="s">"帮我分析一下项目的架构"</span>, <span class="k">"ts"</span>: <span class="n">1786343710345</span>,
-      <span class="k">"content"</span>: [ <span class="c">// 方案A: 完整内容块 (thinking/text/toolCall 全量)</span>
+      <span class="k">"content"</span>: [ <span class="c">// 完整内容块 (thinking/text/toolCall 全量)</span>
         { <span class="k">"type"</span>: <span class="s">"thinking"</span>, <span class="k">"thinking"</span>: <span class="s">"完整推理过程…"</span> },
         { <span class="k">"type"</span>: <span class="s">"toolCall"</span>, <span class="k">"name"</span>: <span class="s">"bash"</span>, <span class="k">"arguments"</span>: { <span class="k">"command"</span>: <span class="s">"ls"</span> } }
       ],
-      <span class="k">"toolResults"</span>: [ <span class="c">// 方案A: 完整工具结果</span>
+      <span class="k">"toolResults"</span>: [ <span class="c">// 完整工具结果</span>
         { <span class="k">"toolName"</span>: <span class="s">"bash"</span>, <span class="k">"content"</span>: [{ <span class="k">"type"</span>: <span class="s">"text"</span>, <span class="k">"text"</span>: <span class="s">"src\nbin"</span> }] }
       ]
     }
@@ -384,8 +384,8 @@
         <tr><td><code>turn</code></td><td>轮次序号(1,2,3…)</td><td>✓</td><td>✓</td></tr>
         <tr><td><code>role</code></td><td>发言角色:user / assistant</td><td style="color:#8b949e">✗ 不存</td><td>✓</td></tr>
         <tr><td><code>msg</code></td><td>摘要文本(供恢复注入与 worker 缓存,各段带长度上限)</td><td style="color:#d29922">截断 200 字符</td><td style="color:#3fb950">完整保存</td></tr>
-        <tr><td><code>content</code></td><td>完整内容块:thinking / text / toolCall(方案 A 新增)</td><td style="color:#8b949e">✗ 不存</td><td style="color:#3fb950">✅ 完整</td></tr>
-        <tr><td><code>toolResults</code></td><td>完整工具结果(方案 A 新增;本地 JSONL 也不存)</td><td style="color:#8b949e">✗ 不存</td><td style="color:#3fb950">✅ 完整</td></tr>
+        <tr><td><code>content</code></td><td>完整内容块:thinking / text / toolCall</td><td style="color:#8b949e">✗ 不存</td><td style="color:#3fb950">✅ 完整</td></tr>
+        <tr><td><code>toolResults</code></td><td>完整工具结果(本地 JSONL 不存)</td><td style="color:#8b949e">✗ 不存</td><td style="color:#3fb950">✅ 完整</td></tr>
         <tr><td><code>ts</code></td><td>时间戳(ms)</td><td>✓</td><td>✓</td></tr>
         <tr><td><code>updatedAt</code></td><td>会话最后更新时间</td><td>✓</td><td style="color:#8b949e">—</td></tr>
       </tbody>
@@ -410,15 +410,15 @@
     <div style="margin-bottom:18px">
       <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q1: 写到 BOS 的是 agent 会话的"所有内容"吗?</div>
       <div style="font-size:13px;color:var(--dim);line-height:1.8">
-        <b style="color:var(--text)">方案 A(完整记忆)已实施:BOS 存完整内容块 + 工具结果</b>,同时保留摘要 msg 供快速注入。完整会话仍以本地 pi JSONL 为准(含 user 轮):
+        <b style="color:var(--text)">BOS 存完整内容块 + 完整工具结果</b>,同时保留摘要 msg 供快速注入。完整会话仍以本地 pi JSONL 为准(含 user 轮):
       </div>
       <table class="obj-table" style="margin-top:8px">
         <thead><tr><th>内容</th><th>BOS(权威)</th><th>本地 JSONL</th></tr></thead>
         <tbody>
           <tr><td>assistant 回复文本</td><td style="color:var(--green)">✅ 完整</td><td>✅ 完整</td></tr>
-          <tr><td>thinking 推理过程</td><td style="color:var(--green)">✅ 完整(方案 A)</td><td>✅ 完整</td></tr>
-          <tr><td>工具调用(名称+完整参数)</td><td style="color:var(--green)">✅ 完整(方案 A)</td><td>✅ 完整</td></tr>
-          <tr><td>工具结果</td><td style="color:var(--green)">✅ 完整(方案 A)</td><td style="color:var(--red)">❌ 不存</td></tr>
+          <tr><td>thinking 推理过程</td><td style="color:var(--green)">✅ 完整</td><td>✅ 完整</td></tr>
+          <tr><td>工具调用(名称+完整参数)</td><td style="color:var(--green)">✅ 完整</td><td>✅ 完整</td></tr>
+          <tr><td>工具结果</td><td style="color:var(--green)">✅ 完整</td><td style="color:var(--red)">❌ 不存</td></tr>
           <tr><td>user 输入</td><td style="color:var(--yellow)">⚠ 仅摘要 msg 里(turn_end 钩子只存 assistant 轮)</td><td>✅ 完整</td></tr>
           <tr><td>摘要 msg(供恢复注入)</td><td style="color:var(--green)">✅ 保留</td><td>—</td></tr>
         </tbody>
@@ -543,7 +543,7 @@
     <div class="dataflow-note">
     <b>一句话定位:</b> <code>BOS = 保数据(权威持久层,跨机器防丢失)</code> ·
     <code>Celld = 保执行(分布式运行时)</code> —
-    "会话永不丢"由 BOS 兑现(真实需求,已验证);Celld 提供节点发现/休眠唤醒/任务状态机(多机场景核心,P0-P2 已启用)。
+    "会话永不丢"由 BOS 兑现(真实需求,已验证);Celld 提供节点发现/休眠唤醒/任务状态机(多机场景核心,)。
   </div>
 
   <table class="obj-table" style="margin-top:10px">
@@ -559,7 +559,7 @@
         <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
         <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、cell 状态(LTX/own 经 BOS)、deploy 里的 worker 执行环境</td>
         <td>低延迟本地缓存(~100ms)、节点自动拉起/故障转移、worker 执行器</td>
-        <td style="color:var(--blue)"><b>✅ 执行层价值:节点发现/状态迁移/休眠唤醒/任务状态机</b> — 多机场景核心组件(P0-P2 已启用:读快路径、休眠、任务、跨节点访问);单机场景价值有限</td>
+        <td style="color:var(--blue)"><b>✅ 执行层价值:节点发现/状态迁移/休眠唤醒/任务状态机</b> — 多机场景核心组件;单机场景价值有限</td>
       </tr>
       <tr>
         <td style="color:#3fb950;font-weight:600">celagent (TUI)</td>
