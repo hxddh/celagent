@@ -74,7 +74,8 @@
 
   /* 数据流动画 */
   .flow { position:relative; background:var(--panel2); border-radius:10px; padding:10px 12px; min-height:150px; overflow:hidden; }
-  .flow-line { font-family:var(--mono); font-size:11.5px; color:var(--dim); padding:2px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .flow-line { font-family:var(--mono); font-size:11.5px; color:var(--dim); padding:2px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:default; }
+  .flow-line:hover { color:var(--text); }
   .flow-line .t { color:var(--dim); opacity:.6; }
   .flow-line .op-write { color:var(--blue); }
   .flow-line .op-read { color:var(--green); }
@@ -222,6 +223,7 @@
   <div class="controls">
     <button class="btn primary" id="btnRun">▶ 运行一轮</button>
     <button class="btn" id="btnAuto">⏵ 自动播放</button>
+    <span id="autoProgress" style="font-size:11px;color:var(--dim);font-family:var(--mono)"></span>
     <button class="btn danger" id="btnKill">⛔ 故障注入:kill 节点</button>
     <button class="btn" id="btnReset">↺ 重置</button>
     <button class="btn" id="btnTheme" title="切换浅色/暗色主题">☀ 浅色</button>
@@ -389,36 +391,7 @@
   </div>
 
   <!-- 定位一句话 + 价值分层表 -->
-  <div class="dataflow-note" style="margin-top:16px" id="value">
-    <b>一句话定位:</b> <code>BOS = 核心价值(权威持久层,跨机器防丢失)</code> ·
-    <code>Celld = 本地加速(缓存,可替换)</code> —
-    把"会话永不丢"交给 BOS(真实需求,已验证),Celld 提供低延迟本地缓存与节点自动管理。
-  </div>
 
-  <table class="obj-table" style="margin-top:10px">
-    <thead><tr><th style="width:100px">组件</th><th>承载的数据类型</th><th>实际价值</th><th>价值评估(诚实版)</th></tr></thead>
-    <tbody>
-      <tr>
-        <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
-        <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,176 个)、<b>deploy/agent-runtime</b>(worker 代码包,9 个)</td>
-        <td>会话跨机器/防丢失(RPO=0)、并发安全(CAS)、换机器/删本地/节点全挂都能找回</td>
-        <td style="color:var(--green)"><b>✅ 核心价值,真实需求,故障注入实测验证</b>(节点全挂可写、恢复 10/10)</td>
-      </tr>
-      <tr>
-        <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
-        <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、cell 状态(LTX/own 经 BOS)、deploy 里的 worker 执行环境</td>
-        <td>低延迟本地缓存(~100ms)、节点自动拉起/故障转移、worker 执行器</td>
-        <td style="color:var(--yellow)"><b>⚠ 边际价值:缓存可丢(BOS 重建);独有能力(休眠/epoch/委托)未启用</b> — 研究驱动遗留,非需求驱动</td>
-      </tr>
-      <tr>
-        <td style="color:#3fb950;font-weight:600">celagent (TUI)</td>
-        <td>运行时态:pi 引擎会话(agentDir 独立目录)、配置 settings.json、BOS 凭证引用(~/.aws/credentials)</td>
-        <td>复用 Pi 引擎全部能力,只替换持久化层;独立品牌、不 fork</td>
-        <td>✅ 交互层,复用成熟引擎,专注持久化差异化</td>
-      </tr>
-    </tbody>
-  </table>
-</div>
 
 <div class="layout">
   <!-- ===== 左: 运行过程 ===== -->
@@ -458,7 +431,7 @@
       <div class="flow" id="flow" aria-live="polite"><div class="flow-line" style="color:var(--dim)">等待运行…(每轮: worker 写 → BOS 读 ETag → CAS 写 → ETag 更新)</div></div>
 
       <!-- 对话消息 -->
-      <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">对话消息(演示脚本 — 展示双写流程用)</div>
+      <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">对话消息(演示脚本,最新在上)</div>
       <div class="chat" id="chat" aria-live="polite"></div>
     </div>
   </div>
@@ -494,6 +467,40 @@
       </table>
     </div>
   </div>
+</div>
+
+  <div class="panel" style="margin-top:24px" id="value">
+    <div class="panel-title">⑥ 价值评估 — 一句话定位 + 诚实评估</div>
+    <div class="dataflow-note">
+    <b>一句话定位:</b> <code>BOS = 核心价值(权威持久层,跨机器防丢失)</code> ·
+    <code>Celld = 本地加速(缓存,可替换)</code> —
+    把"会话永不丢"交给 BOS(真实需求,已验证),Celld 提供低延迟本地缓存与节点自动管理。
+  </div>
+
+  <table class="obj-table" style="margin-top:10px">
+    <thead><tr><th style="width:100px">组件</th><th>承载的数据类型</th><th>实际价值</th><th>价值评估(诚实版)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
+        <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,176 个)、<b>deploy/agent-runtime</b>(worker 代码包,9 个)</td>
+        <td>会话跨机器/防丢失(RPO=0)、并发安全(CAS)、换机器/删本地/节点全挂都能找回</td>
+        <td style="color:var(--green)"><b>✅ 核心价值,真实需求,故障注入实测验证</b>(节点全挂可写、恢复 10/10)</td>
+      </tr>
+      <tr>
+        <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
+        <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、cell 状态(LTX/own 经 BOS)、deploy 里的 worker 执行环境</td>
+        <td>低延迟本地缓存(~100ms)、节点自动拉起/故障转移、worker 执行器</td>
+        <td style="color:var(--yellow)"><b>⚠ 边际价值:缓存可丢(BOS 重建);独有能力(休眠/epoch/委托)未启用</b> — 研究驱动遗留,非需求驱动</td>
+      </tr>
+      <tr>
+        <td style="color:#3fb950;font-weight:600">celagent (TUI)</td>
+        <td>运行时态:pi 引擎会话(agentDir 独立目录)、配置 settings.json、BOS 凭证引用(~/.aws/credentials)</td>
+        <td>复用 Pi 引擎全部能力,只替换持久化层;独立品牌、不 fork</td>
+        <td>✅ 交互层,复用成熟引擎,专注持久化差异化</td>
+      </tr>
+    </tbody>
+  </table>
+    </div>
 </div>
 
 <footer>
@@ -571,6 +578,7 @@ function logFlow(text, cls) {
   div.className = "flow-line";
   const t = new Date().toLocaleTimeString("zh-CN", { hour12:false }) + " ";
   div.innerHTML = `<span class="t">${t}</span><span class="${cls}">${text}</span>`;
+  div.title = text;  // hover 显示完整内容 (nowrap 截断时)
   flowEl.prepend(div);
   while (flowEl.children.length > 30) flowEl.lastChild.remove();
 }
@@ -580,8 +588,7 @@ function addChat(role, text, typing=false) {
   const d = document.createElement("div");
   d.className = "msg " + role + (typing ? " typing" : "");
   d.innerHTML = `<span class="tag">${role === "user" ? "👤 user" : "🤖 assistant"} · turn ${state.turn}</span>${text}`;
-  chatEl.appendChild(d);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  chatEl.prepend(d);  // 最新在上, 与追踪表/日志方向一致
   return d;
 }
 
@@ -716,6 +723,7 @@ async function runOneTurn() {
 
   state.running = false;
   $("btnRun").disabled = false;
+  updateAutoProgress();
 
   // 自动播放结束或继续
   if (state.auto && state.turn < TURNS.length) {
@@ -734,6 +742,11 @@ $("btnAuto").onclick = () => {
   $("btnAuto").textContent = state.auto ? "⏸ 暂停" : "⏵ 自动播放";
   if (state.auto && !state.running && state.turn < TURNS.length) runOneTurn();
 };
+function updateAutoProgress() {
+  $("autoProgress").textContent = state.turn > 0 ? `${state.turn}/${TURNS.length} 轮` : "";
+}
+// 每轮结束更新进度
+const origEnd = runOneTurn;
 $("btnKill").onclick = () => {
   if (state.nodesUp[0] && state.nodesUp[1]) {
     state.nodesUp = [false, false];
@@ -760,6 +773,7 @@ $("btnReset").onclick = () => {
   flowEl.innerHTML = '<div class="flow-line" style="color:var(--dim)">等待运行…</div>';
   chatEl.innerHTML = "";
   $("traceBody").innerHTML = "";
+  updateAutoProgress();
   setNode(0,"up"); setNode(1,"up");
   updateMetrics(); renderObjects();
 };
@@ -781,6 +795,7 @@ try { savedTheme = localStorage.getItem("celagent-theme") || "dark"; } catch (e)
 applyTheme(savedTheme);
 
 // 初始化
+updateAutoProgress();
 updateMetrics();
 renderObjects();
 logFlow("就绪: 双节点在线 · BOS 基线 230 对象 · 点击「运行一轮」开始", "op-ok");
