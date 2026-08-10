@@ -429,7 +429,7 @@
     </div>
 
     <div style="margin-bottom:18px">
-      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q2: BOS 写一次要 ~1.7 秒,性能问题怎么解决?</div>
+      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q2: BOS 写一次要 ~0.7 秒,性能问题怎么解决?</div>
       <div style="font-size:13px;color:var(--dim);line-height:1.8">
         <b style="color:var(--text)">写延迟被完全挡在对话之外</b> — 对话轮结束,turn_end 钩子毫秒级返回,不等待 BOS:
       </div>
@@ -441,7 +441,7 @@
           <tr><td>CAS 冲突重试(3 次,退避)</td><td>网络抖动/并发时不丢数据</td></tr>
           <tr><td>20s 超时</td><td>防网络黑洞卡死队列</td></tr>
           <tr><td>退出时 flush</td><td>关程序前等队列写完,最后几轮不丢</td></tr>
-          <tr><td>Celld 本地缓存(~100ms)</td><td>快路径立即可读;BOS 是慢但稳的权威源</td></tr>
+          <tr><td>Celld 本地缓存(~157ms)</td><td>快路径立即可读;BOS 是慢但稳的权威源</td></tr>
         </tbody>
       </table>
     </div>
@@ -454,7 +454,7 @@
         <b style="color:var(--red)">本地即全部</b>:换电脑 / 删目录 / 磁盘损坏 = 会话永久丢失。<br><br>
         celagent 的增量不是"不用本地了",而是<b style="color:var(--green)">加了一层云端权威副本</b>:
         <code>本地 JSONL(pi 引擎运行时态) + Celld 缓存 + BOS(权威副本)</code> —
-        BOS 解决本地单点故障(换机/丢失/节点挂),代价是 1.7s 延迟,用异步队列隐藏。
+        BOS 解决本地单点故障(换机/丢失/节点挂),代价是 ~0.7s 写延迟,用异步队列隐藏。
       </div>
     </div>
   </div>
@@ -558,7 +558,7 @@
       <tr>
         <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
         <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、cell 状态(LTX/own 经 BOS)、deploy 里的 worker 执行环境</td>
-        <td>低延迟本地缓存(~100ms)、节点自动拉起/故障转移、worker 执行器</td>
+        <td>低延迟本地缓存(~157ms 实测)、节点自动拉起/故障转移、worker 执行器</td>
         <td style="color:var(--blue)"><b>✅ 执行层价值:节点发现/状态迁移/休眠唤醒/任务状态机</b> — 多机场景核心组件;单机场景价值有限</td>
       </tr>
       <tr>
