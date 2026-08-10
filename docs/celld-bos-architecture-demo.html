@@ -70,6 +70,24 @@
   @keyframes pulse { 0%{ background:rgba(88,166,255,.35); } 100%{ background:transparent; } }
 
   /* 消息流 */
+  /* 每轮变化追踪 (Celld vs BOS) */
+  .trace { margin-top:12px; }
+  .trace-head { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:6px; }
+  .trace-head .th {
+    font-size:11px; font-weight:700; padding:6px 10px; border-radius:8px; text-align:center;
+  }
+  .trace-head .th.celld { background:rgba(88,166,255,.12); color:#58a6ff; border:1px solid rgba(88,166,255,.3); }
+  .trace-head .th.bos { background:rgba(210,153,34,.12); color:#d29922; border:1px solid rgba(210,153,34,.3); }
+  .trace-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:6px; }
+  .trace-cell { background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:11px; font-family:var(--mono); }
+  .trace-cell .tt { font-size:10px; color:var(--dim); display:block; margin-bottom:3px; }
+  .trace-cell.celld-c { border-left:3px solid #58a6ff; }
+  .trace-cell.bos-c { border-left:3px solid #d29922; }
+  .trace-cell .kv { color:#e6edf3; }
+  .trace-cell .change { color:var(--green); }
+  .trace-cell .warn-c { color:var(--red); }
+  .trace-row.new .trace-cell { animation:rownew 1s; }
+
   .chat { margin-top:12px; display:flex; flex-direction:column; gap:8px; max-height:300px; overflow-y:auto; padding-right:4px; }
   .msg { border-radius:10px; padding:9px 12px; font-size:12.5px; max-width:95%; animation:slidein .25s; }
   @keyframes slidein { from{ transform:translateY(6px); opacity:0; } }
@@ -125,7 +143,7 @@
 <div class="panel" style="margin-top:14px">
   <div class="panel-title">架构图:Celld × BOS 在 celagent 中的定位、功能与数据承载</div>
 
-  <svg viewBox="0 0 1080 620" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
+  <svg viewBox="0 0 1080 700" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
     <defs>
       <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
@@ -150,26 +168,26 @@
     <text x="50" y="188" font-size="14" font-weight="700" fill="#58a6ff">② 运行时层 — Celld 双节点 (分布式 Durable Object 运行时)</text>
 
     <!-- 节点 A -->
-    <rect x="60" y="205" width="300" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
+    <rect x="60" y="205" width="270" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
     <circle cx="85" cy="222" r="5" fill="#3fb950"/>
     <text x="100" y="226" font-size="12.5" font-weight="600" fill="#e6edf3">celld · 18090 (节点 A)</text>
-    <text x="75" y="248" font-size="11" fill="#8b949e">worker 执行器 · checkpoint/resume API</text>
-    <text x="75" y="268" font-size="11" fill="#8b949e">SQLite 缓存:session:&lt;id&gt; → turns</text>
-    <text x="75" y="288" font-size="11" fill="#8b949e">承载数据:worker 缓存(截断 200 字符)</text>
-    <text x="75" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">task:·cron:·kv:·ledger(测试语义)</text>
+    <text x="75" y="248" font-size="11" fill="#8b949e">worker 执行器 · checkpoint API</text>
+    <text x="75" y="268" font-size="11" fill="#8b949e">SQLite 缓存 session:&lt;id&gt;</text>
+    <text x="75" y="288" font-size="11" fill="#8b949e">承载:worker 缓存(截断 200 字符)</text>
+    <text x="75" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">task:·cron:·kv:·ledger</text>
 
     <!-- 节点 B -->
-    <rect x="390" y="205" width="420" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
-    <circle cx="415" cy="222" r="5" fill="#3fb950"/>
-    <text x="430" y="226" font-size="12.5" font-weight="600" fill="#e6edf3">celld · 18091 (节点 B)</text>
-    <text x="405" y="248" font-size="11" fill="#8b949e">与 A 同构 · 故障转移备节点 · A 挂掉时接管 worker 写入</text>
-    <text x="405" y="268" font-size="11" fill="#8b949e">自动启动 + 端口预检 + 残留所有权清理</text>
-    <text x="405" y="288" font-size="11" fill="#8b949e">同一 BOS bucket · 同一 worker 版本 · 缓存可丢(从 BOS 重建)</text>
-    <text x="405" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">定位="快":低延迟缓存 ~100ms · 替代常驻 DB/内存状态机</text>
+    <rect x="400" y="205" width="410" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
+    <circle cx="425" cy="222" r="5" fill="#3fb950"/>
+    <text x="440" y="226" font-size="12.5" font-weight="600" fill="#e6edf3">celld · 18091 (节点 B)</text>
+    <text x="415" y="248" font-size="11" fill="#8b949e">与 A 同构 · 故障转移备节点 · A 挂掉时接管</text>
+    <text x="415" y="268" font-size="11" fill="#8b949e">自动启动 + 端口预检 + 残留所有权清理</text>
+    <text x="415" y="288" font-size="11" fill="#8b949e">同一 bucket · 同一 worker · 缓存可丢(BOS 重建)</text>
+    <text x="415" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">定位="快":~100ms 缓存 · 替代常驻 DB/内存状态机</text>
 
     <!-- 节点间同步 -->
-    <line x1="360" y1="267" x2="390" y2="267" stroke="#58a6ff" stroke-dasharray="4 3" stroke-width="1.5"/>
-    <text x="362" y="258" font-size="10" fill="#7d8590">failover</text>
+    <line x1="345" y1="267" x2="400" y2="267" stroke="#58a6ff" stroke-dasharray="4 3" stroke-width="1.5"/>
+    <text x="352" y="258" font-size="10" fill="#7d8590">failover</text>
 
     <!-- ===== 层 3: 存储层 ===== -->
     <rect x="30" y="370" width="1020" height="230" rx="14" fill="#12161f" stroke="#d29922" stroke-dasharray="6 4"/>
@@ -207,11 +225,12 @@
 
     <!-- ===== 数据流箭头 ===== -->
     <!-- TUI → Celld (worker 写) -->
-    <path d="M 280 140 C 280 175, 200 180, 200 205" stroke="#bc8cff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
-    <text x="150" y="163" font-size="10.5" fill="#bc8cff" font-family="monospace">① checkpoint(worker缓存)</text>
-    <!-- TUI → BOS (权威直写) -->
-    <path d="M 520 140 C 520 250, 560 380, 600 415" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
-    <text x="540" y="290" font-size="10.5" fill="#d29922" font-family="monospace">② BOS直写(CAS+ETag)</text>
+    <path d="M 240 140 C 240 175, 190 180, 190 205" stroke="#bc8cff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="110" y="163" font-size="10.5" fill="#bc8cff" font-family="monospace">① checkpoint(worker缓存)</text>
+    <!-- TUI → BOS (权威直写, 走节点间通道 x≈365) -->
+    <path d="M 480 140 C 480 170, 365 175, 365 205" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
+    <path d="M 365 330 L 365 415" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
+    <text x="365" y="360" font-size="10.5" fill="#d29922" font-family="monospace" text-anchor="middle">② BOS直写(CAS+ETag)</text>
     <!-- BOS → TUI (恢复, 从 sessions 权威区, 走最右侧专用通道) -->
     <path d="M 955 415 C 1040 330, 1050 250, 920 140" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrG)"/>
     <text x="988" y="300" font-size="10.5" fill="#3fb950" font-family="monospace" text-anchor="end">③ 启动恢复历史→注入上下文</text>
@@ -221,31 +240,42 @@
     <!-- deploy → Celld -->
     <path d="M 800 415 C 720 380, 600 330, 500 330" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
     <text x="700" y="330" font-size="10" fill="#8b949e" font-family="monospace">⑤ 启动加载 worker</text>
+
+    <!-- ===== 替代关系条 ===== -->
+    <rect x="30" y="615" width="1020" height="70" rx="14" fill="#181e2b" stroke="#bc8cff" stroke-dasharray="6 4"/>
+    <text x="50" y="638" font-size="12.5" font-weight="700" fill="#bc8cff">整体替代了什么:传统 agent 的"本地文件 + 常驻服务"底座</text>
+    <text x="50" y="660" font-size="11" fill="#8b949e">替代:本地 JSONL 会话文件(pi 原生)· 本地 SQLite 唯一存储 · 常驻 DB 服务器 · 手动部署的后端服务 · 单机磁盘</text>
+    <text x="50" y="678" font-size="11" fill="#8b949e">换成:对象存储为权威(BOS,RPO=0)+ 分布式运行时为执行体(Celld,自愈)+ 复用 Pi 引擎为交互层(不 fork)</text>
   </svg>
 
   <!-- 定位一句话 + 替代关系表 -->
   <div class="dataflow-note" style="margin-top:10px">
     <b>定位一句话:</b> <code>Celld = 快(运行时+缓存)</code> · <code>BOS = 稳(权威持久层)</code> —
     celagent 把"会话永不丢"交给 BOS,把"低延迟运行"交给 Celld。
+    <br>一个关键事实:<b>它们不是平行组件,而是分工协作</b> — Celld 的 cell 状态也存 BOS(cells/),
+    worker 代码也经 BOS 分发(deploy/),BOS 是整套体系的地基。
   </div>
 
   <table class="obj-table" style="margin-top:10px">
-    <thead><tr><th style="width:110px">组件</th><th>承载的数据类型</th><th>替代了什么</th></tr></thead>
+    <thead><tr><th style="width:100px">组件</th><th>承载的数据类型</th><th>替代了什么</th><th>为什么替代(价值)</th></tr></thead>
     <tbody>
       <tr>
-        <td style="color:#bc8cff;font-weight:600">Celld 双节点</td>
-        <td>worker SQLite 缓存 session:&lt;id&gt;(截断 200 字符)、测试语义 task:/cron:/kv:/ledger、cell 状态(LTX/own 经 BOS)</td>
+        <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
+        <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、测试语义 <code>task:/cron:/kv:/ledger</code>、cell 状态(LTX/own 经 BOS)</td>
         <td>常驻数据库服务器、内存状态机、手动部署的后端服务 — 一个本地自动拉起、故障转移的分布式运行时</td>
+        <td>零运维:检测到无节点自动拉起,端口预检防重复,节点挂了另一节点接管 — 用户无感</td>
       </tr>
       <tr>
         <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
         <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,176 个)、<b>deploy/agent-runtime</b>(worker 代码包,9 个)</td>
-        <td>本地 JSONL 会话文件(pi 原生存储)、本地 SQLite 唯一存储、单机磁盘 — 换成跨机器、RPO=0、并发安全的对象存储</td>
+        <td>本地 JSONL 会话文件(pi 原生存储)、本地 SQLite 唯一存储、单机磁盘</td>
+        <td>跨机器、RPO=0、并发安全(CAS):换机器/删本地/节点全挂都能找回全部会话</td>
       </tr>
       <tr>
         <td style="color:#3fb950;font-weight:600">celagent (TUI)</td>
         <td>运行时态:pi 引擎会话(agentDir 独立目录)、配置 settings.json、BOS 凭证引用(~/.aws/credentials)</td>
-        <td>旧版自写 CLI 壳(已归档)、直接读写会话文件的代码路径 — 复用 Pi 引擎,只替换持久化层</td>
+        <td>旧版自写 CLI 壳(已归档)、直接读写会话文件的代码路径</td>
+        <td>复用 Pi 引擎全部能力(TUI/工具/多模型),只替换持久化层 — 独立品牌、不 fork、不重复造轮子</td>
       </tr>
     </tbody>
   </table>
@@ -271,6 +301,15 @@
           <div class="nrole">worker 节点 B</div>
           <div class="nlat">最近写: —</div>
         </div>
+      </div>
+
+      <!-- 每轮变化追踪: Celld vs BOS -->
+      <div class="trace" id="trace">
+        <div class="trace-head">
+          <div class="th celld">⚙ Celld 侧变化</div>
+          <div class="th bos">☁ BOS 侧变化</div>
+        </div>
+        <div id="traceBody"></div>
       </div>
 
       <!-- 数据流日志 -->
@@ -459,6 +498,15 @@ async function runOneTurn() {
   chatEl.lastChild.classList.remove("typing");
   chatEl.lastChild.lastChild.textContent = turn.msg;
 
+  // 1.5 创建本轮追踪行 (Celld 侧 | BOS 侧)
+  const tr = document.createElement("div");
+  tr.className = "trace-row new";
+  tr.innerHTML = `
+    <div class="trace-cell celld-c"><span class="tt">Celld · turn ${turn.turn}</span><span class="kv">…</span></div>
+    <div class="trace-cell bos-c"><span class="tt">BOS · turn ${turn.turn}</span><span class="kv">…</span></div>`;
+  $("traceBody").prepend(tr);
+  const celldCell = tr.children[0], bosCell = tr.children[1];
+
   // 2. Celld worker 写 (选择节点 A 或 B)
   const nodeIdx = i % 2;
   const workerMs = rec.workerMs;
@@ -473,9 +521,17 @@ async function runOneTurn() {
     nodeLat(active, workerMs);
     state.workerLat = workerMs;
     logFlow(`[Celld] ✓ worker SQLite 缓存写入 ${workerMs}ms`, "op-ok");
+    // 追踪: Celld 侧变化
+    celldCell.innerHTML = `<span class="tt">Celld · turn ${turn.turn} → 节点${[18090,18091][active]}</span>` +
+      `<span class="kv">session:${state.turn ? "demo-session" : ""} 缓存 turns=${state.turn}</span><br>` +
+      `<span class="change">✓ 写入 ${workerMs}ms · msg 截断 200 字符</span>`;
   } else {
     logFlow("[Celld] ⛔ 两节点均离线 — 降级:仅 BOS 持久化 (缓存丢失可重建)", "op-fail");
     state.workerLat = 0;
+    // 追踪: Celld 侧降级
+    celldCell.innerHTML = `<span class="tt">Celld · turn ${turn.turn}</span>` +
+      `<span class="warn-c">⛔ 节点离线 — 本轮无 worker 缓存写入</span><br>` +
+      `<span class="kv">缓存缺失可接受(BOS 为权威源)</span>`;
   }
   await sleep(200);
 
@@ -497,6 +553,11 @@ async function runOneTurn() {
   logFlow(`[BOS] PUT sessions/demo-session.json (If-Match "${state.etag}") ${writeMs}ms → ETag "${newEtag}"`, "op-write");
   await sleep(Math.min(writeMs, 500));
   state.etag = newEtag;  logFlow(`[BOS] ✓ 落盘成功 (turns=${state.turn}, size=${rec.size}B) · 权威源更新`, "op-ok");
+  // 追踪: BOS 侧变化
+  bosCell.innerHTML = `<span class="tt">BOS · turn ${turn.turn} · sessions/demo-session.json</span>` +
+    `<span class="kv">GET ETag "${state.etag}" (${readMs}ms)</span><br>` +
+    `<span class="kv">PUT If-Match CAS → ETag "${newEtag}" (${writeMs}ms)</span><br>` +
+    `<span class="change">✓ turns=${state.turn} · size=${rec.size}B · 权威源已更新</span>`;
   updateMetrics();
   renderObjects("demo-session");
   await sleep(300);
@@ -540,6 +601,7 @@ $("btnReset").onclick = () => {
   state.auto = false; $("btnAuto").textContent = "⏵ 自动播放";
   flowEl.innerHTML = '<div class="flow-line" style="color:var(--dim)">等待运行…</div>';
   chatEl.innerHTML = "";
+  $("traceBody").innerHTML = "";
   setNode(0,"up"); setNode(1,"up");
   updateMetrics(); renderObjects();
 };
