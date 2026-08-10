@@ -7,9 +7,7 @@
     "celagent": "./bin/celagent-tui.mjs"
   },
   "exports": {
-    ".": "./src/index.js",
-    "./llm": "./src/llm.js",
-    "./storage": "./src/storage.js"
+    "./bos": "./src/bos.js"
   },
   "files": [
     "bin/",
