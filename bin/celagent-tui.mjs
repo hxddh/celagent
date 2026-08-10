@@ -9,12 +9,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-// 从 celagent 安装目录的依赖加载 (支持从 ~/.local/bin 链接运行)
-const PI_PKG = [
-  join(homedir(), "celagent", "node_modules", "@earendil-works", "pi-coding-agent"),
-  join(homedir(), ".local", "celagent", "node_modules", "@earendil-works", "pi-coding-agent"),
-].find(p => existsSync(join(p, "package.json")));
-const pi = await import(`file://${PI_PKG}/dist/index.js`);
+// Bug 84: 静态 import pi 包 — Bun 编译可静态分析并打包全部依赖 (2983 modules),
+// 动态 import(file://路径) 无法被 Bun 打包, 单二进制运行时找不到 chalk 等嵌套依赖。
+// 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
+import * as pi from "@earendil-works/pi-coding-agent";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
