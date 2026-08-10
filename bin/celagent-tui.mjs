@@ -46,14 +46,19 @@ async function ensureCelld() {
       const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
       const bucket = cfg.persistence?.bucket;
       // 凭证: 优先环境变量, 否则从 ~/.aws/credentials 读 (像 aws configure get)
-      let AK = process.env.AWS_ACCESS_KEY_ID;
-      let SK = process.env.AWS_SECRET_ACCESS_KEY;
-      if ((!AK || !SK) && existsSync(join(homedir(), ".aws", "credentials"))) {
+      // Bug 77: 与 bos.js awsEnv 同策略 — 要么全用 env, 要么全用 profile,
+      // 绝不混用 (env 只有部分凭证时, 用 profile 的会签名失败且难排查)
+      let AK, SK;
+      const hasFullEnv = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
+      if (hasFullEnv) {
+        AK = process.env.AWS_ACCESS_KEY_ID;
+        SK = process.env.AWS_SECRET_ACCESS_KEY;
+      } else if (existsSync(join(homedir(), ".aws", "credentials"))) {
         try {
           const creds = readFileSync(join(homedir(), ".aws", "credentials"), "utf8");
           const section = creds.split(/\[bos\]/)[1]?.split(/\[/)[0] || "";
-          AK = AK || section.match(/aws_access_key_id\s*=\s*(\S+)/)?.[1];
-          SK = SK || section.match(/aws_secret_access_key\s*=\s*(\S+)/)?.[1];
+          AK = section.match(/aws_access_key_id\s*=\s*(\S+)/)?.[1];
+          SK = section.match(/aws_secret_access_key\s*=\s*(\S+)/)?.[1];
         } catch (e) { /* 读取失败 */ }
       }
       if (bucket && AK && SK) {
@@ -325,14 +330,18 @@ async function listSessions() {
       });
     });
     // 3) 降级: 扫描账号下所有 bucket, 找含 sessions/ 会话的 (Bug 65)
+    // 并发扫描 (Bug 83): bucket 多时串行扫描慢 (每个 ~200ms), 并发限 6
     if (!bucket) {
       console.log("(未找到 settings.json 配置, 自动扫描账号下所有 bucket...)");
       const buckets = await runAws(["s3api", "list-buckets", "--query", "Buckets[].Name", "--output", "json"]);
+      const all = Array.isArray(buckets) ? buckets : [];
       const candidates = [];
-      for (const b of Array.isArray(buckets) ? buckets : []) {
-        // BOS 不支持 KeyCount 查询 (返回 null) — 用 Contents[].Key 判断是否有会话
+      const worker = async (b) => {
         const hit = await runAws(["s3api", "list-objects-v2", "--bucket", b, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", endpoint, "--query", "Contents[].Key", "--output", "json"]);
         if (Array.isArray(hit) && hit.length > 0) candidates.push(b);
+      };
+      for (let i = 0; i < all.length; i += 6) {
+        await Promise.all(all.slice(i, i + 6).map(worker));
       }
       if (candidates.length === 0) { console.log("(账号下没有找到含会话的 bucket)"); return; }
       if (candidates.length === 1) { bucket = candidates[0]; }
@@ -420,6 +429,24 @@ async function configCommand(args) {
     } else {
       o[parts[parts.length - 1]] = value;
       saveConfig(cfg);
+      // Bug 79: model/provider 必须同步到 pi-runtime 配置 — TUI 实际模型由
+      // pi-runtime/settings.json (defaultModel) + models.json 决定,
+      // 只写 celagent settings.json 会让 `config set model` 静默不生效
+      if (key === "model" || key === "provider") {
+        const piSettingsFile = join(homedir(), ".config", "celagent", "pi-runtime", "settings.json");
+        if (existsSync(piSettingsFile)) {
+          try {
+            const piSettings = JSON.parse(readFileSync(piSettingsFile, "utf8"));
+            if (key === "model") piSettings.defaultModel = value;
+            if (key === "provider") piSettings.defaultProvider = value;
+            const { writeFileSync } = require("node:fs");
+            writeFileSync(piSettingsFile, JSON.stringify(piSettings, null, 2) + "\n", "utf8");
+            console.log(`  ↳ 已同步 pi-runtime 配置 (${piSettingsFile})`);
+          } catch (e) {
+            console.warn(`  (警告: pi-runtime 配置同步失败: ${e.message})`);
+          }
+        }
+      }
       console.log(`✓ 已设置 ${key} = ${value} (${configFile()})`);
     }
   } else {
@@ -515,6 +542,11 @@ async function main() {
   if (cmd === "doctor") { await doctorCommand(); return; }
   if (cmd === "export") { await exportCommand(process.argv[3]); return; }
   if (cmd === "rm") { await rmCommand(process.argv[3]); return; }
+  // Bug 80: 未知的 - 开头参数 (拼错的 --xxx) 不应被静默当 sessionId 进 TUI
+  if (cmd && cmd.startsWith("-")) {
+    console.error(`未知选项: ${cmd} (用 celagent help 查看用法)`);
+    process.exit(1);
+  }
   // Bug 46: 无参数时不再共用 "default" — 生成唯一会话名 (时间戳+随机),
   // 避免多实例/多用户写入同一 key 造成串扰覆盖
   // 显式传 sessionId 时保留原名 (用户明确想续写该会话)
@@ -568,13 +600,19 @@ async function main() {
       const startReason = effStartEvent?.reason;
       if (startReason === "startup" && savedHistory && savedHistory.length > 0) {
         try {
+          // Bug 78: 注入历史有长度上限 — 超长会话 (几百轮) 全量拼进一条 steer
+          // 会直接撑爆模型上下文窗口。只注入最近 MAX_INJECT_TURNS 轮 + 提示省略。
+          const MAX_INJECT_TURNS = 50;
+          const recent = savedHistory.slice(-MAX_INJECT_TURNS);
+          const omitted = savedHistory.length - recent.length;
           // 合并为一条清晰的历史上下文, 明确标注是之前的 assistant 回复
           // (避免逐条 steer 成 user 消息误导 LLM — Bug 24)
-          const historySummary = savedHistory
+          const historySummary = recent
             .map(t => `[第${t.turn}轮(assistant)] ${t.msg}`)
             .join("\n");
           result.session.steer(
-            `以下是本会话之前的对话历史(均为 assistant 的回复内容), 请以此作为继续对话的上下文, 不要重复回答这些内容:\n${historySummary}`
+            `以下是本会话之前的对话历史(均为 assistant 的回复内容, 请以此作为继续对话的上下文, 不要重复回答这些内容):\n${historySummary}` +
+            (omitted > 0 ? `\n\n(注: 较早的 ${omitted} 轮历史已省略, 完整历史在 BOS 中)` : "")
           );
         } catch (e) { /* 注入失败不阻塞 */ }
       }
