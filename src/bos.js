@@ -53,7 +53,7 @@ function runAws(args, { timeout = AWS_TIMEOUT_MS } = {}) {
 }
 
 // ---- 直写 BOS (PUT, 支持 If-Match 条件写; 网络错误自动重试) ----
-export async function bosPut(key, content, { bucket, ifMatch, maxRetries = 3, endpoint } = {}) {
+export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRetries = 3, endpoint } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
   const ep = resolveEndpoint(endpoint);
   // 写临时文件 (aws CLI 需要真实文件)
@@ -72,6 +72,10 @@ export async function bosPut(key, content, { bucket, ifMatch, maxRetries = 3, en
     // 条件写: If-Match 乐观锁 (防并发覆盖)
     if (ifMatch) {
       args.push("--if-match", ifMatch);
+    }
+    // Bug 76: If-None-Match 首写条件化 (仅对象不存在时写, 防并发冷启动覆盖)
+    if (ifNoneMatch) {
+      args.push("--if-none-match", "*");
     }
     for (let attempt = 0; ; attempt++) {
       const r = await runAws(args);

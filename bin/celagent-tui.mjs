@@ -177,14 +177,25 @@ function queueBosWrite(sessionId, seq, role, msg) {
       }
       const key = `sessions/${sessionId}.json`;
       // 乐观锁 CAS: 读 ETag → If-Match 写 → 冲突重试 (防并发覆盖)
+      // Bug 75: 冲突重试必须重新读 ETag — 旧实现 3 次都用循环外读的同一个
+      // etag, 并发写入时必 412 重试耗尽 → 该轮数据丢失
       for (let attempt = 0; attempt < 3; attempt++) {
         let session = { id: sessionId, turns: [] };
         let etag = undefined;
+        // 每次尝试都重新读 (冲突后对方已写, 必须拿到新 ETag 才能继续)
         const existing = await bosGet(key, { bucket, endpoint });
         if (existing.ok) {
           try { session = JSON.parse(existing.body); } catch (e) { /* 覆盖 */ }
           etag = existing.etag;
-        } else if (existing.error !== "not-found") {
+        } else if (existing.error === "not-found") {
+          // Bug 76: 首写也条件化 (If-None-Match) — 并发冷启动同 ID 时,
+          // 双方都读 not-found 会互相无条件覆盖丢首轮; 条件写保证只有一个成功
+          const put = await bosPut(key, session, { bucket, endpoint, ifNoneMatch: true });
+          if (put.ok) return;
+          if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; } // 对方已建, 重读合并
+          if (!bosWarned) { console.warn(`  (警告: BOS 首写失败: ${put.error || "未知错误"})`); bosWarned = true; }
+          return;
+        } else {
           // Bug 49: 读失败(网络/限流)时状态未知 — 绝不写, 防止覆盖已有历史
           if (!bosWarned) { console.warn(`  (警告: BOS 读取失败, 跳过本轮持久化: ${existing.error})`); bosWarned = true; }
           return;
@@ -333,7 +344,7 @@ async function listSessions() {
     }
     const list = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--query", "Contents[].{k:Key,s:Size,l:LastModified}", "--output", "json"]);
     const sessions = (Array.isArray(list) ? list : [])
-      .filter(i => i.k?.endsWith(".json") && !/\/verify\/|bugtest-|stress-|takeover-|async-/.test(i.k))
+      .filter(i => i.k?.endsWith(".json") && !/\/verify\/|bugtest-|stress-|takeover-|async-/.test(i.k) && !/-(test|verify|check|fix|tmp|temp)$/i.test(i.k.replace("sessions/", "").replace(/\.json$/, "")) && !/^(bug\d|cred-|iso-|race|dup-|ifmatch|queue-|nooverwrite|conc-|degrade|direct|corrupt|long-msg|bos-|aws-|default|debug|seq-|switch-|final-|full-|restore-e2e)/.test(i.k.replace("sessions/", "").replace(/\.json$/, "")))
       .map(i => ({ id: i.k.replace("sessions/", "").replace(/\.json$/, ""), size: i.s || 0, modified: (i.l || "").slice(0, 16) }))
       .sort((a, b) => b.modified.localeCompare(a.modified));
     if (sessions.length === 0) { console.log("(BOS 暂无会话)"); return; }
@@ -468,6 +479,7 @@ async function getBucketArg() {
   return { bucket: null, endpoint: "https://s3.bj.bcebos.com" };
 }
 async function exportCommand(id) {
+  if (!id || id.startsWith("-")) { console.error("用法: celagent export <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
   const { bucket, endpoint } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { bosGet } = await import("../src/bos.js");
@@ -477,6 +489,7 @@ async function exportCommand(id) {
   console.log(JSON.stringify({ id, exportedAt: new Date().toISOString(), turns: session.turns || [] }, null, 2));
 }
 async function rmCommand(id) {
+  if (!id || id.startsWith("-")) { console.error("用法: celagent rm <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
   const { bucket, endpoint } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { execFile } = await import("node:child_process");

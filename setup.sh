@@ -61,16 +61,9 @@ mkdir -p "$STATE_DIR"
 pkill -f 'celld.*1809' 2>/dev/null || true
 sleep 2
 
-# 需要 worker.js (DO 运行时)
-WORKER="$HOME/.local/celagent/worker.js"
-if [ ! -f "$WORKER" ] && [ -d "$HOME/.local/e2e/agent-runtime" ]; then
-  echo "  打包 worker.js..."
-  (cd "$HOME/.local/e2e/agent-runtime" && npx esbuild src/index.js --bundle --format=esm --outfile="$WORKER" 2>/dev/null) || true
-fi
-if [ ! -f "$WORKER" ]; then
-  echo "  ✗ 未找到 worker.js (需要 agent-runtime 源码)"
-  exit 1
-fi
+# Bug 71: 移除本地 worker.js 打包/检查死代码 — BOS 模式节点从 bucket 的
+# deploy/current.json 加载 worker (上面 celld deploy 已部署), 本地 worker.js
+# 从未被引用; 原逻辑 esbuild 失败还会错误地 exit 1 中止已成功的部署。
 
 for port in 18090 18091; do
   nohup env CELLD_WATCH="$STATE_DIR/node$port" \
