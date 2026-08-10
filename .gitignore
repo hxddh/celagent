@@ -12,3 +12,4 @@ celagent-dbg*
 celagent-final
 celagent-full
 celagent-state/
+*.bun-build
