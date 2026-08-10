@@ -41,7 +41,7 @@ cp -r "${CELAGENT_SRC}/bin" "${CELAGENT_SRC}/src" "${CELAGENT_ROOT}/celagent/"
 if [ ! -d "${CELAGENT_ROOT}/celagent/node_modules/@earendil-works/pi-coding-agent" ]; then
   echo "  安装依赖 (npm install)..."
   cp "${CELAGENT_SRC}/package.json" "${CELAGENT_SRC}/package-lock.json" "${CELAGENT_ROOT}/celagent/" 2>/dev/null || true
-  (cd "${CELAGENT_ROOT}/celagent" && npm install --omit=dev --no-audit --no-fund) || {
+  (cd "${CELAGENT_ROOT}/celagent" && npm install --no-audit --no-fund) || {
     echo "  ✗ npm install 失败 (网络问题?), 请手动在 ${CELAGENT_ROOT}/celagent 执行 npm install"
     exit 1
   }
@@ -97,15 +97,18 @@ else
 fi
 
 # 部署 worker 到 bucket (BOS 模式节点需要 deploy/current.json)
+# Bug 86: worker 源码已纳入仓库 (worker/src/index.js) — 不再依赖开发机特有的
+# .local 目录, 正式模式 (git clone 安装) 也能部署
 echo "  部署 worker..."
-if [ -d "${CELAGENT_SRC}/../.local/e2e/agent-runtime" ]; then
+WORKER_SRC="${CELAGENT_SRC}/worker"
+if [ -d "$WORKER_SRC/src" ]; then
   export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj
-  export CELLD_ESBUILD="${CELLD_ESBUILD:-$HOME/.local/node_modules/.bin/esbuild}"
-  (cd "${CELAGENT_SRC}/../.local/e2e/agent-runtime" && \
-    "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj >/dev/null 2>&1)
-  echo "  ✓ worker 已部署"
+  # Bug 86: esbuild 随仓库安装 (devDependency), 不再依赖 .local
+  export CELLD_ESBUILD="${CELLD_ESBUILD:-$CELAGENT_ROOT/celagent/node_modules/.bin/esbuild}"
+  (cd "$WORKER_SRC" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj >/dev/null 2>&1)
+  echo "  ✓ worker 已部署 (${WORKER_SRC})"
 else
-  echo "  ✗ 未找到 agent-runtime 源码"
+  echo "  ✗ 未找到 worker 源码 (${WORKER_SRC}/src)"
   exit 1
 fi
 

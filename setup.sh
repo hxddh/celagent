@@ -46,13 +46,13 @@ fi
 echo "  celld: $CELLD"
 
 # 部署 worker 到 bucket (BOS 模式节点需要 deploy/current.json)
+# Bug 86: worker 源码在仓库内 worker/ 目录, 不再依赖 .local
 SRC_WORKER="${CELAGENT_SRC:-$HOME/celagent}"
-if [ -d "$SRC_WORKER/../.local/e2e/agent-runtime" ]; then
+if [ -d "$SRC_WORKER/worker/src" ]; then
   echo "  部署 worker 到 bucket..."
   export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj
-  export CELLD_ESBUILD="${CELLD_ESBUILD:-$HOME/.local/node_modules/.bin/esbuild}"
-  (cd "$SRC_WORKER/../.local/e2e/agent-runtime" && \
-    "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj 2>&1 | tail -2)
+  export CELLD_ESBUILD="${CELLD_ESBUILD:-$SRC_WORKER/node_modules/.bin/esbuild}"
+  (cd "$SRC_WORKER/worker" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj 2>&1 | tail -2)
   echo "  ✓ worker 已部署"
 fi
 

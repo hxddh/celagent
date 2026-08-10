@@ -551,6 +551,24 @@ async function main() {
   const sessionId = process.argv[2] || `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   console.log(`celagent — Pi TUI, 会话 ${sessionId}, Celld RPO=0 持久化\n`);
 
+  // 0. Bug 87: celagent settings.json 的 provider/model 是单源配置 —
+  // 启动时同步到 pi-runtime (手改 celagent settings 也生效, 不再有死配置)
+  try {
+    const cfg = loadConfig();
+    const piSettingsFile = join(homedir(), ".config", "celagent", "pi-runtime", "settings.json");
+    if (cfg.model && existsSync(piSettingsFile)) {
+      const piSettings = JSON.parse(readFileSync(piSettingsFile, "utf8"));
+      let changed = false;
+      if (cfg.model && piSettings.defaultModel !== cfg.model) { piSettings.defaultModel = cfg.model; changed = true; }
+      if (cfg.provider && piSettings.defaultProvider !== cfg.provider) { piSettings.defaultProvider = cfg.provider; changed = true; }
+      if (changed) {
+        const { writeFileSync } = require("node:fs");
+        writeFileSync(piSettingsFile, JSON.stringify(piSettings, null, 2) + "\n", "utf8");
+        console.log(`  (已同步模型配置: ${cfg.provider || "deepseek"}/${cfg.model})`);
+      }
+    }
+  } catch (e) { /* 同步失败不阻塞 */ }
+
   // 0. 确保 Celld 节点在跑 (自动启动)
   await ensureCelld();
 

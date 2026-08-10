@@ -1,0 +1,13 @@
+{
+  "name": "agent-runtime",
+  "main": "src/index.js",
+  "durable_objects": {
+    "bindings": [
+      { "name": "AGENT_RUNTIME", "class_name": "AgentRuntime" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AgentRuntime"] }
+  ],
+  "compatibility_date": "2026-08-01"
+}
