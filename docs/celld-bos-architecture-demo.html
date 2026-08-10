@@ -372,23 +372,24 @@
       每轮对话结束,celagent 把<b style="color:var(--text)">这一轮的对话记录</b>(不是文件、不是工作区)打包成一条 JSON 写入两处。
       以下为结构示例(字段结构真实,内容为演示):
     </div>
-    <div class="json-block"><span class="c">// 实测: Celld worker 缓存 (session:demo-large-session, 节点 18090) — msg 截断 200 字符, 无 role
+    <div class="json-block"><span class="c">// Celld worker 缓存结构 (会话经双写路径时, 节点 18090 的形态) — msg 截断 200 字符, 无 role</span>
+<span class="c">// 注: 本页 demo-large-session 由直写生成, 未走 worker 缓存路径; 此结构为经双写时的真实形态</span>
 {
-  <span class="k">"id"</span>: <span class="s">"demo-session"</span>,
+  <span class="k">"id"</span>: <span class="s">"demo-large-session"</span>,
   <span class="k">"turns"</span>: [
-    { <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"msg"</span>: <span class="s">"帮我分析一下项目的架构"</span>, <span class="k">"ts"</span>: <span class="n">1786343709247</span> }
+    { <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"msg"</span>: <span class="s">"继续分析项目的架构部分,重点关注 bin/celagent-tui.mjs 的实现细节"</span>, <span class="k">"ts"</span>: <span class="n">1786352334751</span> }
   ],
-  <span class="k">"updatedAt"</span>: <span class="n">1786343740759</span>  <span class="c">// 实测值 (2026-08-10 采集)</span>
+  <span class="k">"updatedAt"</span>: <span class="n">1786343740759</span>  <span class="c">// 字段形态示例 (worker 缓存含 updatedAt; BOS 权威源不含)</span>
 }
 
 <span class="c">// 实测: BOS 权威源 (sessions/demo-large-session.json) — 完整记忆</span>
 <span class="c">// turn1 为演示脚本 (真实产品 turn_end 只写 assistant 轮); content/toolResults 为完整字段</span>
 {
-  <span class="k">"id"</span>: <span class="s">"demo-session"</span>,
+  <span class="k">"id"</span>: <span class="s">"demo-large-session"</span>,
   <span class="k">"turns"</span>: [
     {
       <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"role"</span>: <span class="s">"user"</span>,
-      <span class="k">"msg"</span>: <span class="s">"帮我分析一下项目的架构"</span>, <span class="k">"ts"</span>: <span class="n">1786343710345</span>,
+      <span class="k">"msg"</span>: <span class="s">"继续分析项目的架构部分,重点关注 bin/celagent-tui.mjs 的实现细节"</span>, <span class="k">"ts"</span>: <span class="n">1786352334751</span>,
       <span class="k">"content"</span>: [ <span class="c">// 完整内容块 (thinking/text/toolCall 全量)</span>
         { <span class="k">"type"</span>: <span class="s">"thinking"</span>, <span class="k">"thinking"</span>: <span class="s">"完整推理过程…"</span> },
         { <span class="k">"type"</span>: <span class="s">"toolCall"</span>, <span class="k">"name"</span>: <span class="s">"bash"</span>, <span class="k">"arguments"</span>: { <span class="k">"command"</span>: <span class="s">"ls"</span> } }
