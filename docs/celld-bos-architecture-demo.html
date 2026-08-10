@@ -302,6 +302,7 @@
   <div id="process">
     <div class="panel">
       <div class="panel-title"><span class="live">● LIVE</span> ② 运行过程(点击"运行一轮"或自动播放 — 每轮展示双写全过程)</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:10px">⚠ 动画为加速演示,追踪表与监控中的数字均为真实采集耗时</div>
 
       <!-- Celld 节点 -->
       <div class="nodes">
@@ -326,15 +327,15 @@
           <div class="th celld">⚙ Celld 侧变化</div>
           <div class="th bos">☁ BOS 侧变化</div>
         </div>
-        <div id="traceBody"></div>
+        <div id="traceBody" aria-live="polite"></div>
       </div>
 
       <!-- 数据流日志 -->
       <div style="font-size:11px;color:var(--dim);margin:12px 0 4px">数据流日志(每轮详细操作,最新在上)</div>
-      <div class="flow" id="flow"><div class="flow-line" style="color:var(--dim)">等待运行…(每轮: worker 写 → BOS 读 ETag → CAS 写 → ETag 更新)</div></div>
+      <div class="flow" id="flow" aria-live="polite"><div class="flow-line" style="color:var(--dim)">等待运行…(每轮: worker 写 → BOS 读 ETag → CAS 写 → ETag 更新)</div></div>
 
       <!-- 对话消息 -->
-      <div class="chat" id="chat"></div>
+      <div class="chat" id="chat" aria-live="polite"></div>
     </div>
   </div>
 
@@ -344,7 +345,7 @@
       <div class="panel-title">③ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
 
       <div class="mon-grid">
-        <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">219</div><div class="m-sub">sessions 35 · cells 163 · deploy 10</div></div>
+        <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">230</div><div class="m-sub">sessions 35 · cells 176 · deploy 10 · 其他 9</div></div>
         <div class="metric"><div class="m-label">demo-session 大小</div><div class="m-value" id="mBytes">117 B</div><div class="m-sub">本轮写入后对象大小</div></div>
         <div class="metric"><div class="m-label">读次数 (演示)</div><div class="m-value green" id="mReads">0</div><div class="m-sub">GET / head-object (ETag)</div></div>
         <div class="metric"><div class="m-label">写次数 (演示)</div><div class="m-value yellow" id="mWrites">0</div><div class="m-sub">PUT (If-Match CAS)</div></div>
@@ -395,7 +396,7 @@ const REAL_RECORDS = [
   { turn:10, workerMs:96, readMs:1303, writeMs:691,  etag:"8f7d910fa3e6a", size:1185 },
 ];
 // 基线 (重建前实测): 对象总数 / 重建前 ETag
-const BASELINE_OBJECTS = 219;
+const BASELINE_OBJECTS = 230;
 const BASELINE_ETAG = "e586af54";
 
 // demo-session 10 轮真实内容
@@ -474,8 +475,8 @@ function updateMetrics() {
   const avg = a => a.length ? Math.round(a.reduce((s,v)=>s+v,0)/a.length) + "ms" : "—";
   $("mReadLat").textContent = avg(state.readLats.slice(-5));
   $("mWriteLat").textContent = avg(state.writeLats.slice(-5));
-  // 延迟条 (相对 2000ms)
-  const pct = ms => Math.min(100, Math.round(ms/2000*100));
+  // 延迟条 (相对 1500ms — 真实延迟量级: worker 56-578, 读 732-1423, 写 665-783)
+  const pct = ms => Math.min(100, Math.round(ms/1500*100));
   $("barWorker").style.width = pct(state.workerLat) + "%"; $("valWorker").textContent = state.workerLat + "ms";
   $("barRead").style.width = pct(state.readLat) + "%"; $("valRead").textContent = state.readLat + "ms";
   $("barWrite").style.width = pct(state.writeLat) + "%"; $("valWrite").textContent = state.writeLat + "ms";
@@ -497,6 +498,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function runOneTurn() {
   if (state.running) return;
+  // 越界保护: 10 轮完成后不再运行 (TURNS[10] 不存在, 会崩溃)
+  if (state.turn >= TURNS.length) {
+    logFlow("🏁 10 轮已全部播放完毕 — 点击「重置」可重新开始", "op-ok");
+    state.auto = false;
+    $("btnAuto").textContent = "⏵ 自动播放";
+    return;
+  }
   state.running = true;
   $("btnRun").disabled = true;
 
@@ -540,7 +548,7 @@ async function runOneTurn() {
     logFlow(`[Celld] ✓ worker SQLite 缓存写入 ${workerMs}ms`, "op-ok");
     // 追踪: Celld 侧变化
     celldCell.innerHTML = `<span class="tt">Celld · turn ${turn.turn} → 节点${[18090,18091][active]}</span>` +
-      `<span class="kv">session:${state.turn ? "demo-session" : ""} 缓存 turns=${state.turn}</span><br>` +
+      `<span class="kv">session:demo-session 缓存 turns=${state.turn}</span><br>` +
       `<span class="change">✓ 写入 ${workerMs}ms · msg 截断 200 字符</span>`;
   } else {
     logFlow("[Celld] ⛔ 两节点均离线 — 降级:仅 BOS 持久化 (缓存丢失可重建)", "op-fail");
@@ -557,7 +565,7 @@ async function runOneTurn() {
   const readMs = rec.readMs;
   state.readLats.push(readMs);
   state.readLat = readMs;
-  logFlow(`[BOS] GET sessions/demo-session.json → ETag "${state.etag}" (${readMs}ms)`, "op-read");
+  logFlow(`[BOS] GET sessions/demo-session.json → 旧 ETag "${state.etag}" (${readMs}ms)`, "op-read");
   await sleep(Math.min(readMs, 250));
   updateMetrics();
 
@@ -572,8 +580,8 @@ async function runOneTurn() {
   state.etag = newEtag;  logFlow(`[BOS] ✓ 落盘成功 (turns=${state.turn}, size=${rec.size}B) · 权威源更新`, "op-ok");
   // 追踪: BOS 侧变化
   bosCell.innerHTML = `<span class="tt">BOS · turn ${turn.turn} · sessions/demo-session.json</span>` +
-    `<span class="kv">GET ETag "${state.etag}" (${readMs}ms)</span><br>` +
-    `<span class="kv">PUT If-Match CAS → ETag "${newEtag}" (${writeMs}ms)</span><br>` +
+    `<span class="kv">GET 旧 ETag "${state.etag}" (${readMs}ms)</span><br>` +
+    `<span class="kv">PUT If-Match CAS → 新 ETag "${newEtag}" (${writeMs}ms)</span><br>` +
     `<span class="change">✓ turns=${state.turn} · size=${rec.size}B · 权威源已更新</span>`;
   updateMetrics();
   renderObjects("demo-session");
@@ -632,7 +640,7 @@ $("btnReset").onclick = () => {
 // 初始化
 updateMetrics();
 renderObjects();
-logFlow("就绪: 双节点在线 · BOS 基线 219 对象 · 点击「运行一轮」开始", "op-ok");
+logFlow("就绪: 双节点在线 · BOS 基线 230 对象 · 点击「运行一轮」开始", "op-ok");
 </script>
 </body>
 </html>
