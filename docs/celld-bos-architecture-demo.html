@@ -124,6 +124,39 @@
   .lat-row .lval { width:64px; color:var(--dim); }
 
   footer { margin-top:18px; text-align:center; color:var(--dim); font-size:11.5px; font-family:var(--mono); }
+
+  /* 锚点目标避开悬浮条 */
+  #arch, #process, #monitor, #value { scroll-margin-top: 130px; }
+
+  /* 悬浮操作条: 滚动时始终可见 */
+  .sticky-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1000;
+    background: rgba(11,14,20,0.92);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    border-radius: 0 0 12px 12px;
+    padding: 10px 14px 12px;
+    margin: 0 -14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .sticky-bar .controls { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  .sticky-bar .nav-links { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  .sticky-bar .nav-links a {
+    color:var(--blue); text-decoration:none; font-size:12px;
+    border:1px solid var(--border); padding:3px 10px; border-radius:8px;
+  }
+  .sticky-bar .nav-links a:hover { border-color:var(--blue); }
+  .sticky-hint { font-size:11px; color:var(--dim); }
+  @media (max-width: 700px) {
+    .sticky-bar { margin: 0 -14px; padding: 8px 8px 10px; }
+    .sticky-hint { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -134,12 +167,6 @@
   <div class="subtitle" style="color:var(--dim);font-size:13px;margin-top:4px">
     三层架构 · 每轮双写过程 · BOS 读写监控 — 数据为真实采集回放(2026-08-10)
   </div>
-  <div class="controls" style="margin-top:10px">
-    <button class="btn primary" id="btnRun">▶ 运行一轮</button>
-    <button class="btn" id="btnAuto">⏵ 自动播放</button>
-    <button class="btn danger" id="btnKill">⛔ 故障注入:kill 节点</button>
-    <button class="btn" id="btnReset">↺ 重置</button>
-  </div>
   <div class="badge-row" style="margin-top:10px;display:flex;gap:14px;justify-content:center;flex-wrap:wrap;font-size:12px;color:var(--dim)">
     <span><span style="color:#58a6ff">■</span> Celld 运行时/缓存</span>
     <span><span style="color:#d29922">■</span> BOS 权威存储</span>
@@ -147,13 +174,24 @@
     <span><span style="color:#f85149">■</span> 故障/降级</span>
     <span><span style="color:#bc8cff">■</span> worker 缓存写</span>
   </div>
-  <nav style="margin-top:12px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
-    <a href="#arch" style="color:var(--blue);text-decoration:none;font-size:13px;border:1px solid var(--border);padding:4px 12px;border-radius:8px">1 架构图</a>
-    <a href="#process" style="color:var(--blue);text-decoration:none;font-size:13px;border:1px solid var(--border);padding:4px 12px;border-radius:8px">2 运行过程</a>
-    <a href="#monitor" style="color:var(--blue);text-decoration:none;font-size:13px;border:1px solid var(--border);padding:4px 12px;border-radius:8px">3 BOS 监控</a>
-    <a href="#value" style="color:var(--blue);text-decoration:none;font-size:13px;border:1px solid var(--border);padding:4px 12px;border-radius:8px">4 价值评估</a>
-  </nav>
-</header></header>
+</header>
+
+<!-- 悬浮操作条: 滚动时始终可见 -->
+<div class="sticky-bar">
+  <div class="controls">
+    <button class="btn primary" id="btnRun">▶ 运行一轮</button>
+    <button class="btn" id="btnAuto">⏵ 自动播放</button>
+    <button class="btn danger" id="btnKill">⛔ 故障注入:kill 节点</button>
+    <button class="btn" id="btnReset">↺ 重置</button>
+  </div>
+  <div class="nav-links">
+    <a href="#arch">1 架构图</a>
+    <a href="#process">2 运行过程</a>
+    <a href="#monitor">3 BOS 监控</a>
+    <a href="#value">4 价值评估</a>
+  </div>
+  <div class="sticky-hint">↓ 滚动页面时本操作条固定于顶部 · 自动播放中可随时点击「故障注入」观察降级</div>
+</div></header>
 
 <!-- ============ 架构图 ============ -->
 <div class="panel" style="margin-top:14px" id="arch">
