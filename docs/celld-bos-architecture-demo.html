@@ -301,7 +301,7 @@
     <text x="540" y="385" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">恢复路径:启动 / 换机器 / 节点故障 ↓</text>
     <rect x="60" y="405" width="990" height="90" rx="14" fill="var(--svg-panel)" stroke="#3fb950"/>
     <text x="90" y="438" font-size="16" font-weight="700" fill="#3fb950">④ 从 BOS 恢复 — 历史完整(RPO=0)</text>
-    <text x="90" y="465" font-size="12.5" fill="var(--svg-dim)">读取优先级:worker 缓存快路径 → miss 回 BOS 权威源。实测:节点全挂后 60 轮记录完整恢复(10/10 → 60/60)</text>
+    <text x="90" y="465" font-size="12.5" fill="var(--svg-dim)">读取优先级:worker 缓存快路径 → miss 回 BOS 权威源。实测:节点全挂后 60/60 轮记录完整恢复</text>
     <path d="M 800 355 L 800 405" stroke="#3fb950" stroke-width="2.5" fill="none" marker-end="url(#arrG)"/>
     <text x="812" y="382" font-size="12.5" fill="#3fb950" font-family="monospace">读历史</text>
   </svg>
@@ -512,8 +512,8 @@
       <div class="trace" id="trace">
         <div style="font-size:11px;color:var(--dim);margin-bottom:8px">每轮双写变化追踪(最新在上)</div>
         <div class="trace-head">
-          <div class="th celld">⚙ Celld 侧变化</div>
-          <div class="th bos">☁ BOS 侧变化</div>
+          <div class="th celld">Celld 侧变化</div>
+          <div class="th bos">BOS 侧变化</div>
         </div>
         <div id="traceBody" aria-live="polite"></div>
       </div>
@@ -596,7 +596,7 @@
         <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
         <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,210 个)、<b>deploy/agent-runtime</b>(worker 代码包,15 个)</td>
         <td>会话跨机器/防丢失(RPO=0)、并发安全(CAS)、换机器/删本地/节点全挂都能找回</td>
-        <td style="color:var(--green)"><b>✅ 核心价值,真实需求,故障注入实测验证</b>(节点全挂可写、恢复 10/10)</td>
+        <td style="color:var(--green)"><b>✅ 核心价值,真实需求,故障注入实测验证</b>(节点全挂可写、恢复 60/60)</td>
       </tr>
       <tr>
         <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
@@ -800,7 +800,8 @@ function pulse(el) { el.classList.remove("pulse"); void el.offsetWidth; el.class
 function addChat(role, text, typing=false) {
   const d = document.createElement("div");
   d.className = "msg " + role + (typing ? " typing" : "");
-  d.innerHTML = `<span class="tag">${role === "user" ? "👤 user" : "🤖 assistant"} · turn ${state.turn}</span>${text}`;
+  d.title = text;  // hover 显示完整内容
+  d.innerHTML = `<span class="tag">${role === "user" ? "[user]" : "[assistant]"} · turn ${state.turn}</span>${text}`;
   chatEl.prepend(d);  // 最新在上, 与追踪表/日志方向一致
   return d;
 }
@@ -847,7 +848,7 @@ async function runOneTurn() {
   if (state.running) return;
   // 越界保护: 10 轮完成后不再运行 (TURNS[10] 不存在, 会崩溃)
   if (state.turn >= TURNS.length) {
-    logFlow("🏁 60 轮已全部播放完毕 — 点击「重置」可重新开始", "op-ok");
+    logFlow("已完成: 60 轮全部播放完毕 — 点击「重置」可重新开始", "op-ok");
     state.auto = false;
     $("btnAuto").textContent = "⏵ 自动播放";
     return;
@@ -944,7 +945,7 @@ async function runOneTurn() {
   } else if (state.turn >= TURNS.length) {
     state.auto = false;
     $("btnAuto").textContent = "⏵ 自动播放";
-    logFlow("🏁 10 轮对话完成 — 全部落盘 BOS, 无丢失 (RPO=0)", "op-ok");
+    logFlow("已完成: 60 轮对话全部落盘 BOS, 无丢失 (RPO=0)", "op-ok");
   }
 }
 
@@ -984,6 +985,7 @@ $("btnFast").onclick = () => {
     state.running = false;
     $("btnRun").disabled = false;
   }
+  const startTurn = state.turn;
   const target = Math.min(state.turn + 10, TURNS.length);
   for (let i = state.turn; i < target; i++) {
     const rec = REAL_RECORDS[i];
@@ -1000,7 +1002,8 @@ $("btnFast").onclick = () => {
     if (turn) {
       const d = document.createElement("div");
       d.className = "msg " + turn.role;
-      d.innerHTML = `<span class="tag">${turn.role === "user" ? "👤 user" : "🤖 assistant"} · turn ${turn.turn}</span>${turn.msg.replace(/\n/g, "<br>").slice(0, 150)}${turn.msg.length > 150 ? "…" : ""}`;
+      d.title = turn.msg;  // hover 显示完整内容
+      d.innerHTML = `<span class="tag">${turn.role === "user" ? "[user]" : "[assistant]"} · turn ${turn.turn}</span>${turn.msg.replace(/\n/g, "<br>").slice(0, 150)}${turn.msg.length > 150 ? "…" : ""}`;
       chatEl.prepend(d);
     }
   }
@@ -1008,12 +1011,13 @@ $("btnFast").onclick = () => {
   // 节点卡片延迟更新 (缺陷修复)
   const lastRec = REAL_RECORDS[target - 1];
   nodeLat(target % 2, lastRec.workerMs);
-  // 批量补追踪摘要 (只显示每批最后一条)
+  // 批量补追踪摘要 (只显示每批最后一条) — 用实际推进数 (修复非整10轮边界错误)
+  const advanced = target - startTurn;
   const tr = document.createElement("div");
   tr.className = "trace-row new";
   tr.innerHTML = `
-    <div class="trace-cell celld-c"><span class="tt">Celld · 快进至 turn ${target}</span><span class="kv">批量推进 ${target - (target - 10) >= 0 ? 10 : target} 轮</span><br><span class="change">✓ worker 缓存已更新 (${lastRec.workerMs}ms)</span></div>
-    <div class="trace-cell bos-c"><span class="tt">BOS · turn ${target}</span><span class="kv">CAS 写 ×${Math.min(10, target)} 完成</span><br><span class="change">✓ ETag "${lastRec.etag}" · ${lastRec.size}B</span></div>`;
+    <div class="trace-cell celld-c"><span class="tt">Celld · 快进至 turn ${target}</span><span class="kv">批量推进 ${advanced} 轮</span><br><span class="change">✓ worker 缓存已更新 (${lastRec.workerMs}ms)</span></div>
+    <div class="trace-cell bos-c"><span class="tt">BOS · turn ${target}</span><span class="kv">CAS 写 ×${advanced} 完成</span><br><span class="change">✓ ETag "${lastRec.etag}" · ${lastRec.size}B</span></div>`;
   $("traceBody").prepend(tr);
   logFlow(`⏩ 快进 10 轮 → turn ${target} (ETag "${lastRec.etag}", ${lastRec.size}B)`, "op-ok");
   updateMetrics();
@@ -1022,7 +1026,7 @@ $("btnFast").onclick = () => {
   if (state.turn >= TURNS.length) {
     state.auto = false;
     $("btnAuto").textContent = "⏵ 自动播放";
-    logFlow("🏁 60 轮已全部播放完毕 — 点击「重置」可重新开始", "op-ok");
+    logFlow("已完成: 60 轮全部播放完毕 — 点击「重置」可重新开始", "op-ok");
   }
 };
 $("btnReset").onclick = () => {
