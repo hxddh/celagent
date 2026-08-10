@@ -21,8 +21,9 @@ if [ -z "$AK" ] || [ -z "$SK" ]; then
 fi
 echo "  ✓ BOS 凭证可用"
 
-# 2. 创建 bucket
-BUCKET="${1:-celagent-$(whoami)-$(date +%s)}"
+# 2. 创建 bucket — Bug 66: 优先复用已有配置的 bucket, 重装不丢数据
+EXISTING_BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
+BUCKET="${1:-${EXISTING_BUCKET:-celagent-$(whoami)-$(date +%s)}}"
 echo "[2/4] 创建 bucket: $BUCKET"
 if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" --profile bos 2>/dev/null; then
   echo "  ✓ bucket 已存在"
