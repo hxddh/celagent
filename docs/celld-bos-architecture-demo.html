@@ -143,7 +143,7 @@
 <div class="panel" style="margin-top:14px">
   <div class="panel-title">架构图:Celld × BOS 在 celagent 中的定位、功能与数据承载</div>
 
-  <svg viewBox="0 0 1080 700" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
+  <svg viewBox="0 0 1080 720" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
     <defs>
       <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
@@ -200,8 +200,8 @@
     <text x="80" y="480" font-size="11" fill="#8b949e">{turn, role, msg, ts} 轮次数组</text>
     <text x="80" y="500" font-size="11" fill="#8b949e">CAS 乐观锁:ETag + If-Match</text>
     <text x="80" y="520" font-size="11" fill="#8b949e">If-None-Match:并发冷启动不覆盖</text>
-    <text x="80" y="540" font-size="10.5" fill="#7d8590">替代:本地 JSONL 会话文件(pi 原生)</text>
-    <text x="80" y="558" font-size="10.5" fill="#7d8590">替代:本地 SQLite 作为唯一存储</text>
+    <text x="80" y="540" font-size="10.5" fill="#7d8590">取代:本地 JSONL 的"唯一真相"地位</text>
+    <text x="80" y="558" font-size="10.5" fill="#7d8590">取代:本地 SQLite 作为唯一存储</text>
 
     <!-- cells -->
     <rect x="390" y="415" width="300" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
@@ -242,10 +242,11 @@
     <text x="700" y="330" font-size="10" fill="#8b949e" font-family="monospace">⑤ 启动加载 worker</text>
 
     <!-- ===== 替代关系条 ===== -->
-    <rect x="30" y="615" width="1020" height="70" rx="14" fill="#181e2b" stroke="#bc8cff" stroke-dasharray="6 4"/>
-    <text x="50" y="638" font-size="12.5" font-weight="700" fill="#bc8cff">整体替代了什么:传统 agent 的"本地文件 + 常驻服务"底座</text>
-    <text x="50" y="660" font-size="11" fill="#8b949e">替代:本地 JSONL 会话文件(pi 原生)· 本地 SQLite 唯一存储 · 常驻 DB 服务器 · 手动部署的后端服务 · 单机磁盘</text>
-    <text x="50" y="678" font-size="11" fill="#8b949e">换成:对象存储为权威(BOS,RPO=0)+ 分布式运行时为执行体(Celld,自愈)+ 复用 Pi 引擎为交互层(不 fork)</text>
+    <rect x="30" y="615" width="1020" height="90" rx="14" fill="#181e2b" stroke="#bc8cff" stroke-dasharray="6 4"/>
+    <text x="50" y="638" font-size="12.5" font-weight="700" fill="#bc8cff">替代了什么:不是"本地文件系统",而是"本地作为唯一存储"的权威地位</text>
+    <text x="50" y="660" font-size="11" fill="#8b949e">本地文件仍然存在:pi 引擎本地 JSONL(运行时态,19 个)· Celld worker SQLite(缓存,1.3MB)· 配置/凭证</text>
+    <text x="50" y="678" font-size="11" fill="#8b949e">但权威性转移:BOS sessions/ 成为唯一真相 — 本地全丢/换机器/节点全挂,从 BOS 找回全部会话</text>
+    <text x="50" y="696" font-size="11" fill="#8b949e">取代的角色:本地单点存储 · 常驻 DB 服务器 · 手动部署的后端服务 — 换成 BOS 权威 + Celld 自愈运行时</text>
   </svg>
 
   <!-- 定位一句话 + 替代关系表 -->
@@ -268,7 +269,7 @@
       <tr>
         <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
         <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,176 个)、<b>deploy/agent-runtime</b>(worker 代码包,9 个)</td>
-        <td>本地 JSONL 会话文件(pi 原生存储)、本地 SQLite 唯一存储、单机磁盘</td>
+        <td>取代"本地单点存储"的权威地位 — 本地 JSONL/SQLite 仍在(运行时态/缓存),但不再是唯一真相;权威移到 BOS(跨机器、RPO=0、并发安全 CAS)</td>
         <td>跨机器、RPO=0、并发安全(CAS):换机器/删本地/节点全挂都能找回全部会话</td>
       </tr>
       <tr>
