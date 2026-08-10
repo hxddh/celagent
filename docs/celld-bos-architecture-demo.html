@@ -35,8 +35,8 @@
   @media (max-width: 900px) { .layout { grid-template-columns:1fr; } }
 
   /* ===== 左: 过程面板 ===== */
-  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px; }
-  .panel-title { font-size:13px; font-weight:700; color:var(--dim); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px 20px; }
+  .panel-title { font-size:13px; font-weight:700; color:var(--dim); margin-bottom:14px; display:flex; align-items:center; gap:8px; }
   .panel-title .live { color:var(--green); font-size:11px; animation:blink 1.2s infinite; }
   @keyframes blink { 50% { opacity:.3; } }
 
@@ -71,7 +71,7 @@
 
   /* 消息流 */
   /* 每轮变化追踪 (Celld vs BOS) */
-  .trace { margin-top:12px; }
+  .trace { margin-top:16px; }
   .trace-head { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:6px; }
   .trace-head .th {
     font-size:11px; font-weight:700; padding:6px 10px; border-radius:8px; text-align:center;
@@ -88,18 +88,25 @@
   .trace-cell .warn-c { color:var(--red); }
   .trace-row.new .trace-cell { animation:rownew 1s; }
 
+  /* 说明条 (dataflow-note) */
+  .dataflow-note {
+    background: var(--panel2); border: 1px dashed var(--border); border-radius: 10px;
+    padding: 14px 18px; font-size: 13px; color: var(--dim); line-height: 1.9;
+  }
+  .dataflow-note + .dataflow-note { margin-top: 12px; }
+
   /* JSON 代码块 */
   .json-block {
     background:#0d1117; border:1px solid var(--border); border-radius:10px;
-    padding:12px 14px; font-family:var(--mono); font-size:12px; line-height:1.7;
-    overflow-x:auto; white-space:pre; color:#c9d1d9;
+    padding:16px 18px; font-family:var(--mono); font-size:12px; line-height:1.8;
+    overflow-x:auto; white-space:pre; color:#c9d1d9; margin-top:12px;
   }
   .json-block .k { color:#79c0ff; }
   .json-block .s { color:#a5d6ff; }
   .json-block .n { color:#ffa657; }
   .json-block .c { color:#8b949e; font-style:italic; }
 
-  .chat { margin-top:12px; display:flex; flex-direction:column; gap:8px; max-height:300px; overflow-y:auto; padding-right:4px; }
+  .chat { margin-top:16px; display:flex; flex-direction:column; gap:10px; max-height:300px; overflow-y:auto; padding-right:4px; }
   .msg { border-radius:10px; padding:9px 12px; font-size:12.5px; max-width:95%; animation:slidein .25s; }
   @keyframes slidein { from{ transform:translateY(6px); opacity:0; } }
   .msg.user { background:var(--blue-bg); border:1px solid rgba(88,166,255,.3); align-self:flex-end; }
@@ -110,7 +117,7 @@
   /* ===== 右: BOS 监控 ===== */
   .mon-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
   @media (max-width:700px){ .mon-grid{ grid-template-columns:repeat(2,1fr); } }
-  .metric { background:var(--panel2); border:1px solid var(--border); border-radius:10px; padding:12px; }
+  .metric { background:var(--panel2); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
   .metric .m-label { font-size:11px; color:var(--dim); }
   .metric .m-value { font-size:22px; font-weight:700; font-family:var(--mono); margin-top:4px; }
   .metric .m-sub { font-size:10.5px; color:var(--dim); margin-top:3px; font-family:var(--mono); }
@@ -118,8 +125,8 @@
   .metric .m-value.yellow { color:var(--yellow); } .metric .m-value.red { color:var(--red); }
 
   /* 对象清单 */
-  .obj-table { width:100%; border-collapse:collapse; margin-top:10px; font-family:var(--mono); font-size:11.5px; }
-  .obj-table th, .obj-table td { padding:5px 8px; text-align:left; border-bottom:1px solid var(--border); }
+  .obj-table { width:100%; border-collapse:collapse; margin-top:12px; font-family:var(--mono); font-size:11.5px; }
+  .obj-table th, .obj-table td { padding:9px 10px; text-align:left; border-bottom:1px solid var(--border); }
   .obj-table th { color:var(--dim); font-weight:600; font-size:10.5px; }
   .obj-table tr.new { animation:rownew 1.2s; }
   @keyframes rownew { 0%{ background:rgba(63,185,80,.3); } 100%{ background:transparent; } }
@@ -127,7 +134,7 @@
   .obj-table .etag { color:var(--yellow); font-size:10.5px; }
 
   /* 延迟条 */
-  .lat-chart { margin-top:10px; }
+  .lat-chart { margin-top:14px; }
   .lat-row { display:flex; align-items:center; gap:8px; margin:5px 0; font-family:var(--mono); font-size:11px; }
   .lat-row .lname { width:110px; color:var(--dim); text-align:right; }
   .lat-row .lbar { flex:1; background:var(--panel2); border-radius:4px; height:14px; overflow:hidden; position:relative; }
@@ -272,7 +279,7 @@
   </svg>
 
   <!-- 三条数据路径 (关键: 避免误导) -->
-  <div style="margin-top:14px" id="paths">
+  <div style="margin-top:24px" id="paths">
     <div class="panel-title">② 三条数据路径 — agent 的"手"和"大脑"分开走</div>
     <table class="obj-table" style="margin-top:8px">
       <thead><tr>
@@ -303,14 +310,14 @@
         </tr>
       </tbody>
     </table>
-    <div class="dataflow-note" style="margin-top:8px">
+    <div class="dataflow-note" style="margin-top:14px">
       <b>一句话:</b> agent 的"手"(工具)只碰本地文件系统;<b>Celld/BOS 管的是"大脑"(对话记忆)</b>。
       你在项目里让 agent 改代码 = 本地写盘;你关掉它/换电脑 = 记忆从 BOS 找回(但改过的文件需要 git)。
     </div>
   </div>
 
   <!-- 具体写入的数据 (真实结构) -->
-  <div style="margin-top:14px" id="payload">
+  <div style="margin-top:24px" id="payload">
     <div class="panel-title">③ 具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照"</div>
     <div style="font-size:12.5px;color:var(--dim);margin-bottom:8px">
       每轮对话结束,celagent 把<b style="color:var(--text)">这一轮的对话记录</b>(不是文件、不是工作区)打包成一条 JSON 写入两处。
@@ -344,13 +351,13 @@
         <tr><td><code>updatedAt</code></td><td>会话最后更新时间</td><td>✓</td><td style="color:#8b949e">—</td></tr>
       </tbody>
     </table>
-    <div class="dataflow-note" style="margin-top:8px">
+    <div class="dataflow-note" style="margin-top:14px">
       <b>不存什么:</b> 不存你的项目文件、不存工具产生的文件内容本身 — 只存<b>对话记录</b>(谁说了什么、调了哪些工具、结果摘要)。
       写入的 msg 形如:<code style="color:var(--blue)">"分析一下… [工具调用: bash(&#34;ls&#34;)] [工具结果: bash: src bin docs…"</code><br>
       <span style="color:var(--dim)">注:真实产品钩子(turn_end)只存 assistant 轮;user 轮仅出现在本页演示脚本中。
       摘要长度上限:工具调用 ≤100 字符、工具结果 ≤300 字符(汇总拼接后写入)。</span>
     </div>
-    <div class="dataflow-note" style="margin-top:6px">
+    <div class="dataflow-note" style="margin-top:12px">
       <b>为什么 worker 缓存截断 200 字符?</b> 缓存写入走 HTTP GET,msg 作为 URL 参数传递 —
       URL 长度受限,且中文经 URL 编码后膨胀约 3 倍(200 中文字符 → 约 1080 字符 URL)。
       截断是安全的:worker 只是缓存(丢了可从 BOS 重建),<b>BOS 权威源永远存完整内容</b>。
@@ -358,7 +365,7 @@
   </div>
 
   <!-- 定位一句话 + 价值分层表 -->
-  <div class="dataflow-note" style="margin-top:10px" id="value">
+  <div class="dataflow-note" style="margin-top:16px" id="value">
     <b>一句话定位:</b> <code>BOS = 核心价值(权威持久层,跨机器防丢失)</code> ·
     <code>Celld = 本地加速(缓存,可替换)</code> —
     把"会话永不丢"交给 BOS(真实需求,已验证),Celld 提供低延迟本地缓存与节点自动管理。
@@ -414,7 +421,7 @@
 
       <!-- 每轮变化追踪: Celld vs BOS (最新在上) -->
       <div class="trace" id="trace">
-        <div style="font-size:11px;color:var(--dim);margin-bottom:6px">每轮双写变化追踪(最新在上)</div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:8px">每轮双写变化追踪(最新在上)</div>
         <div class="trace-head">
           <div class="th celld">⚙ Celld 侧变化</div>
           <div class="th bos">☁ BOS 侧变化</div>
@@ -423,11 +430,11 @@
       </div>
 
       <!-- 数据流日志 -->
-      <div style="font-size:11px;color:var(--dim);margin:12px 0 4px">数据流日志(每轮详细操作,最新在上)</div>
+      <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">数据流日志(每轮详细操作,最新在上)</div>
       <div class="flow" id="flow" aria-live="polite"><div class="flow-line" style="color:var(--dim)">等待运行…(每轮: worker 写 → BOS 读 ETag → CAS 写 → ETag 更新)</div></div>
 
       <!-- 对话消息 -->
-      <div style="font-size:11px;color:var(--dim);margin:12px 0 4px">对话消息(演示脚本 — 展示双写流程用)</div>
+      <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">对话消息(演示脚本 — 展示双写流程用)</div>
       <div class="chat" id="chat" aria-live="polite"></div>
     </div>
   </div>
@@ -456,7 +463,7 @@
       </div>
 
       <!-- 对象清单 -->
-      <div style="font-size:11px;color:var(--dim);margin:10px 0 4px">sessions/ 对象清单(演示 3 个,实际 35 个 — 高亮行为本轮更新;turns 数为对象内轮次)</div>
+      <div style="font-size:11px;color:var(--dim);margin:16px 0 6px">sessions/ 对象清单(演示 3 个,实际 35 个 — 高亮行为本轮更新;turns 数为对象内轮次)</div>
       <table class="obj-table">
         <thead><tr><th>key</th><th>turns</th><th>size</th><th>ETag (前12)</th></tr></thead>
         <tbody id="objBody"></tbody>
