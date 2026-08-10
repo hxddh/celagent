@@ -286,7 +286,7 @@
     <text x="590" y="301" font-size="13" fill="var(--svg-dim)">• 并发写有 CAS 保护,不冲突不丢失</text>
     <text x="590" y="330" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:唯一真相 · 核心价值 · RPO=0</text>
     <text x="590" y="352" font-size="12" fill="var(--svg-dim)" font-family="monospace">存:完整对话 sessions/*.json (35 个)</text>
-    <text x="590" y="372" font-size="11.5" fill="var(--svg-dim)">还存:Celld 节点状态(cells/ 176)+ worker 代码(deploy/ 10)+ 运行元数据(9)</text>
+    <text x="590" y="372" font-size="11.5" fill="var(--svg-dim)">还存:Celld 节点状态(cells/ 210)+ worker 代码(deploy/ 16)+ 运行元数据(9)</text>
 
     <!-- 双写箭头: celagent → Celld -->
     <path d="M 260 125 C 260 155, 250 165, 250 190" stroke="#58a6ff" stroke-width="2.5" fill="none" marker-end="url(#arr)"/>
@@ -511,7 +511,7 @@
       <div class="panel-title">⑥ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
 
       <div class="mon-grid">
-        <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">230</div><div class="m-sub">sessions 35 · cells 176 · deploy 10 · celld 状态 9</div></div>
+        <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">270</div><div class="m-sub">sessions 35 · cells 210 · deploy 16 · celld 状态 9</div></div>
         <div class="metric"><div class="m-label">demo-session 大小</div><div class="m-value" id="mBytes">117 B</div><div class="m-sub">本轮写入后对象大小</div></div>
         <div class="metric"><div class="m-label">读次数 (演示)</div><div class="m-value green" id="mReads">0</div><div class="m-sub">GET / head-object (ETag)</div></div>
         <div class="metric"><div class="m-label">写次数 (演示)</div><div class="m-value yellow" id="mWrites">0</div><div class="m-sub">PUT (If-Match CAS)</div></div>
@@ -551,7 +551,7 @@
     <tbody>
       <tr>
         <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
-        <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,176 个)、<b>deploy/agent-runtime</b>(worker 代码包,9 个)</td>
+        <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,210 个)、<b>deploy/agent-runtime</b>(worker 代码包,15 个)</td>
         <td>会话跨机器/防丢失(RPO=0)、并发安全(CAS)、换机器/删本地/节点全挂都能找回</td>
         <td style="color:var(--green)"><b>✅ 核心价值,真实需求,故障注入实测验证</b>(节点全挂可写、恢复 10/10)</td>
       </tr>
@@ -600,7 +600,7 @@ const REAL_RECORDS = [
   { turn:10, workerMs:96, readMs:1303, writeMs:691,  etag:"8f7d910fa3e6a", size:1185 },
 ];
 // 基线 (重建前实测): 对象总数 / 重建前 ETag
-const BASELINE_OBJECTS = 230;
+const BASELINE_OBJECTS = 270;
 const BASELINE_ETAG = "e586af54";
 
 // demo-session 对话内容 (演示脚本)
@@ -634,7 +634,7 @@ const state = {
 
 // 会话清单 (真实存在的 key + 真实大小)
 const SESSIONS = [
-  { k:"sess-demo-secondary", turns:3, size:87 },
+  { k:"sess-demo-secondary", turns:3, size:113 },  // 实测
   { k:"demo-session", turns:10, size:1185 },  // 重建后真实大小
   { k:"my session 中文", turns:1, size:10 },
 ];
@@ -868,7 +868,7 @@ applyTheme(savedTheme);
 updateAutoProgress();
 updateMetrics();
 renderObjects();
-logFlow("就绪: 双节点在线 · BOS 基线 230 对象 · 点击「运行一轮」开始", "op-ok");
+logFlow("就绪: 双节点在线 · BOS 基线 270 对象 · 点击「运行一轮」开始", "op-ok");
 </script>
 </body>
 </html>
