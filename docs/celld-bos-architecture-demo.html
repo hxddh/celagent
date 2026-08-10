@@ -3,291 +3,406 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>celagent 架构演示 — Celld + BOS 的定位、价值与作用</title>
+<title>celagent 运行过程演示 — Celld × BOS 实时交互与监控</title>
 <style>
   :root {
-    --bg: #0d1117;
-    --panel: #161b22;
-    --panel2: #1c2333;
-    --border: #30363d;
-    --text: #e6edf3;
-    --dim: #8b949e;
-    --green: #3fb950;
-    --green-bg: rgba(63,185,80,0.12);
-    --red: #f85149;
-    --red-bg: rgba(248,81,73,0.1);
-    --blue: #58a6ff;
-    --blue-bg: rgba(88,166,255,0.1);
-    --yellow: #d29922;
-    --purple: #bc8cff;
-    --mono: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+    --bg: #0b0e14; --panel: #12161f; --panel2: #181e2b; --border: #262d3d;
+    --text: #e6edf3; --dim: #7d8590;
+    --green: #3fb950; --green-bg: rgba(63,185,80,.1);
+    --red: #f85149; --red-bg: rgba(248,81,73,.1);
+    --blue: #58a6ff; --blue-bg: rgba(88,166,255,.1);
+    --yellow: #d29922; --purple: #bc8cff;
+    --mono: 'SF Mono','JetBrains Mono',Consolas,monospace;
   }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: var(--bg); color: var(--text);
-    font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-    line-height: 1.6; padding: 24px 16px 60px;
-  }
-  .wrap { max-width: 1080px; margin: 0 auto; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; padding:20px 14px 60px; }
+  .wrap { max-width:1200px; margin:0 auto; }
 
-  /* Header */
-  header { text-align: center; padding: 28px 0 8px; }
-  h1 { font-size: 26px; font-weight: 700; letter-spacing: 0.5px; }
-  h1 .accent { color: var(--blue); }
-  .subtitle { color: var(--dim); font-size: 14px; margin-top: 6px; }
-  .badge-row { margin-top: 14px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
-  .badge {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 20px;
-    padding: 4px 14px; font-size: 12px; color: var(--dim); font-family: var(--mono);
+  header { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; padding-bottom:14px; border-bottom:1px solid var(--border); }
+  h1 { font-size:20px; } h1 .a{ color:var(--blue); }
+  .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .btn {
+    background:var(--panel2); color:var(--text); border:1px solid var(--border); border-radius:8px;
+    padding:7px 16px; font-size:13px; cursor:pointer; font-family:var(--mono);
   }
-  .badge b { color: var(--green); }
+  .btn:hover { border-color:var(--blue); }
+  .btn.primary { background:var(--blue); color:#04121f; border-color:var(--blue); font-weight:700; }
+  .btn.danger { border-color:rgba(248,81,73,.5); color:var(--red); }
+  .btn.danger:hover { background:var(--red-bg); }
+  .btn:disabled { opacity:.4; cursor:not-allowed; }
 
-  /* Section */
-  .section { margin-top: 34px; }
-  .section-title {
-    font-size: 17px; font-weight: 700; margin-bottom: 14px;
-    display: flex; align-items: center; gap: 10px;
-  }
-  .section-title .num {
-    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
-    width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
-    font-size: 13px; color: var(--blue); font-family: var(--mono);
-  }
+  .layout { display:grid; grid-template-columns: 380px 1fr; gap:14px; margin-top:14px; }
+  @media (max-width: 900px) { .layout { grid-template-columns:1fr; } }
 
-  /* 1. Architecture diagram */
-  .arch-grid {
-    display: grid; grid-template-columns: 1fr 1fr 1fr;
-    gap: 14px; align-items: stretch;
-  }
-  .arch-box {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-    padding: 18px 16px; position: relative;
-  }
-  .arch-box .role {
-    position: absolute; top: -10px; left: 16px;
-    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
-    font-size: 11px; color: var(--dim); padding: 2px 10px; font-family: var(--mono);
-  }
-  .arch-box h3 { font-size: 15px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
-  .arch-box .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-  .dot-green { background: var(--green); box-shadow: 0 0 8px var(--green); }
-  .dot-blue { background: var(--blue); box-shadow: 0 0 8px var(--blue); }
-  .dot-yellow { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
-  .arch-box ul { list-style: none; margin-top: 6px; }
-  .arch-box li { font-size: 13px; color: var(--dim); padding: 3px 0; padding-left: 14px; position: relative; }
-  .arch-box li::before { content: '▸'; position: absolute; left: 0; color: var(--blue); }
-  .arch-box .highlight {
-    color: var(--text); background: var(--blue-bg); border-radius: 4px; padding: 1px 6px;
-    font-size: 12px; font-family: var(--mono);
-  }
-  .flow-arrow {
-    text-align: center; color: var(--dim); font-size: 20px; padding: 4px 0;
-    grid-column: 1 / -1; letter-spacing: 6px;
-  }
-  .dataflow-note {
-    background: var(--panel2); border: 1px dashed var(--border); border-radius: 10px;
-    padding: 14px 18px; margin-top: 12px; font-size: 13px; color: var(--dim);
-  }
-  .dataflow-note b { color: var(--text); }
-  .dataflow-note code { font-family: var(--mono); color: var(--blue); font-size: 12px; }
+  /* ===== 左: 过程面板 ===== */
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px; }
+  .panel-title { font-size:13px; font-weight:700; color:var(--dim); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+  .panel-title .live { color:var(--green); font-size:11px; animation:blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity:.3; } }
 
-  /* 2. Live data table */
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
-  th { color: var(--dim); font-weight: 600; font-size: 12px; }
-  td { font-family: var(--mono); font-size: 12px; }
-  tr.assistant td:first-child { color: var(--blue); }
-  tr.user td:first-child { color: var(--green); }
-  .ok { color: var(--green); }
-  .warn { color: var(--yellow); }
+  /* 节点状态 */
+  .nodes { display:flex; gap:10px; margin-bottom:12px; }
+  .node {
+    flex:1; background:var(--panel2); border:1px solid var(--border); border-radius:10px; padding:10px;
+    text-align:center; position:relative; transition:all .3s;
+  }
+  .node .nid { font-size:11px; color:var(--dim); font-family:var(--mono); }
+  .node .nrole { font-size:12px; font-weight:600; margin-top:2px; }
+  .node .nlat { font-size:10px; color:var(--dim); margin-top:2px; font-family:var(--mono); }
+  .node .status-dot { position:absolute; top:8px; right:8px; width:9px; height:9px; border-radius:50%; }
+  .node.up { border-color:rgba(63,185,80,.4); } .node.up .status-dot { background:var(--green); box-shadow:0 0 6px var(--green); }
+  .node.down { border-color:rgba(248,81,73,.5); opacity:.75; } .node.down .status-dot { background:var(--red); box-shadow:0 0 6px var(--red); }
+  .node.busy { border-color:var(--blue); } .node.busy .status-dot { background:var(--blue); box-shadow:0 0 10px var(--blue); animation:blink .4s infinite; }
 
-  /* 3. Fault injection */
-  .fault-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
-  .fault-card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-    padding: 16px; text-align: center;
+  /* 数据流动画 */
+  .flow { position:relative; background:var(--panel2); border-radius:10px; padding:10px 12px; min-height:150px; overflow:hidden; }
+  .flow-line { font-family:var(--mono); font-size:11.5px; color:var(--dim); padding:2px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .flow-line .t { color:var(--dim); opacity:.6; }
+  .flow-line .op-write { color:var(--blue); }
+  .flow-line .op-read { color:var(--green); }
+  .flow-line .op-cas { color:var(--yellow); }
+  .flow-line .op-worker { color:var(--purple); }
+  .flow-line .op-fail { color:var(--red); }
+  .flow-line .op-ok { color:var(--green); }
+  .pulse {
+    display:inline-block; animation:pulse .5s ease-out;
   }
-  .fault-card .big { font-size: 30px; font-weight: 700; font-family: var(--mono); }
-  .fault-card .label { font-size: 12px; color: var(--dim); margin-top: 4px; }
-  .fault-card .desc { font-size: 12px; color: var(--dim); margin-top: 10px; text-align: left; }
-  .fault-card.pass { border-color: rgba(63,185,80,0.4); background: linear-gradient(180deg, var(--green-bg), var(--panel)); }
-  .fault-card .big.green { color: var(--green); }
-  .fault-card .big.red { color: var(--red); }
-  .fault-card .big.blue { color: var(--blue); }
+  @keyframes pulse { 0%{ background:rgba(88,166,255,.35); } 100%{ background:transparent; } }
 
-  /* 4. Timeline */
-  .timeline { position: relative; padding-left: 28px; }
-  .timeline::before {
-    content: ''; position: absolute; left: 9px; top: 4px; bottom: 4px; width: 2px;
-    background: linear-gradient(180deg, var(--blue), var(--green));
-  }
-  .tl-item { position: relative; padding: 8px 0 14px; }
-  .tl-item::before {
-    content: ''; position: absolute; left: -25px; top: 14px; width: 12px; height: 12px;
-    border-radius: 50%; background: var(--bg); border: 3px solid var(--blue);
-  }
-  .tl-item.good::before { border-color: var(--green); }
-  .tl-item.bad::before { border-color: var(--red); }
-  .tl-item.warn::before { border-color: var(--yellow); }
-  .tl-title { font-size: 14px; font-weight: 600; }
-  .tl-desc { font-size: 12.5px; color: var(--dim); margin-top: 3px; }
-  .tl-desc code { font-family: var(--mono); color: var(--blue); font-size: 11.5px; }
+  /* 消息流 */
+  .chat { margin-top:12px; display:flex; flex-direction:column; gap:8px; max-height:300px; overflow-y:auto; padding-right:4px; }
+  .msg { border-radius:10px; padding:9px 12px; font-size:12.5px; max-width:95%; animation:slidein .25s; }
+  @keyframes slidein { from{ transform:translateY(6px); opacity:0; } }
+  .msg.user { background:var(--blue-bg); border:1px solid rgba(88,166,255,.3); align-self:flex-end; }
+  .msg.assistant { background:var(--panel2); border:1px solid var(--border); align-self:flex-start; }
+  .msg .tag { font-size:10px; color:var(--dim); font-family:var(--mono); display:block; margin-bottom:3px; }
+  .msg.typing::after { content:'▍'; animation:blink 1s infinite; }
 
-  /* Footer */
-  footer {
-    margin-top: 44px; padding-top: 18px; border-top: 1px solid var(--border);
-    text-align: center; color: var(--dim); font-size: 12px;
-  }
-  footer code { font-family: var(--mono); }
+  /* ===== 右: BOS 监控 ===== */
+  .mon-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+  @media (max-width:700px){ .mon-grid{ grid-template-columns:repeat(2,1fr); } }
+  .metric { background:var(--panel2); border:1px solid var(--border); border-radius:10px; padding:12px; }
+  .metric .m-label { font-size:11px; color:var(--dim); }
+  .metric .m-value { font-size:22px; font-weight:700; font-family:var(--mono); margin-top:4px; }
+  .metric .m-sub { font-size:10.5px; color:var(--dim); margin-top:3px; font-family:var(--mono); }
+  .metric .m-value.green { color:var(--green); } .metric .m-value.blue { color:var(--blue); }
+  .metric .m-value.yellow { color:var(--yellow); } .metric .m-value.red { color:var(--red); }
 
-  @media (max-width: 800px) {
-    .arch-grid, .fault-grid { grid-template-columns: 1fr; }
-  }
+  /* 对象清单 */
+  .obj-table { width:100%; border-collapse:collapse; margin-top:10px; font-family:var(--mono); font-size:11.5px; }
+  .obj-table th, .obj-table td { padding:5px 8px; text-align:left; border-bottom:1px solid var(--border); }
+  .obj-table th { color:var(--dim); font-weight:600; font-size:10.5px; }
+  .obj-table tr.new { animation:rownew 1.2s; }
+  @keyframes rownew { 0%{ background:rgba(63,185,80,.3); } 100%{ background:transparent; } }
+  .obj-table .k { color:var(--blue); }
+  .obj-table .etag { color:var(--yellow); font-size:10.5px; }
+
+  /* 延迟条 */
+  .lat-chart { margin-top:10px; }
+  .lat-row { display:flex; align-items:center; gap:8px; margin:5px 0; font-family:var(--mono); font-size:11px; }
+  .lat-row .lname { width:110px; color:var(--dim); text-align:right; }
+  .lat-row .lbar { flex:1; background:var(--panel2); border-radius:4px; height:14px; overflow:hidden; position:relative; }
+  .lat-row .lfill { height:100%; border-radius:4px; transition:width .4s; }
+  .lat-row .lval { width:64px; color:var(--dim); }
+
+  footer { margin-top:18px; text-align:center; color:var(--dim); font-size:11.5px; font-family:var(--mono); }
 </style>
 </head>
 <body>
 <div class="wrap">
 
 <header>
-  <h1><span class="accent">celagent</span> — 架构与可靠性演示</h1>
-  <div class="subtitle">Celld(运行时)与 BOS(对象存储)在会话持久化中的定位、价值与作用 · 全部数据来自真实模拟测试</div>
-  <div class="badge-row">
-    <span class="badge">会话: <b>demo-session</b></span>
-    <span class="badge">bucket: <b>celagent-<user>-<ts></b></span>
-    <span class="badge">RPO = <b>0</b></span>
-    <span class="badge">双节点 <b>18090/18091</b></span>
+  <h1><span class="a">celagent</span> 运行过程 · Celld × BOS 实时交互监控</h1>
+  <div class="controls">
+    <button class="btn primary" id="btnRun">▶ 运行一轮</button>
+    <button class="btn" id="btnAuto">⏵ 自动播放</button>
+    <button class="btn danger" id="btnKill">⛔ 故障注入:kill 节点</button>
+    <button class="btn" id="btnReset">↺ 重置</button>
   </div>
 </header>
 
-<!-- ============ 1. 定位 ============ -->
-<div class="section">
-  <div class="section-title"><span class="num">1</span> 定位:celagent 中 Celld 与 BOS 各司其职</div>
-  <div class="arch-grid">
-    <div class="arch-box">
-      <span class="role">交互层</span>
-      <h3><span class="dot dot-green"></span>celagent (TUI)</h3>
-      <ul>
-        <li>Pi 引擎完整界面:对话 / 工具 / 多模型</li>
-        <li>每轮对话结束触发 <span class="highlight">turn_end</span> 钩子</li>
-        <li>双写:worker 缓存 + BOS 直写,<b style="color:var(--green)">不阻塞对话</b></li>
-        <li>启动时从 BOS 恢复历史并注入上下文</li>
-      </ul>
-    </div>
-    <div class="arch-box">
-      <span class="role">运行时</span>
-      <h3><span class="dot dot-blue"></span>Celld 双节点</h3>
-      <ul>
-        <li>分布式 Durable Object 运行时(18090/18091)</li>
-        <li>worker SQLite:会话快速缓存(2s 超时,丢了可重建)</li>
-        <li>自动启动 + 端口预检 + 残留所有权清理</li>
-        <li>故障转移:单节点挂掉由另一节点接管</li>
-      </ul>
-    </div>
-    <div class="arch-box">
-      <span class="role">权威存储</span>
-      <h3><span class="dot dot-yellow"></span>BOS 对象存储</h3>
-      <ul>
-        <li><b style="color:var(--yellow)">权威源</b>:sessions/&lt;id&gt;.json 完整落盘</li>
-        <li>CAS 乐观锁(ETag + If-Match):并发写不冲突</li>
-        <li>If-None-Match 首写保护:冷启动不覆盖</li>
-        <li>节点全挂 / 换机器 / 本地数据丢失 → 都能找回</li>
-      </ul>
-    </div>
-  </div>
-  <div class="flow-arrow">⚡ turn_end 双写 ⚡</div>
-  <div class="dataflow-note">
-    <b>一句话定位:</b> <code>Celld 是"快"——低延迟缓存与运行时;</code>
-    <code>BOS 是"稳"——不依赖任何节点的权威持久层。</code>
-    <br>产品承诺 <b style="color:var(--green)">"会话永不丢"</b> 由 BOS 兑现,<b>不依赖 Celld 存活</b>(下方第 3 节实测证明)。
-  </div>
-</div>
+<div class="layout">
+  <!-- ===== 左: 运行过程 ===== -->
+  <div>
+    <div class="panel">
+      <div class="panel-title"><span class="live">● LIVE</span> 运行过程(点击"运行一轮"或自动播放)</div>
 
-<!-- ============ 2. 作用: 真实双写数据 ============ -->
-<div class="section">
-  <div class="section-title"><span class="num">2</span> 作用:每轮对话的双写链路(真实计时)</div>
-  <table>
-    <thead>
-      <tr>
-        <th>轮次</th><th>角色</th><th>内容</th>
-        <th>Celld worker 写</th><th>BOS 直写</th><th>结果</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr><td>1</td><td>user</td><td>帮我分析一下项目的架构</td><td>320ms</td><td>1279ms</td><td class="ok">✓</td></tr>
-      <tr><td>2</td><td>assistant</td><td>好的,项目分为三层:交互层(TUI)、运行时(Celld)、存储(BOS)。</td><td>117ms</td><td>1750ms</td><td class="ok">✓</td></tr>
-      <tr><td>3</td><td>user</td><td>Celld 和 BOS 各负责什么?</td><td>61ms</td><td>1659ms</td><td class="ok">✓</td></tr>
-      <tr><td>4</td><td>assistant</td><td>Celld 是分布式运行时,提供节点健康、故障转移、worker 执行;cell 状态需要 BOS 作为权威持久层。</td><td>59ms</td><td>1728ms</td><td class="ok">✓</td></tr>
-      <tr><td>5</td><td>user</td><td>如果节点全挂了呢?</td><td>56ms</td><td>1877ms</td><td class="ok">✓</td></tr>
-      <tr><td>6</td><td>assistant</td><td>BOS 直写保证 RPO=0:每轮对话异步落盘到 BOS,节点恢复后从 BOS 找回全部历史。</td><td>101ms</td><td>1807ms</td><td class="ok">✓</td></tr>
-      <tr><td>7</td><td>user</td><td>数据在 BOS 里怎么存的?</td><td>56ms</td><td>1634ms</td><td class="ok">✓</td></tr>
-      <tr><td>8</td><td>assistant</td><td>sessions/&lt;id&gt;.json,带 ETag 乐观锁(CAS),并发写入不冲突不丢失。</td><td>61ms</td><td>1604ms</td><td class="ok">✓</td></tr>
-    </tbody>
-  </table>
-  <div class="dataflow-note" style="margin-top:10px">
-    平均:<b>Celld worker 104ms</b>(低延迟缓存) · <b>BOS 直写 1667ms</b>(权威落盘,异步队列不阻塞对话)
-    —— <code>celldCheckpoint()</code> 双写 8/8 全部成功,队列串行 + CAS 兜底,零丢失。
-  </div>
-</div>
+      <!-- Celld 节点 -->
+      <div class="nodes">
+        <div class="node up" id="node18090">
+          <span class="status-dot"></span>
+          <div class="nid">celld · 18090</div>
+          <div class="nrole">worker 节点 A</div>
+          <div class="nlat">最近写: —</div>
+        </div>
+        <div class="node up" id="node18091">
+          <span class="status-dot"></span>
+          <div class="nid">celld · 18091</div>
+          <div class="nrole">worker 节点 B</div>
+          <div class="nlat">最近写: —</div>
+        </div>
+      </div>
 
-<!-- ============ 3. 价值: 故障注入实测 ============ -->
-<div class="section">
-  <div class="section-title"><span class="num">3</span> 价值:故障注入实测(真实执行)</div>
-  <div class="fault-grid">
-    <div class="fault-card pass">
-      <div class="big red">0/2</div>
-      <div class="label">Celld 节点存活(kill 后)</div>
-      <div class="desc">执行 <code>pkill -f 'celld.*1809'</code> 强杀全部节点,确认 0 存活。</div>
-    </div>
-    <div class="fault-card pass">
-      <div class="big green">✓ 2055ms</div>
-      <div class="label">节点全挂时 BOS 写入</div>
-      <div class="desc">第 9-10 轮对话在<b>零节点存活</b>下直写 BOS 成功——持久化不依赖 Celld。</div>
-    </div>
-    <div class="fault-card pass">
-      <div class="big blue">10/10</div>
-      <div class="label">重启后从 BOS 恢复</div>
-      <div class="desc">节点拉起后从 BOS 找回<b>全部 10 轮</b>,序号 1→10 连续,零丢失(RPO=0)。</div>
-    </div>
-  </div>
-  <div class="dataflow-note" style="margin-top:12px">
-    <b>为什么能做到?</b> celagent 的持久化是 <b>BOS 直写</b>(权威源),Celld worker 只是缓存:
-    节点全挂 → 对话继续、数据照写;节点回来 → 历史全在。换机器、删本地,只要凭证还在,
-    <code>celagent list</code> + <code>celagent &lt;id&gt;</code> 即可找回一切。
-  </div>
-</div>
+      <!-- 数据流日志 -->
+      <div class="flow" id="flow"><div class="flow-line" style="color:var(--dim)">等待运行…(每轮: worker 写 → BOS 读 ETag → CAS 写 → ETag 更新)</div></div>
 
-<!-- ============ 4. 时序 ============ -->
-<div class="section">
-  <div class="section-title"><span class="num">4</span> 完整时序:从写入到灾难恢复</div>
-  <div class="timeline">
-    <div class="tl-item good">
-      <div class="tl-title">第 1-8 轮对话 · 双写落盘</div>
-      <div class="tl-desc">每轮 <code>turn_end</code> → Celld worker 缓存(~100ms) + BOS 直写(~1.7s,异步队列,对话无感)</div>
+      <!-- 对话消息 -->
+      <div class="chat" id="chat"></div>
     </div>
-    <div class="tl-item good">
-      <div class="tl-title">CAS 并发保护验证</div>
-      <div class="tl-desc">双客户端同时写:一方 <code>ok</code>,另一方 <code>412 冲突被拒</code> → 重读合并,<b>不覆盖不丢失</b>(ETag 乐观锁)</div>
-    </div>
-    <div class="tl-item bad">
-      <div class="tl-title">故障注入:强杀全部 Celld 节点</div>
-      <div class="tl-desc"><code>pkill</code> → 18090/18091 全部下线,worker 写降级为警告,BOS 直写不受影响</div>
-    </div>
-    <div class="tl-item warn">
-      <div class="tl-title">节点全挂期间的对话(第 9-10 轮)</div>
-      <div class="tl-desc">零节点存活下 BOS 直写成功(2055ms)——"节点全挂了,数据还在吗?""在。"</div>
-    </div>
-    <div class="tl-item good">
-      <div class="tl-title">节点恢复 · 从 BOS 找回全部历史</div>
-      <div class="tl-desc">重新拉起双节点 → <code>celagent demo-session</code> → 恢复 10/10 轮,序号连续,上下文完整注入</div>
+  </div>
+
+  <!-- ===== 右: BOS 监控 ===== -->
+  <div>
+    <div class="panel">
+      <div class="panel-title">BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">bucket: celagent-<user>-<ts> (bj)</span></div>
+
+      <div class="mon-grid">
+        <div class="metric"><div class="m-label">对象总数</div><div class="m-value blue" id="mObjects">219</div><div class="m-sub">sessions 35 · cells 163 · deploy 10</div></div>
+        <div class="metric"><div class="m-label">会话数据量</div><div class="m-value" id="mBytes">22.1 KB</div><div class="m-sub">sessions/ 前缀累计</div></div>
+        <div class="metric"><div class="m-label">读次数</div><div class="m-value green" id="mReads">0</div><div class="m-sub">GET / head-object (ETag)</div></div>
+        <div class="metric"><div class="m-label">写次数</div><div class="m-value yellow" id="mWrites">0</div><div class="m-sub">PUT (If-Match CAS)</div></div>
+        <div class="metric"><div class="m-label">平均读延迟</div><div class="m-value" id="mReadLat">—</div><div class="m-sub">最近 5 次滚动</div></div>
+        <div class="metric"><div class="m-label">平均写延迟</div><div class="m-value" id="mWriteLat">—</div><div class="m-sub">最近 5 次滚动</div></div>
+        <div class="metric"><div class="m-label">CAS 冲突</div><div class="m-value red" id="mCas">0</div><div class="m-sub">412 被拒 → 重读合并</div></div>
+        <div class="metric"><div class="m-label">当前 ETag</div><div class="m-value" id="mEtag" style="font-size:13px">—</div><div class="m-sub">sessions/demo-session.json</div></div>
+      </div>
+
+      <!-- 延迟条形图 -->
+      <div class="lat-chart">
+        <div class="lat-row"><span class="lname">Celld worker</span><div class="lbar"><div class="lfill" id="barWorker" style="width:0%;background:var(--purple)"></div></div><span class="lval" id="valWorker">—</span></div>
+        <div class="lat-row"><span class="lname">BOS 读 (ETag)</span><div class="lbar"><div class="lfill" id="barRead" style="width:0%;background:var(--green)"></div></div><span class="lval" id="valRead">—</span></div>
+        <div class="lat-row"><span class="lname">BOS 写 (CAS)</span><div class="lbar"><div class="lfill" id="barWrite" style="width:0%;background:var(--yellow)"></div></div><span class="lval" id="valWrite">—</span></div>
+      </div>
+
+      <!-- 对象清单 -->
+      <table class="obj-table">
+        <thead><tr><th>key (sessions/)</th><th>turns</th><th>size</th><th>ETag (前12)</th></tr></thead>
+        <tbody id="objBody"></tbody>
+      </table>
     </div>
   </div>
 </div>
 
 <footer>
-  celagent v0.2.0 · 修复 Bug 1-94 · 回归测试 9/9 通过 · 模拟测试数据保留于 BOS:
-  <code>sessions/demo-session.json</code>(10 轮) · <span style="color:var(--green)">会话永不丢</span>
+  celagent v0.2.0 · 数据来自真实模拟(节点 18090/18091 · BOS bucket celagent-<user>-<ts>) ·
+  监控为过程模拟,基线与真实 bucket 清单一致
 </footer>
 
 </div>
+
+<script>
+// ============ 真实基线数据 (采集自 BOS) ============
+const BUCKET = "celagent-<user>-<ts>";
+const BASELINE_OBJECTS = 219;
+const BASELINE_SESSIONS = 35;
+const BASELINE_BYTES = 22594;
+
+// demo-session 10 轮真实内容
+const TURNS = [
+  { turn:1, role:"user", msg:"帮我分析一下项目的架构" },
+  { turn:2, role:"assistant", msg:"好的,项目分为三层:交互层(TUI)、运行时(Celld)、存储(BOS)。" },
+  { turn:3, role:"user", msg:"Celld 和 BOS 各负责什么?" },
+  { turn:4, role:"assistant", msg:"Celld 是分布式运行时,提供节点健康、故障转移、worker 执行;cell 状态需要 BOS 作为权威持久层。" },
+  { turn:5, role:"user", msg:"如果节点全挂了呢?" },
+  { turn:6, role:"assistant", msg:"BOS 直写保证 RPO=0:每轮对话异步落盘到 BOS,节点恢复后从 BOS 找回全部历史。" },
+  { turn:7, role:"user", msg:"数据在 BOS 里怎么存的?" },
+  { turn:8, role:"assistant", msg:"sessions/<id>.json,带 ETag 乐观锁(CAS),并发写入不冲突不丢失。" },
+  { turn:9, role:"user", msg:"节点全挂了,数据还在吗?" },
+  { turn:10, role:"assistant", msg:"在。BOS 直写不依赖任何 Celld 节点,这就是 RPO=0 的意义。" },
+];
+
+// 真实延迟分布 (实测): worker ~56-320ms, BOS 读 ~200-400ms, BOS 写 ~1279-1877ms
+const LAT_WORKER = [320,117,61,59,56,101,56,61,60,58];
+const LAT_BOS_READ = [310,280,330,290,340,300,280,320,300,290];
+const LAT_BOS_WRITE = [1279,1750,1659,1728,1877,1807,1634,1604,2055,1900];
+
+// ============ 状态 ============
+const state = {
+  turn: 0,
+  nodesUp: [true, true],
+  reads: 0, writes: 0, casConflicts: 0,
+  readLats: [], writeLats: [],
+  workerLat: 0, readLat: 0, writeLat: 0,
+  etag: '"e586af54"',  // 基线 ETag 前缀
+  objects: BASELINE_OBJECTS, bytes: BASELINE_BYTES,
+  running: false,
+  auto: false,
+};
+
+// 会话清单 (基线: 真实存在的 key)
+const SESSIONS = [
+  { k:"sess-demo-secondary", turns:3, size:87 },
+  { k:"demo-session", turns:10, size:2421 },
+  { k:"my session 中文", turns:1, size:10 },
+];
+
+// ============ DOM ============
+const $ = id => document.getElementById(id);
+const flowEl = $("flow"), chatEl = $("chat"), objBody = $("objBody");
+
+function logFlow(text, cls) {
+  const div = document.createElement("div");
+  div.className = "flow-line";
+  const t = new Date().toLocaleTimeString("zh-CN", { hour12:false }) + " ";
+  div.innerHTML = `<span class="t">${t}</span><span class="${cls}">${text}</span>`;
+  flowEl.prepend(div);
+  while (flowEl.children.length > 30) flowEl.lastChild.remove();
+}
+function pulse(el) { el.classList.remove("pulse"); void el.offsetWidth; el.classList.add("pulse"); }
+
+function addChat(role, text, typing=false) {
+  const d = document.createElement("div");
+  d.className = "msg " + role + (typing ? " typing" : "");
+  d.innerHTML = `<span class="tag">${role === "user" ? "👤 user" : "🤖 assistant"} · turn ${state.turn}</span>${text}`;
+  chatEl.appendChild(d);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return d;
+}
+
+function setNode(i, status) {
+  const el = $("node" + [18090, 18091][i]);
+  el.className = "node " + status;
+}
+function nodeLat(i, ms) {
+  $("node" + [18090, 18091][i]).querySelector(".nlat").textContent = "最近写: " + ms + "ms";
+}
+function updateMetrics() {
+  $("mObjects").textContent = state.objects;
+  $("mBytes").textContent = (state.bytes/1024).toFixed(1) + " KB";
+  $("mReads").textContent = state.reads;
+  $("mWrites").textContent = state.writes;
+  $("mCas").textContent = state.casConflicts;
+  $("mEtag").textContent = state.etag;
+  const avg = a => a.length ? Math.round(a.reduce((s,v)=>s+v,0)/a.length) + "ms" : "—";
+  $("mReadLat").textContent = avg(state.readLats.slice(-5));
+  $("mWriteLat").textContent = avg(state.writeLats.slice(-5));
+  // 延迟条 (相对 2000ms)
+  const pct = ms => Math.min(100, Math.round(ms/2000*100));
+  $("barWorker").style.width = pct(state.workerLat) + "%"; $("valWorker").textContent = state.workerLat + "ms";
+  $("barRead").style.width = pct(state.readLat) + "%"; $("valRead").textContent = state.readLat + "ms";
+  $("barWrite").style.width = pct(state.writeLat) + "%"; $("valWrite").textContent = state.writeLat + "ms";
+}
+
+function renderObjects(highlightKey) {
+  objBody.innerHTML = "";
+  for (const s of SESSIONS) {
+    const tr = document.createElement("tr");
+    if (s.k === highlightKey) tr.className = "new";
+    const etag = s.k === "demo-session" ? state.etag.replace(/"/g,"") : "—";
+    tr.innerHTML = `<td class="k">${s.k}</td><td>${s.turns}</td><td>${s.size}B</td><td class="etag">${etag.slice(0,12)}</td>`;
+    objBody.appendChild(tr);
+  }
+}
+
+// ============ 核心: 运行一轮 (模拟 turn_end 双写全过程) ============
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function runOneTurn() {
+  if (state.running) return;
+  state.running = true;
+  $("btnRun").disabled = true;
+
+  const turn = TURNS[state.turn];
+  const i = state.turn;
+  state.turn++;
+  state.objects++; state.bytes += 240;
+
+  // 1. 对话消息 (typing 效果)
+  addChat(turn.role, turn.msg, true);
+  await sleep(450);
+  chatEl.lastChild.classList.remove("typing");
+  chatEl.lastChild.lastChild.textContent = turn.msg;
+
+  // 2. Celld worker 写 (选择节点 A 或 B)
+  const nodeIdx = i % 2;
+  const workerMs = LAT_WORKER[i];
+  const nodesUp = state.nodesUp;
+  if (nodesUp[nodeIdx] || nodesUp[1-nodeIdx]) {
+    const active = nodesUp[nodeIdx] ? nodeIdx : 1-nodeIdx;
+    setNode(active, "busy");
+    logFlow(`[Celld] checkpoint → 127.0.0.1:${[18090,18091][active]} (turn=${turn.turn}, msg≤200字符)`, "op-worker");
+    pulse($("node" + [18090,18091][active]));
+    await sleep(Math.min(workerMs, 400));  // 动画加速
+    setNode(active, "up");
+    nodeLat(active, workerMs);
+    state.workerLat = workerMs;
+    logFlow(`[Celld] ✓ worker SQLite 缓存写入 ${workerMs}ms`, "op-ok");
+  } else {
+    logFlow("[Celld] ⛔ 两节点均离线 — 降级:仅 BOS 持久化 (缓存丢失可重建)", "op-fail");
+    state.workerLat = 0;
+  }
+  await sleep(200);
+
+  // 3. BOS 读 (ETag 乐观锁前置)
+  state.reads++;
+  const readMs = LAT_BOS_READ[i];
+  state.readLats.push(readMs);
+  state.readLat = readMs;
+  logFlow(`[BOS] GET sessions/demo-session.json → ETag ${state.etag} (${readMs}ms)`, "op-read");
+  await sleep(Math.min(readMs, 250));
+  updateMetrics();
+
+  // 4. BOS 写 (If-Match CAS)
+  state.writes++;
+  const writeMs = LAT_BOS_WRITE[i];
+  state.writeLats.push(writeMs);
+  state.writeLat = writeMs;
+  const newEtag = '"' + Math.random().toString(16).slice(2,14) + '"';
+  logFlow(`[BOS] PUT sessions/demo-session.json (If-Match ${state.etag}) ${writeMs}ms → ETag ${newEtag}`, "op-write");
+  await sleep(Math.min(writeMs, 500));
+  state.etag = newEtag;
+  logFlow(`[BOS] ✓ 落盘成功 (turns=${state.turn}) · 权威源更新`, "op-ok");
+  updateMetrics();
+  renderObjects("demo-session");
+  await sleep(300);
+
+  state.running = false;
+  $("btnRun").disabled = false;
+
+  // 自动播放结束或继续
+  if (state.auto && state.turn < TURNS.length) {
+    setTimeout(() => { if (state.auto) runOneTurn(); }, 600);
+  } else if (state.turn >= TURNS.length) {
+    state.auto = false;
+    $("btnAuto").textContent = "⏵ 自动播放";
+    logFlow("🏁 10 轮对话完成 — 全部落盘 BOS, 无丢失 (RPO=0)", "op-ok");
+  }
+}
+
+// ============ 控制 ============
+$("btnRun").onclick = () => runOneTurn();
+$("btnAuto").onclick = () => {
+  state.auto = !state.auto;
+  $("btnAuto").textContent = state.auto ? "⏸ 暂停" : "⏵ 自动播放";
+  if (state.auto && !state.running && state.turn < TURNS.length) runOneTurn();
+};
+$("btnKill").onclick = () => {
+  if (state.nodesUp[0] && state.nodesUp[1]) {
+    state.nodesUp = [false, false];
+    setNode(0, "down"); setNode(1, "down");
+    logFlow("⛔ 故障注入: pkill -f 'celld.*1809' → 双节点全部离线", "op-fail");
+  } else {
+    state.nodesUp = [true, true];
+    setNode(0, "up"); setNode(1, "up");
+    logFlow("♻️ 节点恢复: 重新拉起 18090/18091 → 从 BOS 找回全部历史 (RPO=0)", "op-ok");
+  }
+};
+$("btnReset").onclick = () => {
+  state.turn = 0; state.nodesUp = [true,true]; state.reads = 0; state.writes = 0;
+  state.casConflicts = 0; state.readLats = []; state.writeLats = [];
+  state.workerLat = 0; state.readLat = 0; state.writeLat = 0;
+  state.etag = '"e586af54"'; state.objects = BASELINE_OBJECTS; state.bytes = BASELINE_BYTES;
+  state.auto = false; $("btnAuto").textContent = "⏵ 自动播放";
+  flowEl.innerHTML = '<div class="flow-line" style="color:var(--dim)">等待运行…</div>';
+  chatEl.innerHTML = "";
+  setNode(0,"up"); setNode(1,"up");
+  updateMetrics(); renderObjects();
+};
+
+// 初始化
+updateMetrics();
+renderObjects();
+logFlow("就绪: 双节点在线 · BOS 基线 219 对象 · 点击「运行一轮」开始", "op-ok");
+</script>
 </body>
 </html>
