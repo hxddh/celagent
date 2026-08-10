@@ -243,11 +243,12 @@ export class AgentRuntime {
           return new Response(JSON.stringify({ ok: false, error: 'invalid-turn', turn: rawTurn }), { status: 400 });
         }
         const msg = url.searchParams.get('msg') || '';
+        const role = url.searchParams.get('role') || 'assistant';
         const key = `session:${sessionId}`;
         const existing = await this.state.storage.get(key) || { id: sessionId, turns: [] };
         // 按 turn 去重: 同 turn 替换; 不同 turn 追加到末尾(续写, 不覆盖旧数据)
         const idx = existing.turns.findIndex(t => t.turn === turn);
-        const entry = { turn, msg, ts: Date.now() };
+        const entry = { turn, role, msg, ts: Date.now() };
         if (idx >= 0) {
           existing.turns[idx] = entry;
         } else {
@@ -259,12 +260,65 @@ export class AgentRuntime {
         return new Response(JSON.stringify({ ok: true, sessionId, turn, turns: existing.turns.length }));
       }
 
+      case 'sync': {
+        // P0: 会话全量同步 — 客户端把权威会话状态(BOS 读回)推给 cell,
+        // 使 worker 缓存与 BOS 一致 (迁移/冷启动后对齐用)
+        const sessionId = url.searchParams.get('session') || 'default';
+        const body = await req.json().catch(() => null);
+        if (!body || !Array.isArray(body.turns)) {
+          return new Response(JSON.stringify({ ok: false, error: 'invalid-body' }), { status: 400 });
+        }
+        const key = `session:${sessionId}`;
+        await this.state.storage.put(key, { id: sessionId, turns: body.turns, updatedAt: Date.now() });
+        return new Response(JSON.stringify({ ok: true, sessionId, turns: body.turns.length }));
+      }
+
       case 'resume': {
         // 崩溃/重启后, 客户端从这里恢复完整会话
         const sessionId = url.searchParams.get('session') || 'default';
         const key = `session:${sessionId}`;
         const existing = await this.state.storage.get(key) || null;
         return new Response(JSON.stringify({ ok: existing !== null, sessionId, session: existing }));
+      }
+
+      case 'hibernate': {
+        // P1: 休眠 — agent 空闲时休眠, 状态完整保留在 cell (storage),
+        // 唤醒后从 storage 恢复 (状态不依赖节点存活)
+        const sessionId = url.searchParams.get('session') || 'default';
+        const key = `session:${sessionId}`;
+        const existing = await this.state.storage.get(key);
+        if (!existing) return new Response(JSON.stringify({ ok: false, error: 'not-found' }), { status: 404 });
+        await this.state.storage.put(`hibernate:${sessionId}`, {
+          id: sessionId, turns: existing.turns, sleptAt: Date.now(),
+        });
+        // 休眠: 释放活跃状态 (cell 可被节点回收), 仅保留 hibernate 记录
+        await this.state.storage.delete(key);
+        return new Response(JSON.stringify({ ok: true, sessionId, sleptAt: Date.now(), turns: existing.turns.length }));
+      }
+
+      case 'wake': {
+        // P1: 唤醒 — 从 hibernate 记录恢复完整状态到活跃 cell
+        const sessionId = url.searchParams.get('session') || 'default';
+        const key = `hibernate:${sessionId}`;
+        const sleeping = await this.state.storage.get(key);
+        if (!sleeping) return new Response(JSON.stringify({ ok: false, error: 'not-sleeping' }), { status: 404 });
+        await this.state.storage.put(`session:${sessionId}`, {
+          id: sessionId, turns: sleeping.turns, updatedAt: Date.now(), wokeAt: Date.now(),
+        });
+        await this.state.storage.delete(key);
+        return new Response(JSON.stringify({ ok: true, sessionId, wokeAt: Date.now(), turns: sleeping.turns.length }));
+      }
+
+      case 'hibernate-status': {
+        // P1: 查询休眠状态
+        const sessionId = url.searchParams.get('session') || 'default';
+        const sleeping = await this.state.storage.get(`hibernate:${sessionId}`);
+        const active = await this.state.storage.get(`session:${sessionId}`);
+        return new Response(JSON.stringify({
+          ok: true, sessionId,
+          state: sleeping ? 'hibernated' : (active ? 'active' : 'none'),
+          turns: (sleeping?.turns || active?.turns || []).length,
+        }));
       }
 
       // ===== 通用 KV API: SessionStorage 映射层 =====
@@ -331,27 +385,33 @@ export class AgentRuntime {
         const key = url.searchParams.get('key') || 'cw';
         const val = url.searchParams.get('val') || 'v';
         const expectVer = url.searchParams.get('ver');  // 期望版本(乐观锁)
-        const writeKey = 'writer:current';
-        const current = await this.state.storage.get(writeKey);
-        // 并发检测: 若已有其他 client 在写, 拒绝
-        if (current && current.clientId !== clientId) {
+        const session = url.searchParams.get('session') || 'default';
+        // P1: epoch fencing — 会话级单写者锁 (原子获取: noOverwrite)
+        // 修复竞态: 原实现'检查-写入-删除'三步非原子, 并发双方都能通过检查
+        const writeKey = `writer:${session}`;
+        try {
+          await this.state.storage.put(writeKey, { clientId, seq, ts: Date.now() }, { noOverwrite: true });
+        } catch (e) {
+          // 锁已被其他 client 持有 (noOverwrite 原子失败) → 拒绝
+          const current = await this.state.storage.get(writeKey);
           return new Response(JSON.stringify({ conflict: true, reason: 'writer-busy', current }));
         }
-        // 乐观锁: 若指定了期望版本, 校验当前值版本
-        const existing = await this.state.storage.get(key);
-        if (expectVer !== null && existing && String(existing.ver) !== expectVer) {
-          return new Response(JSON.stringify({
-            conflict: true, reason: 'version-mismatch',
-            expected: expectVer, actual: existing.ver
-          }));
+        try {
+          // 乐观锁: 若指定了期望版本, 校验当前值版本
+          const existing = await this.state.storage.get(key);
+          if (expectVer !== null && existing && String(existing.ver) !== expectVer) {
+            return new Response(JSON.stringify({
+              conflict: true, reason: 'version-mismatch',
+              expected: expectVer, actual: existing.ver
+            }));
+          }
+          // 版本递增(从 0 或现有版本 +1)
+          const nextVer = (existing && existing.ver !== undefined ? existing.ver : 0) + 1;
+          await this.state.storage.put(key, { clientId, seq, val, ver: nextVer, ts: Date.now() });
+          return new Response(JSON.stringify({ ok: true, clientId, seq, key, val, ver: nextVer }));
+        } finally {
+          await this.state.storage.delete(writeKey);  // 释放锁
         }
-        // 版本递增(从 0 或现有版本 +1)
-        const nextVer = (existing && existing.ver !== undefined ? existing.ver : 0) + 1;
-        await this.state.storage.put(writeKey, { clientId, seq, ts: Date.now() });
-        // 写操作(带版本)
-        await this.state.storage.put(key, { clientId, seq, val, ver: nextVer, ts: Date.now() });
-        await this.state.storage.delete(writeKey);
-        return new Response(JSON.stringify({ ok: true, clientId, seq, key, val, ver: nextVer }));
       }
 
       case 'cget': {

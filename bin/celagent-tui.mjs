@@ -248,7 +248,7 @@ async function celldCheckpoint(sessionId, seq, role, content) {
     for (const base of CELD_NODES) {
       try {
         // Bug D: sessionId 和 msg 都编码
-        const url = `${base}/agent/celagent?action=checkpoint&session=${encodeURIComponent(sessionId)}&turn=${seq}&msg=${encodeURIComponent(msg.slice(0, 200))}`;
+        const url = `${base}/agent/celagent?action=checkpoint&session=${encodeURIComponent(sessionId)}&turn=${seq}&role=${encodeURIComponent(role)}&msg=${encodeURIComponent(msg.slice(0, 200))}`;
         const resp = await fetch(url, { signal: AbortSignal.timeout(2000) });
         const data = await resp.json();
         if (data.ok) { workerOk = true; break; }
@@ -277,7 +277,22 @@ function extractText(content) {
 
 // ---- 从 BOS 读历史 (权威源, 重启后恢复) ----
 async function loadHistoryFromBos(sessionId) {
+  // P0: 恢复读路径 — 优先 worker 缓存 (快, ~100ms), miss 回 BOS (权威, ~1.3s)
+  // 让 Celld worker 从"只写不读"变为真正的快路径
   try {
+    // 1. 先试 worker 缓存 (任一节点)
+    for (const base of CELD_NODES) {
+      try {
+        const url = `${base}/agent/celagent?action=resume&session=${encodeURIComponent(sessionId)}`;
+        const resp = await fetch(url, { signal: AbortSignal.timeout(1500) });
+        const data = await resp.json();
+        if (data.ok && data.session && data.session.turns && data.session.turns.length > 0) {
+          return data.session.turns;  // 快路径: worker 缓存命中
+        }
+        break;  // 节点活着但无此会话 → 直接回 BOS
+      } catch (e) { /* try next node */ }
+    }
+    // 2. worker 全 miss → BOS 权威源
     const { bosGet } = await import("../src/bos.js");
     const cfgFile = join(homedir(), ".config", "celagent", "settings.json");
     if (!existsSync(cfgFile)) return null;
@@ -385,6 +400,9 @@ function printHelp() {
   celagent config get <key>   读取配置 (如 persistence.bucket)
   celagent config set <key> <value>  写入配置 (如 model deepseek-v4-flash)
   celagent doctor             自检: 配置/凭证/节点/BOS 连通性
+  celagent task submit <type> [steps]  提交分布式任务 (celld 状态机)
+  celagent task status [taskId]        任务状态 (断点续跑)
+  celagent task ledger                 幂等 ledger (exactly-once)
   celagent version            显示版本
   celagent help               显示帮助
 
@@ -516,6 +534,75 @@ async function getBucketArg() {
   if (cfg.persistence?.bucket) return { bucket: cfg.persistence.bucket, endpoint: cfg.persistence.endpoint || "https://s3.bj.bcebos.com" };
   return { bucket: null, endpoint: "https://s3.bj.bcebos.com" };
 }
+// ---- P1: agent 任务化 — 任务状态机 (celld submit/status/ledger) ----
+async function taskCommand(args) {
+  const [op, ...rest] = args;
+  // celagent task submit <type> [steps]  |  task status [taskId]  |  task ledger
+  if (op === "submit") {
+    const type = rest[0] || "short";
+    const steps = rest[1] || (type === "long" ? "15" : "3");
+    let lastErr = null;
+    for (const base of CELD_NODES) {
+      try {
+        const r = await fetch(`${base}/agent/celagent?action=submit&type=${type}&steps=${steps}`, { signal: AbortSignal.timeout(3000) });
+        const j = await r.json();
+        if (j.taskId) {
+          console.log(`✓ 任务已提交: ${j.taskId} (type=${j.type || type}, steps=${j.steps})`);
+          console.log(`  查看: celagent task status ${j.taskId}`);
+          return;
+        }
+        lastErr = JSON.stringify(j);
+      } catch (e) { lastErr = e.message; }
+    }
+    console.error(`✗ 任务提交失败: ${lastErr}`);
+    process.exit(1);
+  }
+  if (op === "status") {
+    const taskId = rest[0] || "";
+    const q = taskId ? `&task=${encodeURIComponent(taskId)}` : "";
+    let lastErr = null;
+    for (const base of CELD_NODES) {
+      try {
+        const r = await fetch(`${base}/agent/celagent?action=status${q}`, { signal: AbortSignal.timeout(3000) });
+        const j = await r.json();
+        if (Array.isArray(j)) {
+          console.log(`任务列表 (${j.length}):`);
+          for (const t of j) console.log(`  ${t.id} [${t.status}] step ${t.step}/${t.steps} ${t.type}`);
+        } else {
+          console.log(JSON.stringify(j, null, 1));
+        }
+        return;
+      } catch (e) { lastErr = e.message; }
+    }
+    console.error(`✗ 查询失败: ${lastErr}`);
+    process.exit(1);
+  }
+  if (op === "ledger") {
+    // 幂等 ledger — exactly-once 验证
+    let lastErr = null;
+    for (const base of CELD_NODES) {
+      try {
+        const r = await fetch(`${base}/agent/celagent?action=ledger`, { signal: AbortSignal.timeout(3000) });
+        const j = await r.json();
+        if (Array.isArray(j)) {
+          console.log(`execution ledger (${j.length} 条):`);
+          const dedup = j.filter(e => e.deduped).length;
+          const byTool = {};
+          for (const e of j) byTool[e.tool] = (byTool[e.tool] || 0) + 1;
+          console.log(`  工具调用: ${JSON.stringify(byTool)}`);
+          console.log(`  去重命中: ${dedup} 次 (exactly-once 保护)`);
+          return;
+        }
+        lastErr = JSON.stringify(j);
+      } catch (e) { lastErr = e.message; }
+    }
+    console.error(`✗ 查询失败: ${lastErr}`);
+    process.exit(1);
+  }
+  console.error(`用法: celagent task submit <short|long> [steps] | task status [taskId] | task ledger`);
+  process.exit(1);
+}
+
 async function exportCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent export <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
   const { bucket, endpoint } = await getBucketArg();
@@ -553,6 +640,7 @@ async function main() {
   if (cmd === "doctor") { await doctorCommand(); return; }
   if (cmd === "export") { await exportCommand(process.argv[3]); return; }
   if (cmd === "rm") { await rmCommand(process.argv[3]); return; }
+  if (cmd === "task") { await taskCommand(process.argv.slice(3)); return; }
   // Bug 80: 未知的 - 开头参数 (拼错的 --xxx) 不应被静默当 sessionId 进 TUI
   if (cmd && cmd.startsWith("-")) {
     console.error(`未知选项: ${cmd} (用 celagent help 查看用法)`);
@@ -589,6 +677,24 @@ async function main() {
   const savedHistory = await loadHistoryFromBos(sessionId);
   if (savedHistory && savedHistory.length > 0) {
     console.log(`  (已从 BOS 恢复 ${savedHistory.length} 轮历史)`);
+  }
+
+  // P0: 冷启动对齐 — 把 BOS 权威状态同步到 worker 缓存 (sync),
+  // 使 worker 与 BOS 一致 (节点迁移/重启后, 后续读 worker = 完整历史)
+  if (savedHistory && savedHistory.length > 0) {
+    void (async () => {
+      for (const base of CELD_NODES) {
+        try {
+          await fetch(`${base}/agent/celagent?action=sync&session=${encodeURIComponent(sessionId)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ turns: savedHistory }),
+            signal: AbortSignal.timeout(2000),
+          });
+          break;
+        } catch (e) { /* try next */ }
+      }
+    })();
   }
 
   // 1. 组装 services (独立 agentDir)
