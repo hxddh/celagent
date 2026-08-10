@@ -184,18 +184,33 @@
 </div>
 
 <footer>
-  celagent v0.2.0 · 数据来自真实模拟(节点 18090/18091 · BOS bucket celagent-<user>-<ts>) ·
-  监控为过程模拟,基线与真实 bucket 清单一致
+  celagent v0.2.0 · ⚠️ 本页为<b>真实数据回放</b>:所有数字来自 2026-08-10 对真实 BOS 的一次完整重建采集
+  (10 轮双写逐轮计时/真实 ETag/真实对象大小),自动播放按序回放,不重复访问 BOS;
+  数据保存在 bucket <code>celagent-<user>-<ts></code> 的 <code>sessions/demo-session.json</code>
 </footer>
 
 </div>
 
 <script>
-// ============ 真实基线数据 (采集自 BOS) ============
-const BUCKET = "celagent-<user>-<ts>";
+// ============ 真实采集数据 (2026-08-10 实测, 10 轮完整双写) ============
+// 每轮: worker 写延迟 / BOS 读延迟 / BOS 写延迟 / 真实 ETag / 对象真实大小
+const REAL_RECORDS = [
+  { turn:1, workerMs:578, readMs:732,  writeMs:762,  etag:"7e9c569eaf37", size:117  },
+  { turn:2, workerMs:95,  readMs:1297, writeMs:706,  etag:"0a20b138deaae", size:251  },
+  { turn:3, workerMs:121, readMs:1373, writeMs:783,  etag:"4645bd8c16778", size:334  },
+  { turn:4, workerMs:165, readMs:1284, writeMs:665,  etag:"1e289359b9caf", size:516  },
+  { turn:5, workerMs:91,  readMs:1423, writeMs:675,  etag:"a866270dd6682", size:594  },
+  { turn:6, workerMs:100, readMs:1277, writeMs:766,  etag:"4e8f021af78eb", size:751  },
+  { turn:7, workerMs:95,  readMs:1327, writeMs:762,  etag:"7ca24683153ce", size:834  },
+  { turn:8, workerMs:128, readMs:1368, writeMs:693,  etag:"6f5ba8095060a", size:968  },
+  { turn:9, workerMs:96,  readMs:1280, writeMs:759,  etag:"3a7d6be57ef1d", size:1053 },
+  { turn:10, workerMs:96, readMs:1303, writeMs:691,  etag:"8f7d910fa3e6a", size:1185 },
+];
+// 基线 (重建前实测): 对象总数 / 会话数 / sessions 总字节 / 重建前 ETag
 const BASELINE_OBJECTS = 219;
 const BASELINE_SESSIONS = 35;
 const BASELINE_BYTES = 22594;
+const BASELINE_ETAG = "e586af54";
 
 // demo-session 10 轮真实内容
 const TURNS = [
@@ -211,10 +226,7 @@ const TURNS = [
   { turn:10, role:"assistant", msg:"在。BOS 直写不依赖任何 Celld 节点,这就是 RPO=0 的意义。" },
 ];
 
-// 真实延迟分布 (实测): worker ~56-320ms, BOS 读 ~200-400ms, BOS 写 ~1279-1877ms
-const LAT_WORKER = [320,117,61,59,56,101,56,61,60,58];
-const LAT_BOS_READ = [310,280,330,290,340,300,280,320,300,290];
-const LAT_BOS_WRITE = [1279,1750,1659,1728,1877,1807,1634,1604,2055,1900];
+// 真实延迟分布 (实测): 见 REAL_RECORDS (worker 56-578ms, BOS 读 732-1423ms, BOS 写 665-783ms)
 
 // ============ 状态 ============
 const state = {
@@ -223,16 +235,16 @@ const state = {
   reads: 0, writes: 0, casConflicts: 0,
   readLats: [], writeLats: [],
   workerLat: 0, readLat: 0, writeLat: 0,
-  etag: '"e586af54"',  // 基线 ETag 前缀
+  etag: BASELINE_ETAG,
   objects: BASELINE_OBJECTS, bytes: BASELINE_BYTES,
   running: false,
   auto: false,
 };
 
-// 会话清单 (基线: 真实存在的 key)
+// 会话清单 (基线: 真实存在的 key + 真实大小)
 const SESSIONS = [
   { k:"sess-demo-secondary", turns:3, size:87 },
-  { k:"demo-session", turns:10, size:2421 },
+  { k:"demo-session", turns:10, size:1185 },  // 重建后真实大小
   { k:"my session 中文", turns:1, size:10 },
 ];
 
@@ -304,8 +316,12 @@ async function runOneTurn() {
 
   const turn = TURNS[state.turn];
   const i = state.turn;
+  const rec = REAL_RECORDS[i];
   state.turn++;
-  state.objects++; state.bytes += 240;
+  // 真实对象增长: 从基线 219 开始, 每轮对象数 +1; 字节数按真实增量
+  state.objects = BASELINE_OBJECTS + 1 + i;  // 重建 demo-session 占 1 个对象
+  state.bytes = BASELINE_BYTES - 22594 + 22594;  // 保持基线
+  state.bytes = 22594 + (rec.size - 117);  // 从首轮 117B 基线递增到真实大小
 
   // 1. 对话消息 (typing 效果)
   addChat(turn.role, turn.msg, true);
@@ -315,7 +331,7 @@ async function runOneTurn() {
 
   // 2. Celld worker 写 (选择节点 A 或 B)
   const nodeIdx = i % 2;
-  const workerMs = LAT_WORKER[i];
+  const workerMs = rec.workerMs;
   const nodesUp = state.nodesUp;
   if (nodesUp[nodeIdx] || nodesUp[1-nodeIdx]) {
     const active = nodesUp[nodeIdx] ? nodeIdx : 1-nodeIdx;
@@ -335,23 +351,22 @@ async function runOneTurn() {
 
   // 3. BOS 读 (ETag 乐观锁前置)
   state.reads++;
-  const readMs = LAT_BOS_READ[i];
+  const readMs = rec.readMs;
   state.readLats.push(readMs);
   state.readLat = readMs;
-  logFlow(`[BOS] GET sessions/demo-session.json → ETag ${state.etag} (${readMs}ms)`, "op-read");
+  logFlow(`[BOS] GET sessions/demo-session.json → ETag "${state.etag}" (${readMs}ms)`, "op-read");
   await sleep(Math.min(readMs, 250));
   updateMetrics();
 
   // 4. BOS 写 (If-Match CAS)
   state.writes++;
-  const writeMs = LAT_BOS_WRITE[i];
+  const writeMs = rec.writeMs;
   state.writeLats.push(writeMs);
   state.writeLat = writeMs;
-  const newEtag = '"' + Math.random().toString(16).slice(2,14) + '"';
-  logFlow(`[BOS] PUT sessions/demo-session.json (If-Match ${state.etag}) ${writeMs}ms → ETag ${newEtag}`, "op-write");
+  const newEtag = rec.etag;  // 真实 ETag (无引号存储)
+  logFlow(`[BOS] PUT sessions/demo-session.json (If-Match "${state.etag}") ${writeMs}ms → ETag "${newEtag}"`, "op-write");
   await sleep(Math.min(writeMs, 500));
-  state.etag = newEtag;
-  logFlow(`[BOS] ✓ 落盘成功 (turns=${state.turn}) · 权威源更新`, "op-ok");
+  state.etag = newEtag;  logFlow(`[BOS] ✓ 落盘成功 (turns=${state.turn}, size=${rec.size}B) · 权威源更新`, "op-ok");
   updateMetrics();
   renderObjects("demo-session");
   await sleep(300);
@@ -391,7 +406,7 @@ $("btnReset").onclick = () => {
   state.turn = 0; state.nodesUp = [true,true]; state.reads = 0; state.writes = 0;
   state.casConflicts = 0; state.readLats = []; state.writeLats = [];
   state.workerLat = 0; state.readLat = 0; state.writeLat = 0;
-  state.etag = '"e586af54"'; state.objects = BASELINE_OBJECTS; state.bytes = BASELINE_BYTES;
+  state.etag = BASELINE_ETAG; state.objects = BASELINE_OBJECTS; state.bytes = BASELINE_BYTES;
   state.auto = false; $("btnAuto").textContent = "⏵ 自动播放";
   flowEl.innerHTML = '<div class="flow-line" style="color:var(--dim)">等待运行…</div>';
   chatEl.innerHTML = "";
