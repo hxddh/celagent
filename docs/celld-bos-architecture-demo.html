@@ -168,7 +168,7 @@
   footer { margin-top:18px; text-align:center; color:var(--dim); font-size:11.5px; font-family:var(--mono); }
 
   /* 锚点目标避开悬浮条 */
-  #arch, #process, #monitor, #value, #paths, #payload, #faq { scroll-margin-top: 130px; }
+  #arch, #process, #monitor, #value, #paths, #payload, #faq, #stats, #glossary { scroll-margin-top: 130px; }
 
   /* 悬浮操作条: 滚动时始终可见 */
   .sticky-bar {
@@ -223,6 +223,7 @@
   <div class="controls">
     <button class="btn primary" id="btnRun">▶ 运行一轮</button>
     <button class="btn" id="btnAuto">⏵ 自动播放</button>
+    <button class="btn" id="btnFast">⏩ 快进 10 轮</button>
     <span id="autoProgress" style="font-size:11px;color:var(--dim);font-family:var(--mono)"></span>
     <button class="btn danger" id="btnKill">⛔ 故障注入:kill 节点</button>
     <button class="btn" id="btnReset">↺ 重置</button>
@@ -230,12 +231,14 @@
   </div>
   <div class="nav-links">
     <a href="#arch">1 架构图</a>
-    <a href="#paths">2 三条路径</a>
-    <a href="#payload">3 写入的数据</a>
-    <a href="#faq">4 常见问题</a>
-    <a href="#process">5 运行过程</a>
-    <a href="#monitor">6 BOS 监控</a>
-    <a href="#value">7 价值评估</a>
+    <a href="#glossary">2 术语速览</a>
+    <a href="#paths">3 三条路径</a>
+    <a href="#payload">4 写入的数据</a>
+    <a href="#faq">5 常见问题</a>
+    <a href="#process">6 运行过程</a>
+    <a href="#monitor">7 BOS 监控</a>
+    <a href="#stats">8 数据总览</a>
+    <a href="#value">9 价值评估</a>
   </div>
   <div class="sticky-hint">↓ 滚动页面时本操作条固定于顶部 · 自动播放中可随时点击「故障注入」观察降级</div>
 </div></header>
@@ -249,65 +252,82 @@
       <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
       </marker>
-      <marker id="arrG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
-        <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/>
-      </marker>
       <marker id="arrY" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="#d29922"/>
       </marker>
+      <marker id="arrG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/>
+      </marker>
     </defs>
 
-    <!-- ===== 步骤 1: 交互 ===== -->
-    <rect x="30" y="30" width="1020" height="95" rx="16" fill="var(--svg-panel)" stroke="#3fb950"/>
-    <text x="60" y="62" font-size="17" font-weight="700" fill="var(--svg-text)">① 你正在和 celagent 对话</text>
-    <text x="60" y="88" font-size="13" fill="var(--svg-dim)">它回答你、调用工具(bash/read/write…)。注意:工具的文件操作和它的"记忆"走两条完全不同的路——</text>
-    <text x="60" y="110" font-size="13" fill="var(--svg-dim)">记忆(对话历史)每轮自动保存到下面两处;工具的文件操作直接落本地磁盘(与 Celld/BOS 无关,见下方表格)</text>
+    <!-- ===== 第 1 层: 交互 ===== -->
+    <rect x="30" y="20" width="1020" height="90" rx="14" fill="var(--svg-panel)" stroke="#3fb950"/>
+    <text x="60" y="52" font-size="17" font-weight="700" fill="var(--svg-text)">① 交互层 — celagent (Pi TUI 引擎)</text>
+    <text x="60" y="78" font-size="12.5" fill="var(--svg-dim)">对话 / 工具调用(bash·read·write·grep·edit·ls·find) / 多模型切换 / 会话管理(list·resume·/new)</text>
+    <text x="60" y="98" font-size="12.5" fill="var(--svg-dim)">每轮对话结束触发 turn_end 钩子 → 双写;启动时从 BOS 恢复历史注入上下文;工具文件操作直接落本地文件系统(与持久化无关)</text>
 
-    <!-- 步骤 2/3: 双写 -->
-    <text x="540" y="168" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">每轮对话,双写两处 ↓</text>
+    <!-- ===== 第 2/3 层: 双写 ===== -->
+    <text x="540" y="148" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">每轮对话,双写两处 ↓</text>
 
-    <!-- 步骤 2/3: 双写 -->
+    <!-- Celld: 执行层 -->
+    <rect x="60" y="165" width="460" height="190" rx="14" fill="var(--svg-panel2)" stroke="#58a6ff"/>
+    <text x="90" y="200" font-size="16" font-weight="700" fill="#58a6ff">② 执行层 — Celld 双节点</text>
+    <text x="90" y="228" font-size="12.5" fill="var(--svg-dim)">分布式 Durable Object 运行时(18090/18091)</text>
+    <text x="90" y="252" font-size="12.5" fill="var(--svg-dim)">• worker 缓存:最近对话(截断 200 字符,~148ms)</text>
+    <text x="90" y="276" font-size="12.5" fill="var(--svg-dim)">• 节点发现/状态迁移(多机经 BOS 注册表)</text>
+    <text x="90" y="300" font-size="12.5" fill="var(--svg-dim)">• 休眠唤醒 / 任务状态机 / 缓存快路径</text>
+    <text x="90" y="328" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:执行层 · 多机核心 · 单机价值有限</text>
+    <text x="90" y="346" font-size="12" fill="var(--svg-dim)" font-family="monospace">自带 S3 客户端(object_store 库),直连 BOS</text>
 
-    <!-- Celld 框 -->
-    <rect x="60" y="190" width="460" height="190" rx="16" fill="var(--svg-panel2)" stroke="#58a6ff"/>
-    <text x="90" y="225" font-size="16" font-weight="700" fill="#58a6ff">② Celld — 分布式执行层</text>
-    <text x="90" y="253" font-size="13" fill="var(--svg-dim)">• 节点发现/状态迁移(多机经 BOS 注册)</text>
-    <text x="90" y="277" font-size="13" fill="var(--svg-dim)">• 会话即 cell:休眠唤醒、跨节点访问</text>
-    <text x="90" y="301" font-size="13" fill="var(--svg-dim)">• 任务状态机 + 缓存快路径</text>
-    <text x="90" y="330" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:执行层 · 多机核心 · 单机价值有限</text>
-    <text x="90" y="352" font-size="12" fill="var(--svg-dim)" font-family="monospace">存:最近对话(截断 200 字符,见下方说明)</text>
-    <text x="90" y="374" font-size="11.5" fill="var(--svg-dim)">自带 S3 客户端(内置 object_store 库)— 直连 BOS,不调外部工具</text>
+    <!-- BOS: 存储层 -->
+    <rect x="560" y="165" width="490" height="190" rx="14" fill="var(--svg-panel2)" stroke="#d29922"/>
+    <text x="590" y="200" font-size="16" font-weight="700" fill="#d29922">③ 存储层 — BOS 对象存储</text>
+    <text x="590" y="228" font-size="12.5" fill="var(--svg-dim)">权威源(完整对话,不截断,含 thinking/工具结果)</text>
+    <text x="590" y="252" font-size="12.5" fill="var(--svg-dim)">• CAS 乐观锁(ETag + If-Match):并发不冲突</text>
+    <text x="590" y="276" font-size="12.5" fill="var(--svg-dim)">• 换机器/本地丢失/节点全挂 → 数据都在</text>
+    <text x="590" y="300" font-size="12.5" fill="var(--svg-dim)">• 另存:celld 状态(cells/ 210)+ worker 代码(deploy/ 16)</text>
+    <text x="590" y="328" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:权威存储 · 核心价值 · RPO=0</text>
+    <text x="590" y="346" font-size="12" fill="var(--svg-dim)" font-family="monospace">sessions/*.json (35 个) · 含运行元数据(9)</text>
 
-    <!-- BOS 框 -->
-    <rect x="560" y="190" width="490" height="190" rx="16" fill="var(--svg-panel2)" stroke="#d29922"/>
-    <text x="590" y="225" font-size="16" font-weight="700" fill="#d29922">③ BOS — 权威存储(稳)</text>
-    <text x="590" y="253" font-size="13" fill="var(--svg-dim)">• 云端对象存储,存完整对话(不截断)</text>
-    <text x="590" y="277" font-size="13" fill="var(--svg-dim)">• 换电脑 / 本地删了 / 节点全挂 → 都在</text>
-    <text x="590" y="301" font-size="13" fill="var(--svg-dim)">• 并发写有 CAS 保护,不冲突不丢失</text>
-    <text x="590" y="330" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:唯一真相 · 核心价值 · RPO=0</text>
-    <text x="590" y="352" font-size="12" fill="var(--svg-dim)" font-family="monospace">存:完整对话 sessions/*.json (35 个)</text>
-    <text x="590" y="372" font-size="11.5" fill="var(--svg-dim)">还存:Celld 节点状态(cells/ 210)+ worker 代码(deploy/ 16)+ 运行元数据(9)</text>
+    <!-- 双写箭头 -->
+    <path d="M 250 110 C 250 135, 230 140, 230 165" stroke="#58a6ff" stroke-width="2.5" fill="none" marker-end="url(#arr)"/>
+    <text x="130" y="140" font-size="12.5" fill="#58a6ff" font-family="monospace">worker 缓存写</text>
+    <path d="M 760 110 C 760 135, 790 140, 800 165" stroke="#d29922" stroke-width="2.5" fill="none" marker-end="url(#arrY)"/>
+    <text x="820" y="140" font-size="12.5" fill="#d29922" font-family="monospace">BOS 权威直写</text>
 
-    <!-- 双写箭头: celagent → Celld -->
-    <path d="M 260 125 C 260 155, 250 165, 250 190" stroke="#58a6ff" stroke-width="2.5" fill="none" marker-end="url(#arr)"/>
-    <text x="170" y="160" font-size="12" fill="#58a6ff" font-family="monospace">写缓存</text>
-    <!-- 双写箭头: celagent → BOS -->
-    <path d="M 740 125 C 740 155, 780 165, 800 190" stroke="#d29922" stroke-width="2.5" fill="none" marker-end="url(#arrY)"/>
-    <text x="810" y="160" font-size="12" fill="#d29922" font-family="monospace">写权威</text>
-
-    <!-- 步骤 4: 恢复 -->
-    <text x="540" y="428" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">无论何时:启动 / 换电脑 / 本地误删 ↓ 都能找回</text>
-    <rect x="60" y="448" width="990" height="85" rx="16" fill="var(--svg-panel)" stroke="#3fb950"/>
-    <text x="90" y="480" font-size="16" font-weight="700" fill="#3fb950">④ 从 BOS 恢复 — 历史一条不丢</text>
-    <text x="90" y="508" font-size="13" fill="var(--svg-dim)">celagent list 看有哪些会话 → celagent &lt;会话ID&gt; 续写 — 实测:节点全挂后恢复 10/10 轮</text>
-    <!-- 恢复箭头: BOS → 步骤4 (就地) -->
-    <path d="M 800 380 L 800 448" stroke="#3fb950" stroke-width="2.5" fill="none" marker-end="url(#arrG)"/>
-    <text x="812" y="420" font-size="12" fill="#3fb950" font-family="monospace">读历史</text>
+    <!-- ===== 第 4 层: 恢复 ===== -->
+    <text x="540" y="385" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">恢复路径:启动 / 换机器 / 节点故障 ↓</text>
+    <rect x="60" y="405" width="990" height="90" rx="14" fill="var(--svg-panel)" stroke="#3fb950"/>
+    <text x="90" y="438" font-size="16" font-weight="700" fill="#3fb950">④ 从 BOS 恢复 — 历史完整(RPO=0)</text>
+    <text x="90" y="465" font-size="12.5" fill="var(--svg-dim)">读取优先级:worker 缓存快路径 → miss 回 BOS 权威源。实测:节点全挂后 60 轮记录完整恢复(10/10 → 60/60)</text>
+    <path d="M 800 355 L 800 405" stroke="#3fb950" stroke-width="2.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="812" y="382" font-size="12.5" fill="#3fb950" font-family="monospace">读历史</text>
   </svg>
+
+  <!-- 术语速览: 专业术语保留, 一句话解释 -->
+  <div class="panel" style="margin-top:24px" id="glossary">
+    <div class="panel-title">② 术语速览 — 看懂架构图需要的 8 个词</div>
+    <table class="obj-table" style="margin-top:8px">
+      <thead><tr><th style="width:160px">术语</th><th>一句话解释</th></tr></thead>
+      <tbody>
+        <tr><td><code>celagent</code></td><td>本产品的名字:一个终端里的 AI 编程助手(复用 Pi 引擎的交互能力)</td></tr>
+        <tr><td><code>Celld</code></td><td>自托管的分布式运行时:让"会话/任务状态"存在节点上,可休眠、可迁移、可跨机器访问</td></tr>
+        <tr><td><code>BOS</code></td><td>百度对象存储(S3 兼容):云端存数据的服务,本产品用它做会话的权威备份</td></tr>
+        <tr><td><code>双写</code></td><td>每轮对话同时写两处:本地缓存(快)+ 云端权威(稳),互不依赖</td></tr>
+        <tr><td><code>worker 缓存</code></td><td>Celld 节点上的本地副本,读取快(~0.15s),可随时从 BOS 重建</td></tr>
+        <tr><td><code>CAS / ETag</code></td><td>乐观锁机制:写入前比对版本号,版本变了就拒绝——防止多人同时写覆盖彼此</td></tr>
+        <tr><td><code>RPO=0</code></td><td>零数据丢失:任何时刻出故障,已确认的对话一条都不丢(因为 BOS 是权威)</td></tr>
+        <tr><td><code>turn_end 钩子</code></td><td>每轮对话结束时的自动回调,触发"双写保存"动作</td></tr>
+      </tbody>
+    </table>
+    <div class="dataflow-note" style="margin-top:8px">
+      术语在页面中保留原样使用(不简化),此处提供解释 — 既保持技术准确性,也方便非技术读者对照阅读。
+    </div>
+  </div>
 
   <!-- 三条数据路径 (关键: 避免误导) -->
   <div style="margin-top:24px" id="paths">
-    <div class="panel-title">② 三条数据路径 — agent 的"手"和"大脑"分开走</div>
+    <div class="panel-title">③ 三条数据路径 — agent 的"手"和"大脑"分开走</div>
     <table class="obj-table" style="margin-top:8px">
       <thead><tr>
         <th style="width:130px">路径</th><th style="width:200px">谁在操作</th>
@@ -345,7 +365,7 @@
 
   <!-- 具体写入的数据 (真实结构) -->
   <div style="margin-top:24px" id="payload">
-    <div class="panel-title">③ 具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照"</div>
+    <div class="panel-title">④ 具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照"</div>
     <div style="font-size:12.5px;color:var(--dim);margin-bottom:8px">
       每轮对话结束,celagent 把<b style="color:var(--text)">这一轮的对话记录</b>(不是文件、不是工作区)打包成一条 JSON 写入两处。
       以下为结构示例(字段结构真实,内容为演示):
@@ -405,7 +425,7 @@
 
   <!-- 常见问题解答 (存什么/性能/之前在哪) -->
   <div class="panel" style="margin-top:24px" id="faq">
-    <div class="panel-title">④ 常见问题 — 存什么 · 性能 · 之前在哪</div>
+    <div class="panel-title">⑤ 常见问题 — 存什么 · 性能 · 之前在哪</div>
 
     <div style="margin-bottom:18px">
       <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q1: 写到 BOS 的是 agent 会话的"所有内容"吗?</div>
@@ -466,7 +486,7 @@
   <!-- ===== 左: 运行过程 ===== -->
   <div id="process">
     <div class="panel">
-      <div class="panel-title"><span class="live">● LIVE</span> ⑤ 运行过程(点击"运行一轮"或自动播放 — 每轮展示双写全过程)</div>
+      <div class="panel-title"><span class="live">● LIVE</span> ⑥ 运行过程(点击"运行一轮"或自动播放 — 每轮展示双写全过程)</div>
       <div style="font-size:11px;color:var(--dim);margin-bottom:10px">⚠ 对话内容为演示脚本(展示双写流程);追踪表与监控中的延迟/ETag/大小均为真实采集值</div>
 
       <!-- Celld 节点 -->
@@ -508,7 +528,7 @@
   <!-- ===== 右: BOS 监控 ===== -->
   <div id="monitor">
     <div class="panel">
-      <div class="panel-title">⑥ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
+      <div class="panel-title">⑦ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
 
       <div class="mon-grid">
         <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">270</div><div class="m-sub">sessions 35 · cells 210 · deploy 16 · celld 状态 9</div></div>
@@ -538,8 +558,28 @@
   </div>
 </div>
 
+  <!-- 60 轮数据统计 (真实采集汇总) -->
+  <div class="panel" style="margin-top:24px" id="stats">
+    <div class="panel-title">⑧ 数据总览 — demo-large-session 60 轮真实采集</div>
+    <div class="mon-grid">
+      <div class="metric"><div class="m-label">会话轮次</div><div class="m-value blue">60</div><div class="m-sub">真实工作流:代码分析任务</div></div>
+      <div class="metric"><div class="m-label">会话总大小</div><div class="m-value">79 KB</div><div class="m-sub">80879B,含完整 thinking/工具结果</div></div>
+      <div class="metric"><div class="m-label">工具调用轮次</div><div class="m-value yellow">40</div><div class="m-sub">ls/find/grep/read/bash 等</div></div>
+      <div class="metric"><div class="m-label">平均读延迟</div><div class="m-value green">1.47 s</div><div class="m-sub">BOS GET (807ms-1.7s)</div></div>
+      <div class="metric"><div class="m-label">平均写延迟</div><div class="m-value">0.84 s</div><div class="m-sub">BOS PUT CAS (665ms-1s)</div></div>
+      <div class="metric"><div class="m-label">本地缓存延迟</div><div class="m-value">0.15 s</div><div class="m-sub">Celld worker (67-238ms)</div></div>
+      <div class="metric"><div class="m-label">ETag 更新次数</div><div class="m-value red">60</div><div class="m-sub">每轮 CAS 乐观锁校验</div></div>
+      <div class="metric"><div class="m-label">增长曲线</div><div class="m-value" style="font-size:15px">173B → 79KB</div><div class="m-sub">第1轮 → 第60轮</div></div>
+    </div>
+    <div class="dataflow-note" style="margin-top:12px">
+      <b>说明:</b> 以上数字来自 60 轮逐轮真实写入 BOS 的采集记录(2026-08-10)。
+      每轮经完整链路:本地缓存写 → BOS 读 ETag → CAS 写 → ETag 更新。数据真实存在于
+      <code>sessions/demo-large-session.json</code>。
+    </div>
+  </div>
+
   <div class="panel" style="margin-top:24px" id="value">
-    <div class="panel-title">⑦ 价值评估 — 一句话定位 + 诚实评估</div>
+    <div class="panel-title">⑨ 价值评估 — 一句话定位 + 诚实评估</div>
     <div class="dataflow-note">
     <b>一句话定位:</b> <code>BOS = 保数据(权威持久层,跨机器防丢失)</code> ·
     <code>Celld = 保执行(分布式运行时)</code> —
@@ -930,6 +970,39 @@ $("btnKill").onclick = () => {
     $("btnKill").textContent = "⛔ 故障注入:kill 节点";
     $("btnKill").classList.add("danger");
     logFlow("♻️ 节点恢复: 重新拉起 18090/18091 → 从 BOS 找回全部历史 (RPO=0)", "op-ok");
+  }
+};
+$("btnFast").onclick = () => {
+  // 快进: 一次推进 10 轮 (用真实记录更新状态, 不逐轮动画)
+  const target = Math.min(state.turn + 10, TURNS.length);
+  for (let i = state.turn; i < target; i++) {
+    const rec = REAL_RECORDS[i];
+    state.reads++; state.writes++;
+    state.readLats.push(rec.readMs);
+    state.writeLats.push(rec.writeMs);
+    state.readLat = rec.readMs;
+    state.writeLat = rec.writeMs;
+    state.workerLat = rec.workerMs;
+    state.etag = rec.etag;
+    state.bytes = rec.size;
+  }
+  state.turn = target;
+  // 批量补追踪摘要 (只显示每批最后一条)
+  const lastRec = REAL_RECORDS[target - 1];
+  const tr = document.createElement("div");
+  tr.className = "trace-row new";
+  tr.innerHTML = `
+    <div class="trace-cell celld-c"><span class="tt">Celld · 快进至 turn ${target}</span><span class="kv">批量推进 10 轮</span><br><span class="change">✓ worker 缓存已更新 (${lastRec.workerMs}ms)</span></div>
+    <div class="trace-cell bos-c"><span class="tt">BOS · turn ${target}</span><span class="kv">CAS 写 ×10 完成</span><br><span class="change">✓ ETag "${lastRec.etag}" · ${lastRec.size}B</span></div>`;
+  $("traceBody").prepend(tr);
+  logFlow(`⏩ 快进 10 轮 → turn ${target} (ETag "${lastRec.etag}", ${lastRec.size}B)`, "op-ok");
+  updateMetrics();
+  renderObjects("demo-large-session");
+  updateAutoProgress();
+  if (state.turn >= TURNS.length) {
+    state.auto = false;
+    $("btnAuto").textContent = "⏵ 自动播放";
+    logFlow("🏁 60 轮已全部播放完毕 — 点击「重置」可重新开始", "op-ok");
   }
 };
 $("btnReset").onclick = () => {
