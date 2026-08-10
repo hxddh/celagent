@@ -32,6 +32,8 @@ if [ -z "$CELAGENT_SRC" ]; then
   CELAGENT_SRC="$TMP_SRC"
 fi
 mkdir -p "${CELAGENT_ROOT}/bin" "${CELAGENT_ROOT}/celagent"
+# Bug 68: 先清理目标目录再拷贝 — cp -r 不删除旧文件, 残留旧版 bin 会误导用户
+rm -rf "${CELAGENT_ROOT}/celagent/bin" "${CELAGENT_ROOT}/celagent/src"
 # Bug 58: 必须连 src/ 一起拷贝 (celagent-tui.mjs 运行时 import ../src/bos.js)
 cp -r "${CELAGENT_SRC}/bin" "${CELAGENT_SRC}/src" "${CELAGENT_ROOT}/celagent/"
 # 依赖安装: TUI 运行时 import @earendil-works/pi-coding-agent (Bug 58: 之前只拷 bin,
@@ -45,9 +47,16 @@ if [ ! -d "${CELAGENT_ROOT}/celagent/node_modules/@earendil-works/pi-coding-agen
   }
 fi
 # 链接 celagent 命令 (Bug H: 用 TUI 版, 与默认一致)
-ln -sf "${CELAGENT_ROOT}/celagent/bin/celagent-tui.mjs" "${CELAGENT_ROOT}/bin/celagent"
+# Bug 67: 开发模式 (CELAGENT_SRC 指向本机源码) 时软链直接指向源码 —
+# 改源码即生效 (Bug 47 修复), 避免 install.sh 重跑后回归成“跑安装副本旧版”。
+if [ -f "${CELAGENT_SRC}/bin/celagent-tui.mjs" ] && [ -d "${CELAGENT_SRC}/.git" ]; then
+  ln -sf "${CELAGENT_SRC}/bin/celagent-tui.mjs" "${CELAGENT_ROOT}/bin/celagent"
+  echo "  ✓ celagent 已安装 (开发模式软链→源码: ${CELAGENT_SRC}/bin/celagent-tui.mjs)"
+else
+  ln -sf "${CELAGENT_ROOT}/celagent/bin/celagent-tui.mjs" "${CELAGENT_ROOT}/bin/celagent"
+  echo "  ✓ celagent 已安装到 ${CELAGENT_ROOT}/bin/celagent"
+fi
 chmod +x "${CELAGENT_ROOT}/bin/celagent"
-echo "  ✓ celagent 已安装到 ${CELAGENT_ROOT}/bin/celagent"
 
 # 3. 安装 celld 运行时
 echo "[3/5] 安装 celld 运行时..."

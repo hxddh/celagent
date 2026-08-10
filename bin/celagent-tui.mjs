@@ -170,6 +170,7 @@ function queueBosWrite(sessionId, seq, role, msg) {
       const { bosPut, bosGet } = await import("../src/bos.js");
       const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
       const bucket = cfg.persistence?.bucket;
+      const endpoint = cfg.persistence?.endpoint; // Bug 70: 透传自定义 endpoint
       if (!bucket) {
         if (!bosWarned) { console.warn("  (警告: 未配置 persistence.bucket, 会话不会持久化)"); bosWarned = true; }
         return;
@@ -179,7 +180,7 @@ function queueBosWrite(sessionId, seq, role, msg) {
       for (let attempt = 0; attempt < 3; attempt++) {
         let session = { id: sessionId, turns: [] };
         let etag = undefined;
-        const existing = await bosGet(key, { bucket });
+        const existing = await bosGet(key, { bucket, endpoint });
         if (existing.ok) {
           try { session = JSON.parse(existing.body); } catch (e) { /* 覆盖 */ }
           etag = existing.etag;
@@ -205,7 +206,7 @@ function queueBosWrite(sessionId, seq, role, msg) {
         if (idx >= 0) session.turns[idx] = entry;
         else session.turns.push(entry);
         session.updatedAt = Date.now();
-        const put = await bosPut(key, session, { bucket, ifMatch: etag });
+        const put = await bosPut(key, session, { bucket, ifMatch: etag, endpoint });
         if (put.ok) return;
         if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; } // 冲突重试
         // 其他错误: 警告一次
@@ -268,8 +269,9 @@ async function loadHistoryFromBos(sessionId) {
     if (!existsSync(cfgFile)) return null;
     const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
     const bucket = cfg.persistence?.bucket;
+    const endpoint = cfg.persistence?.endpoint;
     if (!bucket) return null;
-    const existing = await bosGet(`sessions/${sessionId}.json`, { bucket });
+    const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint });
     if (existing.ok) {
       try {
         const session = JSON.parse(existing.body);
@@ -336,11 +338,11 @@ async function listSessions() {
       .sort((a, b) => b.modified.localeCompare(a.modified));
     if (sessions.length === 0) { console.log("(BOS 暂无会话)"); return; }
     console.log(`celagent — BOS 会话列表 (${sessions.length} 个, bucket=${bucket})\n`);
-    console.log("  ID (用于 celagent <id> 续写)                               轮数    大小    更新");
+    console.log("  ID (用于 celagent <id> 续写)                                           大小    更新");
     console.log("  " + "-".repeat(95));
     for (const s of sessions) {
       const id = s.id.length > 52 ? s.id.slice(0, 49) + "..." : s.id;
-      console.log(`  ${id.padEnd(52)} ${String(s.size).padStart(5)}B  ${s.modified}`);
+      console.log(`  ${id.padEnd(52)} ${String(s.size).padStart(8)}B  ${s.modified}`);
     }
     console.log("\n  续写: celagent <id>    新会话: celagent (不带参数)");
   } catch (e) {
@@ -469,7 +471,7 @@ async function exportCommand(id) {
   const { bucket, endpoint } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { bosGet } = await import("../src/bos.js");
-  const r = await bosGet(`sessions/${id}.json`, { bucket });
+  const r = await bosGet(`sessions/${id}.json`, { bucket, endpoint });
   if (!r.ok) { console.error(`✗ 会话不存在或读取失败: ${r.error}`); process.exit(1); }
   const session = JSON.parse(r.body);
   console.log(JSON.stringify({ id, exportedAt: new Date().toISOString(), turns: session.turns || [] }, null, 2));

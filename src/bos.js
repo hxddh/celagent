@@ -15,6 +15,12 @@ const EP = "https://s3.bj.bcebos.com";
 // aws CLI 调用超时 (Bug 59: 防网络黑洞永久挂起队列, 卡死退出路径)
 const AWS_TIMEOUT_MS = 20000;
 
+function resolveEndpoint(override) {
+  // Bug 70: endpoint 支持从调用方传入 — settings.json 配了自定义 endpoint
+  // (OSS/minio/其他 S3 兼容) 时不再硬编码 BOS, 避免读写路径不一致
+  return override || EP;
+}
+
 function awsEnv() {
   const env = { ...process.env, AWS_EC2_METADATA_DISABLED: "true" };
   // Bug F: 凭证要么全用 env, 要么全用 profile — 不能混用
@@ -47,8 +53,9 @@ function runAws(args, { timeout = AWS_TIMEOUT_MS } = {}) {
 }
 
 // ---- 直写 BOS (PUT, 支持 If-Match 条件写; 网络错误自动重试) ----
-export async function bosPut(key, content, { bucket, ifMatch, maxRetries = 3 } = {}) {
+export async function bosPut(key, content, { bucket, ifMatch, maxRetries = 3, endpoint } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
+  const ep = resolveEndpoint(endpoint);
   // 写临时文件 (aws CLI 需要真实文件)
   const tmp = join(tmpdir(), `celagent-${randomBytes(4).toString("hex")}.json`);
   const body = typeof content === "string" ? content : JSON.stringify(content);
@@ -59,7 +66,7 @@ export async function bosPut(key, content, { bucket, ifMatch, maxRetries = 3 } =
       "--bucket", bucket,
       "--key", key,
       "--body", tmp,
-      "--endpoint-url", EP,
+      "--endpoint-url", ep,
       "--output", "json",
     ];
     // 条件写: If-Match 乐观锁 (防并发覆盖)
@@ -90,8 +97,9 @@ export async function bosPut(key, content, { bucket, ifMatch, maxRetries = 3 } =
 }
 
 // ---- 直读 BOS (GET, 返回 ETag 用于条件写) ----
-export async function bosGet(key, { bucket } = {}) {
+export async function bosGet(key, { bucket, endpoint } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
+  const ep = resolveEndpoint(endpoint);
   const tmp = join(tmpdir(), `celagent-get-${randomBytes(4).toString("hex")}.json`);
   try {
     // 1. 下载文件
@@ -99,7 +107,7 @@ export async function bosGet(key, { bucket } = {}) {
       "s3api", "get-object",
       "--bucket", bucket,
       "--key", key,
-      "--endpoint-url", EP,
+      "--endpoint-url", ep,
       tmp,
     ]);
     if (!dl.ok) {
@@ -113,7 +121,7 @@ export async function bosGet(key, { bucket } = {}) {
       "s3api", "head-object",
       "--bucket", bucket,
       "--key", key,
-      "--endpoint-url", EP,
+      "--endpoint-url", ep,
       "--query", "ETag",
       "--output", "text",
     ]);
