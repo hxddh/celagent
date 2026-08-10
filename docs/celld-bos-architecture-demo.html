@@ -165,7 +165,7 @@
 <header>
   <h1><span class="a">celagent</span> 运行过程 · Celld × BOS 实时交互监控</h1>
   <div class="subtitle" style="color:var(--dim);font-size:13px;margin-top:4px">
-    三层架构 · 每轮双写过程 · BOS 读写监控 — 数据为真实采集回放(2026-08-10)
+    三层架构 · 每轮双写过程 · BOS 读写监控 — 数据为真实采集回放(2026-08-10 采集于 bucket celagent-<user>-<ts>)
   </div>
   <div class="badge-row" style="margin-top:10px;display:flex;gap:14px;justify-content:center;flex-wrap:wrap;font-size:12px;color:var(--dim)">
     <span><span style="color:#58a6ff">■</span> Celld 运行时/缓存</span>
@@ -197,7 +197,7 @@
 <div class="panel" style="margin-top:14px" id="arch">
   <div class="panel-title">① 架构图:Celld × BOS 在 celagent 中的定位、功能与数据承载</div>
 
-  <svg viewBox="0 0 1080 720" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
+  <svg viewBox="0 0 1080 740" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
     <defs>
       <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
@@ -244,7 +244,7 @@
     <text x="352" y="258" font-size="10" fill="#7d8590">failover</text>
 
     <!-- ===== 层 3: 存储层 ===== -->
-    <rect x="30" y="370" width="1020" height="230" rx="14" fill="#12161f" stroke="#d29922" stroke-dasharray="6 4"/>
+    <rect x="30" y="370" width="1020" height="250" rx="14" fill="#12161f" stroke="#d29922" stroke-dasharray="6 4"/>
     <text x="50" y="398" font-size="14" font-weight="700" fill="#d29922">③ 存储层 — BOS 对象存储 (百度智能云 · bucket: celagent-<user>-<ts> · bj)</text>
 
     <!-- sessions -->
@@ -259,23 +259,32 @@
 
     <!-- cells -->
     <rect x="390" y="415" width="300" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
-    <text x="410" y="438" font-size="12" font-weight="600" fill="#e6edf3">cells/*/ltx (175 个)</text>
-    <text x="410" y="460" font-size="11" fill="#8b949e">Celld 的 cell 状态日志(LTX)</text>
-    <text x="410" y="480" font-size="11" fill="#8b949e">cells/*/own.json:所有权标记</text>
+    <text x="410" y="438" font-size="12" font-weight="600" fill="#e6edf3">cells/ 共 176 个 = ltx 175 + own 1</text>
+    <text x="410" y="460" font-size="11" fill="#8b949e">ltx/:cell 状态日志(LTX 追加式)</text>
+    <text x="410" y="480" font-size="11" fill="#8b949e">own.json:节点所有权标记(唯一)</text>
     <text x="410" y="500" font-size="11" fill="#8b949e">承载 Celld 自身分布式状态</text>
     <text x="410" y="520" font-size="11" fill="#8b949e">节点恢复/休眠的依赖</text>
-    <text x="410" y="558" font-size="10.5" fill="#7d8590">备注:当前 celld 版本 replica 缺口 →</text>
+    <text x="410" y="558" font-size="10.5" fill="#7d8590">备注:当前 celld replica 缺口 →</text>
     <text x="410" y="572" font-size="10.5" fill="#7d8590">会话权威性由 sessions/ 直写保障</text>
 
     <!-- deploy -->
-    <rect x="710" y="415" width="320" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
-    <text x="730" y="438" font-size="12" font-weight="600" fill="#e6edf3">deploy/agent-runtime/ (9 个)</text>
-    <text x="730" y="460" font-size="11" fill="#8b949e">worker 代码包(esbuild 打包部署)</text>
-    <text x="730" y="480" font-size="11" fill="#8b949e">deploy/current.json:当前版本指针</text>
-    <text x="730" y="500" font-size="11" fill="#8b949e">Celld 节点启动时从这里加载 worker</text>
-    <text x="730" y="520" font-size="11" fill="#8b949e">承载:worker 二进制/源码分发</text>
-    <text x="730" y="558" font-size="10.5" fill="#7d8590">替代:本地上传/手动部署流程</text>
-    <text x="730" y="572" font-size="10.5" fill="#7d8590">替代:开发机独有目录依赖</text>
+    <rect x="710" y="415" width="160" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
+    <text x="730" y="438" font-size="12" font-weight="600" fill="#e6edf3">deploy/ (10 个)</text>
+    <text x="730" y="460" font-size="11" fill="#8b949e">agent-runtime/</text>
+    <text x="730" y="478" font-size="11" fill="#8b949e">worker 代码包 ×9</text>
+    <text x="730" y="498" font-size="11" fill="#8b949e">current.json</text>
+    <text x="730" y="516" font-size="11" fill="#8b949e">版本指针 ×1</text>
+    <text x="730" y="540" font-size="10.5" fill="#7d8590">节点启动时加载</text>
+    <text x="730" y="556" font-size="10.5" fill="#7d8590">替代手动部署</text>
+
+    <!-- celld 分布式状态 (其他 9 个的准确身份) -->
+    <rect x="890" y="415" width="140" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
+    <text x="910" y="438" font-size="12" font-weight="600" fill="#e6edf3">celld 状态 (9)</text>
+    <text x="910" y="460" font-size="11" fill="#8b949e">fleet/peer-auth</text>
+    <text x="910" y="478" font-size="11" fill="#8b949e">nodes/*.json ×2</text>
+    <text x="910" y="498" font-size="11" fill="#8b949e">wake/waker.json</text>
+    <text x="910" y="520" font-size="11" fill="#8b949e">perf-test ×5(遗留)</text>
+    <text x="910" y="556" font-size="10.5" fill="#7d8590">Celld 运行元数据</text>
 
     <!-- ===== 数据流箭头 ===== -->
     <!-- TUI → Celld (worker 写) -->
@@ -285,22 +294,22 @@
     <path d="M 480 140 C 480 170, 365 175, 365 205" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
     <path d="M 365 330 L 365 415" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
     <text x="365" y="360" font-size="10.5" fill="#d29922" font-family="monospace" text-anchor="middle">② BOS直写(CAS+ETag)</text>
-    <!-- BOS → TUI (恢复, 从 sessions 权威区, 走最右侧专用通道) -->
-    <path d="M 955 415 C 1040 330, 1050 250, 920 140" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrG)"/>
-    <text x="988" y="300" font-size="10.5" fill="#3fb950" font-family="monospace" text-anchor="end">③ 启动恢复历史→注入上下文</text>
+    <!-- BOS → TUI (恢复: 从 sessions 底部水平向右, 再上到交互层) -->
+    <path d="M 200 590 L 1000 590 C 1050 590, 1050 300, 950 140" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrG)"/>
+    <text x="700" y="582" font-size="10.5" fill="#3fb950" font-family="monospace">③ 启动恢复历史→注入上下文</text>
     <!-- Celld → BOS (cell 状态) -->
-    <path d="M 690 267 C 780 300, 800 380, 780 415" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
-    <text x="800" y="360" font-size="10" fill="#58a6ff" font-family="monospace">④ cell状态(LTX/own)</text>
+    <path d="M 690 267 C 700 300, 660 380, 655 415" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
+    <text x="640" y="360" font-size="10" fill="#58a6ff" font-family="monospace">④ cell状态(LTX/own)</text>
     <!-- deploy → Celld -->
     <path d="M 800 415 C 720 380, 600 330, 500 330" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
     <text x="700" y="330" font-size="10" fill="#8b949e" font-family="monospace">⑤ 启动加载 worker</text>
 
-    <!-- ===== 替代关系条 ===== -->
-    <rect x="30" y="615" width="1020" height="90" rx="14" fill="#181e2b" stroke="#bc8cff" stroke-dasharray="6 4"/>
-    <text x="50" y="638" font-size="12.5" font-weight="700" fill="#bc8cff">价值分层:BOS = 核心价值(已验证) · Celld = 本地加速(可替换)</text>
-    <text x="50" y="660" font-size="11" fill="#8b949e">BOS 解决真实需求:会话跨机器/防丢失(RPO=0)——故障注入实测:节点全挂仍可写、恢复 10/10 轮</text>
-    <text x="50" y="678" font-size="11" fill="#8b949e">Celld 当前实际价值:低延迟本地缓存(~100ms) + 节点自动管理;其独有能力(休眠唤醒/epoch/委托)</text>
-    <text x="50" y="696" font-size="11" fill="#8b949e">在单机 agent 场景无实际需求(研究驱动,非需求驱动)——本地文件未消失,但权威地位移交 BOS</text>
+    <!-- ===== 替代关系条 (右侧留 60px 给 ③ 恢复通道) ===== -->
+    <rect x="30" y="635" width="950" height="90" rx="14" fill="#181e2b" stroke="#bc8cff" stroke-dasharray="6 4"/>
+    <text x="50" y="658" font-size="12.5" font-weight="700" fill="#bc8cff">价值分层:BOS = 核心价值(已验证) · Celld = 本地加速(可替换)</text>
+    <text x="50" y="680" font-size="11" fill="#8b949e">BOS 解决真实需求:会话跨机器/防丢失(RPO=0)——故障注入实测:节点全挂仍可写、恢复 10/10 轮</text>
+    <text x="50" y="698" font-size="11" fill="#8b949e">Celld 当前实际价值:低延迟本地缓存(~100ms) + 节点自动管理;其独有能力(休眠唤醒/epoch/委托)</text>
+    <text x="50" y="716" font-size="11" fill="#8b949e">在单机 agent 场景无实际需求(研究驱动,非需求驱动)——本地文件未消失,但权威地位移交 BOS</text>
   </svg>
 
   <!-- 定位一句话 + 价值分层表 -->
@@ -383,7 +392,7 @@
       <div class="panel-title">③ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
 
       <div class="mon-grid">
-        <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">230</div><div class="m-sub">sessions 35 · cells 176 · deploy 10 · 其他 9</div></div>
+        <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">230</div><div class="m-sub">sessions 35 · cells 176 · deploy 10 · celld 状态 9</div></div>
         <div class="metric"><div class="m-label">demo-session 大小</div><div class="m-value" id="mBytes">117 B</div><div class="m-sub">本轮写入后对象大小</div></div>
         <div class="metric"><div class="m-label">读次数 (演示)</div><div class="m-value green" id="mReads">0</div><div class="m-sub">GET / head-object (ETag)</div></div>
         <div class="metric"><div class="m-label">写次数 (演示)</div><div class="m-value yellow" id="mWrites">0</div><div class="m-sub">PUT (If-Match CAS)</div></div>
