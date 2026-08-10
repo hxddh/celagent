@@ -197,119 +197,62 @@
 <div class="panel" style="margin-top:14px" id="arch">
   <div class="panel-title">① 架构图:Celld × BOS 在 celagent 中的定位、功能与数据承载</div>
 
-  <svg viewBox="0 0 1080 740" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
+  <svg viewBox="0 0 1080 560" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
     <defs>
-      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
       </marker>
-      <marker id="arrG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <marker id="arrG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/>
       </marker>
-      <marker id="arrY" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <marker id="arrY" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
         <path d="M0,0 L10,5 L0,10 z" fill="#d29922"/>
       </marker>
     </defs>
 
-    <!-- ===== 层 1: 交互层 ===== -->
-    <rect x="30" y="20" width="1020" height="120" rx="14" fill="#181e2b" stroke="#30363d"/>
-    <text x="50" y="48" font-size="14" font-weight="700" fill="#3fb950">① 交互层 — celagent (Pi TUI 引擎)</text>
-    <text x="50" y="72" font-size="12" fill="#8b949e">功能:对话 / 工具调用(bash·read·write·grep·edit·ls·find) / 多模型切换 / 会话管理(list·resume·/new)</text>
-    <text x="50" y="94" font-size="12" fill="#8b949e">持久化职责:每轮 turn_end 钩子 → 双写(Celld 缓存 + BOS 权威直写);启动时从 BOS 恢复历史注入上下文</text>
-    <text x="50" y="114" font-size="11.5" fill="#7d8590" font-family="monospace">本地只保留 pi 引擎运行时态;会话真相在 BOS,不依赖 Celld 存活</text>
+    <!-- ===== 步骤 1: 交互 ===== -->
+    <rect x="30" y="30" width="1020" height="95" rx="16" fill="#181e2b" stroke="#3fb950"/>
+    <text x="60" y="62" font-size="17" font-weight="700" fill="#e6edf3">① 你正在和 celagent 对话</text>
+    <text x="60" y="88" font-size="13" fill="#8b949e">它回答你的问题、调用工具(bash/read/write…)。每轮对话结束,它会把这一轮自动保存——</text>
+    <text x="60" y="110" font-size="13" fill="#8b949e">不是只存在你电脑里,而是同时写到下面两个地方:</text>
 
-    <!-- ===== 层 2: 运行时层 ===== -->
-    <rect x="30" y="160" width="1020" height="190" rx="14" fill="#12161f" stroke="#30363d" stroke-dasharray="6 4"/>
-    <text x="50" y="188" font-size="14" font-weight="700" fill="#58a6ff">② 运行时层 — Celld 双节点 (本地缓存/执行器 · 非权威源)</text>
+    <!-- 步骤 2/3: 双写 -->
+    <text x="540" y="168" font-size="14" font-weight="700" fill="#7d8590" text-anchor="middle">每轮对话,双写两处 ↓</text>
 
-    <!-- 节点 A -->
-    <rect x="60" y="205" width="270" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
-    <circle cx="85" cy="222" r="5" fill="#3fb950"/>
-    <text x="100" y="226" font-size="12.5" font-weight="600" fill="#e6edf3">celld · 18090 (节点 A)</text>
-    <text x="75" y="248" font-size="11" fill="#8b949e">worker 执行器 · checkpoint API</text>
-    <text x="75" y="268" font-size="11" fill="#8b949e">SQLite 缓存 session:&lt;id&gt;(截断 200 字符)</text>
-    <text x="75" y="288" font-size="11" fill="#8b949e">低延迟本地缓存(~100ms)</text>
-    <text x="75" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">缓存可丢 — BOS 是权威源</text>
+    <!-- Celld 框 -->
+    <rect x="60" y="190" width="460" height="190" rx="16" fill="#12161f" stroke="#58a6ff"/>
+    <text x="90" y="225" font-size="16" font-weight="700" fill="#58a6ff">② Celld — 本地缓存(快)</text>
+    <text x="90" y="253" font-size="13" fill="#8b949e">• 本机运行,写入约 100ms,对话无感</text>
+    <text x="90" y="277" font-size="13" fill="#8b949e">• 双节点自动管理,一个挂了另一个接管</text>
+    <text x="90" y="301" font-size="13" fill="#8b949e">• 缓存可以丢——丢了从 BOS 重建</text>
+    <text x="90" y="330" font-size="12" fill="#7d8590" font-family="monospace">定位:本地加速 · 可替换 · 非权威</text>
+    <text x="90" y="352" font-size="12" fill="#7d8590" font-family="monospace">存:最近对话(截断 200 字符)</text>
 
-    <!-- 节点 B -->
-    <rect x="400" y="205" width="410" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
-    <circle cx="425" cy="222" r="5" fill="#3fb950"/>
-    <text x="440" y="226" font-size="12.5" font-weight="600" fill="#e6edf3">celld · 18091 (节点 B)</text>
-    <text x="415" y="248" font-size="11" fill="#8b949e">与 A 同构 · 故障转移备节点 · A 挂掉时接管</text>
-    <text x="415" y="268" font-size="11" fill="#8b949e">自动启动 + 端口预检 + 残留所有权清理</text>
-    <text x="415" y="288" font-size="11" fill="#8b949e">同一 bucket · 同一 worker · 缓存可丢(BOS 重建)</text>
-    <text x="415" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">定位=本地缓存(可替换) · 独有能力(休眠/epoch/委托)未启用</text>
+    <!-- BOS 框 -->
+    <rect x="560" y="190" width="490" height="190" rx="16" fill="#12161f" stroke="#d29922"/>
+    <text x="590" y="225" font-size="16" font-weight="700" fill="#d29922">③ BOS — 权威存储(稳)</text>
+    <text x="590" y="253" font-size="13" fill="#8b949e">• 云端对象存储,存完整对话(不截断)</text>
+    <text x="590" y="277" font-size="13" fill="#8b949e">• 换电脑 / 本地删了 / 节点全挂 → 都在</text>
+    <text x="590" y="301" font-size="13" fill="#8b949e">• 并发写有 CAS 保护,不冲突不丢失</text>
+    <text x="590" y="330" font-size="12" fill="#7d8590" font-family="monospace">定位:唯一真相 · 核心价值 · RPO=0</text>
+    <text x="590" y="352" font-size="12" fill="#7d8590" font-family="monospace">存:完整对话 sessions/*.json (35 个)</text>
+    <text x="590" y="372" font-size="11.5" fill="#7d8590">还存:Celld 节点状态(cells/ 176)+ worker 代码(deploy/ 10)+ 运行元数据(9)</text>
 
-    <!-- 节点间同步 -->
-    <line x1="345" y1="267" x2="400" y2="267" stroke="#58a6ff" stroke-dasharray="4 3" stroke-width="1.5"/>
-    <text x="352" y="258" font-size="10" fill="#7d8590">failover</text>
+    <!-- 双写箭头: celagent → Celld -->
+    <path d="M 260 125 C 260 155, 250 165, 250 190" stroke="#58a6ff" stroke-width="2.5" fill="none" marker-end="url(#arr)"/>
+    <text x="170" y="160" font-size="12" fill="#58a6ff" font-family="monospace">写缓存</text>
+    <!-- 双写箭头: celagent → BOS -->
+    <path d="M 740 125 C 740 155, 780 165, 800 190" stroke="#d29922" stroke-width="2.5" fill="none" marker-end="url(#arrY)"/>
+    <text x="810" y="160" font-size="12" fill="#d29922" font-family="monospace">写权威</text>
 
-    <!-- ===== 层 3: 存储层 ===== -->
-    <rect x="30" y="370" width="1020" height="250" rx="14" fill="#12161f" stroke="#d29922" stroke-dasharray="6 4"/>
-    <text x="50" y="398" font-size="14" font-weight="700" fill="#d29922">③ 存储层 — BOS 对象存储 (百度智能云 · bucket: celagent-<user>-<ts> · bj)</text>
-
-    <!-- sessions -->
-    <rect x="60" y="415" width="310" height="165" rx="10" fill="#181e2b" stroke="#d29922"/>
-    <text x="80" y="438" font-size="12" font-weight="600" fill="#e6edf3">sessions/&lt;id&gt;.json (35 个)</text>
-    <text x="80" y="460" font-size="11" fill="#8b949e">★ 权威源:完整对话历史(不截断)</text>
-    <text x="80" y="480" font-size="11" fill="#8b949e">{turn, role, msg, ts} 轮次数组</text>
-    <text x="80" y="500" font-size="11" fill="#8b949e">CAS 乐观锁:ETag + If-Match</text>
-    <text x="80" y="520" font-size="11" fill="#8b949e">If-None-Match:并发冷启动不覆盖</text>
-    <text x="80" y="540" font-size="10.5" fill="#7d8590">取代:本地 JSONL 的"唯一真相"地位</text>
-    <text x="80" y="558" font-size="10.5" fill="#7d8590">取代:本地 SQLite 作为唯一存储</text>
-
-    <!-- cells -->
-    <rect x="390" y="415" width="300" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
-    <text x="410" y="438" font-size="12" font-weight="600" fill="#e6edf3">cells/ 共 176 个 = ltx 175 + own 1</text>
-    <text x="410" y="460" font-size="11" fill="#8b949e">ltx/:cell 状态日志(LTX 追加式)</text>
-    <text x="410" y="480" font-size="11" fill="#8b949e">own.json:节点所有权标记(唯一)</text>
-    <text x="410" y="500" font-size="11" fill="#8b949e">承载 Celld 自身分布式状态</text>
-    <text x="410" y="520" font-size="11" fill="#8b949e">节点恢复/休眠的依赖</text>
-    <text x="410" y="558" font-size="10.5" fill="#7d8590">备注:当前 celld replica 缺口 →</text>
-    <text x="410" y="572" font-size="10.5" fill="#7d8590">会话权威性由 sessions/ 直写保障</text>
-
-    <!-- deploy -->
-    <rect x="710" y="415" width="160" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
-    <text x="730" y="438" font-size="12" font-weight="600" fill="#e6edf3">deploy/ (10 个)</text>
-    <text x="730" y="460" font-size="11" fill="#8b949e">agent-runtime/</text>
-    <text x="730" y="478" font-size="11" fill="#8b949e">worker 代码包 ×9</text>
-    <text x="730" y="498" font-size="11" fill="#8b949e">current.json</text>
-    <text x="730" y="516" font-size="11" fill="#8b949e">版本指针 ×1</text>
-    <text x="730" y="540" font-size="10.5" fill="#7d8590">节点启动时加载</text>
-    <text x="730" y="556" font-size="10.5" fill="#7d8590">替代手动部署</text>
-
-    <!-- celld 分布式状态 (其他 9 个的准确身份) -->
-    <rect x="890" y="415" width="140" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
-    <text x="910" y="438" font-size="12" font-weight="600" fill="#e6edf3">celld 状态 (9)</text>
-    <text x="910" y="460" font-size="11" fill="#8b949e">fleet/peer-auth</text>
-    <text x="910" y="478" font-size="11" fill="#8b949e">nodes/*.json ×2</text>
-    <text x="910" y="498" font-size="11" fill="#8b949e">wake/waker.json</text>
-    <text x="910" y="520" font-size="11" fill="#8b949e">perf-test ×5(遗留)</text>
-    <text x="910" y="556" font-size="10.5" fill="#7d8590">Celld 运行元数据</text>
-
-    <!-- ===== 数据流箭头 ===== -->
-    <!-- TUI → Celld (worker 写) -->
-    <path d="M 240 140 C 240 175, 190 180, 190 205" stroke="#bc8cff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
-    <text x="110" y="163" font-size="10.5" fill="#bc8cff" font-family="monospace">① checkpoint(worker缓存)</text>
-    <!-- TUI → BOS (权威直写, 走节点间通道 x≈365) -->
-    <path d="M 480 140 C 480 170, 365 175, 365 205" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
-    <path d="M 365 330 L 365 415" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
-    <text x="365" y="360" font-size="10.5" fill="#d29922" font-family="monospace" text-anchor="middle">② BOS直写(CAS+ETag)</text>
-    <!-- BOS → TUI (恢复: 从 sessions 底部水平向右, 再上到交互层) -->
-    <path d="M 200 590 L 1000 590 C 1050 590, 1050 300, 950 140" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrG)"/>
-    <text x="700" y="582" font-size="10.5" fill="#3fb950" font-family="monospace">③ 启动恢复历史→注入上下文</text>
-    <!-- Celld → BOS (cell 状态) -->
-    <path d="M 690 267 C 700 300, 660 380, 655 415" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
-    <text x="640" y="360" font-size="10" fill="#58a6ff" font-family="monospace">④ cell状态(LTX/own)</text>
-    <!-- deploy → Celld -->
-    <path d="M 800 415 C 720 380, 600 330, 500 330" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
-    <text x="700" y="330" font-size="10" fill="#8b949e" font-family="monospace">⑤ 启动加载 worker</text>
-
-    <!-- ===== 替代关系条 (右侧留 60px 给 ③ 恢复通道) ===== -->
-    <rect x="30" y="635" width="950" height="90" rx="14" fill="#181e2b" stroke="#bc8cff" stroke-dasharray="6 4"/>
-    <text x="50" y="658" font-size="12.5" font-weight="700" fill="#bc8cff">价值分层:BOS = 核心价值(已验证) · Celld = 本地加速(可替换)</text>
-    <text x="50" y="680" font-size="11" fill="#8b949e">BOS 解决真实需求:会话跨机器/防丢失(RPO=0)——故障注入实测:节点全挂仍可写、恢复 10/10 轮</text>
-    <text x="50" y="698" font-size="11" fill="#8b949e">Celld 当前实际价值:低延迟本地缓存(~100ms) + 节点自动管理;其独有能力(休眠唤醒/epoch/委托)</text>
-    <text x="50" y="716" font-size="11" fill="#8b949e">在单机 agent 场景无实际需求(研究驱动,非需求驱动)——本地文件未消失,但权威地位移交 BOS</text>
+    <!-- 步骤 4: 恢复 -->
+    <text x="540" y="428" font-size="14" font-weight="700" fill="#7d8590" text-anchor="middle">无论何时:启动 / 换电脑 / 本地误删 ↓ 都能找回</text>
+    <rect x="60" y="448" width="990" height="85" rx="16" fill="#181e2b" stroke="#3fb950"/>
+    <text x="90" y="480" font-size="16" font-weight="700" fill="#3fb950">④ 从 BOS 恢复 — 历史一条不丢</text>
+    <text x="90" y="508" font-size="13" fill="#8b949e">celagent list 看有哪些会话 → celagent &lt;会话ID&gt; 续写 — 实测:节点全挂后恢复 10/10 轮</text>
+    <!-- 恢复箭头: BOS → 步骤4 (就地) -->
+    <path d="M 800 380 L 800 448" stroke="#3fb950" stroke-width="2.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="812" y="420" font-size="12" fill="#3fb950" font-family="monospace">读历史</text>
   </svg>
 
   <!-- 定位一句话 + 价值分层表 -->
