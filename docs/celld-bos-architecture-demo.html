@@ -121,6 +121,144 @@
   </div>
 </header>
 
+<!-- ============ 架构图 ============ -->
+<div class="panel" style="margin-top:14px">
+  <div class="panel-title">架构图:Celld × BOS 在 celagent 中的定位、功能与数据承载</div>
+
+  <svg viewBox="0 0 1080 620" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+      </marker>
+      <marker id="arrG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/>
+      </marker>
+      <marker id="arrY" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#d29922"/>
+      </marker>
+    </defs>
+
+    <!-- ===== 层 1: 交互层 ===== -->
+    <rect x="30" y="20" width="1020" height="120" rx="14" fill="#181e2b" stroke="#30363d"/>
+    <text x="50" y="48" font-size="14" font-weight="700" fill="#3fb950">① 交互层 — celagent (Pi TUI 引擎)</text>
+    <text x="50" y="70" font-size="12" fill="#8b949e">功能:对话 / 工具调用(bash·read·write·grep·edit·ls·find) / 多模型切换 / 会话管理(list·resume·/new)</text>
+    <text x="50" y="90" font-size="12" fill="#8b949e">持久化职责:每轮对话结束触发 turn_end 钩子 → 双写(Celld worker 缓存 + BOS 权威直写);启动时从 BOS 恢复历史注入上下文</text>
+    <text x="50" y="112" font-size="11.5" fill="#7d8590" font-family="monospace">不直接碰磁盘会话文件 — 会话数据全部交给下层,本地只保留 pi 引擎的运行时状态</text>
+
+    <!-- ===== 层 2: 运行时层 ===== -->
+    <rect x="30" y="160" width="1020" height="190" rx="14" fill="#12161f" stroke="#30363d" stroke-dasharray="6 4"/>
+    <text x="50" y="188" font-size="14" font-weight="700" fill="#58a6ff">② 运行时层 — Celld 双节点 (分布式 Durable Object 运行时)</text>
+
+    <!-- 节点 A -->
+    <rect x="60" y="205" width="300" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
+    <circle cx="85" cy="222" r="5" fill="#3fb950"/>
+    <text x="100" y="226" font-size="12.5" font-weight="600" fill="#e6edf3">celld · 18090 (节点 A)</text>
+    <text x="75" y="248" font-size="11" fill="#8b949e">worker 执行器 · checkpoint/resume API</text>
+    <text x="75" y="268" font-size="11" fill="#8b949e">SQLite 缓存:session:&lt;id&gt; → turns</text>
+    <text x="75" y="288" font-size="11" fill="#8b949e">承载数据:worker 缓存(截断 200 字符)</text>
+    <text x="75" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">task:·cron:·kv:·ledger(测试语义)</text>
+
+    <!-- 节点 B -->
+    <rect x="390" y="205" width="300" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
+    <circle cx="415" cy="222" r="5" fill="#3fb950"/>
+    <text x="430" y="226" font-size="12.5" font-weight="600" fill="#e6edf3">celld · 18091 (节点 B)</text>
+    <text x="405" y="248" font-size="11" fill="#8b949e">与 A 同构 · 故障转移备节点</text>
+    <text x="405" y="268" font-size="11" fill="#8b949e">A 挂掉时接管 worker 写入</text>
+    <text x="405" y="288" font-size="11" fill="#8b949e">自动启动 + 端口预检 + 所有权清理</text>
+    <text x="405" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">同一 BOS bucket · 同一 worker 版本</text>
+
+    <!-- 节点间同步 -->
+    <line x1="360" y1="267" x2="390" y2="267" stroke="#58a6ff" stroke-dasharray="4 3" stroke-width="1.5"/>
+    <text x="362" y="258" font-size="10" fill="#7d8590">failover</text>
+
+    <!-- 右侧: 定位说明 -->
+    <rect x="720" y="205" width="310" height="125" rx="10" fill="#181e2b" stroke="#30363d"/>
+    <text x="740" y="226" font-size="12" font-weight="600" fill="#e6edf3">Celld 的定位 = "快"</text>
+    <text x="740" y="248" font-size="11" fill="#8b949e">低延迟会话缓存(~100ms)</text>
+    <text x="740" y="268" font-size="11" fill="#8b949e">分布式运行时(节点/故障转移/worker)</text>
+    <text x="740" y="288" font-size="11" fill="#8b949e">⚠ 缓存可丢 — 丢了从 BOS 重建</text>
+    <text x="740" y="308" font-size="10.5" fill="#7d8590">替代:常驻 DB 服务器 / 内存状态机</text>
+
+    <!-- ===== 层 3: 存储层 ===== -->
+    <rect x="30" y="370" width="1020" height="230" rx="14" fill="#12161f" stroke="#d29922" stroke-dasharray="6 4"/>
+    <text x="50" y="398" font-size="14" font-weight="700" fill="#d29922">③ 存储层 — BOS 对象存储 (百度智能云 · bucket: celagent-<user>-<ts> · bj)</text>
+
+    <!-- sessions -->
+    <rect x="60" y="415" width="310" height="165" rx="10" fill="#181e2b" stroke="#d29922"/>
+    <text x="80" y="438" font-size="12" font-weight="600" fill="#e6edf3">sessions/&lt;id&gt;.json (35 个)</text>
+    <text x="80" y="460" font-size="11" fill="#8b949e">★ 权威源:完整对话历史(不截断)</text>
+    <text x="80" y="480" font-size="11" fill="#8b949e">{turn, role, msg, ts} 轮次数组</text>
+    <text x="80" y="500" font-size="11" fill="#8b949e">CAS 乐观锁:ETag + If-Match</text>
+    <text x="80" y="520" font-size="11" fill="#8b949e">If-None-Match:并发冷启动不覆盖</text>
+    <text x="80" y="540" font-size="10.5" fill="#7d8590">替代:本地 JSONL 会话文件(pi 原生)</text>
+    <text x="80" y="558" font-size="10.5" fill="#7d8590">替代:本地 SQLite 作为唯一存储</text>
+
+    <!-- cells -->
+    <rect x="390" y="415" width="300" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
+    <text x="410" y="438" font-size="12" font-weight="600" fill="#e6edf3">cells/*/ltx (175 个)</text>
+    <text x="410" y="460" font-size="11" fill="#8b949e">Celld 的 cell 状态日志(LTX)</text>
+    <text x="410" y="480" font-size="11" fill="#8b949e">cells/*/own.json:所有权标记</text>
+    <text x="410" y="500" font-size="11" fill="#8b949e">承载 Celld 自身分布式状态</text>
+    <text x="410" y="520" font-size="11" fill="#8b949e">节点恢复/休眠的依赖</text>
+    <text x="410" y="558" font-size="10.5" fill="#7d8590">备注:当前 celld 版本 replica 缺口 →</text>
+    <text x="410" y="572" font-size="10.5" fill="#7d8590">会话权威性由 sessions/ 直写保障</text>
+
+    <!-- deploy -->
+    <rect x="710" y="415" width="320" height="165" rx="10" fill="#181e2b" stroke="#30363d"/>
+    <text x="730" y="438" font-size="12" font-weight="600" fill="#e6edf3">deploy/agent-runtime/ (9 个)</text>
+    <text x="730" y="460" font-size="11" fill="#8b949e">worker 代码包(esbuild 打包部署)</text>
+    <text x="730" y="480" font-size="11" fill="#8b949e">deploy/current.json:当前版本指针</text>
+    <text x="730" y="500" font-size="11" fill="#8b949e">Celld 节点启动时从这里加载 worker</text>
+    <text x="730" y="520" font-size="11" fill="#8b949e">承载:worker 二进制/源码分发</text>
+    <text x="730" y="558" font-size="10.5" fill="#7d8590">替代:本地上传/手动部署流程</text>
+    <text x="730" y="572" font-size="10.5" fill="#7d8590">替代:开发机独有目录依赖</text>
+
+    <!-- ===== 数据流箭头 ===== -->
+    <!-- TUI → Celld (worker 写) -->
+    <path d="M 280 140 C 280 175, 200 180, 200 205" stroke="#bc8cff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="150" y="163" font-size="10.5" fill="#bc8cff" font-family="monospace">① checkpoint(worker缓存)</text>
+    <!-- TUI → BOS (权威直写) -->
+    <path d="M 520 140 C 520 250, 560 380, 600 415" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arrY)"/>
+    <text x="540" y="290" font-size="10.5" fill="#d29922" font-family="monospace">② BOS直写(CAS+ETag)</text>
+    <!-- BOS → TUI (恢复, 从 sessions 权威区) -->
+    <path d="M 240 415 C 180 320, 120 250, 260 140" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arrG)"/>
+    <text x="60" y="290" font-size="10.5" fill="#3fb950" font-family="monospace">③ 启动时从 sessions 恢复→注入上下文</text>
+    <!-- Celld → BOS (cell 状态) -->
+    <path d="M 690 267 C 780 300, 800 380, 780 415" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
+    <text x="800" y="360" font-size="10" fill="#58a6ff" font-family="monospace">④ cell状态(LTX/own)</text>
+    <!-- deploy → Celld -->
+    <path d="M 800 415 C 720 380, 600 330, 500 330" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#arr)"/>
+    <text x="700" y="330" font-size="10" fill="#8b949e" font-family="monospace">⑤ 启动加载 worker</text>
+  </svg>
+
+  <!-- 定位一句话 + 替代关系表 -->
+  <div class="dataflow-note" style="margin-top:10px">
+    <b>定位一句话:</b> <code>Celld = 快(运行时+缓存)</code> · <code>BOS = 稳(权威持久层)</code> —
+    celagent 把"会话永不丢"交给 BOS,把"低延迟运行"交给 Celld。
+  </div>
+
+  <table class="obj-table" style="margin-top:10px">
+    <thead><tr><th style="width:110px">组件</th><th>承载的数据类型</th><th>替代了什么</th></tr></thead>
+    <tbody>
+      <tr>
+        <td style="color:#bc8cff;font-weight:600">Celld 双节点</td>
+        <td>worker SQLite 缓存 session:&lt;id&gt;(截断 200 字符)、测试语义 task:/cron:/kv:/ledger、cell 状态(LTX/own 经 BOS)</td>
+        <td>常驻数据库服务器、内存状态机、手动部署的后端服务 — 一个本地自动拉起、故障转移的分布式运行时</td>
+      </tr>
+      <tr>
+        <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
+        <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,176 个)、<b>deploy/agent-runtime</b>(worker 代码包,9 个)</td>
+        <td>本地 JSONL 会话文件(pi 原生存储)、本地 SQLite 唯一存储、单机磁盘 — 换成跨机器、RPO=0、并发安全的对象存储</td>
+      </tr>
+      <tr>
+        <td style="color:#3fb950;font-weight:600">celagent (TUI)</td>
+        <td>运行时态:pi 引擎会话(agentDir 独立目录)、配置 settings.json、BOS 凭证引用(~/.aws/credentials)</td>
+        <td>旧版自写 CLI 壳(已归档)、直接读写会话文件的代码路径 — 复用 Pi 引擎,只替换持久化层</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
 <div class="layout">
   <!-- ===== 左: 运行过程 ===== -->
   <div>
