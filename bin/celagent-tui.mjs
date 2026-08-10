@@ -161,7 +161,9 @@ let bosQueue = Promise.resolve();
 let bosQueueLen = 0;
 let bosWarned = false;  // 只警告一次, 避免刷屏
 const BOS_QUEUE_MAX = 50;  // Bug E: 队列限长, 防内存泄漏
-function queueBosWrite(sessionId, seq, role, msg) {
+function queueBosWrite(sessionId, seq, role, msg, opts = {}) {
+  // 完整记忆 (方案 A): fullContent 完整内容块 + fullToolResults 完整工具结果
+  const { fullContent = null, fullToolResults = null } = opts || {};
   // 队列过长时丢弃最旧任务 (防堆积)
   if (bosQueueLen >= BOS_QUEUE_MAX) {
     if (!bosWarned) { console.warn("  (警告: BOS 写队列过长, 丢弃旧任务)"); bosWarned = true; }
@@ -216,7 +218,10 @@ function queueBosWrite(sessionId, seq, role, msg) {
           }
         }
         const idx = session.turns.findIndex(t => t.turn === finalSeq);
+        // 完整记忆: 同轮替换时也保留完整字段; 新轮直接存
         const entry = { turn: finalSeq, role, msg, ts: Date.now() };
+        if (fullContent && fullContent.length > 0) entry.content = fullContent;
+        if (fullToolResults && fullToolResults.length > 0) entry.toolResults = fullToolResults;
         if (idx >= 0) session.turns[idx] = entry;
         else session.turns.push(entry);
         session.updatedAt = Date.now();
@@ -237,8 +242,11 @@ function queueBosWrite(sessionId, seq, role, msg) {
 }
 
 // ---- Celld 镜像 (worker 同步 + BOS 异步, 不阻塞对话) ----
-async function celldCheckpoint(sessionId, seq, role, content) {
+async function celldCheckpoint(sessionId, seq, role, content, opts = {}) {
   const msg = typeof content === "string" ? content : JSON.stringify(content ?? "");
+  // 完整记忆 (方案 A): fullContent/fullToolResults 全量存 BOS (权威源),
+  // worker 缓存只存摘要 msg (URL 截断 200 字符)
+  const { fullContent = null, fullToolResults = null } = opts;
 
   // 1. worker SQLite (即时缓存 — Bug 52: 异步 fire-and-forget, 不阻塞对话;
   //    超时 2s (worker 只是缓存, BOS 是权威源, 丢了可重建))
@@ -261,8 +269,8 @@ async function celldCheckpoint(sessionId, seq, role, content) {
     }
   })();
 
-  // 2. BOS 直写 (异步队列, 完整 msg — Bug 40 修复: BOS 是权威源不该截断)
-  queueBosWrite(sessionId, seq, role, msg);
+  // 2. BOS 直写 (异步队列, 完整 msg + 完整记忆 — 方案 A)
+  queueBosWrite(sessionId, seq, role, msg, { fullContent, fullToolResults });
 
   return { worker: "async", bos: "queued" };
 }
@@ -781,12 +789,16 @@ async function main() {
         if (event?.type === "turn_end") {
           seq++;
           const text = extractText(event.message?.content);
-          // 存完整内容: 文本 + 工具调用 + 工具结果内容 (Bug: 恢复需有工具上下文)
-          const toolCalls = Array.isArray(event.message?.content)
-            ? event.message.content.filter(b => b.type === "toolCall").map(b => `${b.name}(${JSON.stringify(b.arguments)})`)
-            : [];
-          // 提取工具结果文本 (toolResults[].content 是 TextContent/ImageContent)
-          const toolResults = (event.toolResults || []).map(tr => {
+          // 完整记忆 (方案 A): 完整 message 内容块 (text/thinking/toolCall 全量)
+          // + 完整 toolResults (含文本结果), 存 BOS 权威源
+          const fullContent = Array.isArray(event.message?.content) ? event.message.content : [];
+          const fullToolResults = (event.toolResults || []).map(tr => ({
+            toolName: tr.toolName,
+            content: Array.isArray(tr.content) ? tr.content : null,
+          }));
+          // 摘要 msg (兼容: worker 缓存 URL 截断 + 恢复注入用, 不占大体积)
+          const toolCalls = fullContent.filter(b => b.type === "toolCall").map(b => `${b.name}(${JSON.stringify(b.arguments)})`);
+          const toolResults = fullToolResults.map(tr => {
             const resultText = Array.isArray(tr.content)
               ? tr.content.filter(b => b.type === "text").map(b => b.text).join(" ").trim()
               : "";
@@ -796,7 +808,7 @@ async function main() {
           if (toolCalls.length > 0) msg += ` [工具调用: ${toolCalls.join(", ").slice(0, 100)}]`;
           if (toolResults.length > 0) msg += ` [工具结果: ${toolResults.join(" | ").slice(0, 300)}]`;
           // Bug 52: 不 await — checkpoint 全异步 (worker fire-and-forget + BOS 队列), 绝不阻塞对话
-          void celldCheckpoint(persistId, seq, "assistant", msg);
+          void celldCheckpoint(persistId, seq, "assistant", msg, { fullContent, fullToolResults });
         }
       });
       return { ...result, services, diagnostics: [] };  // 完整契约 (Bug: /new 需 services+diagnostics)

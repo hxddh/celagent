@@ -398,20 +398,21 @@
     <div style="margin-bottom:18px">
       <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q1: 写到 BOS 的是 agent 会话的"所有内容"吗?</div>
       <div style="font-size:13px;color:var(--dim);line-height:1.8">
-        <b style="color:var(--text)">不是。BOS 存的是"摘要级记忆"</b>,不是完整会话(完整逐轮记录在本地 pi JSONL):
+        <b style="color:var(--text)">方案 A(完整记忆)已实施:BOS 存完整内容块 + 工具结果</b>,同时保留摘要 msg 供快速注入。完整会话仍以本地 pi JSONL 为准(含 user 轮):
       </div>
       <table class="obj-table" style="margin-top:8px">
-        <thead><tr><th>内容</th><th>是否写入 BOS</th></tr></thead>
+        <thead><tr><th>内容</th><th>BOS(权威)</th><th>本地 JSONL</th></tr></thead>
         <tbody>
-          <tr><td>assistant 回复文本</td><td style="color:var(--green)">✅ 完整写入</td></tr>
-          <tr><td>工具调用摘要(工具名+参数)</td><td style="color:var(--yellow)">⚠ 拼接后截断 ≤100 字符</td></tr>
-          <tr><td>工具结果摘要</td><td style="color:var(--yellow)">⚠ 每个结果取前 120 字符,汇总 ≤300 字符</td></tr>
-          <tr><td>user 输入</td><td style="color:var(--red)">❌ 不写(turn_end 钩子只存 assistant 轮)</td></tr>
-          <tr><td>完整工具参数/输出、项目文件内容、agent 推理过程</td><td style="color:var(--red)">❌ 不写</td></tr>
+          <tr><td>assistant 回复文本</td><td style="color:var(--green)">✅ 完整</td><td>✅ 完整</td></tr>
+          <tr><td>thinking 推理过程</td><td style="color:var(--green)">✅ 完整(方案 A)</td><td>✅ 完整</td></tr>
+          <tr><td>工具调用(名称+完整参数)</td><td style="color:var(--green)">✅ 完整(方案 A)</td><td>✅ 完整</td></tr>
+          <tr><td>工具结果</td><td style="color:var(--green)">✅ 完整(方案 A)</td><td style="color:var(--red)">❌ 不存</td></tr>
+          <tr><td>user 输入</td><td style="color:var(--yellow)">⚠ 仅摘要 msg 里(turn_end 钩子只存 assistant 轮)</td><td>✅ 完整</td></tr>
+          <tr><td>摘要 msg(供恢复注入)</td><td style="color:var(--green)">✅ 保留</td><td>—</td></tr>
         </tbody>
       </table>
       <div style="font-size:12.5px;color:var(--dim);margin-top:6px">
-        设计意图:BOS 存"重启后恢复对话所需的最小记忆"——之前聊了什么、调过哪些工具、大概结果;不是逐字节完整会话。
+        注:BOS 的 toolResults 完整存储甚至比本地 JSONL 更全(JSONL 不持久化工具结果);两者互补。
       </div>
     </div>
 
