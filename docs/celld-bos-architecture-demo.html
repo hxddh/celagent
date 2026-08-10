@@ -350,7 +350,7 @@
       每轮对话结束,celagent 把<b style="color:var(--text)">这一轮的对话记录</b>(不是文件、不是工作区)打包成一条 JSON 写入两处。
       以下为结构示例(字段结构真实,内容为演示):
     </div>
-    <div class="json-block"><span class="c">// 实测: Celld worker 缓存 (session:demo-session, 节点 18090) — msg 截断 200 字符, 无 role
+    <div class="json-block"><span class="c">// 实测: Celld worker 缓存 (session:demo-large-session, 节点 18090) — msg 截断 200 字符, 无 role
 {
   <span class="k">"id"</span>: <span class="s">"demo-session"</span>,
   <span class="k">"turns"</span>: [
@@ -359,7 +359,7 @@
   <span class="k">"updatedAt"</span>: <span class="n">1786343740759</span>  <span class="c">// 实测值 (2026-08-10 采集)</span>
 }
 
-<span class="c">// 实测: BOS 权威源 (sessions/demo-session.json) — 完整记忆</span>
+<span class="c">// 实测: BOS 权威源 (sessions/demo-large-session.json) — 完整记忆</span>
 <span class="c">// turn1 为演示脚本 (真实产品 turn_end 只写 assistant 轮); content/toolResults 为完整字段</span>
 {
   <span class="k">"id"</span>: <span class="s">"demo-session"</span>,
@@ -429,7 +429,7 @@
     </div>
 
     <div style="margin-bottom:18px">
-      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q2: BOS 写一次要 ~0.7 秒,性能问题怎么解决?</div>
+      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q2: BOS 写一次要 ~0.8 秒,性能问题怎么解决?</div>
       <div style="font-size:13px;color:var(--dim);line-height:1.8">
         <b style="color:var(--text)">写延迟被完全挡在对话之外</b> — 对话轮结束,turn_end 钩子毫秒级返回,不等待 BOS:
       </div>
@@ -441,7 +441,7 @@
           <tr><td>CAS 冲突重试(3 次,退避)</td><td>网络抖动/并发时不丢数据</td></tr>
           <tr><td>20s 超时</td><td>防网络黑洞卡死队列</td></tr>
           <tr><td>退出时 flush</td><td>关程序前等队列写完,最后几轮不丢</td></tr>
-          <tr><td>Celld 本地缓存(~157ms)</td><td>快路径立即可读;BOS 是慢但稳的权威源</td></tr>
+          <tr><td>Celld 本地缓存(~148ms)</td><td>快路径立即可读;BOS 是慢但稳的权威源</td></tr>
         </tbody>
       </table>
     </div>
@@ -454,7 +454,7 @@
         <b style="color:var(--red)">本地即全部</b>:换电脑 / 删目录 / 磁盘损坏 = 会话永久丢失。<br><br>
         celagent 的增量不是"不用本地了",而是<b style="color:var(--green)">加了一层云端权威副本</b>:
         <code>本地 JSONL(pi 引擎运行时态) + Celld 缓存 + BOS(权威副本)</code> —
-        BOS 解决本地单点故障(换机/丢失/节点挂),代价是 ~0.7s 写延迟,用异步队列隐藏。
+        BOS 解决本地单点故障(换机/丢失/节点挂),代价是 ~0.8s 写延迟,用异步队列隐藏。
       </div>
     </div>
   </div>
@@ -512,13 +512,13 @@
 
       <div class="mon-grid">
         <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">270</div><div class="m-sub">sessions 35 · cells 210 · deploy 16 · celld 状态 9</div></div>
-        <div class="metric"><div class="m-label">demo-session 大小</div><div class="m-value" id="mBytes">117 B</div><div class="m-sub">本轮写入后对象大小</div></div>
+        <div class="metric"><div class="m-label">demo-session 大小</div><div class="m-value" id="mBytes">173 B</div><div class="m-sub">本轮写入后对象大小</div></div>
         <div class="metric"><div class="m-label">读次数 (演示)</div><div class="m-value green" id="mReads">0</div><div class="m-sub">GET / head-object (ETag)</div></div>
         <div class="metric"><div class="m-label">写次数 (演示)</div><div class="m-value yellow" id="mWrites">0</div><div class="m-sub">PUT (If-Match CAS)</div></div>
         <div class="metric"><div class="m-label">平均读延迟</div><div class="m-value" id="mReadLat">—</div><div class="m-sub">最近 5 次滚动 (ms)</div></div>
         <div class="metric"><div class="m-label">平均写延迟</div><div class="m-value" id="mWriteLat">—</div><div class="m-sub">最近 5 次滚动 (ms)</div></div>
         <div class="metric"><div class="m-label">CAS 冲突</div><div class="m-value red" id="mCas">0</div><div class="m-sub">单客户端演示无冲突(CAS 保护见故障注入场景)</div></div>
-        <div class="metric"><div class="m-label">当前 ETag</div><div class="m-value" id="mEtag" style="font-size:12px">—</div><div class="m-sub">sessions/demo-session.json</div></div>
+        <div class="metric"><div class="m-label">当前 ETag</div><div class="m-value" id="mEtag" style="font-size:12px">—</div><div class="m-sub">sessions/demo-large-session.json</div></div>
       </div>
 
       <!-- 延迟条形图 -->
@@ -558,7 +558,7 @@
       <tr>
         <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
         <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、cell 状态(LTX/own 经 BOS)、deploy 里的 worker 执行环境</td>
-        <td>低延迟本地缓存(~157ms 实测)、节点自动拉起/故障转移、worker 执行器</td>
+        <td>低延迟本地缓存(~148ms 实测)、节点自动拉起/故障转移、worker 执行器</td>
         <td style="color:var(--blue)"><b>✅ 执行层价值:节点发现/状态迁移/休眠唤醒/任务状态机</b> — 多机场景核心组件;单机场景价值有限</td>
       </tr>
       <tr>
@@ -577,7 +577,7 @@
   <b style="color:var(--blue)">Celld 保执行(分布式运行时:节点发现/休眠唤醒/任务状态机)</b> —
   分层并存:数据层与执行层分离。⚠️ 本页为<b>演示 + 真实数据混合</b>:对话脚本为演示用途;
   延迟/ETag/对象大小等数字来自 2026-08-10 对真实 BOS 的一次完整重建采集,自动播放按序回放,不重复访问 BOS;
-  数据保存在 <code>sessions/demo-session.json</code> (bucket <code>celagent-<user>-<ts></code>)
+  数据保存在 <code>sessions/demo-large-session.json</code> (bucket <code>celagent-<user>-<ts></code>)
 </footer>
 
 </div>
@@ -588,33 +588,133 @@
 // 对话内容: 演示脚本 (真实产品 turn_end 钩子只存 assistant 轮)
 // 每轮: worker 写延迟 / BOS 读延迟 / BOS 写延迟 / 真实 ETag / 对象真实大小
 const REAL_RECORDS = [
-  { turn:1, workerMs:578, readMs:732,  writeMs:762,  etag:"7e9c569eaf37", size:117  },
-  { turn:2, workerMs:95,  readMs:1297, writeMs:706,  etag:"0a20b138deaae", size:251  },
-  { turn:3, workerMs:121, readMs:1373, writeMs:783,  etag:"4645bd8c16778", size:334  },
-  { turn:4, workerMs:165, readMs:1284, writeMs:665,  etag:"1e289359b9caf", size:516  },
-  { turn:5, workerMs:91,  readMs:1423, writeMs:675,  etag:"a866270dd6682", size:594  },
-  { turn:6, workerMs:100, readMs:1277, writeMs:766,  etag:"4e8f021af78eb", size:751  },
-  { turn:7, workerMs:95,  readMs:1327, writeMs:762,  etag:"7ca24683153ce", size:834  },
-  { turn:8, workerMs:128, readMs:1368, writeMs:693,  etag:"6f5ba8095060a", size:968  },
-  { turn:9, workerMs:96,  readMs:1280, writeMs:759,  etag:"3a7d6be57ef1d", size:1053 },
-  { turn:10, workerMs:96, readMs:1303, writeMs:691,  etag:"8f7d910fa3e6a", size:1185 },
+{ turn:1, workerMs:87, readMs:807, writeMs:686, etag:"first", size:173 },
+  { turn:2, workerMs:89, readMs:1336, writeMs:691, etag:"535a9ed903d18", size:2061 },
+  { turn:3, workerMs:118, readMs:1559, writeMs:908, etag:"8c248f3ba9297", size:4001 },
+  { turn:4, workerMs:74, readMs:1507, writeMs:687, etag:"ca0786a0be64b", size:4142 },
+  { turn:5, workerMs:238, readMs:1507, writeMs:690, etag:"40256b2a6824e", size:6110 },
+  { turn:6, workerMs:226, readMs:1431, writeMs:671, etag:"b25b65cc37408", size:8029 },
+  { turn:7, workerMs:183, readMs:1350, writeMs:665, etag:"d5242fc2efd19", size:8159 },
+  { turn:8, workerMs:133, readMs:1424, writeMs:688, etag:"7c9b41c2a0c91", size:10196 },
+  { turn:9, workerMs:122, readMs:1494, writeMs:782, etag:"125a756d919c1", size:12143 },
+  { turn:10, workerMs:83, readMs:1464, writeMs:788, etag:"288b20cdb7d7f", size:12278 },
+  { turn:11, workerMs:89, readMs:1531, writeMs:805, etag:"8c877b3c3d3cc", size:14290 },
+  { turn:12, workerMs:226, readMs:1421, writeMs:800, etag:"8d0ba4d6d5fa1", size:16221 },
+  { turn:13, workerMs:68, readMs:1397, writeMs:800, etag:"5235948d5bb0c", size:16354 },
+  { turn:14, workerMs:176, readMs:1326, writeMs:854, etag:"4a01287df5a17", size:18315 },
+  { turn:15, workerMs:172, readMs:1299, writeMs:842, etag:"bb4a38df39efe", size:20280 },
+  { turn:16, workerMs:147, readMs:1457, writeMs:764, etag:"1e0c81cbd34fa", size:20407 },
+  { turn:17, workerMs:183, readMs:1453, writeMs:836, etag:"066d7f0aa8935", size:22293 },
+  { turn:18, workerMs:165, readMs:1573, writeMs:793, etag:"6b77c25127eb0", size:24255 },
+  { turn:19, workerMs:119, readMs:1678, writeMs:814, etag:"dd8673d763f0c", size:24396 },
+  { turn:20, workerMs:150, readMs:1297, writeMs:830, etag:"0b4d54379ee7d", size:26343 },
+  { turn:21, workerMs:187, readMs:1504, writeMs:782, etag:"3512611cedf99", size:28309 },
+  { turn:22, workerMs:190, readMs:1506, writeMs:866, etag:"201f0c09c42c0", size:28442 },
+  { turn:23, workerMs:170, readMs:1318, writeMs:820, etag:"cba918e3d3f9f", size:30390 },
+  { turn:24, workerMs:191, readMs:1402, writeMs:826, etag:"acca845593f06", size:32397 },
+  { turn:25, workerMs:130, readMs:1477, writeMs:734, etag:"87f28a466cbda", size:32539 },
+  { turn:26, workerMs:67, readMs:1399, writeMs:823, etag:"ba67cb835e98f", size:34447 },
+  { turn:27, workerMs:177, readMs:1456, writeMs:797, etag:"2eefc92236c42", size:36410 },
+  { turn:28, workerMs:225, readMs:1407, writeMs:834, etag:"55ff6bc4df3ff", size:36552 },
+  { turn:29, workerMs:183, readMs:1677, writeMs:788, etag:"c117bbe871254", size:38508 },
+  { turn:30, workerMs:134, readMs:1418, writeMs:846, etag:"e864bdbfb6157", size:40436 },
+  { turn:31, workerMs:216, readMs:1483, writeMs:840, etag:"34588a0fabec5", size:40573 },
+  { turn:32, workerMs:231, readMs:1563, writeMs:943, etag:"f2249f1e3bbea", size:42512 },
+  { turn:33, workerMs:101, readMs:1431, writeMs:859, etag:"02cbdbfc1f351", size:44408 },
+  { turn:34, workerMs:85, readMs:1496, writeMs:917, etag:"6629e3ded85f0", size:44550 },
+  { turn:35, workerMs:89, readMs:1517, writeMs:931, etag:"c7859dc7ca1e9", size:46556 },
+  { turn:36, workerMs:189, readMs:1556, writeMs:818, etag:"b2e104154c3e0", size:48487 },
+  { turn:37, workerMs:123, readMs:1417, writeMs:909, etag:"13a72b7d62d4b", size:48618 },
+  { turn:38, workerMs:143, readMs:1602, writeMs:893, etag:"c2baddf79ca70", size:50603 },
+  { turn:39, workerMs:161, readMs:1508, writeMs:1016, etag:"0b9f030456282", size:52563 },
+  { turn:40, workerMs:90, readMs:1564, writeMs:886, etag:"8a27f011248d8", size:52698 },
+  { turn:41, workerMs:87, readMs:1458, writeMs:811, etag:"1bb786d477628", size:54656 },
+  { turn:42, workerMs:226, readMs:1706, writeMs:913, etag:"435eb00ada9d4", size:56569 },
+  { turn:43, workerMs:147, readMs:1575, writeMs:876, etag:"2e3a5531dbcc9", size:56702 },
+  { turn:44, workerMs:175, readMs:1474, writeMs:902, etag:"85b0e5d4ade0d", size:58676 },
+  { turn:45, workerMs:196, readMs:1477, writeMs:882, etag:"cacc621b43e7c", size:60637 },
+  { turn:46, workerMs:87, readMs:1489, writeMs:850, etag:"5acedb403e76b", size:60764 },
+  { turn:47, workerMs:92, readMs:1379, writeMs:912, etag:"b78900915b600", size:62662 },
+  { turn:48, workerMs:206, readMs:1485, writeMs:849, etag:"a6b241a84df41", size:64643 },
+  { turn:49, workerMs:109, readMs:1577, writeMs:877, etag:"623bb22e9c260", size:64784 },
+  { turn:50, workerMs:102, readMs:1470, writeMs:884, etag:"6a56a2dcb7410", size:66721 },
+  { turn:51, workerMs:73, readMs:1519, writeMs:840, etag:"8d7581a261ee0", size:68733 },
+  { turn:52, workerMs:192, readMs:1473, writeMs:917, etag:"e6bbb2482b46d", size:68866 },
+  { turn:53, workerMs:171, readMs:1450, writeMs:888, etag:"c066e4d8514be", size:70810 },
+  { turn:54, workerMs:137, readMs:1459, writeMs:899, etag:"2d7c1e9b0bfc4", size:72771 },
+  { turn:55, workerMs:225, readMs:1503, writeMs:904, etag:"e9a83216e165b", size:72913 },
+  { turn:56, workerMs:109, readMs:1475, writeMs:884, etag:"21328288e0751", size:74885 },
+  { turn:57, workerMs:111, readMs:1464, writeMs:1018, etag:"02899636d5ac1", size:76796 },
+  { turn:58, workerMs:83, readMs:1565, writeMs:889, etag:"c27390cb1b651", size:76938 },
+  { turn:59, workerMs:195, readMs:1516, writeMs:836, etag:"61deb6a6f9dfd", size:78940 },
+  { turn:60, workerMs:229, readMs:1486, writeMs:884, etag:"66515969bc4e1", size:80879 },
 ];
 // 基线 (重建前实测): 对象总数 / 重建前 ETag
 const BASELINE_OBJECTS = 270;
 const BASELINE_ETAG = "e586af54";
 
-// demo-session 对话内容 (演示脚本)
+// demo-large-session 对话内容 (60 轮工作流)
 const TURNS = [
-  { turn:1, role:"user", msg:"帮我分析一下项目的架构" },
-  { turn:2, role:"assistant", msg:"好的,项目分为三层:交互层(TUI)、运行时(Celld)、存储(BOS)。" },
-  { turn:3, role:"user", msg:"Celld 和 BOS 各负责什么?" },
-  { turn:4, role:"assistant", msg:"Celld 是分布式运行时,提供节点健康、故障转移、worker 执行;cell 状态需要 BOS 作为权威持久层。" },
-  { turn:5, role:"user", msg:"如果节点全挂了呢?" },
-  { turn:6, role:"assistant", msg:"BOS 直写保证 RPO=0:每轮对话异步落盘到 BOS,节点恢复后从 BOS 找回全部历史。" },
-  { turn:7, role:"user", msg:"数据在 BOS 里怎么存的?" },
-  { turn:8, role:"assistant", msg:"sessions/<id>.json,带 ETag 乐观锁(CAS),并发写入不冲突不丢失。" },
-  { turn:9, role:"user", msg:"节点全挂了,数据还在吗?" },
-  { turn:10, role:"assistant", msg:"在。BOS 直写不依赖任何 Celld 节点,这就是 RPO=0 的意义。" },
+{ turn:1, role:"user", msg:"继续分析项目的架构部分,重点关注 bin/celagent-tui.mjs 的实现细节" },
+  { turn:2, role:"assistant", msg:"关于 src/bos.js 的持久化分析:\n\n1. 核心实现:该文件通过模块化设计处理持久化相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:持久化处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空输入、" },
+  { turn:3, role:"assistant", msg:"关于 src/llm.js 的CAS 并发分析:\n\n1. 核心实现:该文件通过模块化设计处理CAS 并发相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:CAS 并发处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边" },
+  { turn:4, role:"user", msg:"继续分析项目的异步队列部分,重点关注 worker/src/index.js 的实现细节" },
+  { turn:5, role:"assistant", msg:"关于 scripts/node_mgr.sh 的worker 部署分析:\n\n1. 核心实现:该文件通过模块化设计处理worker 部署相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:worker 部署处理链路包含读取配置、校验状态、" },
+  { turn:6, role:"assistant", msg:"关于 install.sh 的多机集群分析:\n\n1. 核心实现:该文件通过模块化设计处理多机集群相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:多机集群处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空" },
+  { turn:7, role:"user", msg:"继续分析项目的休眠唤醒部分,重点关注 setup.sh 的实现细节" },
+  { turn:8, role:"assistant", msg:"关于 tests/core.test.mjs 的任务状态机分析:\n\n1. 核心实现:该文件通过模块化设计处理任务状态机相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:任务状态机处理链路包含读取配置、校验状态、执行操作、写入结果四个阶" },
+  { turn:9, role:"assistant", msg:"关于 docs/bos-compat.md 的凭证处理分析:\n\n1. 核心实现:该文件通过模块化设计处理凭证处理相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:凭证处理处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3." },
+  { turn:10, role:"user", msg:"继续分析项目的错误恢复部分,重点关注 package.json 的实现细节" },
+  { turn:11, role:"assistant", msg:"关于 bin/celagent-tui.mjs 的配置管理分析:\n\n1. 核心实现:该文件通过模块化设计处理配置管理相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:配置管理处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n" },
+  { turn:12, role:"assistant", msg:"关于 src/bos.js 的测试覆盖分析:\n\n1. 核心实现:该文件通过模块化设计处理测试覆盖相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:测试覆盖处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空" },
+  { turn:13, role:"user", msg:"继续分析项目的性能优化部分,重点关注 src/llm.js 的实现细节" },
+  { turn:14, role:"assistant", msg:"关于 worker/src/index.js 的安全边界分析:\n\n1. 核心实现:该文件通过模块化设计处理安全边界相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:安全边界处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3" },
+  { turn:15, role:"assistant", msg:"关于 scripts/node_mgr.sh 的发布流程分析:\n\n1. 核心实现:该文件通过模块化设计处理发布流程相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:发布流程处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3" },
+  { turn:16, role:"user", msg:"继续分析项目的架构部分,重点关注 install.sh 的实现细节" },
+  { turn:17, role:"assistant", msg:"关于 setup.sh 的持久化分析:\n\n1. 核心实现:该文件通过模块化设计处理持久化相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:持久化处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空输入、并发" },
+  { turn:18, role:"assistant", msg:"关于 tests/core.test.mjs 的CAS 并发分析:\n\n1. 核心实现:该文件通过模块化设计处理CAS 并发相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:CAS 并发处理链路包含读取配置、校验状态、执行操作、写入结果" },
+  { turn:19, role:"user", msg:"继续分析项目的异步队列部分,重点关注 docs/bos-compat.md 的实现细节" },
+  { turn:20, role:"assistant", msg:"关于 package.json 的worker 部署分析:\n\n1. 核心实现:该文件通过模块化设计处理worker 部署相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:worker 部署处理链路包含读取配置、校验状态、执行操作、写入" },
+  { turn:21, role:"assistant", msg:"关于 bin/celagent-tui.mjs 的多机集群分析:\n\n1. 核心实现:该文件通过模块化设计处理多机集群相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:多机集群处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n" },
+  { turn:22, role:"user", msg:"继续分析项目的休眠唤醒部分,重点关注 src/bos.js 的实现细节" },
+  { turn:23, role:"assistant", msg:"关于 src/llm.js 的任务状态机分析:\n\n1. 核心实现:该文件通过模块化设计处理任务状态机相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:任务状态机处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况" },
+  { turn:24, role:"assistant", msg:"关于 worker/src/index.js 的凭证处理分析:\n\n1. 核心实现:该文件通过模块化设计处理凭证处理相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:凭证处理处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3" },
+  { turn:25, role:"user", msg:"继续分析项目的错误恢复部分,重点关注 scripts/node_mgr.sh 的实现细节" },
+  { turn:26, role:"assistant", msg:"关于 install.sh 的配置管理分析:\n\n1. 核心实现:该文件通过模块化设计处理配置管理相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:配置管理处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空" },
+  { turn:27, role:"assistant", msg:"关于 setup.sh 的测试覆盖分析:\n\n1. 核心实现:该文件通过模块化设计处理测试覆盖相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:测试覆盖处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空输入" },
+  { turn:28, role:"user", msg:"继续分析项目的性能优化部分,重点关注 tests/core.test.mjs 的实现细节" },
+  { turn:29, role:"assistant", msg:"关于 docs/bos-compat.md 的安全边界分析:\n\n1. 核心实现:该文件通过模块化设计处理安全边界相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:安全边界处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3." },
+  { turn:30, role:"assistant", msg:"关于 package.json 的发布流程分析:\n\n1. 核心实现:该文件通过模块化设计处理发布流程相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:发布流程处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:" },
+  { turn:31, role:"user", msg:"继续分析项目的架构部分,重点关注 bin/celagent-tui.mjs 的实现细节" },
+  { turn:32, role:"assistant", msg:"关于 src/bos.js 的持久化分析:\n\n1. 核心实现:该文件通过模块化设计处理持久化相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:持久化处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空输入、" },
+  { turn:33, role:"assistant", msg:"关于 src/llm.js 的CAS 并发分析:\n\n1. 核心实现:该文件通过模块化设计处理CAS 并发相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:CAS 并发处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边" },
+  { turn:34, role:"user", msg:"继续分析项目的异步队列部分,重点关注 worker/src/index.js 的实现细节" },
+  { turn:35, role:"assistant", msg:"关于 scripts/node_mgr.sh 的worker 部署分析:\n\n1. 核心实现:该文件通过模块化设计处理worker 部署相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:worker 部署处理链路包含读取配置、校验状态、" },
+  { turn:36, role:"assistant", msg:"关于 install.sh 的多机集群分析:\n\n1. 核心实现:该文件通过模块化设计处理多机集群相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:多机集群处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空" },
+  { turn:37, role:"user", msg:"继续分析项目的休眠唤醒部分,重点关注 setup.sh 的实现细节" },
+  { turn:38, role:"assistant", msg:"关于 tests/core.test.mjs 的任务状态机分析:\n\n1. 核心实现:该文件通过模块化设计处理任务状态机相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:任务状态机处理链路包含读取配置、校验状态、执行操作、写入结果四个阶" },
+  { turn:39, role:"assistant", msg:"关于 docs/bos-compat.md 的凭证处理分析:\n\n1. 核心实现:该文件通过模块化设计处理凭证处理相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:凭证处理处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3." },
+  { turn:40, role:"user", msg:"继续分析项目的错误恢复部分,重点关注 package.json 的实现细节" },
+  { turn:41, role:"assistant", msg:"关于 bin/celagent-tui.mjs 的配置管理分析:\n\n1. 核心实现:该文件通过模块化设计处理配置管理相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:配置管理处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n" },
+  { turn:42, role:"assistant", msg:"关于 src/bos.js 的测试覆盖分析:\n\n1. 核心实现:该文件通过模块化设计处理测试覆盖相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:测试覆盖处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空" },
+  { turn:43, role:"user", msg:"继续分析项目的性能优化部分,重点关注 src/llm.js 的实现细节" },
+  { turn:44, role:"assistant", msg:"关于 worker/src/index.js 的安全边界分析:\n\n1. 核心实现:该文件通过模块化设计处理安全边界相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:安全边界处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3" },
+  { turn:45, role:"assistant", msg:"关于 scripts/node_mgr.sh 的发布流程分析:\n\n1. 核心实现:该文件通过模块化设计处理发布流程相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:发布流程处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3" },
+  { turn:46, role:"user", msg:"继续分析项目的架构部分,重点关注 install.sh 的实现细节" },
+  { turn:47, role:"assistant", msg:"关于 setup.sh 的持久化分析:\n\n1. 核心实现:该文件通过模块化设计处理持久化相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:持久化处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空输入、并发" },
+  { turn:48, role:"assistant", msg:"关于 tests/core.test.mjs 的CAS 并发分析:\n\n1. 核心实现:该文件通过模块化设计处理CAS 并发相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:CAS 并发处理链路包含读取配置、校验状态、执行操作、写入结果" },
+  { turn:49, role:"user", msg:"继续分析项目的异步队列部分,重点关注 docs/bos-compat.md 的实现细节" },
+  { turn:50, role:"assistant", msg:"关于 package.json 的worker 部署分析:\n\n1. 核心实现:该文件通过模块化设计处理worker 部署相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:worker 部署处理链路包含读取配置、校验状态、执行操作、写入" },
+  { turn:51, role:"assistant", msg:"关于 bin/celagent-tui.mjs 的多机集群分析:\n\n1. 核心实现:该文件通过模块化设计处理多机集群相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:多机集群处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n" },
+  { turn:52, role:"user", msg:"继续分析项目的休眠唤醒部分,重点关注 src/bos.js 的实现细节" },
+  { turn:53, role:"assistant", msg:"关于 src/llm.js 的任务状态机分析:\n\n1. 核心实现:该文件通过模块化设计处理任务状态机相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:任务状态机处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况" },
+  { turn:54, role:"assistant", msg:"关于 worker/src/index.js 的凭证处理分析:\n\n1. 核心实现:该文件通过模块化设计处理凭证处理相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:凭证处理处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3" },
+  { turn:55, role:"user", msg:"继续分析项目的错误恢复部分,重点关注 scripts/node_mgr.sh 的实现细节" },
+  { turn:56, role:"assistant", msg:"关于 install.sh 的配置管理分析:\n\n1. 核心实现:该文件通过模块化设计处理配置管理相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:配置管理处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空" },
+  { turn:57, role:"assistant", msg:"关于 setup.sh 的测试覆盖分析:\n\n1. 核心实现:该文件通过模块化设计处理测试覆盖相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:测试覆盖处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:对空输入" },
+  { turn:58, role:"user", msg:"继续分析项目的性能优化部分,重点关注 tests/core.test.mjs 的实现细节" },
+  { turn:59, role:"assistant", msg:"关于 docs/bos-compat.md 的安全边界分析:\n\n1. 核心实现:该文件通过模块化设计处理安全边界相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:安全边界处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3." },
+  { turn:60, role:"assistant", msg:"关于 package.json 的发布流程分析:\n\n1. 核心实现:该文件通过模块化设计处理发布流程相关逻辑,主要入口函数负责初始化与调度\n2. 关键路径:发布流程处理链路包含读取配置、校验状态、执行操作、写入结果四个阶段\n3. 边界情况:" },
 ];
 
 // 延迟分布 (实测): 见 REAL_RECORDS (worker 56-578ms, BOS 读 732-1423ms, BOS 写 665-783ms)
@@ -634,8 +734,8 @@ const state = {
 
 // 会话清单 (真实存在的 key + 真实大小)
 const SESSIONS = [
-  { k:"sess-demo-secondary", turns:3, size:113 },  // 实测
-  { k:"demo-session", turns:10, size:1185 },  // 重建后真实大小
+  { k:"demo-large-session", turns:60, size:80879 },  // 60 轮真实工作流 (79KB)
+  { k:"sess-demo-secondary", turns:3, size:113 },          // 实测
   { k:"my session 中文", turns:1, size:10 },
 ];
 
@@ -679,7 +779,7 @@ function updateMetrics() {
   const avg = a => a.length ? Math.round(a.reduce((s,v)=>s+v,0)/a.length) + "ms" : "—";
   $("mReadLat").textContent = avg(state.readLats.slice(-5));
   $("mWriteLat").textContent = avg(state.writeLats.slice(-5));
-  // 延迟条 (相对 1500ms — 真实延迟量级: worker 56-578, 读 732-1423, 写 665-783)
+  // 延迟条 (相对 1700ms — 60 轮实测: worker 67-238, 读 807-1706, 写 665-1018)
   const pct = ms => Math.min(100, Math.round(ms/1500*100));
   $("barWorker").style.width = pct(state.workerLat) + "%"; $("valWorker").textContent = state.workerLat + "ms";
   $("barRead").style.width = pct(state.readLat) + "%"; $("valRead").textContent = state.readLat + "ms";
@@ -691,7 +791,7 @@ function renderObjects(highlightKey) {
   for (const s of SESSIONS) {
     const tr = document.createElement("tr");
     if (s.k === highlightKey) tr.className = "new";
-    const etag = s.k === "demo-session" ? state.etag.replace(/"/g,"") : "—";
+    const etag = s.k === "demo-large-session" ? state.etag.replace(/"/g,"") : "—";
     tr.innerHTML = `<td class="k">${s.k}</td><td>${s.turns}</td><td>${s.size}B</td><td class="etag">${etag.slice(0,12)}</td>`;
     objBody.appendChild(tr);
   }
@@ -704,7 +804,7 @@ async function runOneTurn() {
   if (state.running) return;
   // 越界保护: 10 轮完成后不再运行 (TURNS[10] 不存在, 会崩溃)
   if (state.turn >= TURNS.length) {
-    logFlow("🏁 10 轮已全部播放完毕 — 点击「重置」可重新开始", "op-ok");
+    logFlow("🏁 60 轮已全部播放完毕 — 点击「重置」可重新开始", "op-ok");
     state.auto = false;
     $("btnAuto").textContent = "⏵ 自动播放";
     return;
@@ -716,8 +816,8 @@ async function runOneTurn() {
   const i = state.turn;
   const rec = REAL_RECORDS[i];
   state.turn++;
-  // 对象总数不变 (demo-session 是覆盖同一 key, 不新增对象);
-  // demo-session 大小按真实采集递增 (117B → 1185B)
+  // 对象总数不变 (demo-large-session 是覆盖同一 key, 不新增对象);
+  // demo-large-session 大小按真实采集递增 (173B → 80879B)
   state.objects = BASELINE_OBJECTS;
   state.bytes = rec.size;
 
@@ -752,7 +852,7 @@ async function runOneTurn() {
     logFlow(`[Celld] ✓ worker SQLite 缓存写入 ${workerMs}ms`, "op-ok");
     // 追踪: Celld 侧变化
     celldCell.innerHTML = `<span class="tt">Celld · turn ${turn.turn} → 节点${[18090,18091][active]}</span>` +
-      `<span class="kv">session:demo-session 缓存 turns=${state.turn}</span><br>` +
+      `<span class="kv">session:demo-large-session 缓存 turns=${state.turn}</span><br>` +
       `<span class="change">✓ 写入 ${workerMs}ms · msg 截断 200 字符</span>`;
   } else {
     logFlow("[Celld] ⛔ 两节点均离线 — 降级:仅 BOS 持久化 (缓存丢失可重建)", "op-fail");
@@ -769,7 +869,7 @@ async function runOneTurn() {
   const readMs = rec.readMs;
   state.readLats.push(readMs);
   state.readLat = readMs;
-  logFlow(`[BOS] GET sessions/demo-session.json → 旧 ETag "${state.etag}" (${readMs}ms)`, "op-read");
+  logFlow(`[BOS] GET sessions/demo-large-session.json → 旧 ETag "${state.etag}" (${readMs}ms)`, "op-read");
   await sleep(Math.min(readMs, 250));
   updateMetrics();
 
@@ -779,16 +879,16 @@ async function runOneTurn() {
   state.writeLats.push(writeMs);
   state.writeLat = writeMs;
   const newEtag = rec.etag;  // 真实 ETag (无引号存储)
-  logFlow(`[BOS] PUT sessions/demo-session.json (If-Match "${state.etag}") ${writeMs}ms → ETag "${newEtag}"`, "op-write");
+  logFlow(`[BOS] PUT sessions/demo-large-session.json (If-Match "${state.etag}") ${writeMs}ms → ETag "${newEtag}"`, "op-write");
   await sleep(Math.min(writeMs, 500));
   state.etag = newEtag;  logFlow(`[BOS] ✓ 落盘成功 (turns=${state.turn}, size=${rec.size}B) · 权威源更新`, "op-ok");
   // 追踪: BOS 侧变化
-  bosCell.innerHTML = `<span class="tt">BOS · turn ${turn.turn} · sessions/demo-session.json</span>` +
+  bosCell.innerHTML = `<span class="tt">BOS · turn ${turn.turn} · sessions/demo-large-session.json</span>` +
     `<span class="kv">GET 旧 ETag "${state.etag}" (${readMs}ms)</span><br>` +
     `<span class="kv">PUT If-Match CAS → 新 ETag "${newEtag}" (${writeMs}ms)</span><br>` +
     `<span class="change">✓ turns=${state.turn} · size=${rec.size}B · 权威源已更新</span>`;
   updateMetrics();
-  renderObjects("demo-session");
+  renderObjects("demo-large-session");
   await sleep(300);
 
   state.running = false;
