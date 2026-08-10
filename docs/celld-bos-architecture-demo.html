@@ -126,7 +126,7 @@
   footer { margin-top:18px; text-align:center; color:var(--dim); font-size:11.5px; font-family:var(--mono); }
 
   /* 锚点目标避开悬浮条 */
-  #arch, #process, #monitor, #value { scroll-margin-top: 130px; }
+  #arch, #process, #monitor, #value, #paths { scroll-margin-top: 130px; }
 
   /* 悬浮操作条: 滚动时始终可见 */
   .sticky-bar {
@@ -189,6 +189,7 @@
     <a href="#process">2 运行过程</a>
     <a href="#monitor">3 BOS 监控</a>
     <a href="#value">4 价值评估</a>
+    <a href="#paths">5 三条数据路径</a>
   </div>
   <div class="sticky-hint">↓ 滚动页面时本操作条固定于顶部 · 自动播放中可随时点击「故障注入」观察降级</div>
 </div></header>
@@ -213,11 +214,13 @@
     <!-- ===== 步骤 1: 交互 ===== -->
     <rect x="30" y="30" width="1020" height="95" rx="16" fill="#181e2b" stroke="#3fb950"/>
     <text x="60" y="62" font-size="17" font-weight="700" fill="#e6edf3">① 你正在和 celagent 对话</text>
-    <text x="60" y="88" font-size="13" fill="#8b949e">它回答你的问题、调用工具(bash/read/write…)。每轮对话结束,它会把这一轮自动保存——</text>
-    <text x="60" y="110" font-size="13" fill="#8b949e">不是只存在你电脑里,而是同时写到下面两个地方:</text>
+    <text x="60" y="88" font-size="13" fill="#8b949e">它回答你、调用工具(bash/read/write…)。注意:工具的文件操作和它的"记忆"走两条完全不同的路——</text>
+    <text x="60" y="110" font-size="13" fill="#8b949e">记忆(对话历史)每轮自动保存到下面两处;工具的文件操作直接落本地磁盘(与 Celld/BOS 无关,见下方表格)</text>
 
     <!-- 步骤 2/3: 双写 -->
     <text x="540" y="168" font-size="14" font-weight="700" fill="#7d8590" text-anchor="middle">每轮对话,双写两处 ↓</text>
+
+    <!-- 步骤 2/3: 双写 -->
 
     <!-- Celld 框 -->
     <rect x="60" y="190" width="460" height="190" rx="16" fill="#12161f" stroke="#58a6ff"/>
@@ -254,6 +257,44 @@
     <path d="M 800 380 L 800 448" stroke="#3fb950" stroke-width="2.5" fill="none" marker-end="url(#arrG)"/>
     <text x="812" y="420" font-size="12" fill="#3fb950" font-family="monospace">读历史</text>
   </svg>
+
+  <!-- 三条数据路径 (关键: 避免误导) -->
+  <div style="margin-top:14px" id="paths">
+    <div class="panel-title">三条数据路径 — agent 的"手"和"大脑"分开走</div>
+    <table class="obj-table" style="margin-top:8px">
+      <thead><tr>
+        <th style="width:130px">路径</th><th style="width:200px">谁在操作</th>
+        <th>交互对象</th><th>是否经过 Celld/BOS</th><th>丢了会怎样</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td style="color:#8b949e;font-weight:600">A. 工具文件操作</td>
+          <td>bash / read / write / edit / grep / find / ls</td>
+          <td><b>本地文件系统</b>(你项目里的代码/文件)</td>
+          <td style="color:#8b949e"><b>完全不经过</b> — 就是普通本地读写,改完立即生效</td>
+          <td>与 Celld/BOS 无关 — 需自行 git 提交保护</td>
+        </tr>
+        <tr>
+          <td style="color:#58a6ff;font-weight:600">B. 对话记忆(持久化)</td>
+          <td>celagent 每轮 turn_end 钩子</td>
+          <td><b>双写</b>:Celld 本地缓存 + BOS sessions/*.json</td>
+          <td style="color:#3fb950"><b>这是 Celld/BOS 参与的唯一路径</b></td>
+          <td>BOS 是权威 — 本地/节点全丢也能从 BOS 找回</td>
+        </tr>
+        <tr>
+          <td style="color:#7d8590;font-weight:600">C. 运行时态</td>
+          <td>pi 引擎 / 配置</td>
+          <td>本地文件:agentDir 会话 JSONL、settings.json、凭证引用</td>
+          <td>不经过(纯本地)</td>
+          <td>本地丢失不影响 BOS 里的对话历史</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="dataflow-note" style="margin-top:8px">
+      <b>一句话:</b> agent 的"手"(工具)只碰本地文件系统;<b>Celld/BOS 管的是"大脑"(对话记忆)</b>。
+      你在项目里让 agent 改代码 = 本地写盘;你关掉它/换电脑 = 记忆从 BOS 找回(但改过的文件需要 git)。
+    </div>
+  </div>
 
   <!-- 定位一句话 + 价值分层表 -->
   <div class="dataflow-note" style="margin-top:10px" id="value">
