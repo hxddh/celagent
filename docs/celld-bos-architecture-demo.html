@@ -174,9 +174,9 @@
 <div class="wrap">
 
 <header>
-  <h1><span class="a">celagent</span> 运行过程 · Celld × BOS 实时交互监控</h1>
+  <h1><span class="a">celagent</span> 运行过程演示 · Celld × BOS 交互与监控</h1>
   <div class="subtitle" style="color:var(--dim);font-size:13px;margin-top:4px">
-    三层架构 · 每轮双写过程 · BOS 读写监控 — 数据为真实采集回放(2026-08-10 采集于 bucket celagent-<user>-<ts>)
+    三层定位 · 每轮双写过程 · BOS 读写监控 — 对话为演示脚本;延迟/ETag/对象大小等数字为真实采集(2026-08-10, bucket celagent-<user>-<ts>)
   </div>
   <div class="badge-row" style="margin-top:10px;display:flex;gap:14px;justify-content:center;flex-wrap:wrap;font-size:12px;color:var(--dim)">
     <span><span style="color:#58a6ff">■</span> Celld 运行时/缓存</span>
@@ -197,11 +197,11 @@
   </div>
   <div class="nav-links">
     <a href="#arch">1 架构图</a>
-    <a href="#process">2 运行过程</a>
-    <a href="#monitor">3 BOS 监控</a>
-    <a href="#value">4 价值评估</a>
-    <a href="#paths">5 三条数据路径</a>
-    <a href="#payload">6 写入的数据</a>
+    <a href="#paths">2 三条路径</a>
+    <a href="#payload">3 写入的数据</a>
+    <a href="#process">4 运行过程</a>
+    <a href="#monitor">5 BOS 监控</a>
+    <a href="#value">6 价值评估</a>
   </div>
   <div class="sticky-hint">↓ 滚动页面时本操作条固定于顶部 · 自动播放中可随时点击「故障注入」观察降级</div>
 </div></header>
@@ -273,7 +273,7 @@
 
   <!-- 三条数据路径 (关键: 避免误导) -->
   <div style="margin-top:14px" id="paths">
-    <div class="panel-title">三条数据路径 — agent 的"手"和"大脑"分开走</div>
+    <div class="panel-title">② 三条数据路径 — agent 的"手"和"大脑"分开走</div>
     <table class="obj-table" style="margin-top:8px">
       <thead><tr>
         <th style="width:130px">路径</th><th style="width:200px">谁在操作</th>
@@ -311,10 +311,10 @@
 
   <!-- 具体写入的数据 (真实结构) -->
   <div style="margin-top:14px" id="payload">
-    <div class="panel-title">具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照"</div>
+    <div class="panel-title">③ 具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照"</div>
     <div style="font-size:12.5px;color:var(--dim);margin-bottom:8px">
       每轮对话结束,celagent 把<b style="color:var(--text)">这一轮的对话记录</b>(不是文件、不是工作区)打包成一条 JSON 写入两处。
-      以 demo-session 第 1 轮为例(真实数据,2026-08-10 采集):
+      以下为结构示例(字段结构真实,内容为演示):
     </div>
     <div class="json-block"><span class="c">// Celld worker 缓存 (session:demo-session) — msg 截断 200 字符</span>
 {
@@ -326,6 +326,7 @@
 }
 
 <span class="c">// BOS 权威源 (sessions/demo-session.json) — msg 完整不截断, 多一个 role 字段</span>
+<span class="c">// (示例中 role=user 为演示脚本; 真实产品 turn_end 钩子只写 assistant 轮)</span>
 {
   <span class="k">"id"</span>: <span class="s">"demo-session"</span>,
   <span class="k">"turns"</span>: [
@@ -338,14 +339,16 @@
       <tbody>
         <tr><td><code>turn</code></td><td>轮次序号(1,2,3…)</td><td>✓</td><td>✓</td></tr>
         <tr><td><code>role</code></td><td>发言角色:user / assistant</td><td style="color:#8b949e">✗ 不存</td><td>✓</td></tr>
-        <tr><td><code>msg</code></td><td>该轮内容:回复文本 + 工具调用摘要(≤100字符)+ 工具结果摘要(≤300字符)</td><td style="color:#d29922">截断 200 字符</td><td style="color:#3fb950">完整保存</td></tr>
+        <tr><td><code>msg</code></td><td>回复文本 + 工具调用摘要 + 工具结果摘要(各带长度上限,见下方说明)</td><td style="color:#d29922">截断 200 字符</td><td style="color:#3fb950">完整保存</td></tr>
         <tr><td><code>ts</code></td><td>时间戳(ms)</td><td>✓</td><td>✓</td></tr>
         <tr><td><code>updatedAt</code></td><td>会话最后更新时间</td><td>✓</td><td style="color:#8b949e">—</td></tr>
       </tbody>
     </table>
     <div class="dataflow-note" style="margin-top:8px">
       <b>不存什么:</b> 不存你的项目文件、不存工具产生的文件内容本身 — 只存<b>对话记录</b>(谁说了什么、调了哪些工具、结果摘要)。
-      写入的 msg 形如:<code style="color:var(--blue)">"分析一下… [工具调用: bash(&#34;ls&#34;)] [工具结果: bash: src bin docs…"</code>
+      写入的 msg 形如:<code style="color:var(--blue)">"分析一下… [工具调用: bash(&#34;ls&#34;)] [工具结果: bash: src bin docs…"</code><br>
+      <span style="color:var(--dim)">注:真实产品钩子(turn_end)只存 assistant 轮;user 轮仅出现在本页演示脚本中。
+      摘要长度上限:工具调用 ≤100 字符、工具结果 ≤300 字符(汇总拼接后写入)。</span>
     </div>
     <div class="dataflow-note" style="margin-top:6px">
       <b>为什么 worker 缓存截断 200 字符?</b> 缓存写入走 HTTP GET,msg 作为 URL 参数传递 —
@@ -390,8 +393,8 @@
   <!-- ===== 左: 运行过程 ===== -->
   <div id="process">
     <div class="panel">
-      <div class="panel-title"><span class="live">● LIVE</span> ② 运行过程(点击"运行一轮"或自动播放 — 每轮展示双写全过程)</div>
-      <div style="font-size:11px;color:var(--dim);margin-bottom:10px">⚠ 动画为加速演示,追踪表与监控中的数字均为真实采集耗时</div>
+      <div class="panel-title"><span class="live">● LIVE</span> ④ 运行过程(点击"运行一轮"或自动播放 — 每轮展示双写全过程)</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:10px">⚠ 对话内容为演示脚本(展示双写流程);追踪表与监控中的延迟/ETag/大小均为真实采集值</div>
 
       <!-- Celld 节点 -->
       <div class="nodes">
@@ -424,6 +427,7 @@
       <div class="flow" id="flow" aria-live="polite"><div class="flow-line" style="color:var(--dim)">等待运行…(每轮: worker 写 → BOS 读 ETag → CAS 写 → ETag 更新)</div></div>
 
       <!-- 对话消息 -->
+      <div style="font-size:11px;color:var(--dim);margin:12px 0 4px">对话消息(演示脚本 — 展示双写流程用)</div>
       <div class="chat" id="chat" aria-live="polite"></div>
     </div>
   </div>
@@ -431,7 +435,7 @@
   <!-- ===== 右: BOS 监控 ===== -->
   <div id="monitor">
     <div class="panel">
-      <div class="panel-title">③ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
+      <div class="panel-title">⑤ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
 
       <div class="mon-grid">
         <div class="metric"><div class="m-label">对象总数 (bucket)</div><div class="m-value blue" id="mObjects">230</div><div class="m-sub">sessions 35 · cells 176 · deploy 10 · celld 状态 9</div></div>
@@ -440,7 +444,7 @@
         <div class="metric"><div class="m-label">写次数 (演示)</div><div class="m-value yellow" id="mWrites">0</div><div class="m-sub">PUT (If-Match CAS)</div></div>
         <div class="metric"><div class="m-label">平均读延迟</div><div class="m-value" id="mReadLat">—</div><div class="m-sub">最近 5 次滚动 (ms)</div></div>
         <div class="metric"><div class="m-label">平均写延迟</div><div class="m-value" id="mWriteLat">—</div><div class="m-sub">最近 5 次滚动 (ms)</div></div>
-        <div class="metric"><div class="m-label">CAS 冲突</div><div class="m-value red" id="mCas">0</div><div class="m-sub">412 被拒 → 重读合并</div></div>
+        <div class="metric"><div class="m-label">CAS 冲突</div><div class="m-value red" id="mCas">0</div><div class="m-sub">单客户端演示无冲突(CAS 保护见故障注入场景)</div></div>
         <div class="metric"><div class="m-label">当前 ETag</div><div class="m-value" id="mEtag" style="font-size:12px">—</div><div class="m-sub">sessions/demo-session.json</div></div>
       </div>
 
@@ -452,7 +456,7 @@
       </div>
 
       <!-- 对象清单 -->
-      <div style="font-size:11px;color:var(--dim);margin:10px 0 4px">sessions/ 对象清单(演示 3 个,实际 35 个 — 高亮行为本轮更新)</div>
+      <div style="font-size:11px;color:var(--dim);margin:10px 0 4px">sessions/ 对象清单(演示 3 个,实际 35 个 — 高亮行为本轮更新;turns 数为对象内轮次)</div>
       <table class="obj-table">
         <thead><tr><th>key</th><th>turns</th><th>size</th><th>ETag (前12)</th></tr></thead>
         <tbody id="objBody"></tbody>
@@ -463,14 +467,17 @@
 
 <footer>
   <b>核心结论:</b> BOS 是 celagent 的核心价值(会话跨机器/防丢失,RPO=0,故障注入实测恢复 10/10 轮);
-  Celld 提供本地缓存加速(可替换)。⚠️ 本页为<b>真实数据回放</b>:数字来自 2026-08-10 对真实 BOS 的一次完整重建采集,
-  自动播放按序回放,不重复访问 BOS;数据保存在 <code>sessions/demo-session.json</code> (bucket <code>celagent-<user>-<ts></code>)
+  Celld 提供本地缓存加速(可替换)。⚠️ 本页为<b>演示 + 真实数据混合</b>:对话脚本为演示用途;
+  延迟/ETag/对象大小等数字来自 2026-08-10 对真实 BOS 的一次完整重建采集,自动播放按序回放,不重复访问 BOS;
+  数据保存在 <code>sessions/demo-session.json</code> (bucket <code>celagent-<user>-<ts></code>)
 </footer>
 
 </div>
 
 <script>
-// ============ 真实采集数据 (2026-08-10 实测, 10 轮完整双写) ============
+// ============ 数据来源说明 ============
+// 延迟/ETag/大小: 2026-08-10 对真实 BOS 一次完整重建采集 (10 轮双写逐轮实测)
+// 对话内容: 演示脚本 (真实产品 turn_end 钩子只存 assistant 轮)
 // 每轮: worker 写延迟 / BOS 读延迟 / BOS 写延迟 / 真实 ETag / 对象真实大小
 const REAL_RECORDS = [
   { turn:1, workerMs:578, readMs:732,  writeMs:762,  etag:"7e9c569eaf37", size:117  },
@@ -488,7 +495,7 @@ const REAL_RECORDS = [
 const BASELINE_OBJECTS = 230;
 const BASELINE_ETAG = "e586af54";
 
-// demo-session 10 轮真实内容
+// demo-session 对话内容 (演示脚本)
 const TURNS = [
   { turn:1, role:"user", msg:"帮我分析一下项目的架构" },
   { turn:2, role:"assistant", msg:"好的,项目分为三层:交互层(TUI)、运行时(Celld)、存储(BOS)。" },
@@ -502,7 +509,7 @@ const TURNS = [
   { turn:10, role:"assistant", msg:"在。BOS 直写不依赖任何 Celld 节点,这就是 RPO=0 的意义。" },
 ];
 
-// 真实延迟分布 (实测): 见 REAL_RECORDS (worker 56-578ms, BOS 读 732-1423ms, BOS 写 665-783ms)
+// 延迟分布 (实测): 见 REAL_RECORDS (worker 56-578ms, BOS 读 732-1423ms, BOS 写 665-783ms)
 
 // ============ 状态 ============
 const state = {
@@ -517,7 +524,7 @@ const state = {
   auto: false,
 };
 
-// 会话清单 (基线: 真实存在的 key + 真实大小)
+// 会话清单 (真实存在的 key + 真实大小)
 const SESSIONS = [
   { k:"sess-demo-secondary", turns:3, size:87 },
   { k:"demo-session", turns:10, size:1185 },  // 重建后真实大小
