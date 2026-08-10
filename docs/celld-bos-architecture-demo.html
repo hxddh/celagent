@@ -165,7 +165,7 @@
 
     <!-- ===== 层 2: 运行时层 ===== -->
     <rect x="30" y="160" width="1020" height="190" rx="14" fill="#12161f" stroke="#30363d" stroke-dasharray="6 4"/>
-    <text x="50" y="188" font-size="14" font-weight="700" fill="#58a6ff">② 运行时层 — Celld 双节点 (分布式 Durable Object 运行时)</text>
+    <text x="50" y="188" font-size="14" font-weight="700" fill="#58a6ff">② 运行时层 — Celld 双节点 (本地缓存/执行器 · 非权威源)</text>
 
     <!-- 节点 A -->
     <rect x="60" y="205" width="270" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
@@ -174,7 +174,7 @@
     <text x="75" y="248" font-size="11" fill="#8b949e">worker 执行器 · checkpoint API</text>
     <text x="75" y="268" font-size="11" fill="#8b949e">SQLite 缓存 session:&lt;id&gt;</text>
     <text x="75" y="288" font-size="11" fill="#8b949e">承载:worker 缓存(截断 200 字符)</text>
-    <text x="75" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">task:·cron:·kv:·ledger</text>
+    <text x="75" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">缓存可丢 — BOS 是权威源</text>
 
     <!-- 节点 B -->
     <rect x="400" y="205" width="410" height="125" rx="10" fill="#181e2b" stroke="#58a6ff"/>
@@ -183,7 +183,7 @@
     <text x="415" y="248" font-size="11" fill="#8b949e">与 A 同构 · 故障转移备节点 · A 挂掉时接管</text>
     <text x="415" y="268" font-size="11" fill="#8b949e">自动启动 + 端口预检 + 残留所有权清理</text>
     <text x="415" y="288" font-size="11" fill="#8b949e">同一 bucket · 同一 worker · 缓存可丢(BOS 重建)</text>
-    <text x="415" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">定位="快":~100ms 缓存 · 替代常驻 DB/内存状态机</text>
+    <text x="415" y="308" font-size="10.5" fill="#7d8590" font-family="monospace">定位=本地缓存(可替换) · 独有能力(休眠/epoch/委托)未启用</text>
 
     <!-- 节点间同步 -->
     <line x1="345" y1="267" x2="400" y2="267" stroke="#58a6ff" stroke-dasharray="4 3" stroke-width="1.5"/>
@@ -243,40 +243,39 @@
 
     <!-- ===== 替代关系条 ===== -->
     <rect x="30" y="615" width="1020" height="90" rx="14" fill="#181e2b" stroke="#bc8cff" stroke-dasharray="6 4"/>
-    <text x="50" y="638" font-size="12.5" font-weight="700" fill="#bc8cff">替代了什么:不是"本地文件系统",而是"本地作为唯一存储"的权威地位</text>
-    <text x="50" y="660" font-size="11" fill="#8b949e">本地文件仍然存在:pi 引擎本地 JSONL(运行时态,19 个)· Celld worker SQLite(缓存,1.3MB)· 配置/凭证</text>
-    <text x="50" y="678" font-size="11" fill="#8b949e">但权威性转移:BOS sessions/ 成为唯一真相 — 本地全丢/换机器/节点全挂,从 BOS 找回全部会话</text>
-    <text x="50" y="696" font-size="11" fill="#8b949e">取代的角色:本地单点存储 · 常驻 DB 服务器 · 手动部署的后端服务 — 换成 BOS 权威 + Celld 自愈运行时</text>
+    <text x="50" y="638" font-size="12.5" font-weight="700" fill="#bc8cff">价值分层:BOS = 核心价值(已验证) · Celld = 本地加速(可替换)</text>
+    <text x="50" y="660" font-size="11" fill="#8b949e">BOS 解决真实需求:会话跨机器/防丢失(RPO=0)——故障注入实测:节点全挂仍可写、恢复 10/10 轮</text>
+    <text x="50" y="678" font-size="11" fill="#8b949e">Celld 当前实际价值:低延迟本地缓存(~100ms) + 节点自动管理;其独有能力(休眠唤醒/epoch/委托)</text>
+    <text x="50" y="696" font-size="11" fill="#8b949e">在单机 agent 场景无实际需求(研究驱动,非需求驱动)——本地文件未消失,但权威地位移交 BOS</text>
   </svg>
 
-  <!-- 定位一句话 + 替代关系表 -->
+  <!-- 定位一句话 + 价值分层表 -->
   <div class="dataflow-note" style="margin-top:10px">
-    <b>定位一句话:</b> <code>Celld = 快(运行时+缓存)</code> · <code>BOS = 稳(权威持久层)</code> —
-    celagent 把"会话永不丢"交给 BOS,把"低延迟运行"交给 Celld。
-    <br>一个关键事实:<b>它们不是平行组件,而是分工协作</b> — Celld 的 cell 状态也存 BOS(cells/),
-    worker 代码也经 BOS 分发(deploy/),BOS 是整套体系的地基。
+    <b>一句话定位:</b> <code>BOS = 核心价值(权威持久层,跨机器防丢失)</code> ·
+    <code>Celld = 本地加速(缓存,可替换)</code> —
+    把"会话永不丢"交给 BOS(真实需求,已验证),Celld 提供低延迟本地缓存与节点自动管理。
   </div>
 
   <table class="obj-table" style="margin-top:10px">
-    <thead><tr><th style="width:100px">组件</th><th>承载的数据类型</th><th>替代了什么</th><th>为什么替代(价值)</th></tr></thead>
+    <thead><tr><th style="width:100px">组件</th><th>承载的数据类型</th><th>实际价值</th><th>价值评估(诚实版)</th></tr></thead>
     <tbody>
-      <tr>
-        <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
-        <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、测试语义 <code>task:/cron:/kv:/ledger</code>、cell 状态(LTX/own 经 BOS)</td>
-        <td>常驻数据库服务器、内存状态机、手动部署的后端服务 — 一个本地自动拉起、故障转移的分布式运行时</td>
-        <td>零运维:检测到无节点自动拉起,端口预检防重复,节点挂了另一节点接管 — 用户无感</td>
-      </tr>
       <tr>
         <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
         <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,176 个)、<b>deploy/agent-runtime</b>(worker 代码包,9 个)</td>
-        <td>取代"本地单点存储"的权威地位 — 本地 JSONL/SQLite 仍在(运行时态/缓存),但不再是唯一真相;权威移到 BOS(跨机器、RPO=0、并发安全 CAS)</td>
-        <td>跨机器、RPO=0、并发安全(CAS):换机器/删本地/节点全挂都能找回全部会话</td>
+        <td>会话跨机器/防丢失(RPO=0)、并发安全(CAS)、换机器/删本地/节点全挂都能找回</td>
+        <td style="color:var(--green)"><b>✅ 核心价值,真实需求,故障注入实测验证</b>(节点全挂可写、恢复 10/10)</td>
+      </tr>
+      <tr>
+        <td style="color:#58a6ff;font-weight:600">Celld 双节点</td>
+        <td>worker SQLite 缓存 <code>session:&lt;id&gt;</code>(截断 200 字符)、cell 状态(LTX/own 经 BOS)、deploy 里的 worker 执行环境</td>
+        <td>低延迟本地缓存(~100ms)、节点自动拉起/故障转移、worker 执行器</td>
+        <td style="color:var(--yellow)"><b>⚠ 边际价值:缓存可丢(BOS 重建);独有能力(休眠/epoch/委托)未启用</b> — 研究驱动遗留,非需求驱动</td>
       </tr>
       <tr>
         <td style="color:#3fb950;font-weight:600">celagent (TUI)</td>
         <td>运行时态:pi 引擎会话(agentDir 独立目录)、配置 settings.json、BOS 凭证引用(~/.aws/credentials)</td>
-        <td>旧版自写 CLI 壳(已归档)、直接读写会话文件的代码路径</td>
-        <td>复用 Pi 引擎全部能力(TUI/工具/多模型),只替换持久化层 — 独立品牌、不 fork、不重复造轮子</td>
+        <td>复用 Pi 引擎全部能力,只替换持久化层;独立品牌、不 fork</td>
+        <td>✅ 交互层,复用成熟引擎,专注持久化差异化</td>
       </tr>
     </tbody>
   </table>
