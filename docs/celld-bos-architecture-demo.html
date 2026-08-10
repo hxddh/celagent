@@ -12,7 +12,25 @@
     --red: #f85149; --red-bg: rgba(248,81,73,.1);
     --blue: #58a6ff; --blue-bg: rgba(88,166,255,.1);
     --yellow: #d29922; --purple: #bc8cff;
+    --svg-dim: #8b949e;   /* SVG 内次级文字 */
+    --svg-panel: #181e2b; /* SVG 内卡片底 */
+    --svg-panel2: #12161f;/* SVG 内层底 */
+    --svg-text: #e6edf3;  /* SVG 内标题文字 */
+    --sticky-bg: rgba(11,14,20,0.92);
     --mono: 'SF Mono','JetBrains Mono',Consolas,monospace;
+  }
+  [data-theme="light"] {
+    --bg: #f6f8fa; --panel: #ffffff; --panel2: #eef1f5; --border: #d0d7de;
+    --text: #1f2328; --dim: #57606a;
+    --sticky-bg: rgba(246,248,250,0.92);
+    --green: #1a7f37; --green-bg: rgba(26,127,55,.08);
+    --red: #cf222e; --red-bg: rgba(207,34,46,.08);
+    --blue: #0969da; --blue-bg: rgba(9,105,218,.08);
+    --yellow: #9a6700; --purple: #8250df;
+    --svg-dim: #57606a;
+    --svg-panel: #f6f8fa;
+    --svg-panel2: #ffffff;
+    --svg-text: #1f2328;
   }
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:var(--bg); color:var(--text); font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; padding:20px 14px 60px; }
@@ -105,6 +123,11 @@
   .json-block .s { color:#a5d6ff; }
   .json-block .n { color:#ffa657; }
   .json-block .c { color:#8b949e; font-style:italic; }
+  [data-theme="light"] .json-block { background:#f6f8fa; color:#1f2328; }
+  [data-theme="light"] .json-block .k { color:#0550ae; }
+  [data-theme="light"] .json-block .s { color:#0a3069; }
+  [data-theme="light"] .json-block .n { color:#953800; }
+  [data-theme="light"] .json-block .c { color:#57606a; }
 
   .chat { margin-top:16px; display:flex; flex-direction:column; gap:10px; max-height:300px; overflow-y:auto; padding-right:4px; }
   .msg { border-radius:10px; padding:9px 12px; font-size:12.5px; max-width:95%; animation:slidein .25s; }
@@ -151,7 +174,7 @@
     position: sticky;
     top: 0;
     z-index: 1000;
-    background: rgba(11,14,20,0.92);
+    background: var(--sticky-bg, rgba(11,14,20,0.92));
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
     border-bottom: 1px solid var(--border);
@@ -201,6 +224,7 @@
     <button class="btn" id="btnAuto">⏵ 自动播放</button>
     <button class="btn danger" id="btnKill">⛔ 故障注入:kill 节点</button>
     <button class="btn" id="btnReset">↺ 重置</button>
+    <button class="btn" id="btnTheme" title="切换浅色/暗色主题">☀ 浅色</button>
   </div>
   <div class="nav-links">
     <a href="#arch">1 架构图</a>
@@ -231,35 +255,35 @@
     </defs>
 
     <!-- ===== 步骤 1: 交互 ===== -->
-    <rect x="30" y="30" width="1020" height="95" rx="16" fill="#181e2b" stroke="#3fb950"/>
-    <text x="60" y="62" font-size="17" font-weight="700" fill="#e6edf3">① 你正在和 celagent 对话</text>
-    <text x="60" y="88" font-size="13" fill="#8b949e">它回答你、调用工具(bash/read/write…)。注意:工具的文件操作和它的"记忆"走两条完全不同的路——</text>
-    <text x="60" y="110" font-size="13" fill="#8b949e">记忆(对话历史)每轮自动保存到下面两处;工具的文件操作直接落本地磁盘(与 Celld/BOS 无关,见下方表格)</text>
+    <rect x="30" y="30" width="1020" height="95" rx="16" fill="var(--svg-panel)" stroke="#3fb950"/>
+    <text x="60" y="62" font-size="17" font-weight="700" fill="var(--svg-text)">① 你正在和 celagent 对话</text>
+    <text x="60" y="88" font-size="13" fill="var(--svg-dim)">它回答你、调用工具(bash/read/write…)。注意:工具的文件操作和它的"记忆"走两条完全不同的路——</text>
+    <text x="60" y="110" font-size="13" fill="var(--svg-dim)">记忆(对话历史)每轮自动保存到下面两处;工具的文件操作直接落本地磁盘(与 Celld/BOS 无关,见下方表格)</text>
 
     <!-- 步骤 2/3: 双写 -->
-    <text x="540" y="168" font-size="14" font-weight="700" fill="#7d8590" text-anchor="middle">每轮对话,双写两处 ↓</text>
+    <text x="540" y="168" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">每轮对话,双写两处 ↓</text>
 
     <!-- 步骤 2/3: 双写 -->
 
     <!-- Celld 框 -->
-    <rect x="60" y="190" width="460" height="190" rx="16" fill="#12161f" stroke="#58a6ff"/>
+    <rect x="60" y="190" width="460" height="190" rx="16" fill="var(--svg-panel2)" stroke="#58a6ff"/>
     <text x="90" y="225" font-size="16" font-weight="700" fill="#58a6ff">② Celld — 本地缓存(快)</text>
-    <text x="90" y="253" font-size="13" fill="#8b949e">• 本机运行,写入约 100ms,对话无感</text>
-    <text x="90" y="277" font-size="13" fill="#8b949e">• 双节点自动管理,一个挂了另一个接管</text>
-    <text x="90" y="301" font-size="13" fill="#8b949e">• 缓存可以丢——丢了从 BOS 重建</text>
-    <text x="90" y="330" font-size="12" fill="#7d8590" font-family="monospace">定位:本地加速 · 可替换 · 非权威</text>
-    <text x="90" y="352" font-size="12" fill="#7d8590" font-family="monospace">存:最近对话(截断 200 字符,见下方说明)</text>
-    <text x="90" y="374" font-size="11.5" fill="#7d8590">自带 S3 客户端(内置 object_store 库)— 直连 BOS,不调外部工具</text>
+    <text x="90" y="253" font-size="13" fill="var(--svg-dim)">• 本机运行,写入约 100ms,对话无感</text>
+    <text x="90" y="277" font-size="13" fill="var(--svg-dim)">• 双节点自动管理,一个挂了另一个接管</text>
+    <text x="90" y="301" font-size="13" fill="var(--svg-dim)">• 缓存可以丢——丢了从 BOS 重建</text>
+    <text x="90" y="330" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:本地加速 · 可替换 · 非权威</text>
+    <text x="90" y="352" font-size="12" fill="var(--svg-dim)" font-family="monospace">存:最近对话(截断 200 字符,见下方说明)</text>
+    <text x="90" y="374" font-size="11.5" fill="var(--svg-dim)">自带 S3 客户端(内置 object_store 库)— 直连 BOS,不调外部工具</text>
 
     <!-- BOS 框 -->
-    <rect x="560" y="190" width="490" height="190" rx="16" fill="#12161f" stroke="#d29922"/>
+    <rect x="560" y="190" width="490" height="190" rx="16" fill="var(--svg-panel2)" stroke="#d29922"/>
     <text x="590" y="225" font-size="16" font-weight="700" fill="#d29922">③ BOS — 权威存储(稳)</text>
-    <text x="590" y="253" font-size="13" fill="#8b949e">• 云端对象存储,存完整对话(不截断)</text>
-    <text x="590" y="277" font-size="13" fill="#8b949e">• 换电脑 / 本地删了 / 节点全挂 → 都在</text>
-    <text x="590" y="301" font-size="13" fill="#8b949e">• 并发写有 CAS 保护,不冲突不丢失</text>
-    <text x="590" y="330" font-size="12" fill="#7d8590" font-family="monospace">定位:唯一真相 · 核心价值 · RPO=0</text>
-    <text x="590" y="352" font-size="12" fill="#7d8590" font-family="monospace">存:完整对话 sessions/*.json (35 个)</text>
-    <text x="590" y="372" font-size="11.5" fill="#7d8590">还存:Celld 节点状态(cells/ 176)+ worker 代码(deploy/ 10)+ 运行元数据(9)</text>
+    <text x="590" y="253" font-size="13" fill="var(--svg-dim)">• 云端对象存储,存完整对话(不截断)</text>
+    <text x="590" y="277" font-size="13" fill="var(--svg-dim)">• 换电脑 / 本地删了 / 节点全挂 → 都在</text>
+    <text x="590" y="301" font-size="13" fill="var(--svg-dim)">• 并发写有 CAS 保护,不冲突不丢失</text>
+    <text x="590" y="330" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:唯一真相 · 核心价值 · RPO=0</text>
+    <text x="590" y="352" font-size="12" fill="var(--svg-dim)" font-family="monospace">存:完整对话 sessions/*.json (35 个)</text>
+    <text x="590" y="372" font-size="11.5" fill="var(--svg-dim)">还存:Celld 节点状态(cells/ 176)+ worker 代码(deploy/ 10)+ 运行元数据(9)</text>
 
     <!-- 双写箭头: celagent → Celld -->
     <path d="M 260 125 C 260 155, 250 165, 250 190" stroke="#58a6ff" stroke-width="2.5" fill="none" marker-end="url(#arr)"/>
@@ -269,10 +293,10 @@
     <text x="810" y="160" font-size="12" fill="#d29922" font-family="monospace">写权威</text>
 
     <!-- 步骤 4: 恢复 -->
-    <text x="540" y="428" font-size="14" font-weight="700" fill="#7d8590" text-anchor="middle">无论何时:启动 / 换电脑 / 本地误删 ↓ 都能找回</text>
-    <rect x="60" y="448" width="990" height="85" rx="16" fill="#181e2b" stroke="#3fb950"/>
+    <text x="540" y="428" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">无论何时:启动 / 换电脑 / 本地误删 ↓ 都能找回</text>
+    <rect x="60" y="448" width="990" height="85" rx="16" fill="var(--svg-panel)" stroke="#3fb950"/>
     <text x="90" y="480" font-size="16" font-weight="700" fill="#3fb950">④ 从 BOS 恢复 — 历史一条不丢</text>
-    <text x="90" y="508" font-size="13" fill="#8b949e">celagent list 看有哪些会话 → celagent &lt;会话ID&gt; 续写 — 实测:节点全挂后恢复 10/10 轮</text>
+    <text x="90" y="508" font-size="13" fill="var(--svg-dim)">celagent list 看有哪些会话 → celagent &lt;会话ID&gt; 续写 — 实测:节点全挂后恢复 10/10 轮</text>
     <!-- 恢复箭头: BOS → 步骤4 (就地) -->
     <path d="M 800 380 L 800 448" stroke="#3fb950" stroke-width="2.5" fill="none" marker-end="url(#arrG)"/>
     <text x="812" y="420" font-size="12" fill="#3fb950" font-family="monospace">读历史</text>
@@ -739,6 +763,22 @@ $("btnReset").onclick = () => {
   setNode(0,"up"); setNode(1,"up");
   updateMetrics(); renderObjects();
 };
+
+// 主题切换 (默认暗色, localStorage 记忆)
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  $("btnTheme").textContent = theme === "light" ? "🌙 暗色" : "☀ 浅色";
+}
+$("btnTheme").onclick = () => {
+  const cur = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+  const next = cur === "light" ? "dark" : "light";
+  applyTheme(next);
+  try { localStorage.setItem("celagent-theme", next); } catch (e) { /* 隐私模式忽略 */ }
+};
+// 初始化: 优先 localStorage, 默认暗色
+let savedTheme = "dark";
+try { savedTheme = localStorage.getItem("celagent-theme") || "dark"; } catch (e) { /* ignore */ }
+applyTheme(savedTheme);
 
 // 初始化
 updateMetrics();
