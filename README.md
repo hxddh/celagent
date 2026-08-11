@@ -116,10 +116,10 @@ node tests/core.test.mjs              # 回归测试 (需节点在跑: scripts/n
 
 ## 测试记录
 
-- 回归: core.test.mjs 5/5 (Celld API / checkpoint+resume / kv / Agent 构造 / 工具)
+- 回归: core.test.mjs 9 用例 (Celld API / checkpoint+resume / kv / Agent 构造 / 工具 / 持久化完整性;节点未启动时 mock 模式 6 pass)
 - BOS 链路: 写→读→ETag→CAS 冲突→并发写 (无重复无丢失)
 - 20 次高频写压测: 序号连续 1-20 无重复
-- Bug 1-65 修复: 覆盖持久化完整性、并发安全、信号处理、安装部署
+- Bug 1-94 修复: 覆盖持久化完整性、并发安全、信号处理、安装部署、worker 部署、凭证混用
 
 ## 开发者 / Agent 接手
 

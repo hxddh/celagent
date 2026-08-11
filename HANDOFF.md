@@ -27,7 +27,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 
 | 路径 | 职责 |
 |------|------|
-| `bin/celagent-tui.mjs` | CLI + TUI 主程序(874 行:命令解析、节点自动启动、turn_end 持久化钩子、会话恢复) |
+| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~875 行:命令解析、节点自动启动、turn_end 持久化钩子、会话恢复) |
 | `src/bos.js` | BOS 直写核心(aws CLI 异步封装、CAS If-Match/If-None-Match、指数退避重试) |
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
 | `worker/src/index.js` | Celld worker(缓存读路径、Sync API、AWS SigV4 手写签名) |
@@ -41,6 +41,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
 | `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、60 轮真实数据回放) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |
+| `docs/archive/` | POC 阶段遗留(旧 SDK 探索/旧代码),仅供考古,勿用于新开发 |
 
 ## 2. 开发环境与命令
 
@@ -73,7 +74,7 @@ node tests/e2e-memory-tools.mjs
 ### 已完成
 - ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content)
 - ✅ 测试:core 9 用例(节点在跑时全绿)、e2e 真实 LLM 验证
-- ✅ **发布前安全检查(六轮穷尽)**:文件层 + git 历史层 + 对象库层 + 代码逻辑层全部干净;61 个提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥/零用户名/零本机路径/零真实 bucket 名
+- ✅ **发布前安全检查(六轮穷尽)**:文件层 + git 历史层 + 对象库层 + 代码逻辑层全部干净;62 个提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥/零用户名/零本机路径/零真实 bucket 名
 - ✅ 构建物:`celagent-bin`(75MB Bun 单二进制)mac arm64 已验证可运行(version/help/doctor/list/TUI 完整启动)
 - ✅ README/install.sh 已指向 `github.com/hxddh/celagent/releases/latest/download/install.sh`
 
@@ -105,7 +106,7 @@ node tests/e2e-memory-tools.mjs
 | v0.1.x | CLI 骨架 + BOS 直写 + 双节点 | ✅ |
 | v0.2.x | 分布式运行时(worker 缓存/sync、休眠唤醒、agent 任务化、cluster_mgr、多机部署文档) | ✅ |
 | P1 记忆增强 | history_search + session_snapshot + 完整记忆(不截断) | ✅ 已并入 |
-| v0.3.0 | **发布版**:Release 二进制分发 + celld 随包 + install.sh 下载模式 + CI 全绿 | 🔄 进行中(卡认证) |
+| v0.3.0 | **发布版**(含 P1 记忆增强):Release 二进制分发 + celld 随包 + install.sh 下载模式 + CI 全绿 | 🔄 进行中(卡认证) |
 
 后续候选方向(未排期):多 provider 认证管理、快照浏览 UI、会话 diff/合并、Bucket 生命周期(降本)。
 

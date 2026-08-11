@@ -36,7 +36,7 @@
 ```bash
 # celagent + celld + 相同配置 (同一 bucket!)
 CELAGENT_SRC=~/celagent ./install.sh
-# 或: curl -fsSL <发布地址>/install.sh | sh
+# 或: curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh
 
 # 确认 settings.json 的 bucket 与集群一致
 cat ~/.config/celagent/settings.json

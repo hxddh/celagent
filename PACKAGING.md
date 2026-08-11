@@ -50,7 +50,7 @@ GitHub Release:
 
 ## 注意
 
-1. 二进制不含 API key — key 运行时从环境变量 / auth.json 读取
+1. 二进制不含 API key — 凭证运行时从环境变量 (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) 或 ~/.aws/credentials 的 [bos] profile 动态读取
 2. Celld 运行时独立下载 (install.sh 处理), 不打包进 celagent 二进制
 3. TUI 版动态 import: 需重新验证 Bun 编译 (打包前必做)
 4. **发布前置**: 创建 GitHub 仓库 (默认 CELAGENT_REPO=https://github.com/hxddh/celagent.git),
