@@ -27,7 +27,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 
 | 路径 | 职责 |
 |------|------|
-| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~875 行:命令解析、节点自动启动、turn_end 持久化钩子、会话恢复) |
+| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~875 行:命令解析含 task 分布式任务、节点自动启动、turn_end 持久化钩子、会话恢复) |
 | `src/bos.js` | BOS 直写核心(aws CLI 异步封装、CAS If-Match/If-None-Match、指数退避重试) |
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
 | `worker/src/index.js` | Celld worker(缓存读路径、Sync API、AWS SigV4 手写签名) |
@@ -57,6 +57,11 @@ node bin/celagent-tui.mjs doctor
 
 # 真实 LLM e2e (需要 DEEPSEEK_API_KEY 环境变量)
 node tests/e2e-memory-tools.mjs
+
+# 分布式任务 (celld 状态机, 断点续跑)
+node bin/celagent-tui.mjs task submit write-report 5
+node bin/celagent-tui.mjs task status
+node bin/celagent-tui.mjs task ledger
 ```
 
 ### 关键环境事实
@@ -66,6 +71,8 @@ node tests/e2e-memory-tools.mjs
   - 或 `aws s3api list-buckets --profile bos`
   - endpoint `https://s3.bj.bcebos.com`,凭证在 `~/.aws/credentials` 的 `[bos]` profile(动态读取)
 - **LLM**:DeepSeek(OpenAI 兼容),key 在 `DEEPSEEK_API_KEY` 环境变量(无值时自动降级 mock)
+- **凭证优先级**:环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` 优先(必须成对);否则用 `~/.aws/credentials` 的 `[bos]` profile(不混用)
+- **install.sh 可配置 env**:`CELAGENT_REPO`(仓库地址)、`CELAGENT_SRC`(开发模式)、`CELAGENT_ROOT`(安装根目录,默认 ~/.local)、`CELAGENT_BUCKET`(强制 bucket)、`CELLD_ESBUILD`(esbuild 路径)
 - **Celld**:开发机本机路径见本机安装位置;发布后随包分发到 `~/.local/bin`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
@@ -130,3 +137,4 @@ node tests/e2e-memory-tools.mjs
 - worker 缓存读路径有 200 字符截断(URL 限制所致),完整数据在 BOS 权威源
 - HTML 演示页数字需与实时 BOS 对齐(演示数据来自 2026-08-10 实测)
 - ci.yml 的单元测试步骤带 `continue-on-error: true`(无节点时 mock 模式)——CI 全绿要求下应确认该步骤是否应改为必须通过
+- CI 不构建发布二进制(当前跨平台构建为手动 `bun build`,见 PACKAGING)——后续可加 CI release job 自动化构建+上传
