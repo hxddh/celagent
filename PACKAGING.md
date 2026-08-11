@@ -52,7 +52,7 @@ GitHub Release:
 
 0. **构建环境规范 (安全红线, 第八轮安全检查发现)**: Bun 编译会把模块绝对路径嵌入二进制
    (`__dirname`/模块注释)。**禁止在含用户名/项目名的路径下构建发布物** —
-   旧构建实测含 `/Users/<local-user>/celagent-poc/...`。正确做法:
+   旧构建实测含 `/Users/<user>/<project>/...`(本机用户名+项目名)。正确做法:
    ```bash
    rm -rf /tmp/anon-build && mkdir -p /tmp/anon-build
    cp -al bin src worker package.json package-lock.json scripts /tmp/anon-build/
