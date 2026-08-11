@@ -113,6 +113,24 @@
   .trace-cell .warn-c { color:var(--red); }
   .trace-row.new .trace-cell { animation:rownew 1s; }
 
+  /* 分区组 */
+  .section-group {
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px 24px 10px;
+    margin-top: 44px;
+  }
+  .section-group-title {
+    font-size: 15px; font-weight: 700; color: var(--blue);
+    margin-bottom: 4px; padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .section-group-title::after { content: ""; flex: 1; }
+  .section-group .panel { margin-top: 16px !important; }
+  .section-group > .panel:first-child { margin-top: 0 !important; }
+  .section-group > div > .panel { margin-top: 16px !important; }
+
   /* 运行过程 tabs */
   .proc-tabs { display:flex; gap:6px; margin:12px 0 10px; flex-wrap:wrap; }
   .proc-tab {
@@ -261,8 +279,10 @@
   <div class="sticky-hint">↓ 滚动页面时本操作条固定于顶部 · 自动播放中可随时点击「故障注入」观察降级</div>
 </div></header>
 
-<!-- ============ 架构图 ============ -->
-<div class="panel" style="margin-top:14px" id="arch">
+<!-- ============ 分区 1: 理解架构 ============ -->
+<div class="section-group" id="group-understand">
+  <div class="section-group-title">第一部分 · 理解架构</div>
+<div class="panel" style="margin-top:0" id="arch">
   <div class="panel-title">① 架构图:Celld × BOS 在 celagent 中的定位、功能与数据承载</div>
 
   <svg viewBox="0 0 1080 560" style="width:100%;height:auto;display:block" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,'PingFang SC',sans-serif">
@@ -447,8 +467,13 @@
     </div>
     </div>
   </div>
+</div><!-- /分区1 -->
 
-  <!-- 常见问题解答 (存什么/性能/之前在哪) -->
+<!-- ============ 分区 2: 动态演示 ============ -->
+<div class="section-group" id="group-demo">
+  <div class="section-group-title">第二部分 · 动态演示</div>
+
+    <!-- 常见问题解答 (存什么/性能/之前在哪) -->
   <div class="panel" style="margin-top:36px" id="faq">
     <div class="panel-title collapsible" onclick="togglePanel(this)">⑤ 常见问题 — 存什么 · 性能 · 之前在哪 <span class="toggle">▶ 点击展开</span></div>
     <div class="panel-collapsible" style="display:none">
@@ -530,9 +555,6 @@
     </div>
     </div>
   </div>
-
-  <!-- 定位一句话 + 价值分层表 -->
-
 
 <div class="layout">
   <!-- ===== 左: 运行过程 ===== -->
@@ -665,7 +687,12 @@
     </div>
   </div>
 
-  <div class="panel" style="margin-top:36px" id="value">
+</div><!-- /分区2 -->
+
+<!-- ============ 分区 3: 结论 ============ -->
+<div class="section-group" id="group-summary">
+  <div class="section-group-title">第三部分 · 结论</div>
+  <div class="panel" style="margin-top:0" id="value">
     <div class="panel-title">⑨ 价值评估 — 一句话定位 + 诚实评估</div>
     <div class="dataflow-note">
     <b>一句话定位:</b> <code>BOS = 保数据(权威持久层,跨机器防丢失)</code> ·
@@ -698,6 +725,8 @@
   </table>
     </div>
 </div>
+
+</div><!-- /分区3 -->
 
 <footer>
   <b>架构结论:</b> <b style="color:var(--yellow)">BOS 保数据(权威,跨机器/防丢失,RPO=0)</b> ·
