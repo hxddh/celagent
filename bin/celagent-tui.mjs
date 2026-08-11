@@ -732,10 +732,14 @@ async function main() {
       // 并返回完整契约: {session, services, diagnostics, ...} 防止 /new 崩溃退出
       const effSessionManager = opts?.sessionManager || sessionManager;
       const effStartEvent = opts?.sessionStartEvent || { type: "session_start", reason: "startup" };
+      // P1 记忆增强: 注入 BOS 记忆工具 (history_search / session_snapshot)
+      const { history_search, session_snapshot } = await import("../src/bos-tools.js");
       const result = await pi.createAgentSessionFromServices({
         cwd, agentDir: AGENT_DIR, services,
         sessionManager: effSessionManager,
         sessionStartEvent: effStartEvent,
+        // P1: agent 可主动检索历史记忆 / 打显式快照
+        customTools: [history_search, session_snapshot],
       });
       // 恢复历史注入: 仅首次启动(startup)注入 argv 会话的历史
       // 注: /resume /new /fork 不注入 — resume 可能是别的会话(无法匹配),
@@ -785,6 +789,9 @@ async function main() {
       }
       // seq 从当前会话历史长度继续 (resume 续写; new 从 0)
       let seq = (persistHistory && persistHistory.length) || 0;
+      // P1: 维护当前会话 turns 快照缓存 (供 session_snapshot 工具保存用)
+      let snapshotTurns = (persistHistory || []).map(t => ({ turn: t.turn, role: t.role || "assistant", msg: t.msg, ts: t.ts }));
+      globalThis.__celagentSnapshotTurns = () => snapshotTurns;
       result.session.subscribe(async (event) => {
         if (event?.type === "turn_end") {
           seq++;
@@ -809,6 +816,8 @@ async function main() {
           if (toolResults.length > 0) msg += ` [工具结果: ${toolResults.join(" | ").slice(0, 300)}]`;
           // Bug 52: 不 await — checkpoint 全异步 (worker fire-and-forget + BOS 队列), 绝不阻塞对话
           void celldCheckpoint(persistId, seq, "assistant", msg, { fullContent, fullToolResults });
+          // P1: 同步快照缓存
+          snapshotTurns.push({ turn: seq, role: "assistant", msg, ts: Date.now() });
         }
       });
       return { ...result, services, diagnostics: [] };  // 完整契约 (Bug: /new 需 services+diagnostics)

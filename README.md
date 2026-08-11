@@ -53,6 +53,17 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 
 恢复优先级:**BOS 是权威源** — 启动 `celagent <id>` 时从 BOS 读历史注入上下文;`/resume` 从本地 JSONL 恢复完整会话。
 
+## agent 内置 BOS 记忆工具 (P1)
+
+对话中 agent 可主动调用(经 customTools 注入):
+
+| 工具 | 功能 |
+|------|------|
+| `history_search` | 跨会话检索 BOS 历史记忆(关键词/限定会话/条数), 返回匹配轮次片段 |
+| `session_snapshot` | 将当前会话状态保存为 BOS 快照(显式记忆锚点, snapshots/ 前缀) |
+
+示例: agent 可说 "搜索一下我之前关于并发问题的讨论" → 调用 history_search 找回并引用。
+
 ## 命令一览
 
 | 命令 | 作用 |
