@@ -759,33 +759,33 @@ const REAL_RECORDS = [
   { turn:8, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
   { turn:9, workerMs:183, readMs:1350, writeMs:665, etag:"d5242fc2efd19", size:22128 },
   { turn:10, workerMs:133, readMs:1424, writeMs:688, etag:"7c9b41c2a0c91", size:22820 },
-  { turn:11, workerMs:122, readMs:1494, writeMs:782, etag:"125a756d919c1", size:27077 },
-  { turn:12, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:11, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:12, workerMs:122, readMs:1494, writeMs:782, etag:"125a756d919c1", size:27077 },
   { turn:13, workerMs:83, readMs:1464, writeMs:788, etag:"288b20cdb7d7f", size:30724 },
   { turn:14, workerMs:89, readMs:1531, writeMs:805, etag:"8c877b3c3d3cc", size:33187 },
   { turn:15, workerMs:226, readMs:1421, writeMs:800, etag:"8d0ba4d6d5fa1", size:36662 },
   { turn:16, workerMs:68, readMs:1397, writeMs:800, etag:"5235948d5bb0c", size:44641 },
-  { turn:17, workerMs:176, readMs:1326, writeMs:854, etag:"4a01287df5a17", size:50590 },
-  { turn:18, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:17, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:18, workerMs:176, readMs:1326, writeMs:854, etag:"4a01287df5a17", size:50590 },
   { turn:19, workerMs:172, readMs:1299, writeMs:842, etag:"bb4a38df39efe", size:55232 },
   { turn:20, workerMs:147, readMs:1457, writeMs:764, etag:"1e0c81cbd34fa", size:60768 },
   { turn:21, workerMs:183, readMs:1453, writeMs:836, etag:"066d7f0aa8935", size:68079 },
   { turn:22, workerMs:165, readMs:1573, writeMs:793, etag:"6b77c25127eb0", size:71994 },
   { turn:23, workerMs:119, readMs:1678, writeMs:814, etag:"dd8673d763f0c", size:76109 },
-  { turn:24, workerMs:150, readMs:1297, writeMs:830, etag:"0b4d54379ee7d", size:79838 },
-  { turn:25, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:24, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:25, workerMs:150, readMs:1297, writeMs:830, etag:"0b4d54379ee7d", size:79838 },
   { turn:26, workerMs:187, readMs:1504, writeMs:782, etag:"3512611cedf99", size:85629 },
   { turn:27, workerMs:190, readMs:1506, writeMs:866, etag:"201f0c09c42c0", size:95352 },
-  { turn:28, workerMs:170, readMs:1318, writeMs:820, etag:"cba918e3d3f9f", size:104621 },
-  { turn:29, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:28, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:29, workerMs:170, readMs:1318, writeMs:820, etag:"cba918e3d3f9f", size:104621 },
   { turn:30, workerMs:191, readMs:1402, writeMs:826, etag:"acca845593f06", size:114566 },
-  { turn:31, workerMs:130, readMs:1477, writeMs:734, etag:"87f28a466cbda", size:114566 },
-  { turn:32, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:31, workerMs:0, readMs:0, writeMs:0, etag:"—", size:0 },
+  { turn:32, workerMs:130, readMs:1477, writeMs:734, etag:"87f28a466cbda", size:114566 },
   { turn:33, workerMs:67, readMs:1399, writeMs:823, etag:"ba67cb835e98f", size:114566 }
 ];
 // 基线 (重建前实测): 对象总数 / 重建前 ETag
 const BASELINE_OBJECTS = 278;
-const BASELINE_ETAG = "e586af54";
+const BASELINE_ETAG = "—";  // 实录会话首写 If-None-Match, 无初始 ETag
 
 // sess-demo-xxxxxxxx 对话内容 (2026-08-11 实录: 7 用户指令 + 26 assistant 轮)
 const TURNS = [
@@ -924,9 +924,6 @@ async function runOneTurn() {
   const i = state.turn;
   const rec = REAL_RECORDS[i];
   state.turn++;
-  // 对象总数随运行增长: sessions 覆盖写不新增, 但 celld 的 cells/ 状态
-  // 每轮写入 LTX (实测约 1.5 个/轮) — 真实运行中对象数持续增加
-  state.objects = BASELINE_OBJECTS + state.turn + Math.floor(state.turn / 2);
   state.bytes = rec.size;
 
   // 1. 对话消息 (typing 效果)
@@ -949,6 +946,9 @@ async function runOneTurn() {
     }
     return;
   }
+  // 对象总数随运行增长: sessions 覆盖写不新增, 但 celld 的 cells/ 状态
+  // 每轮写入 LTX (实测约 1.5 个/轮) — 仅 assistant 轮写入 (user 轮无 BOS 写入)
+  state.objects = BASELINE_OBJECTS + state.turn + Math.floor(state.turn / 2);
 
   // 1.5 创建本轮追踪行 (Celld 侧 | BOS 侧)
   const tr = document.createElement("div");
