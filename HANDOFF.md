@@ -98,8 +98,11 @@ node bin/celagent-tui.mjs task ledger
 1. **推送**:建仓 + push(gh repo create --push 或 git push -u origin main)
 2. **CI 首跑**:`.github/workflows/ci.yml` 首次运行,修到全绿(node 20/22 矩阵)
 3. **版本统一**:`install.sh` 的 `VERSION="0.1.0"` 与 `package.json` 的 `"0.2.0"` 不一致 → 统一为发布版本(建议 v0.3.0,因含 P1 记忆增强 + P2 分布式,已超 0.2.0 语义)
-4. **跨平台构建**:
+4. **跨平台构建**(⚠️ 必须在匿名路径构建, 见 PACKAGING.md 注意 0 — Bun 嵌入本机绝对路径,
+   仓库目录实测含 `/Users/<user>/<project>/...`; 构建后 `strings <bin> | grep -E "<local-user>|/Users/"` 必须为空):
    ```bash
+   # 先按 PACKAGING.md 注意 0 准备 /tmp/anon-build
+   cd /tmp/anon-build
    bun build bin/celagent-tui.mjs --compile --outfile celagent-darwin-arm64
    bun build bin/celagent-tui.mjs --compile --target=bun-darwin-x64 --outfile celagent-darwin-x64
    bun build bin/celagent-tui.mjs --compile --target=bun-linux-x64 --outfile celagent-linux-x64

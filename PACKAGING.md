@@ -50,6 +50,18 @@ GitHub Release:
 
 ## 注意
 
+0. **构建环境规范 (安全红线, 第八轮安全检查发现)**: Bun 编译会把模块绝对路径嵌入二进制
+   (`__dirname`/模块注释)。**禁止在含用户名/项目名的路径下构建发布物** —
+   旧构建实测含 `/Users/<local-user>/celagent-poc/...`。正确做法:
+   ```bash
+   rm -rf /tmp/anon-build && mkdir -p /tmp/anon-build
+   cp -al bin src worker package.json package-lock.json scripts /tmp/anon-build/
+   cp -al node_modules /tmp/anon-build/node_modules    # 必须硬链接复制, 不能符号链接
+   cd /tmp/anon-build && bun build bin/celagent-tui.mjs --compile --outfile celagent-<平台>
+   strings celagent-<平台> | grep -E "<local-user>|/Users/|celld-test"   # 必须为空
+   ```
+   或直接用 CI (GitHub Actions runner 路径 /home/runner/work/..., 天然干净)。
+   仓库目录下的旧 `celagent-bin` (含本机路径) 已废弃, 严禁上传 Release。
 1. 二进制不含 API key — 凭证运行时从环境变量 (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) 或 ~/.aws/credentials 的 [bos] profile 动态读取
 2. Celld 运行时独立下载 (install.sh 处理), 不打包进 celagent 二进制
 3. TUI 版动态 import: 需重新验证 Bun 编译 (打包前必做)
