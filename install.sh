@@ -99,10 +99,10 @@ echo "  ✓ BOS 凭证可用"
 # 绝不在重装时新建 bucket 丢失用户数据
 EXISTING_BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
 BUCKET="${CELAGENT_BUCKET:-${EXISTING_BUCKET:-celagent-$(whoami)-$(date +%s)}}"
-if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" --profile bos 2>/dev/null; then
+if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
   echo "  ✓ bucket 已存在: $BUCKET"
 else
-  aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" --profile bos >/dev/null 2>&1
+  AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" >/dev/null 2>&1
   echo "  ✓ bucket 创建: $BUCKET"
 fi
 

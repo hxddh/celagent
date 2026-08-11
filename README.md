@@ -120,7 +120,7 @@ install.sh 可配置环境变量(全部有默认值):
 ```
 celagent (TUI, bin/celagent-tui.mjs)
    ├── pi-coding-agent 引擎 (交互/LLM/工具)
-   ├── Celld 双节点 (18090/18091, 自动启动 + 端口预检)
+   ├── Celld 节点 (18090/18091 自动启动, 19000 候选, 端口预检)
    └── BOS 直写 (src/bos.js, CAS + 重试 + 异步队列)
 ```
 

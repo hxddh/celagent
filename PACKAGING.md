@@ -54,4 +54,5 @@ GitHub Release:
 2. Celld 运行时独立下载 (install.sh 处理), 不打包进 celagent 二进制
 3. TUI 版动态 import: 需重新验证 Bun 编译 (打包前必做)
 4. **发布前置**: 创建 GitHub 仓库 (默认 CELAGENT_REPO=https://github.com/hxddh/celagent.git),
-   推送代码, 配置 CI 构建 release
+   推送代码。当前 CI 仅 test/build (npm pack dry-run), 无 release 构建 job —
+   二进制构建为手动 bun build (见上), 后续可加 CI release job 自动化

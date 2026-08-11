@@ -28,10 +28,10 @@ echo "  ✓ BOS 凭证可用"
 EXISTING_BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
 BUCKET="${1:-${EXISTING_BUCKET:-celagent-$(whoami)-$(date +%s)}}"
 echo "[2/4] 创建 bucket: $BUCKET"
-if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" --profile bos 2>/dev/null; then
+if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
   echo "  ✓ bucket 已存在"
 else
-  aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" --profile bos 2>&1 | head -2
+  AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" 2>&1 | head -2
   echo "  ✓ bucket 创建成功"
 fi
 
