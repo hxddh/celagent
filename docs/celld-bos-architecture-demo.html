@@ -113,6 +113,17 @@
   .trace-cell .warn-c { color:var(--red); }
   .trace-row.new .trace-cell { animation:rownew 1s; }
 
+  /* 运行过程 tabs */
+  .proc-tabs { display:flex; gap:6px; margin:12px 0 10px; flex-wrap:wrap; }
+  .proc-tab {
+    background:var(--panel2); color:var(--dim); border:1px solid var(--border);
+    border-radius:8px; padding:6px 14px; font-size:12px; cursor:pointer;
+  }
+  .proc-tab:hover { color:var(--text); border-color:var(--blue); }
+  .proc-tab.active { background:var(--blue-bg); color:var(--blue); border-color:var(--blue); }
+  .proc-pane { display:none; }
+  .proc-pane.active { display:block; }
+
   /* 说明条 (dataflow-note) */
   .dataflow-note {
     background: var(--panel2); border: 1px dashed var(--border); border-radius: 10px;
@@ -234,6 +245,7 @@
     <button class="btn danger" id="btnKill">⛔ 故障注入:kill 节点</button>
     <button class="btn" id="btnReset">↺ 重置</button>
     <button class="btn" id="btnTheme" title="切换浅色/暗色主题">☀ 浅色</button>
+    <button class="btn" id="btnToggleAll" title="展开/折叠所有静态章节">⇅ 全部展开</button>
   </div>
   <div class="nav-links">
     <a href="#arch">1 架构图</a>
@@ -312,8 +324,8 @@
 
   <!-- 术语速览: 专业术语保留, 一句话解释 -->
   <div class="panel" style="margin-top:36px" id="glossary">
-    <div class="panel-title collapsible" onclick="togglePanel(this)">② 术语速览 — 看懂架构图需要的 8 个词 <span class="toggle">▼ 点击折叠</span></div>
-    <div class="panel-collapsible">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">② 术语速览 — 看懂架构图需要的 8 个词 <span class="toggle">▶ 点击展开</span></div>
+    <div class="panel-collapsible" style="display:none">
     <table class="obj-table" style="margin-top:8px">
       <thead><tr><th style="width:160px">术语</th><th>一句话解释</th></tr></thead>
       <tbody>
@@ -335,8 +347,8 @@
 
   <!-- 三条数据路径 (关键: 避免误导) -->
   <div style="margin-top:36px" id="paths">
-    <div class="panel-title collapsible" onclick="togglePanel(this)">③ 三条数据路径 — agent 的"手"和"大脑"分开走 <span class="toggle">▼ 点击折叠</span></div>
-    <div class="panel-collapsible">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">③ 三条数据路径 — agent 的"手"和"大脑"分开走 <span class="toggle">▶ 点击展开</span></div>
+    <div class="panel-collapsible" style="display:none">
     <table class="obj-table" style="margin-top:8px">
       <thead><tr>
         <th style="width:130px">路径</th><th style="width:200px">谁在操作</th>
@@ -375,8 +387,8 @@
 
   <!-- 具体写入的数据 (真实结构) -->
   <div style="margin-top:36px" id="payload">
-    <div class="panel-title collapsible" onclick="togglePanel(this)">④ 具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照" <span class="toggle">▼ 点击折叠</span></div>
-    <div class="panel-collapsible">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">④ 具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照" <span class="toggle">▶ 点击展开</span></div>
+    <div class="panel-collapsible" style="display:none">
     <div style="font-size:12.5px;color:var(--dim);margin-bottom:8px">
       每轮对话结束,celagent 把<b style="color:var(--text)">这一轮的对话记录</b>(不是文件、不是工作区)打包成一条 JSON 写入两处。
       以下为结构示例(字段结构真实,内容为演示):
@@ -438,8 +450,8 @@
 
   <!-- 常见问题解答 (存什么/性能/之前在哪) -->
   <div class="panel" style="margin-top:36px" id="faq">
-    <div class="panel-title collapsible" onclick="togglePanel(this)">⑤ 常见问题 — 存什么 · 性能 · 之前在哪 <span class="toggle">▼ 点击折叠</span></div>
-    <div class="panel-collapsible">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">⑤ 常见问题 — 存什么 · 性能 · 之前在哪 <span class="toggle">▶ 点击展开</span></div>
+    <div class="panel-collapsible" style="display:none">
 
     <div style="margin-bottom:18px">
       <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q1: 写到 BOS 的是 agent 会话的"所有内容"吗?</div>
@@ -555,16 +567,30 @@
         <div id="traceBody" aria-live="polite"></div>
       </div>
 
-      <!-- 数据流日志 -->
-      <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">数据流日志(每轮详细操作,最新在上)</div>
-      <div class="flow" id="flow" aria-live="polite"><div class="flow-line" style="color:var(--dim)">等待运行…(每轮: worker 写 → BOS 读 ETag → CAS 写 → ETag 更新)</div></div>
+      <!-- 查看 tabs: 对话/追踪/日志/记忆 -->
+      <div class="proc-tabs">
+        <div class="proc-tab active" onclick="switchProcTab(this, 'chatPane')">对话</div>
+        <div class="proc-tab" onclick="switchProcTab(this, 'tracePane')">双写追踪</div>
+        <div class="proc-tab" onclick="switchProcTab(this, 'flowPane')">操作日志</div>
+        <div class="proc-tab" onclick="switchProcTab(this, 'memPane')">记忆工具</div>
+      </div>
 
-      <!-- 对话消息 -->
-      <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">对话消息(演示脚本,最新在上)</div>
-      <div class="chat" id="chat" aria-live="polite"></div>
-
-      <!-- 记忆工具演示 (P1) -->
-      <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">记忆工具演示 — agent 主动检索历史 / 打快照</div>
+      <div class="proc-pane active" id="chatPane">
+        <div style="font-size:11px;color:var(--dim);margin:8px 0 6px">对话消息(演示脚本,最新在上)</div>
+        <div class="chat" id="chat" aria-live="polite"></div>
+      </div>
+      <div class="proc-pane" id="tracePane">
+        <div style="font-size:11px;color:var(--dim);margin:8px 0 6px">每轮双写变化(最新在上)</div>
+        <div class="trace" id="trace" style="margin-top:0">
+          <div id="traceBody" aria-live="polite"></div>
+        </div>
+      </div>
+      <div class="proc-pane" id="flowPane">
+        <div style="font-size:11px;color:var(--dim);margin:8px 0 6px">操作日志(每轮详细操作,最新在上)</div>
+        <div class="flow" id="flow" aria-live="polite"><div class="flow-line" style="color:var(--dim)">等待运行…(每轮: worker 写 → BOS 读 ETag → CAS 写 → ETag 更新)</div></div>
+      </div>
+      <div class="proc-pane" id="memPane">
+        <div style="font-size:11px;color:var(--dim);margin:8px 0 6px">记忆工具 — agent 主动检索历史 / 打快照</div>
       <div class="trace" id="memTools" style="margin-top:0">
         <div class="trace-row">
           <div class="trace-cell bos-c">
@@ -582,6 +608,7 @@
           agent 在对话中可直接调用这两个工具(经 customTools 注入 pi 引擎),
           让 BOS 从"被动备份"变为"agent 主动可用的记忆库"。
         </div>
+      </div>
       </div>
     </div>
   </div>
@@ -621,18 +648,15 @@
 
   <!-- 60 轮数据统计 (真实采集汇总) -->
   <div class="panel" style="margin-top:36px" id="stats">
-    <div class="panel-title collapsible" onclick="togglePanel(this)">⑧ 数据总览 — demo-large-session 60 轮真实采集 <span class="toggle">▼ 点击折叠</span></div>
-    <div class="panel-collapsible">
-    <div class="mon-grid">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">⑧ 数据总览 — demo-large-session 60 轮真实采集 <span class="toggle">▶ 点击展开</span></div>
+    <div class="panel-collapsible" style="display:none">
+    <div class="mon-grid" style="grid-template-columns:repeat(4,1fr)">
       <div class="metric"><div class="m-label">会话轮次</div><div class="m-value blue">60</div><div class="m-sub">真实工作流:代码分析任务</div></div>
       <div class="metric"><div class="m-label">会话总大小</div><div class="m-value">79 KB</div><div class="m-sub">80879B,含完整 thinking/工具结果</div></div>
       <div class="metric"><div class="m-label">工具调用轮次</div><div class="m-value yellow">40</div><div class="m-sub">ls/find/grep/read/bash 等</div></div>
-      <div class="metric"><div class="m-label">平均读延迟</div><div class="m-value green">1.47 s</div><div class="m-sub">BOS GET (807ms-1.7s)</div></div>
-      <div class="metric"><div class="m-label">平均写延迟</div><div class="m-value">0.84 s</div><div class="m-sub">BOS PUT CAS (665ms-1s)</div></div>
-      <div class="metric"><div class="m-label">本地缓存延迟</div><div class="m-value">0.15 s</div><div class="m-sub">Celld worker (67-238ms)</div></div>
-      <div class="metric"><div class="m-label">ETag 更新次数</div><div class="m-value red">60</div><div class="m-sub">每轮 CAS 乐观锁校验</div></div>
       <div class="metric"><div class="m-label">增长曲线</div><div class="m-value" style="font-size:15px">173B → 79KB</div><div class="m-sub">第1轮 → 第60轮</div></div>
     </div>
+    <div style="font-size:12px;color:var(--dim);margin-top:10px">延迟指标见上方 ⑦ 监控面板(1.47s 读 / 0.84s 写 / 0.15s 缓存)——此处不重复。</div>
     <div class="dataflow-note" style="margin-top:12px">
       <b>说明:</b> 以上数字来自 60 轮逐轮真实写入 BOS 的采集记录(2026-08-10)。
       每轮经完整链路:本地缓存写 → BOS 读 ETag → CAS 写 → ETag 更新。数据真实存在于
@@ -1010,6 +1034,14 @@ async function runOneTurn() {
   }
 }
 
+// ============ 运行过程 tabs ============
+function switchProcTab(tabEl, paneId) {
+  document.querySelectorAll(".proc-tab").forEach(t => t.classList.remove("active"));
+  document.querySelectorAll(".proc-pane").forEach(p => p.classList.remove("active"));
+  tabEl.classList.add("active");
+  document.getElementById(paneId).classList.add("active");
+}
+
 // ============ 折叠控制 ============
 function togglePanel(titleEl) {
   const panel = titleEl.nextElementSibling;
@@ -1019,6 +1051,19 @@ function togglePanel(titleEl) {
   const toggle = titleEl.querySelector(".toggle");
   if (toggle) toggle.textContent = isHidden ? "▼ 点击折叠" : "▶ 点击展开";
 }
+
+// ============ 全部展开/折叠 ============
+let allExpanded = false;
+$("btnToggleAll").onclick = () => {
+  allExpanded = !allExpanded;
+  const panels = document.querySelectorAll(".panel-collapsible");
+  for (const panel of panels) {
+    panel.style.display = allExpanded ? "" : "none";
+  }
+  const titles = document.querySelectorAll(".panel-title.collapsible .toggle");
+  for (const t of titles) t.textContent = allExpanded ? "▼ 点击折叠" : "▶ 点击展开";
+  $("btnToggleAll").textContent = allExpanded ? "⇅ 全部折叠" : "⇅ 全部展开";
+};
 
 // ============ 控制 ============
 $("btnRun").onclick = () => runOneTurn();
