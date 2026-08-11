@@ -76,7 +76,7 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:开发机本机路径见本机安装位置;发布后随包分发到 `~/.local/bin`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(P0 进行中)
+## 3. 发布状态(v0.3.0 发布,卡 GitHub 认证)
 
 ### 已完成
 - ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content)
@@ -93,6 +93,9 @@ node bin/celagent-tui.mjs task ledger
 
 ### 发布流程(认证后按序执行)
 
+0. **docs/archive 去留决策**(发布前):archive/ 含 POC 探索代码(src-legacy 旧版、
+   poc-pi-sdk 等,已脱敏但价值低)。建议发布前删除整个目录(公开仓库不带 POC 垃圾),
+   或保留作为开发历史——需发布者拍板
 1. **推送**:建仓 + push(gh repo create --push 或 git push -u origin main)
 2. **CI 首跑**:`.github/workflows/ci.yml` 首次运行,修到全绿(node 20/22 矩阵)
 3. **版本统一**:`install.sh` 的 `VERSION="0.1.0"` 与 `package.json` 的 `"0.2.0"` 不一致 → 统一为发布版本(建议 v0.3.0,因含 P1 记忆增强 + P2 分布式,已超 0.2.0 语义)

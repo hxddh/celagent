@@ -1,7 +1,7 @@
 # BOS × Celld 兼容性边界文档
 
 > 基于多轮实测 (2026-08-07) 整理的百度 BOS 与 Celld 组合的兼容性边界与避坑指南
-> 配套测试: `scripts/celld-bos-test.sh` (10/10 通过)
+> 配套测试: `scripts/celld-bos-test.sh`(17 项检查,以脚本输出 PASS/FAIL 为准)
 
 ## 一、BOS 对 Celld 核心原语的支持（全部实测确认 ✅）
 
@@ -100,6 +100,6 @@ AWS_PROFILE=bos aws s3api ...   # 正常
 
 ## 五、建议
 
-1. **测试基线**: 每次改动后跑 `celld-bos-test.sh` 确认 10/10
+1. **测试基线**: 每次改动后跑 `celld-bos-test.sh`,确认输出 0 失败(17 项检查)
 2. **生产配置**: 双节点 + BOS, 串行启动, 监控 RestoreFailed
 3. **容量**: BOS 小对象 PUT P99 决定写延迟, 高频场景需关注
