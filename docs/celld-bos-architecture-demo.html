@@ -56,10 +56,11 @@
   /* ===== 左: 过程面板 ===== */
   .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px 20px; }
   .panel-title { font-size:13px; font-weight:700; color:var(--dim); margin-bottom:14px; display:flex; align-items:center; gap:8px; }
-  .panel-title.collapsible { cursor:pointer; user-select:none; }
-  .panel-title.collapsible:hover { color:var(--text); }
+  .panel-title.collapsible { cursor:pointer; user-select:none; padding:8px 10px; margin:-8px -10px 6px; border-radius:8px; }
+  .panel-title.collapsible:hover { color:var(--text); background:var(--panel2); }
   .panel-title .toggle { color:var(--dim); font-size:11px; margin-left:auto; opacity:.7; }
   .panel-collapsible { transition: all .25s ease; }
+  .panel-collapsible[style*="display:none"] + * { }
   .panel-title .live { color:var(--green); font-size:11px; animation:blink 1.2s infinite; }
   @keyframes blink { 50% { opacity:.3; } }
 
@@ -127,6 +128,7 @@
     display: flex; align-items: center; gap: 8px;
   }
   .section-group-title::after { content: ""; flex: 1; }
+  .section-group-title .desc { font-size:12px; color:var(--dim); font-weight:400; margin-left:10px; }
   .section-group .panel { margin-top: 16px !important; }
   .section-group > .panel:first-child { margin-top: 0 !important; }
   .section-group > div > .panel { margin-top: 16px !important; }
@@ -256,32 +258,31 @@
 <!-- 悬浮操作条: 滚动时始终可见 -->
 <div class="sticky-bar">
   <div class="controls">
+    <span style="font-size:11px;color:var(--dim);font-weight:600">演示:</span>
     <button class="btn primary" id="btnRun">▶ 运行一轮</button>
     <button class="btn" id="btnAuto">⏵ 自动播放</button>
     <button class="btn" id="btnFast">⏩ 快进 10 轮</button>
     <span id="autoProgress" style="font-size:11px;color:var(--dim);font-family:var(--mono)"></span>
-    <button class="btn danger" id="btnKill">⛔ 故障注入:kill 节点</button>
+    <button class="btn danger" id="btnKill">⛔ 故障注入</button>
     <button class="btn" id="btnReset">↺ 重置</button>
-    <button class="btn" id="btnTheme" title="切换浅色/暗色主题">☀ 浅色</button>
+    <span style="font-size:11px;color:var(--dim);font-weight:600;margin-left:8px">视图:</span>
     <button class="btn" id="btnToggleAll" title="展开/折叠所有静态章节">⇅ 全部展开</button>
+    <button class="btn" id="btnTheme" title="切换浅色/暗色主题">☀ 浅色</button>
   </div>
   <div class="nav-links">
-    <a href="#arch">1 架构图</a>
-    <a href="#glossary">2 术语速览</a>
-    <a href="#paths">3 三条路径</a>
-    <a href="#payload">4 写入的数据</a>
-    <a href="#faq">5 常见问题</a>
-    <a href="#process">6 运行过程</a>
-    <a href="#monitor">7 BOS 监控</a>
-    <a href="#stats">8 数据总览</a>
-    <a href="#value">9 价值评估</a>
+    <span style="font-size:11px;color:var(--dim);font-weight:600">跳转:</span>
+    <a href="#group-understand">Ⅰ 理解架构</a>
+    <a href="#group-demo">Ⅱ 动态演示</a>
+    <a href="#group-summary">Ⅲ 结论</a>
+    <a href="#process">运行过程</a>
+    <a href="#monitor">监控</a>
   </div>
   <div class="sticky-hint">↓ 滚动页面时本操作条固定于顶部 · 自动播放中可随时点击「故障注入」观察降级</div>
 </div></header>
 
 <!-- ============ 分区 1: 理解架构 ============ -->
 <div class="section-group" id="group-understand">
-  <div class="section-group-title">第一部分 · 理解架构</div>
+  <div class="section-group-title">Ⅰ 理解架构 <span style="font-size:12px;color:var(--dim);font-weight:400">架构图 · 术语 · 数据路径 · 存储内容</span></div>
 <div class="panel" style="margin-top:0" id="arch">
   <div class="panel-title">① 架构图:Celld × BOS 在 celagent 中的定位、功能与数据承载</div>
 
@@ -471,7 +472,7 @@
 
 <!-- ============ 分区 2: 动态演示 ============ -->
 <div class="section-group" id="group-demo">
-  <div class="section-group-title">第二部分 · 动态演示</div>
+  <div class="section-group-title">Ⅱ 动态演示 <span style="font-size:12px;color:var(--dim);font-weight:400">FAQ · 运行过程 · 监控 · 数据总览</span></div>
 
     <!-- 常见问题解答 (存什么/性能/之前在哪) -->
   <div class="panel" style="margin-top:36px" id="faq">
@@ -691,7 +692,7 @@
 
 <!-- ============ 分区 3: 结论 ============ -->
 <div class="section-group" id="group-summary">
-  <div class="section-group-title">第三部分 · 结论</div>
+  <div class="section-group-title">Ⅲ 结论 <span style="font-size:12px;color:var(--dim);font-weight:400">价值评估</span></div>
   <div class="panel" style="margin-top:0" id="value">
     <div class="panel-title">⑨ 价值评估 — 一句话定位 + 诚实评估</div>
     <div class="dataflow-note">
