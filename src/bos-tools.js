@@ -3,7 +3,7 @@
 // session_snapshot: 显式记忆锚点 (写 snapshots/ 前缀, 不碰权威数据)
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
 import { execFile } from "node:child_process";
 
 const EP = "https://s3.bj.bcebos.com";
@@ -90,7 +90,7 @@ export const history_search = {
         });
         if (!dl) continue;
         try {
-          const session = JSON.parse(require("node:fs").readFileSync(tmp, "utf8"));
+          const session = JSON.parse(readFileSync(tmp, "utf8"));
           const sessionId = key.replace("sessions/", "").replace(".json", "");
           for (const turn of (session.turns || [])) {
             const haystack = textOf(turn).toLowerCase();
@@ -101,7 +101,7 @@ export const history_search = {
             }
           }
         } catch (e) { /* 跳过损坏会话 */ }
-        try { require("node:fs").unlinkSync(tmp); } catch (e) { /* ignore */ }
+        try { unlinkSync(tmp); } catch (e) { /* ignore */ }
         if (hits.length >= limit) break;
       }
 
@@ -147,13 +147,12 @@ export const session_snapshot = {
         turns: currentTurns,
       });
       // 写临时文件再 put
-      const fs = require("node:fs");
       const tmp = `/tmp/celagent-snap-${Date.now()}.json`;
-      fs.writeFileSync(tmp, body, "utf8");
+      writeFileSync(tmp, body, "utf8");
       const put = await new Promise((resolve) => {
         execFile("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", tmp, "--endpoint-url", EP, "--output", "json"], { env: awsEnv(), timeout: 20000 }, (err, stdout) => resolve(!err));
       });
-      fs.unlinkSync(tmp);
+      unlinkSync(tmp);
       if (!put) return { content: [{ type: "text", text: "快照保存失败" }] };
       return { content: [{ type: "text", text: `已保存会话快照: ${key} (${currentTurns.length} 轮)` }] };
     } catch (e) {
