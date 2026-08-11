@@ -480,6 +480,31 @@
         BOS 解决本地单点故障(换机/丢失/节点挂),代价是 ~0.84s 写延迟(60 轮实测均值),用异步队列隐藏。
       </div>
     </div>
+
+    <div style="margin-top:24px">
+      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q4: agent 能主动用 BOS 做什么? — 记忆增强工具(实测)</div>
+      <div style="font-size:13px;color:var(--dim);line-height:1.8">
+        agent 对话中内置两个 BOS 记忆工具,可<b style="color:var(--text)">主动调用</b>(不只是被动被持久化):
+      </div>
+      <table class="obj-table" style="margin-top:8px">
+        <thead><tr><th style="width:160px">工具</th><th>功能</th><th>实测结果</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>history_search</code></td>
+            <td>跨会话检索 BOS 历史记忆:按关键词/会话/条数,返回匹配轮次片段(会话/轮次/角色/时间/内容)</td>
+            <td style="color:var(--green)">✅ 真实 LLM 对话中调用,搜"持久化"命中 4 条历史记忆</td>
+          </tr>
+          <tr>
+            <td><code>session_snapshot</code></td>
+            <td>显式记忆锚点:把当前会话状态保存为 BOS 快照(<code>snapshots/&lt;name&gt;-&lt;ts&gt;.json</code>)</td>
+            <td style="color:var(--green)">✅ 快照轮次随对话增长(2 轮 → 4 轮)</td>
+          </tr>
+        </tbody>
+      </table>
+      <div style="font-size:12.5px;color:var(--dim);margin-top:8px">
+        意义:agent 从"只记得当前会话"升级为"可检索全部历史" — 例如问它"我之前关于并发问题的讨论",它能主动搜索 BOS 并引用结论。
+      </div>
+    </div>
   </div>
 
   <!-- 定位一句话 + 价值分层表 -->
@@ -617,7 +642,8 @@
 
 <footer>
   <b>架构结论:</b> <b style="color:var(--yellow)">BOS 保数据(权威,跨机器/防丢失,RPO=0)</b> ·
-  <b style="color:var(--blue)">Celld 保执行(分布式运行时:节点发现/休眠唤醒/任务状态机)</b> —
+  <b style="color:var(--blue)">Celld 保执行(分布式运行时:节点发现/休眠唤醒/任务状态机)</b> ·
+  <b style="color:var(--green)">agent 可用 BOS(记忆工具:history_search/session_snapshot)</b> —
   分层并存:数据层与执行层分离。⚠️ 本页为<b>演示 + 真实数据混合</b>:对话脚本为演示用途;
   延迟/ETag/对象大小等数字来自 2026-08-10 对真实 BOS 的一次完整重建采集,自动播放按序回放,不重复访问 BOS;
   数据保存在 <code>sessions/demo-large-session.json</code> (bucket <code>celagent-<user>-<ts></code>)
