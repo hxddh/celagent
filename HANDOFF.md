@@ -134,7 +134,7 @@ node bin/celagent-tui.mjs task ledger
 
 ## 6. 已知技术债/注意点
 
-- `install.sh` 正式模式仍依赖 `git clone`(发布改造点,见 3.5)
+- `install.sh` 正式模式仍依赖 `git clone`(发布改造点,见发布流程步骤 5)
 - `install.sh` 中 celld 下载走 `https://celld.dev/install.sh`(celld 官方);Release 随包分发后应改为从本仓库 Release 下载(随包分发决策)
 - worker 缓存读路径有 200 字符截断(URL 限制所致),完整数据在 BOS 权威源
 - HTML 演示页数字需与实时 BOS 对齐(演示数据来自 2026-08-10 实测)

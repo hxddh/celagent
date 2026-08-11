@@ -13,7 +13,11 @@
     "bin/",
     "src/",
     "scripts/",
+    "worker/",
+    "install.sh",
+    "setup.sh",
     "README.md",
+    "HANDOFF.md",
     "LICENSE"
   ],
   "scripts": {
