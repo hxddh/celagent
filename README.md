@@ -39,6 +39,7 @@ celagent config set model deepseek-v4-flash
 celagent task submit write-report 5   # 提交分布式任务 (celld 状态机, 断点续跑)
 celagent task status <taskId>         # 任务状态
 celagent task ledger                  # 幂等 ledger (exactly-once)
+celagent version           # 显示版本
 celagent help              # 全部命令
 ```
 
