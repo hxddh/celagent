@@ -74,7 +74,7 @@ node tests/e2e-memory-tools.mjs
 ### 已完成
 - ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content)
 - ✅ 测试:core 9 用例(节点在跑时全绿)、e2e 真实 LLM 验证
-- ✅ **发布前安全检查(六轮穷尽)**:文件层 + git 历史层 + 对象库层 + 代码逻辑层全部干净;62 个提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥/零用户名/零本机路径/零真实 bucket 名
+- ✅ **发布前安全检查(六轮穷尽)**:文件层 + git 历史层 + 对象库层 + 代码逻辑层全部干净;全部提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥/零用户名/零本机路径/零真实 bucket 名
 - ✅ 构建物:`celagent-bin`(75MB Bun 单二进制)mac arm64 已验证可运行(version/help/doctor/list/TUI 完整启动)
 - ✅ README/install.sh 已指向 `github.com/hxddh/celagent/releases/latest/download/install.sh`
 
