@@ -287,9 +287,9 @@
     <text x="590" y="228" font-size="12.5" fill="var(--svg-dim)">权威源(完整对话,不截断,含 thinking/工具结果)</text>
     <text x="590" y="252" font-size="12.5" fill="var(--svg-dim)">• CAS 乐观锁(ETag + If-Match):并发不冲突</text>
     <text x="590" y="276" font-size="12.5" fill="var(--svg-dim)">• 换机器/本地丢失/节点全挂 → 数据都在</text>
-    <text x="590" y="300" font-size="12.5" fill="var(--svg-dim)">• 另存:celld 状态(cells/ 210)+ worker 代码(deploy/ 16)</text>
+    <text x="590" y="300" font-size="12.5" fill="var(--svg-dim)">• 另存:celld 状态(cells/ 215)+ worker 代码(deploy/ 16)</text>
     <text x="590" y="328" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:权威存储 · 核心价值 · RPO=0</text>
-    <text x="590" y="346" font-size="12" fill="var(--svg-dim)" font-family="monospace">sessions/*.json (35 个) · 含运行元数据(9)</text>
+    <text x="590" y="346" font-size="12" fill="var(--svg-dim)" font-family="monospace">sessions/*.json (36 个) · 含运行元数据(9)</text>
 
     <!-- 双写箭头 -->
     <path d="M 250 110 C 250 135, 230 140, 230 165" stroke="#58a6ff" stroke-width="2.5" fill="none" marker-end="url(#arr)"/>
@@ -580,7 +580,7 @@
       <div class="panel-title">⑦ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
 
       <div class="mon-grid">
-        <div class="metric"><div class="m-label">对象总数 (bucket, 随运行增长)</div><div class="m-value blue" id="mObjects">270</div><div class="m-sub">sessions 覆盖写不新增;celld 状态 cells/ 每轮写 LTX (~1.5 个/轮, 实测)</div></div>
+        <div class="metric"><div class="m-label">对象总数 (bucket, 随运行增长)</div><div class="m-value blue" id="mObjects">276</div><div class="m-sub">sessions 36 · cells 215 · deploy 16 · celld 状态 9;运行中 cells/ 每轮写 LTX (~1.5 个/轮, 实测)</div></div>
         <div class="metric"><div class="m-label">demo-large-session 大小</div><div class="m-value" id="mBytes">173 B</div><div class="m-sub">本轮写入后对象大小</div></div>
         <div class="metric"><div class="m-label">读次数 (演示)</div><div class="m-value green" id="mReads">0</div><div class="m-sub">GET / head-object (ETag)</div></div>
         <div class="metric"><div class="m-label">写次数 (演示)</div><div class="m-value yellow" id="mWrites">0</div><div class="m-sub">PUT (If-Match CAS)</div></div>
@@ -598,7 +598,7 @@
       </div>
 
       <!-- 对象清单 -->
-      <div style="font-size:11px;color:var(--dim);margin:16px 0 6px">sessions/ 对象清单(演示 3 个,实际 35 个 — 高亮行为本轮更新;turns 数为对象内轮次)</div>
+      <div style="font-size:11px;color:var(--dim);margin:16px 0 6px">sessions/ 对象清单(演示 3 个,实际 36 个 — 高亮行为本轮更新;turns 数为对象内轮次)</div>
       <table class="obj-table">
         <thead><tr><th>key</th><th>turns</th><th>size</th><th>ETag (前12)</th></tr></thead>
         <tbody id="objBody"></tbody>
@@ -640,7 +640,7 @@
     <tbody>
       <tr>
         <td style="color:#d29922;font-weight:600">BOS 对象存储</td>
-        <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,35 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,210 个)、<b>deploy/agent-runtime</b>(worker 代码包,15 个)</td>
+        <td><b>sessions/&lt;id&gt;.json</b>(权威对话,完整不截断,36 个)、<b>cells/*/ltx + own.json</b>(Celld 分布式状态,215 个)、<b>deploy/agent-runtime</b>(worker 代码包,15 个)</td>
         <td>会话跨机器/防丢失(RPO=0)、并发安全(CAS)、换机器/删本地/节点全挂都能找回</td>
         <td style="color:var(--green)"><b>✅ 核心价值,真实需求,故障注入实测验证</b>(节点全挂可写、恢复 60/60)</td>
       </tr>
@@ -740,7 +740,7 @@ const REAL_RECORDS = [
   { turn:60, workerMs:229, readMs:1486, writeMs:884, etag:"66515969bc4e1", size:80879 },
 ];
 // 基线 (重建前实测): 对象总数 / 重建前 ETag
-const BASELINE_OBJECTS = 270;
+const BASELINE_OBJECTS = 276;
 const BASELINE_ETAG = "e586af54";
 
 // demo-large-session 对话内容 (60 轮工作流)
@@ -1114,7 +1114,7 @@ applyTheme(savedTheme);
 updateAutoProgress();
 updateMetrics();
 renderObjects();
-logFlow("就绪: 双节点在线 · BOS 基线 270 对象 · 点击「运行一轮」开始", "op-ok");
+logFlow("就绪: 双节点在线 · BOS 基线 276 对象 · 点击「运行一轮」开始", "op-ok");
 </script>
 </body>
 </html>
