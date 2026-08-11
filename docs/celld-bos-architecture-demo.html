@@ -265,8 +265,8 @@
     <!-- ===== 第 1 层: 交互 ===== -->
     <rect x="30" y="20" width="1020" height="90" rx="14" fill="var(--svg-panel)" stroke="#3fb950"/>
     <text x="60" y="52" font-size="17" font-weight="700" fill="var(--svg-text)">① 交互层 — celagent (Pi TUI 引擎)</text>
-    <text x="60" y="78" font-size="12.5" fill="var(--svg-dim)">对话 / 工具调用(bash·read·write·grep·edit·ls·find) / 多模型切换 / 会话管理(list·resume·/new)</text>
-    <text x="60" y="98" font-size="12.5" fill="var(--svg-dim)">每轮对话结束触发 turn_end 钩子 → 双写;启动时从 BOS 恢复历史注入上下文;工具文件操作直接落本地文件系统(与持久化无关)</text>
+    <text x="60" y="78" font-size="12.5" fill="var(--svg-dim)">对话 / 工具调用(bash·read·write·grep·edit·ls·find · <tspan fill="#3fb950">history_search·session_snapshot</tspan>) / 多模型切换 / 会话管理</text>
+    <text x="60" y="98" font-size="12.5" fill="var(--svg-dim)">每轮 turn_end → 双写;BOS 恢复历史注入;agent 可主动检索历史记忆(history_search)或打快照(session_snapshot);文件操作落本地磁盘</text>
 
     <!-- ===== 第 2/3 层: 双写 ===== -->
     <text x="540" y="148" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">每轮对话,双写两处 ↓</text>
@@ -301,7 +301,7 @@
     <text x="540" y="385" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">恢复路径:启动 / 换机器 / 节点故障 ↓</text>
     <rect x="60" y="405" width="990" height="90" rx="14" fill="var(--svg-panel)" stroke="#3fb950"/>
     <text x="90" y="438" font-size="16" font-weight="700" fill="#3fb950">④ 从 BOS 恢复 — 历史完整(RPO=0)</text>
-    <text x="90" y="465" font-size="12.5" fill="var(--svg-dim)">读取优先级:worker 缓存快路径 → miss 回 BOS 权威源。实测:节点全挂后 60/60 轮记录完整恢复</text>
+    <text x="90" y="465" font-size="12.5" fill="var(--svg-dim)">读取优先级:worker 缓存快路径 → miss 回 BOS 权威源;agent 可跨会话检索历史(history_search)。实测:节点全挂后 60/60 轮完整恢复</text>
     <path d="M 800 355 L 800 405" stroke="#3fb950" stroke-width="2.5" fill="none" marker-end="url(#arrG)"/>
     <text x="812" y="382" font-size="12.5" fill="#3fb950" font-family="monospace">读历史</text>
   </svg>
@@ -550,6 +550,27 @@
       <!-- 对话消息 -->
       <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">对话消息(演示脚本,最新在上)</div>
       <div class="chat" id="chat" aria-live="polite"></div>
+
+      <!-- 记忆工具演示 (P1) -->
+      <div style="font-size:11px;color:var(--dim);margin:18px 0 6px">记忆工具演示 — agent 主动检索历史 / 打快照</div>
+      <div class="trace" id="memTools" style="margin-top:0">
+        <div class="trace-row">
+          <div class="trace-cell bos-c">
+            <span class="tt">history_search — agent 调用</span>
+            <span class="kv">query: "持久化" → 扫描 sessions/*.json</span><br>
+            <span class="change">✓ 实测命中 4 条历史记忆(会话/轮次/时间)</span>
+          </div>
+          <div class="trace-cell bos-c">
+            <span class="tt">session_snapshot — agent 调用</span>
+            <span class="kv">name: 记忆锚点 → snapshots/&lt;name&gt;-&lt;ts&gt;.json</span><br>
+            <span class="change">✓ 快照轮次随对话增长(2 → 4 轮)</span>
+          </div>
+        </div>
+        <div class="dataflow-note" style="margin-top:10px">
+          agent 在对话中可直接调用这两个工具(经 customTools 注入 pi 引擎),
+          让 BOS 从"被动备份"变为"agent 主动可用的记忆库"。
+        </div>
+      </div>
     </div>
   </div>
 
