@@ -325,7 +325,7 @@
     <text x="590" y="228" font-size="12.5" fill="var(--svg-dim)">权威源(完整对话,不截断,含 thinking/工具结果)</text>
     <text x="590" y="252" font-size="12.5" fill="var(--svg-dim)">• CAS 乐观锁(ETag + If-Match):并发不冲突</text>
     <text x="590" y="276" font-size="12.5" fill="var(--svg-dim)">• 换机器/本地丢失/节点全挂 → 数据都在</text>
-    <text x="590" y="300" font-size="12.5" fill="var(--svg-dim)">• 另存:celld 状态(cells/ 215)+ worker 代码(deploy/ 16)</text>
+    <text x="590" y="300" font-size="12.5" fill="var(--svg-dim)">• 另存:celld 状态(cells/ 215)+ worker 代码(deploy/ 16 = agent-runtime 15 + current 1)</text>
     <text x="590" y="328" font-size="12" fill="var(--svg-dim)" font-family="monospace">定位:权威存储 · 核心价值 · RPO=0</text>
     <text x="590" y="346" font-size="12" fill="var(--svg-dim)" font-family="monospace">sessions/*.json (36 个) · 含运行元数据(9)</text>
 
@@ -674,11 +674,12 @@
   <div class="panel" style="margin-top:36px" id="stats">
     <div class="panel-title collapsible" onclick="togglePanel(this)">⑧ 数据总览 — demo-large-session 60 轮真实采集 <span class="toggle">▶ 点击展开</span></div>
     <div class="panel-collapsible" style="display:none">
-    <div class="mon-grid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="mon-grid" style="grid-template-columns:repeat(5,1fr)">
       <div class="metric"><div class="m-label">会话轮次</div><div class="m-value blue">60</div><div class="m-sub">真实工作流:代码分析任务</div></div>
       <div class="metric"><div class="m-label">会话总大小</div><div class="m-value">79 KB</div><div class="m-sub">80879B,含完整 thinking/工具结果</div></div>
       <div class="metric"><div class="m-label">工具调用轮次</div><div class="m-value yellow">40</div><div class="m-sub">ls/find/grep/read/bash 等</div></div>
-      <div class="metric"><div class="m-label">增长曲线</div><div class="m-value" style="font-size:15px">173B → 79KB</div><div class="m-sub">第1轮 → 第60轮</div></div>
+      <div class="metric"><div class="m-label">会话大小增长</div><div class="m-value" style="font-size:15px">173B → 79KB</div><div class="m-sub">第1轮 → 第60轮</div></div>
+      <div class="metric"><div class="m-label">bucket 对象增长</div><div class="m-value" style="font-size:15px">276 → 366</div><div class="m-sub">基线 + 60 轮 cells/LTX 写入</div></div>
     </div>
     <div style="font-size:12px;color:var(--dim);margin-top:10px">延迟指标见上方 ⑦ 监控面板(1.47s 读 / 0.84s 写 / 148ms 缓存)——此处不重复。</div>
     <div class="dataflow-note" style="margin-top:12px">
