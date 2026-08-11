@@ -41,7 +41,6 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
 | `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、60 轮真实数据回放) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |
-| `docs/archive/` | POC 阶段遗留(旧 SDK 探索/旧代码),仅供考古,勿用于新开发 |
 
 ## 2. 开发环境与命令
 
@@ -93,9 +92,9 @@ node bin/celagent-tui.mjs task ledger
 
 ### 发布流程(认证后按序执行)
 
-0. **docs/archive 去留决策**(发布前):archive/ 含 POC 探索代码(src-legacy 旧版、
-   poc-pi-sdk 等,已脱敏但价值低)。建议发布前删除整个目录(公开仓库不带 POC 垃圾),
-   或保留作为开发历史——需发布者拍板
+0. ✅ **docs/archive 已删除**(2026-08-11 决策):POC 探索代码(src-legacy/poc-pi-sdk/
+   p0-verify)及 75MB 旧二进制不再随公开仓库发布;有价值结论已在 HANDOFF/
+   bos-compat 等文档中
 1. **推送**:建仓 + push(gh repo create --push 或 git push -u origin main)
 2. **CI 首跑**:`.github/workflows/ci.yml` 首次运行,修到全绿(node 20/22 矩阵)
 3. **版本统一**:`install.sh` 的 `VERSION="0.1.0"` 与 `package.json` 的 `"0.2.0"` 不一致 → 统一为发布版本(建议 v0.3.0,因含 P1 记忆增强 + P2 分布式,已超 0.2.0 语义)
