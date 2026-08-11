@@ -420,19 +420,19 @@
 {
   <span class="k">"id"</span>: <span class="s">"sess-demo-xxxxxxxx"</span>,
   <span class="k">"turns"</span>: [
-    { <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"msg"</span>: <span class="s">"继续分析项目的架构部分,重点关注 bin/celagent-tui.mjs 的实现细节"</span>, <span class="k">"ts"</span>: <span class="n">1786352334751</span> }
+    { <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"msg"</span>: <span class="s">"使用本机的 awscli 创建 bos 的 bucket,并且随机写入 100个 object"</span>, <span class="k">"ts"</span>: <span class="n">1786352334751</span> }
   ],
   <span class="k">"updatedAt"</span>: <span class="n">1786343740759</span>  <span class="c">// 字段形态示例 (worker 缓存含 updatedAt; BOS 权威源不含)</span>
 }
 
 <span class="c">// 实测: BOS 权威源 (sessions/sess-demo-xxxxxxxx.json) — 完整记忆</span>
-<span class="c">// turn1 为演示脚本 (真实产品 turn_end 只写 assistant 轮); content/toolResults 为完整字段</span>
+<span class="c">// 真实会话 turns 均为 assistant (用户消息在本地 JSONL, 不写 BOS); content/toolResults 为完整字段</span>
 {
   <span class="k">"id"</span>: <span class="s">"sess-demo-xxxxxxxx"</span>,
   <span class="k">"turns"</span>: [
     {
-      <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"role"</span>: <span class="s">"user"</span>,
-      <span class="k">"msg"</span>: <span class="s">"继续分析项目的架构部分,重点关注 bin/celagent-tui.mjs 的实现细节"</span>, <span class="k">"ts"</span>: <span class="n">1786352334751</span>,
+      <span class="k">"turn"</span>: <span class="n">1</span>, <span class="k">"role"</span>: <span class="s">"assistant"</span>,
+      <span class="k">"msg"</span>: <span class="s">"环境已就绪:awscli 已安装,且 `~/.aws/credentials` 中已有 `[bos]` profile(BOS 北京 region, endpoint `https://s3.bj.bcebos.com`)"</span>, <span class="k">"ts"</span>: <span class="n">1786352334751</span>,
       <span class="k">"content"</span>: [ <span class="c">// 完整内容块 (thinking/text/toolCall 全量)</span>
         { <span class="k">"type"</span>: <span class="s">"thinking"</span>, <span class="k">"thinking"</span>: <span class="s">"完整推理过程…"</span> },
         { <span class="k">"type"</span>: <span class="s">"toolCall"</span>, <span class="k">"name"</span>: <span class="s">"bash"</span>, <span class="k">"arguments"</span>: { <span class="k">"command"</span>: <span class="s">"ls"</span> } }
