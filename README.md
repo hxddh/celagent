@@ -121,6 +121,12 @@ node tests/core.test.mjs              # 回归测试 (需节点在跑: scripts/n
 - 20 次高频写压测: 序号连续 1-20 无重复
 - Bug 1-65 修复: 覆盖持久化完整性、并发安全、信号处理、安装部署
 
+## 开发者 / Agent 接手
+
+- **HANDOFF.md** — 项目交接文档(架构/代码地图/发布状态/工程约定),新 agent 或开发者从它开始
+- **PACKAGING.md** — 打包与发布流程
+- **docs/distributed-deployment.md** — 多机部署
+
 ## License
 
 MIT
