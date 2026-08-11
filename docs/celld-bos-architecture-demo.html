@@ -245,7 +245,7 @@
 <header>
   <h1><span class="a">celagent</span> 运行过程演示 · Celld × BOS 交互与监控</h1>
   <div class="subtitle" style="color:var(--dim);font-size:13px;margin-top:4px">
-    三层定位 · 每轮双写过程 · BOS 读写监控 — 对话为演示脚本;延迟/ETag/对象大小等数字为真实采集(2026-08-10, bucket celagent-<user>-<ts>)
+    三层定位 · 每轮双写过程 · BOS 读写监控 — 对话为演示脚本;延迟/ETag/对象大小等数字为真实采集(2026-08-10, 真实 bucket)
   </div>
   <div class="badge-row" style="margin-top:10px;display:flex;gap:14px;justify-content:center;flex-wrap:wrap;font-size:12px;color:var(--dim)">
     <span><span style="color:#58a6ff">■</span> Celld 运行时/缓存</span>
@@ -640,7 +640,7 @@
   <!-- ===== 右: BOS 监控 ===== -->
   <div id="monitor">
     <div class="panel">
-      <div class="panel-title">⑦ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: celagent-<user>-<ts> (bj)</span></div>
+      <div class="panel-title">⑦ BOS 对象存储 · 读写监控 <span style="color:var(--dim);font-weight:400;font-size:11px">本演示会话内累计 · bucket: <用户bucket> (bj)</span></div>
 
       <div class="mon-grid">
         <div class="metric"><div class="m-label">对象总数 (bucket, 随运行增长)</div><div class="m-value blue" id="mObjects">276</div><div class="m-sub">sessions 36 · cells 215 · deploy 16 · celld 状态 9;运行中 cells/ 每轮写 LTX (~1.5 个/轮, 实测)</div></div>
@@ -737,7 +737,7 @@
   <b style="color:var(--green)">agent 可用 BOS(记忆工具:history_search/session_snapshot)</b> —
   分层并存:数据层与执行层分离。⚠️ 本页为<b>演示 + 真实数据混合</b>:对话脚本为演示用途;
   延迟/ETag/对象大小等数字来自 2026-08-10 对真实 BOS 的一次完整重建采集,自动播放按序回放,不重复访问 BOS;
-  数据保存在 <code>sessions/demo-large-session.json</code> (bucket <code>celagent-<user>-<ts></code>)
+  数据保存在 <code>sessions/demo-large-session.json</code> (bucket 为用户私有 BOS bucket)
 </footer>
 
 </div>

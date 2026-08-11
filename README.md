@@ -15,11 +15,11 @@
 ## 安装
 
 ```bash
-# 方式 1: 源码开发模式
-CELAGENT_SRC=~/celagent ./install.sh
+# 一键安装 (GitHub Release 二进制, 含 celld 运行时)
+curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh
 
-# 方式 2: (发布后) npm / GitHub release 一键安装
-curl -fsSL https://<发布地址>/install.sh | sh
+# 或开发模式 (源码)
+CELAGENT_SRC=~/celagent ./install.sh
 ```
 
 ## 使用
