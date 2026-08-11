@@ -34,8 +34,8 @@
     --svg-text: #1f2328;
   }
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:var(--bg); color:var(--text); font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; padding:20px 14px 60px; }
-  .wrap { max-width:1200px; margin:0 auto; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; padding:28px 24px 80px; }
+  .wrap { max-width:1400px; margin:0 auto; }
 
   header { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; padding-bottom:14px; border-bottom:1px solid var(--border); }
   h1 { font-size:20px; } h1 .a{ color:var(--blue); }
@@ -50,12 +50,16 @@
   .btn.danger:hover { background:var(--red-bg); }
   .btn:disabled { opacity:.4; cursor:not-allowed; }
 
-  .layout { display:grid; grid-template-columns: 380px 1fr; gap:14px; margin-top:14px; }
+  .layout { display:grid; grid-template-columns: 420px 1fr; gap:20px; margin-top:20px; }
   @media (max-width: 900px) { .layout { grid-template-columns:1fr; } }
 
   /* ===== 左: 过程面板 ===== */
   .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px 20px; }
   .panel-title { font-size:13px; font-weight:700; color:var(--dim); margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+  .panel-title.collapsible { cursor:pointer; user-select:none; }
+  .panel-title.collapsible:hover { color:var(--text); }
+  .panel-title .toggle { color:var(--dim); font-size:11px; margin-left:auto; opacity:.7; }
+  .panel-collapsible { transition: all .25s ease; }
   .panel-title .live { color:var(--green); font-size:11px; animation:blink 1.2s infinite; }
   @keyframes blink { 50% { opacity:.3; } }
 
@@ -75,7 +79,7 @@
 
   /* 数据流动画 */
   .flow { position:relative; background:var(--panel2); border-radius:10px; padding:10px 12px; min-height:150px; max-height:300px; overflow-y:auto; }
-  .flow-line { font-family:var(--mono); font-size:11.5px; color:var(--dim); padding:2px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:default; }
+  .flow-line { font-family:var(--mono); font-size:12.5px; color:var(--dim); padding:4px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:default; }
   .flow-line:hover { color:var(--text); }
   .flow-line .t { color:var(--dim); opacity:.6; }
   .flow-line .op-write { color:var(--blue); }
@@ -99,8 +103,8 @@
   .trace-head .th.celld { background:rgba(88,166,255,.12); color:#58a6ff; border:1px solid rgba(88,166,255,.3); }
   .trace-head .th.bos { background:rgba(210,153,34,.12); color:#d29922; border:1px solid rgba(210,153,34,.3); }
   #traceBody { max-height: 320px; overflow-y: auto; padding-right: 4px; }
-  .trace-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:6px; }
-  .trace-cell { background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:11px; font-family:var(--mono); }
+  .trace-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:10px; }
+  .trace-cell { background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:11px 13px; font-size:12px; font-family:var(--mono); }
   .trace-cell .tt { font-size:10px; color:var(--dim); display:block; margin-bottom:3px; }
   .trace-cell.celld-c { border-left:3px solid #58a6ff; }
   .trace-cell.bos-c { border-left:3px solid #d29922; }
@@ -118,8 +122,8 @@
 
   /* JSON 代码块 */
   .json-block {
-    background:#0d1117; border:1px solid var(--border); border-radius:10px;
-    padding:16px 18px; font-family:var(--mono); font-size:12px; line-height:1.8;
+    background:#0d1117; border:1px solid var(--border); border-radius:12px;
+    padding:18px 20px; font-family:var(--mono); font-size:12.5px; line-height:1.9;
     overflow-x:auto; white-space:pre; color:#c9d1d9; margin-top:12px;
   }
   .json-block .k { color:#79c0ff; }
@@ -141,9 +145,9 @@
   .msg.typing::after { content:'▍'; animation:blink 1s infinite; }
 
   /* ===== 右: BOS 监控 ===== */
-  .mon-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+  .mon-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
   @media (max-width:700px){ .mon-grid{ grid-template-columns:repeat(2,1fr); } }
-  .metric { background:var(--panel2); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .metric { background:var(--panel2); border:1px solid var(--border); border-radius:12px; padding:18px 20px; }
   .metric .m-label { font-size:11px; color:var(--dim); }
   .metric .m-value { font-size:22px; font-weight:700; font-family:var(--mono); margin-top:4px; }
   .metric .m-sub { font-size:10.5px; color:var(--dim); margin-top:3px; font-family:var(--mono); }
@@ -151,9 +155,9 @@
   .metric .m-value.yellow { color:var(--yellow); } .metric .m-value.red { color:var(--red); }
 
   /* 对象清单 */
-  .obj-table { width:100%; border-collapse:collapse; margin-top:12px; font-family:var(--mono); font-size:11.5px; }
-  .obj-table th, .obj-table td { padding:9px 10px; text-align:left; border-bottom:1px solid var(--border); }
-  .obj-table th { color:var(--dim); font-weight:600; font-size:10.5px; }
+  .obj-table { width:100%; border-collapse:collapse; margin-top:14px; font-family:var(--mono); font-size:12.5px; }
+  .obj-table th, .obj-table td { padding:11px 12px; text-align:left; border-bottom:1px solid var(--border); }
+  .obj-table th { color:var(--dim); font-weight:600; font-size:11.5px; }
   .obj-table tr.new { animation:rownew 1.2s; }
   @keyframes rownew { 0%{ background:rgba(63,185,80,.3); } 100%{ background:transparent; } }
   .obj-table .k { color:var(--blue); }
@@ -307,8 +311,9 @@
   </svg>
 
   <!-- 术语速览: 专业术语保留, 一句话解释 -->
-  <div class="panel" style="margin-top:24px" id="glossary">
-    <div class="panel-title">② 术语速览 — 看懂架构图需要的 8 个词</div>
+  <div class="panel" style="margin-top:36px" id="glossary">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">② 术语速览 — 看懂架构图需要的 8 个词 <span class="toggle">▼ 点击折叠</span></div>
+    <div class="panel-collapsible">
     <table class="obj-table" style="margin-top:8px">
       <thead><tr><th style="width:160px">术语</th><th>一句话解释</th></tr></thead>
       <tbody>
@@ -325,11 +330,13 @@
     <div class="dataflow-note" style="margin-top:8px">
       术语在页面中保留原样使用(不简化),此处提供解释 — 既保持技术准确性,也方便非技术读者对照阅读。
     </div>
+    </div>
   </div>
 
   <!-- 三条数据路径 (关键: 避免误导) -->
-  <div style="margin-top:24px" id="paths">
-    <div class="panel-title">③ 三条数据路径 — agent 的"手"和"大脑"分开走</div>
+  <div style="margin-top:36px" id="paths">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">③ 三条数据路径 — agent 的"手"和"大脑"分开走 <span class="toggle">▼ 点击折叠</span></div>
+    <div class="panel-collapsible">
     <table class="obj-table" style="margin-top:8px">
       <thead><tr>
         <th style="width:130px">路径</th><th style="width:200px">谁在操作</th>
@@ -363,11 +370,13 @@
       <b>一句话:</b> agent 的"手"(工具)只碰本地文件系统;<b>Celld/BOS 管的是"大脑"(对话记忆)</b>。
       你在项目里让 agent 改代码 = 本地写盘;你关掉它/换电脑 = 记忆从 BOS 找回(但改过的文件需要 git)。
     </div>
+    </div>
   </div>
 
   <!-- 具体写入的数据 (真实结构) -->
-  <div style="margin-top:24px" id="payload">
-    <div class="panel-title">④ 具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照"</div>
+  <div style="margin-top:36px" id="payload">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">④ 具体写入 Celld / BOS 的是什么 — 每轮对话的"记忆快照" <span class="toggle">▼ 点击折叠</span></div>
+    <div class="panel-collapsible">
     <div style="font-size:12.5px;color:var(--dim);margin-bottom:8px">
       每轮对话结束,celagent 把<b style="color:var(--text)">这一轮的对话记录</b>(不是文件、不是工作区)打包成一条 JSON 写入两处。
       以下为结构示例(字段结构真实,内容为演示):
@@ -424,11 +433,13 @@
       URL 长度受限,且中文经 URL 编码后膨胀约 3 倍(200 中文字符 → 约 1080 字符 URL)。
       截断是安全的:worker 只是缓存(丢了可从 BOS 重建),<b>BOS 权威源永远存完整内容</b>。
     </div>
+    </div>
   </div>
 
   <!-- 常见问题解答 (存什么/性能/之前在哪) -->
-  <div class="panel" style="margin-top:24px" id="faq">
-    <div class="panel-title">⑤ 常见问题 — 存什么 · 性能 · 之前在哪</div>
+  <div class="panel" style="margin-top:36px" id="faq">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">⑤ 常见问题 — 存什么 · 性能 · 之前在哪 <span class="toggle">▼ 点击折叠</span></div>
+    <div class="panel-collapsible">
 
     <div style="margin-bottom:18px">
       <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px">Q1: 写到 BOS 的是 agent 会话的"所有内容"吗?</div>
@@ -504,6 +515,7 @@
       <div style="font-size:12.5px;color:var(--dim);margin-top:8px">
         意义:agent 从"只记得当前会话"升级为"可检索全部历史" — 例如问它"我之前关于并发问题的讨论",它能主动搜索 BOS 并引用结论。
       </div>
+    </div>
     </div>
   </div>
 
@@ -608,8 +620,9 @@
 </div>
 
   <!-- 60 轮数据统计 (真实采集汇总) -->
-  <div class="panel" style="margin-top:24px" id="stats">
-    <div class="panel-title">⑧ 数据总览 — demo-large-session 60 轮真实采集</div>
+  <div class="panel" style="margin-top:36px" id="stats">
+    <div class="panel-title collapsible" onclick="togglePanel(this)">⑧ 数据总览 — demo-large-session 60 轮真实采集 <span class="toggle">▼ 点击折叠</span></div>
+    <div class="panel-collapsible">
     <div class="mon-grid">
       <div class="metric"><div class="m-label">会话轮次</div><div class="m-value blue">60</div><div class="m-sub">真实工作流:代码分析任务</div></div>
       <div class="metric"><div class="m-label">会话总大小</div><div class="m-value">79 KB</div><div class="m-sub">80879B,含完整 thinking/工具结果</div></div>
@@ -625,9 +638,10 @@
       每轮经完整链路:本地缓存写 → BOS 读 ETag → CAS 写 → ETag 更新。数据真实存在于
       <code>sessions/demo-large-session.json</code>。
     </div>
+    </div>
   </div>
 
-  <div class="panel" style="margin-top:24px" id="value">
+  <div class="panel" style="margin-top:36px" id="value">
     <div class="panel-title">⑨ 价值评估 — 一句话定位 + 诚实评估</div>
     <div class="dataflow-note">
     <b>一句话定位:</b> <code>BOS = 保数据(权威持久层,跨机器防丢失)</code> ·
@@ -994,6 +1008,16 @@ async function runOneTurn() {
     $("btnAuto").textContent = "⏵ 自动播放";
     logFlow("已完成: 60 轮对话全部落盘 BOS, 无丢失 (RPO=0)", "op-ok");
   }
+}
+
+// ============ 折叠控制 ============
+function togglePanel(titleEl) {
+  const panel = titleEl.nextElementSibling;
+  if (!panel) return;
+  const isHidden = panel.style.display === "none";
+  panel.style.display = isHidden ? "" : "none";
+  const toggle = titleEl.querySelector(".toggle");
+  if (toggle) toggle.textContent = isHidden ? "▼ 点击折叠" : "▶ 点击展开";
 }
 
 // ============ 控制 ============
