@@ -132,10 +132,10 @@ if [ -n "$NODE1_PID" ]; then
   # 恢复节点1
   AK=$(aws configure get aws_access_key_id --profile bos)
   SK=$(aws configure get aws_secret_access_key --profile bos)
-  nohup env CELLD_WATCH="$HOME/.local/e2e/nodes/node1-watch" CELLD_IDLE_EVICT_S=30 \
+  nohup env CELLD_IDLE_EVICT_S=30 \
     AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj \
-    "$HOME/.local/bin/celld" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
-    --listen 127.0.0.1:18090 --advertise 127.0.0.1:18090 > ~/.local/e2e/nodes/node1.log 2>&1 &
+    "${CELLD:-$HOME/.local/bin/celld}" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
+    --listen 127.0.0.1:18090 --advertise 127.0.0.1:18090 > "${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log" 2>&1 &
   sleep 6
 else
   check "节点1 存在" "fail"

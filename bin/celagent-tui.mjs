@@ -66,7 +66,7 @@ async function ensureCelld() {
         const stateDir = join(homedir(), ".local", "celagent", "state");
         mkdirSync(stateDir, { recursive: true });
         let celldBin = null;
-        for (const cand of [join(homedir(), ".local", "bin", "celld"), join(homedir(), ".local", "bin", "celld"), "/usr/local/bin/celld"]) {
+        for (const cand of [join(homedir(), ".local", "bin", "celld"), "/usr/local/bin/celld"]) {
           if (existsSync(cand)) { celldBin = cand; break; }
         }
         if (celldBin) {

@@ -39,7 +39,7 @@ fi
 echo "[3/4] 启动 BOS 模式 Celld 节点..."
 # 探测 celld (常见位置)
 CELLD=""
-for cand in "$HOME/.local/bin/celld" "$HOME/.local/bin/celld" "/usr/local/bin/celld" "/opt/homebrew/bin/celld"; do
+for cand in "$HOME/.local/bin/celld" "/usr/local/bin/celld" "/opt/homebrew/bin/celld"; do
   [ -x "$cand" ] && CELLD="$cand" && break
 done
 if [ -z "$CELLD" ]; then
@@ -49,7 +49,7 @@ fi
 echo "  celld: $CELLD"
 
 # 部署 worker 到 bucket (BOS 模式节点需要 deploy/current.json)
-# Bug 86: worker 源码在仓库内 worker/ 目录, 不再依赖 .local
+# Bug 86: worker 源码在仓库内 worker/ 目录
 SRC_WORKER="${CELAGENT_SRC:-$HOME/celagent}"
 if [ -d "$SRC_WORKER/worker/src" ]; then
   echo "  部署 worker 到 bucket..."

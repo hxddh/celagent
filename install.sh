@@ -71,7 +71,7 @@ chmod +x "${CELAGENT_ROOT}/bin/celagent"
 # 3. 安装 celld 运行时
 echo "[3/5] 安装 celld 运行时..."
 CELLD=""
-for cand in "$HOME/.local/bin/celld" "$HOME/.local/bin/celld" "/usr/local/bin/celld"; do
+for cand in "$HOME/.local/bin/celld" "/usr/local/bin/celld"; do
   [ -x "$cand" ] && CELLD="$cand" && break
 done
 if [ -z "$CELLD" ]; then
@@ -108,12 +108,12 @@ fi
 
 # 部署 worker 到 bucket (BOS 模式节点需要 deploy/current.json)
 # Bug 86: worker 源码已纳入仓库 (worker/src/index.js) — 不再依赖开发机特有的
-# .local 目录, 正式模式 (git clone 安装) 也能部署
+# 正式模式 (git clone 安装) 也能部署
 echo "  部署 worker..."
 WORKER_SRC="${CELAGENT_SRC}/worker"
 if [ -d "$WORKER_SRC/src" ]; then
   export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj
-  # Bug 86: esbuild 随仓库安装 (devDependency), 不再依赖 .local
+  # Bug 86: esbuild 随仓库安装 (devDependency)
   export CELLD_ESBUILD="${CELLD_ESBUILD:-$CELAGENT_ROOT/celagent/node_modules/.bin/esbuild}"
   (cd "$WORKER_SRC" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj >/dev/null 2>&1)
   echo "  ✓ worker 已部署 (${WORKER_SRC})"

@@ -5,15 +5,15 @@ set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 export AWS_PROFILE=bos AWS_REGION=bj
 
-CELLD="$HOME/.local/bin/celld"
+CELLD="${CELLD:-$HOME/.local/bin/celld}"
 # bucket 优先从 celagent 配置读 (与自动启动一致 — Bug 49), 回退旧测试值
 BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
 [ -z "$BUCKET" ] && BUCKET=$(cat /tmp/celld_e2e_bucket 2>/dev/null)
 EP="https://s3.bj.bcebos.com"
-WATCH1="$HOME/.local/e2e/nodes/node1-watch"
-WATCH2="$HOME/.local/e2e/nodes/node2-watch"
-LOG1="$HOME/.local/e2e/nodes/node1.log"
-LOG2="$HOME/.local/e2e/nodes/node2.log"
+WATCH1="${NODE_DIR:-$HOME/.local/celagent/nodes}/node1-watch"
+WATCH2="${NODE_DIR:-$HOME/.local/celagent/nodes}/node2-watch"
+LOG1="${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log"
+LOG2="${NODE_DIR:-$HOME/.local/celagent/nodes}/node2.log"
 
 start_node() {
   local port=$1 watch=$2 log=$3

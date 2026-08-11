@@ -7,7 +7,7 @@ set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 export AWS_PROFILE=bos AWS_REGION=bj
 
-CELLD="$HOME/.local/bin/celld"
+CELLD="${CELLD:-$HOME/.local/bin/celld}"
 BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
 [ -z "$BUCKET" ] && BUCKET=$(cat /tmp/celld_e2e_bucket 2>/dev/null)
 EP="https://s3.bj.bcebos.com"
