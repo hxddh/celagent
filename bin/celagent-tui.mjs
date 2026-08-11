@@ -195,6 +195,12 @@ function queueBosWrite(sessionId, seq, role, msg, opts = {}) {
         } else if (existing.error === "not-found") {
           // Bug 76: 首写也条件化 (If-None-Match) — 并发冷启动同 ID 时,
           // 双方都读 not-found 会互相无条件覆盖丢首轮; 条件写保证只有一个成功
+          // Bug 97: 首写必须包含当前轮次 — 旧实现建空对象后 return, 首轮数据丢失
+          const entry = { turn: seq, role, msg, ts: Date.now() };
+          if (fullContent && fullContent.length > 0) entry.content = fullContent;
+          if (fullToolResults && fullToolResults.length > 0) entry.toolResults = fullToolResults;
+          session.turns.push(entry);
+          session.updatedAt = Date.now();
           const put = await bosPut(key, session, { bucket, endpoint, ifNoneMatch: true });
           if (put.ok) return;
           if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; } // 对方已建, 重读合并
