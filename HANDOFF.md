@@ -31,7 +31,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
 | `worker/src/index.js` | Celld worker(缓存读路径、Sync API、AWS SigV4 手写签名) |
 | `worker/wrangler.jsonc` | worker 配置 |
-| `install.sh` | 一键安装(正式模式:git clone + npm install;开发模式:CELAGENT_SRC) |
+| `install.sh` | 一键安装(正式模式:GitHub Release 下载平台二进制 + celld/worker;开发模式:CELAGENT_SRC) |
 | `setup.sh` | 一键部署(凭证检测→建 bucket→部署 worker→启动双节点→写配置) |
 | `scripts/node_mgr.sh` | 本机双节点管理(start/stop/status/restart,18090/18091) |
 | `scripts/cluster_mgr.sh` | 多机集群管理(add-node/status 等) |
@@ -130,7 +130,7 @@ node bin/celagent-tui.mjs task ledger
    bun build bin/celagent-tui.mjs --compile --target=bun-darwin-x64 --outfile celagent-darwin-x64
    bun build bin/celagent-tui.mjs --compile --target=bun-linux-x64 --outfile celagent-linux-x64
    ```
-5. **install.sh 正式模式端到端**:install.sh 当前正式模式走 `git clone + npm install`(仓库安装),**尚未改成"curl GitHub Release 下载二进制"**——这是发布前最后一个改造点。目标:Release 资产含 `celagent-<平台>` + `celld` 二进制,install.sh 检测平台 → 下载对应二进制 → 装到 `~/.local/bin`
+5. ✅ **install.sh 正式模式**:已改为从 GitHub Release 下载 `celagent-<平台>` / `celld-<平台>` / `worker.tar.gz`(开发模式仍可用 `CELAGENT_SRC`)
 6. **创建 Release**:`gh release create v0.3.0` → 上传二进制 + celld + install.sh
 7. **端到端验证**:全新机器 `curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh` 真实走一遍
 
@@ -162,8 +162,8 @@ node bin/celagent-tui.mjs task ledger
 
 ## 6. 已知技术债/注意点
 
-- `install.sh` 正式模式仍依赖 `git clone`(发布改造点,见发布流程步骤 5)
-- `install.sh` 中 celld 下载走 `https://celld.dev/install.sh`(celld 官方);Release 随包分发后应改为从本仓库 Release 下载(随包分发决策)
+- `install.sh` 正式模式已走 Release 二进制下载;开发模式用 `CELAGENT_SRC`
+- `install.sh` 中 celld: Release 随包优先, 回退 `https://celld.dev/install.sh`
 - worker 缓存读路径有 200 字符截断(URL 限制所致),完整数据在 BOS 权威源
 - HTML 演示页数字已按 2026-08-11 实时 BOS 对齐;回放为 33 轮真实会话实录(脱敏后),
   后续更新数据时保持与 BOS 一致 + 敏感扫描(见红线)
