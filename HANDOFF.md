@@ -144,7 +144,7 @@ node bin/celagent-tui.mjs task ledger
 1. **中文交流**(代码注释/文档/commit message 用中文)
 2. **先分析方案再动手**,不直接改;改动前说明影响面
 3. **数据必须真实**——测试/演示数据来自实测,不得虚构(发布物中的演示数字需与实时 BOS 对齐)
-4. **仓库安全红线**(发布过六轮安全检查,任何新提交不得引入):
+4. **仓库安全红线**(发布前已多轮穷尽检查,任何新提交不得引入):
    - 不得提交任何 API key/凭证/密钥(含 git 历史)
    - 不得提交真实用户名(<local-user>)、本机路径(/Users/、celld-test、celagent-poc)、真实 bucket 名
    - 凭证一律运行时动态获取(env / aws configure)
