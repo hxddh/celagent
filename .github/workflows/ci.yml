@@ -28,7 +28,7 @@ jobs:
         run: |
           node bin/celagent-tui.mjs help >/dev/null
           node bin/celagent-tui.mjs version | grep -q "celagent v"
-      - name: Unit tests (no celld: mock mode)
+      - name: "Unit tests (no celld, mock mode)"
         run: npm test
         env:
           CELAGENT_MOCK: "1"
