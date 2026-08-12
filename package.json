@@ -27,7 +27,7 @@
     "list": "node bin/celagent-tui.mjs list"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "keywords": [
     "agent",

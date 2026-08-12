@@ -46,6 +46,8 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 ### 快速上手(新环境,按序执行)
 
 ```bash
+# 0. 前置: node >= 22 (pi 依赖链 undici 8.x 不支持 node 20)
+node --version
 # 1. 依赖 (pi 引擎等)
 npm install
 # 2. Celld 运行时 (测试/节点必需; 不在仓库内, 需单独安装)

@@ -14,7 +14,13 @@ echo "=== celagent v${VERSION} 一键安装 (Celld + BOS) ==="
 for cmd in node curl aws jq; do
   command -v $cmd >/dev/null 2>&1 || { echo "  需要 $cmd (brew install jq)"; exit 1; }
 done
-echo "  ✓ node/curl/aws/jq 就绪"
+# undici 8.x 依赖链要求 node >= 22 (node 20 运行时 import 崩溃)
+NODE_MAJOR=$(node -e "console.log(process.versions.node.split('.')[0])" 2>/dev/null)
+if [ "${NODE_MAJOR:-0}" -lt 22 ]; then
+  echo "  ✗ 需要 node >= 22 (当前 $NODE_MAJOR) — pi 引擎依赖链 undici 8.x 不支持 node 20"
+  exit 1
+fi
+echo "  ✓ node $NODE_MAJOR/curl/aws/jq 就绪"
 
 # 2. 安装 celagent CLI
 # Bug 58/66: 正式模式支持从 git 仓库/npm 包安装, 不再强制要求 CELAGENT_SRC

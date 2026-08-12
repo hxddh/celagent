@@ -128,6 +128,7 @@ celagent (TUI, bin/celagent-tui.mjs)
 
 ```bash
 cd <仓库路径>
+node --version                         # 需 >= 22 (pi 依赖链 undici 8.x 要求)
 npm install                            # 依赖 (pi 引擎等)
 CELAGENT_SRC=<仓库路径> ./setup.sh     # 首次: 建 bucket + 部署 worker + 写配置 + 启动节点
 node bin/celagent-tui.mjs doctor       # 自检
