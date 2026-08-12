@@ -147,6 +147,7 @@ node tests/core.test.mjs               # 回归测试 (需节点在跑: scripts/
 
 - **HANDOFF.md** — 项目交接文档(代码地图/发布状态/工程约定),新 agent 或开发者从它开始
 - **docs/architecture.md** — 架构权威(三层模型/数据流/机制原理/设计决策/扩展点)
+- **docs/project-evaluation.md** — 深度评估(文档/代码对照、成熟度、优先改进)
 - **PACKAGING.md** — 打包与发布流程
 - **docs/distributed-deployment.md** — 多机部署
 
