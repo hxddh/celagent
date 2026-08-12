@@ -17,15 +17,14 @@ LOG2="${NODE_DIR:-$HOME/.local/celagent/nodes}/node2.log"
 
 start_node() {
   local port=$1 watch=$2 log=$3
-  AK=$(aws configure get aws_access_key_id --profile bos)
-  SK=$(aws configure get aws_secret_access_key --profile bos)
   # Bug 93: 启动时截断旧日志 (celld 的 durability proof 刷屏会无限增长)
   # 保留最近 1MB, 避免日志无限膨胀
   if [ -f "$log" ]; then
     tail -c 1048576 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log"
   fi
-  nohup env CELLD_WATCH="$watch" CELLD_IDLE_EVICT_S=30 \
-    AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj \
+  # 凭证卫生: AWS_PROFILE=bos, 不把 SK 读进变量/显式注入
+  nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+    CELLD_WATCH="$watch" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
     --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" > "$log" 2>&1 &
   echo "started node on $port (pid $!)"

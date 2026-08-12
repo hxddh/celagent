@@ -43,23 +43,31 @@ async function ensureCelld() {
     try {
       const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
       const bucket = cfg.persistence?.bucket;
-      // 凭证: 优先环境变量, 否则从 ~/.aws/credentials 读 (像 aws configure get)
+      // 凭证: 优先完整环境变量; 否则 AWS_PROFILE=bos (不把 SK 读进 Node 堆)
       // Bug 77: 与 bos.js awsEnv 同策略 — 要么全用 env, 要么全用 profile,
       // 绝不混用 (env 只有部分凭证时, 用 profile 的会签名失败且难排查)
-      let AK, SK;
-      const hasFullEnv = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
-      if (hasFullEnv) {
-        AK = process.env.AWS_ACCESS_KEY_ID;
-        SK = process.env.AWS_SECRET_ACCESS_KEY;
-      } else if (existsSync(join(homedir(), ".aws", "credentials"))) {
+      const hasFullEnv = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+      let hasBosProfile = false;
+      if (!hasFullEnv && existsSync(join(homedir(), ".aws", "credentials"))) {
         try {
           const creds = readFileSync(join(homedir(), ".aws", "credentials"), "utf8");
           const section = creds.split(/\[bos\]/)[1]?.split(/\[/)[0] || "";
-          AK = section.match(/aws_access_key_id\s*=\s*(\S+)/)?.[1];
-          SK = section.match(/aws_secret_access_key\s*=\s*(\S+)/)?.[1];
+          hasBosProfile = !!(section.match(/aws_access_key_id\s*=\s*\S+/) && section.match(/aws_secret_access_key\s*=\s*\S+/));
         } catch (e) { /* 读取失败 */ }
       }
-      if (bucket && AK && SK) {
+      const bosChildEnv = () => {
+        const env = { ...process.env, AWS_REGION: cfg.persistence?.region || "bj", AWS_EC2_METADATA_DISABLED: "true" };
+        if (hasFullEnv) {
+          delete env.AWS_PROFILE;
+        } else {
+          delete env.AWS_ACCESS_KEY_ID;
+          delete env.AWS_SECRET_ACCESS_KEY;
+          delete env.AWS_SESSION_TOKEN;
+          env.AWS_PROFILE = "bos";
+        }
+        return env;
+      };
+      if (bucket && (hasFullEnv || hasBosProfile)) {
         console.log("  (自动启动 Celld 节点, bucket=" + bucket + ")...");
         const { spawn } = await import("node:child_process");
         const { mkdirSync } = await import("node:fs");
@@ -82,7 +90,7 @@ async function ensureCelld() {
               "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com",
               "--query", "Contents[?ends_with(Key, `own.json`)].Key",
               "--output", "json",
-            ], { env: { ...process.env, AWS_ACCESS_KEY_ID: AK, AWS_SECRET_ACCESS_KEY: SK }, encoding: "utf8" });
+            ], { env: bosChildEnv(), encoding: "utf8" });
             const ownKeys = JSON.parse(keys || "[]");
             if (ownKeys.length > 0) {
               for (const k of ownKeys) {
@@ -91,7 +99,7 @@ async function ensureCelld() {
                   "--bucket", bucket,
                   "--key", k,
                   "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com",
-                ], { env: { ...process.env, AWS_ACCESS_KEY_ID: AK, AWS_SECRET_ACCESS_KEY: SK }, stdio: "ignore" });
+                ], { env: bosChildEnv(), stdio: "ignore" });
               }
               console.log(`  (已清理 ${ownKeys.length} 个残留 ownership)`);
             }
@@ -113,7 +121,7 @@ async function ensureCelld() {
               "--listen", `127.0.0.1:${port}`,
               "--advertise", `127.0.0.1:${port}`,
             ], {
-              env: { ...process.env, CELLD_WATCH: join(stateDir, `node${port}`), AWS_ACCESS_KEY_ID: AK, AWS_SECRET_ACCESS_KEY: SK, AWS_REGION: cfg.persistence?.region || "bj" },
+              env: { ...bosChildEnv(), CELLD_WATCH: join(stateDir, `node${port}`) },
               stdio: "ignore",
               detached: true,
             });

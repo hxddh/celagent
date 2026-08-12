@@ -10,11 +10,10 @@ echo "=== celagent 一键部署 (Celld + BOS 对象存储) ==="
 # Bug 90: jq 是 bucket 复用逻辑的依赖, 缺失时静默新建 bucket 覆盖配置
 command -v jq >/dev/null 2>&1 || { echo "  ✗ 需要 jq (brew install jq)"; exit 1; }
 
-# 1. 检测 BOS 凭证
+# 1. 检测 BOS 凭证 (只验证存在, 不把 SK 读进 shell 变量)
 echo "[1/4] 检测 BOS 凭证..."
-AK=$(aws configure get aws_access_key_id --profile bos 2>/dev/null || true)
-SK=$(aws configure get aws_secret_access_key --profile bos 2>/dev/null || true)
-if [ -z "$AK" ] || [ -z "$SK" ]; then
+if ! aws configure get aws_access_key_id --profile bos >/dev/null 2>&1 \
+  || ! aws configure get aws_secret_access_key --profile bos >/dev/null 2>&1; then
   echo "  ✗ 未找到 BOS 凭证 (需 ~/.aws/credentials 的 [bos] profile)"
   echo "  请配置: aws configure --profile bos"
   echo "    AWS Access Key ID: <你的 AK>"
@@ -25,8 +24,10 @@ fi
 echo "  ✓ BOS 凭证可用"
 
 # 2. 创建 bucket — Bug 66: 优先复用已有配置的 bucket, 重装不丢数据
+# 默认名用随机后缀, 不含 whoami (避免 OS 用户名进入云资源名)
+_rand() { openssl rand -hex 4 2>/dev/null || od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'; }
 EXISTING_BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
-BUCKET="${1:-${EXISTING_BUCKET:-celagent-$(whoami)-$(date +%s)}}"
+BUCKET="${1:-${EXISTING_BUCKET:-celagent-$(_rand)-$(date +%s)}}"
 echo "[2/4] 创建 bucket: $BUCKET"
 if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
   echo "  ✓ bucket 已存在"
@@ -53,7 +54,9 @@ echo "  celld: $CELLD"
 SRC_WORKER="${CELAGENT_SRC:-$HOME/celagent}"
 if [ -d "$SRC_WORKER/worker/src" ]; then
   echo "  部署 worker 到 bucket..."
-  export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj
+  # 凭证卫生: 用 AWS_PROFILE, 不把 SK 注入进程环境
+  export AWS_PROFILE=bos AWS_REGION=bj
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
   export CELLD_ESBUILD="${CELLD_ESBUILD:-$SRC_WORKER/node_modules/.bin/esbuild}"
   (cd "$SRC_WORKER/worker" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj 2>&1 | tail -2)
   echo "  ✓ worker 已部署"
@@ -78,8 +81,9 @@ done
 # 从未被引用; 原逻辑 esbuild 失败还会错误地 exit 1 中止已成功的部署。
 
 for port in 18090 18091; do
-  nohup env CELLD_WATCH="$STATE_DIR/node$port" \
-    AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj \
+  # 凭证卫生: celld 走 AWS_PROFILE=bos, 清除可能残留的显式密钥 env
+  nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+    CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
     --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" \
     > "$STATE_DIR/node$port.log" 2>&1 &

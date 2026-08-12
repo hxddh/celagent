@@ -89,8 +89,9 @@ node bin/celagent-tui.mjs task ledger
   - 或 `AWS_PROFILE=bos aws s3api list-buckets`(避坑指南: 统一 env 形式)
   - endpoint `https://s3.bj.bcebos.com`,凭证在 `~/.aws/credentials` 的 `[bos]` profile(动态读取)
 - **LLM**:DeepSeek(OpenAI 兼容),key 在 `DEEPSEEK_API_KEY` 环境变量(无值时自动降级 mock)
-- **凭证优先级**:环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` 优先(必须成对);否则用 `~/.aws/credentials` 的 `[bos]` profile(不混用)
+- **凭证优先级**:完整环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` 优先(必须成对);否则用 `AWS_PROFILE=bos`(不把 SK 读进脚本变量/Node 堆).两者不混用
 - **install.sh 可配置 env**:`CELAGENT_REPO`(仓库地址)、`CELAGENT_SRC`(开发模式)、`CELAGENT_ROOT`(安装根目录,默认 ~/.local)、`CELAGENT_BUCKET`(强制 bucket)、`CELLD_ESBUILD`(esbuild 路径)
+- **默认 bucket**:`celagent-<rand8>-<ts>`(随机后缀, 不含 whoami)
 - **Celld**:不在仓库内,安装方式 `curl -fsSL https://celld.dev/install.sh | sh`(装到 `~/.local/bin/celld`);发布后随 Release 包分发
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
@@ -119,7 +120,7 @@ node bin/celagent-tui.mjs task ledger
 2. **CI 首跑**:`.github/workflows/ci.yml` 首次运行,修到全绿(node 20/22 矩阵)
 3. **版本统一**:`install.sh` 的 `VERSION="0.1.0"` 与 `package.json` 的 `"0.2.0"` 不一致 → 统一为发布版本(建议 v0.3.0,因含 P1 记忆增强 + P2 分布式,已超 0.2.0 语义)
 4. **跨平台构建**(⚠️ 必须在匿名路径构建, 见 PACKAGING.md 注意 0 — Bun 嵌入本机绝对路径,
-   仓库目录实测含 `/Users/<user>/<project>/...`; 构建后 `strings <bin> | grep -E "<local-user>|/Users/"` 必须为空):
+   仓库目录实测含 `/Users/<user>/<project>/...`; 构建后 `strings <bin> | grep -E '/Users/|/home/[^/]+/|celld-test|celagent-poc'` 必须为空):
    ```bash
    # 先按 PACKAGING.md 注意 0 准备 /tmp/anon-build
    cd /tmp/anon-build
@@ -149,11 +150,13 @@ node bin/celagent-tui.mjs task ledger
 3. **数据必须真实**——测试/演示数据来自实测,不得虚构(发布物中的演示数字需与实时 BOS 对齐)
 4. **仓库安全红线**(发布前已多轮穷尽检查,任何新提交不得引入):
    - 不得提交任何 API key/凭证/密钥(含 git 历史)
-   - 不得提交真实用户名(<local-user>)、本机路径(/Users/、celld-test、celagent-poc)、真实 bucket 名
-   - 凭证一律运行时动态获取(env / aws configure)
-   - 新增文件默认自检:`grep -rnE 'sk-[a-zA-Z0-9]{20,}|AKIA|ghp_|ALTAK' <文件>`
+   - 不得提交真实本机用户名、本机绝对路径(`/Users/...`、`/home/...`)、内部项目名(`celld-test`、`celagent-poc`)、真实 bucket/session id
+   - **禁止在文档里写真实敏感样例当 denylist**(用抽象模式,如 `<local-user>` / `/Users/<user>/`)
+   - 凭证一律运行时动态获取(优先 `AWS_PROFILE=bos`; 不全量把 SK 拷进脚本变量/子进程 env)
+   - 默认 bucket 名不得含 `whoami`(用随机后缀)
+   - 新增文件默认自检:`rg -n 'sk-[a-zA-Z0-9]{20,}|AKIA|ghp_|ALTAK|/Users/[A-Za-z0-9._-]+/' <文件>`
 5. 提交作者统一 `hxddh <hxddh@users.noreply.github.com>`(新环境需自行 `git config user.name/email` 设置,开发机已设)
-6. 改完跑测试:`node tests/core.test.mjs`(节点在跑时)+ 相关脚本 `bash -n` 语法检查
+6. 改完跑测试:`node tests/core.test.mjs`(节点在跑时)+ 相关脚本 `bash -n` 语法检查 + CI secret/PII scan
 
 ## 6. 已知技术债/注意点
 

@@ -60,7 +60,7 @@ GitHub Release:
    cp -al bin src worker package.json package-lock.json scripts /tmp/anon-build/
    cp -al node_modules /tmp/anon-build/node_modules    # 必须硬链接复制, 不能符号链接
    cd /tmp/anon-build && bun build bin/celagent-tui.mjs --compile --outfile celagent-<平台>
-   strings celagent-<平台> | grep -E "<local-user>|/Users/|celld-test"   # 必须为空
+   strings celagent-<平台> | grep -E '/Users/|/home/[^/]+/|celld-test|celagent-poc'   # 必须为空
    ```
    或直接用 CI (GitHub Actions runner 路径 /home/runner/work/..., 天然干净)。
    仓库目录下的旧 `celagent-bin` (含本机路径) 已废弃, 严禁上传 Release。

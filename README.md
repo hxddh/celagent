@@ -96,7 +96,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
   "provider": "deepseek",
   "model": "deepseek-v4-flash",
   "persistence": {
-    "bucket": "celagent-<user>-<ts>",
+    "bucket": "celagent-<rand>-<ts>",
     "endpoint": "https://s3.bj.bcebos.com",
     "region": "bj"
   }

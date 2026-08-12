@@ -19,10 +19,9 @@ DEFAULT_PORTS="18090 18091"
 
 start_node() {
   local port=$1 advertise=$2
-  AK=$(aws configure get aws_access_key_id --profile bos)
-  SK=$(aws configure get aws_secret_access_key --profile bos)
-  nohup env CELLD_WATCH="$STATE_DIR/node$port" \
-    AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj \
+  # 凭证卫生: AWS_PROFILE=bos, 不把 SK 读进变量/显式注入
+  nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+    CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
     --listen "127.0.0.1:${port}" --advertise "$advertise" \
     > "$STATE_DIR/node$port.log" 2>&1 &

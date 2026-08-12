@@ -90,11 +90,10 @@ if [ -z "$CELLD" ]; then
 fi
 echo "  ✓ celld: $CELLD"
 
-# 4. 检测 BOS 凭证 + 创建 bucket
+# 4. 检测 BOS 凭证 + 创建 bucket (只验证存在, 不把 SK 读进 shell 变量)
 echo "[4/5] 配置 BOS 对象存储..."
-AK=$(aws configure get aws_access_key_id --profile bos 2>/dev/null || true)
-SK=$(aws configure get aws_secret_access_key --profile bos 2>/dev/null || true)
-if [ -z "$AK" ] || [ -z "$SK" ]; then
+if ! aws configure get aws_access_key_id --profile bos >/dev/null 2>&1 \
+  || ! aws configure get aws_secret_access_key --profile bos >/dev/null 2>&1; then
   echo "  ✗ 未找到 BOS 凭证 (需 ~/.aws/credentials 的 [bos] profile)"
   echo "  请配置: aws configure --profile bos"
   exit 1
@@ -103,8 +102,10 @@ echo "  ✓ BOS 凭证可用"
 
 # 创建/复用 bucket — Bug 66: 已有 settings.json 时优先复用其 bucket,
 # 绝不在重装时新建 bucket 丢失用户数据
+# 默认名用随机后缀, 不含 whoami
+_rand() { openssl rand -hex 4 2>/dev/null || od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'; }
 EXISTING_BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
-BUCKET="${CELAGENT_BUCKET:-${EXISTING_BUCKET:-celagent-$(whoami)-$(date +%s)}}"
+BUCKET="${CELAGENT_BUCKET:-${EXISTING_BUCKET:-celagent-$(_rand)-$(date +%s)}}"
 if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
   echo "  ✓ bucket 已存在: $BUCKET"
 else
@@ -118,7 +119,8 @@ fi
 echo "  部署 worker..."
 WORKER_SRC="${CELAGENT_SRC}/worker"
 if [ -d "$WORKER_SRC/src" ]; then
-  export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj
+  export AWS_PROFILE=bos AWS_REGION=bj
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
   # Bug 86: esbuild 随仓库安装 (devDependency)
   export CELLD_ESBUILD="${CELLD_ESBUILD:-$CELAGENT_ROOT/celagent/node_modules/.bin/esbuild}"
   (cd "$WORKER_SRC" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj >/dev/null 2>&1)
@@ -136,8 +138,8 @@ pkill -f 'celld.*1809' 2>/dev/null || true
 sleep 2
 
 for port in 18090 18091; do
-  nohup env CELLD_WATCH="$STATE_DIR/node$port" \
-    AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj \
+  nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+    CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
     --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" \
     > "$STATE_DIR/node$port.log" 2>&1 &

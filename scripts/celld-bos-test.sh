@@ -129,11 +129,9 @@ if [ -n "$NODE1_PID" ]; then
   sleep 5
   LTX_AFTER=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "cells/" --endpoint-url "$EP" --query 'length(Contents)' --output text --no-paginate 2>/dev/null | head -1 || echo 0)
   check "原会话 LTX 保留在 BOS (≥1)" "$([ "$LTX_AFTER" -gt 0 ] 2>/dev/null && echo ok || echo fail)"
-  # 恢复节点1
-  AK=$(aws configure get aws_access_key_id --profile bos)
-  SK=$(aws configure get aws_secret_access_key --profile bos)
-  nohup env CELLD_IDLE_EVICT_S=30 \
-    AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_REGION=bj \
+  # 恢复节点1 (凭证卫生: AWS_PROFILE, 不物化 SK)
+  nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+    CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
     "${CELLD:-$HOME/.local/bin/celld}" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
     --listen 127.0.0.1:18090 --advertise 127.0.0.1:18090 > "${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log" 2>&1 &
   sleep 6

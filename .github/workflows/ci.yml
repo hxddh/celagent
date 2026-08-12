@@ -35,6 +35,21 @@ jobs:
         env:
           CELAGENT_MOCK: "1"
         continue-on-error: true
+      - name: Secret / PII scan
+        run: |
+          set -euo pipefail
+          # 拦截密钥形态 + 红线禁止的本机路径/历史 PII 样例
+          if command -v rg >/dev/null 2>&1; then
+            SCAN=(rg -n --glob '!package-lock.json' --glob '!.git/**')
+          else
+            SCAN=(grep -RIn --exclude=package-lock.json --exclude-dir=.git)
+          fi
+          PATTERN='<local-user>|x-blocked-sess|/Users/[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/(celagent|celld)|ALTAK[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|aws_secret_access_key[[:space:]]*=[[:space:]]*[^[:space:]<$]'
+          if "${SCAN[@]}" -E "$PATTERN" .; then
+            echo "::error::Secret/PII scan failed — 命中敏感模式"
+            exit 1
+          fi
+          echo "OK: secret/PII scan clean"
       - name: Shell syntax check
         run: |
           bash -n install.sh setup.sh scripts/*.sh
