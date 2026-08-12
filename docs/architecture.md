@@ -27,6 +27,9 @@
 
 **一句话**:BOS 保数据(权威源,RPO=0)、Celld 保执行(缓存/任务/集群)、agent 可用 BOS(记忆工具)。
 
+**记忆体系**:`sessions/<id>.json`(权威会话)+ `snapshots/<name>-<ts>.json`(显式记忆锚点,
+由 `session_snapshot` 工具写入,不碰权威数据,可跨会话检索 via `history_search`)。
+
 ### 1.2 一次对话的完整旅程
 
 ```
@@ -35,7 +38,8 @@
    → celldCheckpoint:
        ① worker 缓存: HTTP checkpoint 到任一 celld 节点
           (fire-and-forget, 2s 超时, 失败仅警告 — 缓存可重建)
-       ② BOS 直写: 入异步队列 queueBosWrite (串行执行)
+       ② BOS 直写: 入异步队列 queueBosWrite (串行执行, 限长 50 —
+          BOS_QUEUE_MAX, Bug E 防内存泄漏, 超出丢最旧任务)
           → bosGet 读当前对象 + ETag → 合并轮次 → If-Match CAS 写
           → 冲突(412)重读重试 ×3 → 失败警告但不阻塞对话
    → 退出前: await bosQueue (Bug 17: flush 队列, 不丢最后几轮)
@@ -45,7 +49,8 @@
 
 ```
 celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
-   → 取最近 N 轮 → result.session.steer("以下是本会话之前的对话历史...")
+   → 取最近 50 轮 (MAX_INJECT_TURNS, Bug 78: 防超长会话撑爆模型上下文)
+   → result.session.steer("以下是本会话之前的对话历史...")  (Bug 24: 标注 assistant 轮)
    → seq 续写起点 = BOS 历史长度 (防二次 resume 覆盖旧轮)
 优先级: BOS 权威源 > worker 缓存 (恢复读 BOS, 不依赖节点)
 ```
@@ -76,6 +81,23 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **一致性模型**:BOS 为准,缓存可过期/缺失,无强一致要求。
 
 ## 3. 组件职责边界(为什么这样划分)
+
+### worker API 一览(Celld 节点上的完整接口, HTTP ?action=)
+
+| action | 职责 |
+|---|---|
+| `checkpoint` / `resume` | 会话轮次写入 / 读取(缓存层, 双写路径用) |
+| `sync` | 会话同步(节点间/与 BOS 对齐) |
+| `submit` / `status` / `ledger` | 任务状态机(断点续跑, exactly-once) |
+| `schedule` / `delegate` | 定时任务 / 跨 cell 委托 |
+| `hibernate` / `wake` / `hibernate-status` | 休眠唤醒(会话即 cell, 空闲回收) |
+| `kv-put/get/list/delete` | 通用 KV(缓存/协调) |
+| `obj-put` / `obj-get` | 对象直读直写(webhook 代理签名, worker 零凭证) |
+| `cwrite` / `cget` | 条件写/读(带 ETag 语义) |
+| `webhook-test` | 连通性自检 |
+
+**扩展任务类型**:在 worker `switch(action)` 加 case(状态机内建, 见 §3 扩展点 4)。
+
 
 | 组件 | 职责 | 明确不做 | 改动入口 |
 |---|---|---|---|
