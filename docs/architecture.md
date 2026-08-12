@@ -88,7 +88,8 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 **扩展点(改造/迭代入口)**:
 1. **换 LLM provider**:`config set provider/model` + pi 引擎支持(多模型已内建)
 2. **换存储后端**:`settings.json` 的 `persistence.endpoint` 指向任意 S3 兼容服务
-   (OSS/MinIO 已验证, Bug 70 透传);底层是 `src/bos.js` 的 aws CLI 封装
+   (自定义 endpoint 透传设计, Bug 70;底层是 `src/bos.js` 的 aws CLI 封装,
+   BOS 为本项目唯一实测后端, 其他 S3 兼容服务需自行验证)
 3. **新记忆工具**:在 `src/bos-tools.js` 加函数,注册进 customTools 数组
 4. **任务类型**:worker 的 `action=submit` switch 加分支(状态机已内建)
 5. **集群拓扑**:`cluster_mgr.sh` + nodes/ 注册表(节点自动发现,无需手动 peer)
