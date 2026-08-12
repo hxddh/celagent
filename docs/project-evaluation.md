@@ -1,28 +1,28 @@
 # celagent 深度评估报告
 
-> 评估日期: 2026-08-12  
-> 评估基线: `origin/main` @ `31d12a4`  
-> 方法: 全量文档审阅 + 核心源码精读 + 本地语法/CLI/单测实测 + GitHub Release/CI 交叉核对  
+> 评估日期: 2026-08-12(三轮)  
+> 评估基线: `origin/main` @ `31d12a4`(+ 对照 PR#1 `cursor/security-sanitize-2d82`)  
+> 方法: 全量文档审阅 + 核心源码精读 + 并发/安全专项审查 + 本地实测 + GitHub Release/CI/开源 PR 交叉核对  
 > 目的: 对照文档声称与代码事实,给出可执行的成熟度判断与优先改进项
 
 ---
 
 ## 0. 一句话结论
 
-**架构方向正确、工程纪律强、核心持久化路径基本立得住; 但「RPO=0 / 权威源优先恢复」的对外叙事与读路径实现不完全一致, CI 当前全红, 发布物不完整, 产品仍处「可演示的早期发布」而非「生产可依赖」。**
+**架构方向正确、工程纪律强、写路径 CAS 扎实; 但读路径/队列丢弃/ensureLock/仅 assistant 落盘等会实质性削弱「RPO=0」, CI 与 Release 未闭环, 安全面仍有本地威胁模型缺口。综合仍属「可演示的早期发布」, 合入 PR#1 并修 P0 正确性后才能谈生产可信。**
 
-综合成熟度评分(满分 10):
+综合成熟度评分(满分 10, **第三轮校准**):
 
 | 维度 | 分 | 说明 |
 |------|----|------|
 | 产品定位与架构清晰度 | 9.0 | 三层心智模型清晰, ADR 齐全 |
-| 核心持久化正确性 | 7.5 | 写路径 CAS/幂等扎实; 读路径有权威性漏洞 |
-| 代码工程质量 | 7.0 | Bug 驱动修复充分; 单体文件/重复代码偏重 |
-| 测试与 CI | 4.5 | 用例设计合理, 但 CI 假绿/假红并存 |
-| 文档质量与一致性 | 7.0 | 文档体系优秀, 但多处已过时 |
-| 发布与可安装性 | 6.0 | v0.3.0 已发, 资产缺平台, 门禁红 |
-| 安全与卫生 | 8.0 | 红线明确且多轮净化; CI 扫描误伤 node_modules |
-| **综合** | **7.0** | 值得继续投入的早期产品, 优先修读路径与 CI |
+| 核心持久化正确性 | **6.5** | 写路径强; 读/队列/sync/seq 有可证伪丢数据路径 |
+| 代码工程质量 | 7.0 | Bug 驱动充分; 单体文件/重复 `awsEnv`/静默 catch 偏多 |
+| 测试与 CI | **4.0** | 设计合理; scan 误伤 + 无配置挂死 + continue-on-error |
+| 文档质量与一致性 | 7.5 | 体系优秀; 本评估 PR 已修过时阻塞; 语义口径仍偏乐观 |
+| 发布与可安装性 | **5.5** | 缺 celld-linux/windows; Release install ≠ main |
+| 安全与卫生 | **7.0** | 红线好; 无校验下载、/tmp、无鉴权 worker、凭证读入堆 |
+| **综合** | **6.8** | 值得投入; 必须先止血正确性+CI+合入安全 PR |
 
 ---
 
@@ -377,3 +377,134 @@ celagent 不是又一个「包装 LLM 的 CLI」,而是一次把 **durable agent
 | 文档一致性 | 7.0 | **7.5** | 本 PR 已修正过时阻塞描述 |
 
 **结论不变**:值得继续投入;下一迭代必须先做「语义诚实 + CI/发布闭环」,再谈功能扩展。
+
+---
+
+## 12. 第三轮全面排查(并发 + 安全 + 依赖 + Release 矩阵)
+
+> 范围:并发/一致性专项、安全威胁模型、`npm audit`、Release 全资产 HTTP 矩阵、
+> 开源 PR 对照(PR#1 安全加固 vs main)、HTML 演示页抽样。  
+> 方法:源码精读 + 两路并行专项审查 + `gh`/`curl`/`npm` 实测。
+
+### 12.1 Release 资产矩阵(实测 HTTP)
+
+| 资产 | HTTP | 备注 |
+|------|------|------|
+| celagent-darwin-arm64 / x64 / linux-x64 | 200 | OK |
+| celagent-windows-x64.exe | **404** | PACKAGING 写了 Windows,未发 |
+| celld-darwin-arm64 | 200 | OK |
+| celld-darwin-x64 / celld-linux-x64 | **404** | Linux 安装必回退 celld.dev |
+| install.sh / worker.tar.gz | 200 | OK;install 内容 ≠ 当前 main |
+
+### 12.2 并发 / 数据丢失 — 新 Critical 发现
+
+| ID | 严重度 | 问题 | 场景后果 | 修复方向 |
+|----|--------|------|----------|----------|
+| R3-C1 | **Critical** | worker 截断缓存命中后**永不对照 BOS**;续写用 `seq=length` + 同 turn **替换** | 热节点续写可能用截断内容**覆盖** BOS 完整轮 | 恢复 BOS-first;或 worker 命中后仍 GET BOS 取较新/较完整副本;禁止无条件 replace |
+| R3-C2 | **Critical** | 启动 `sync` fire-and-forget **盲写**旧 `savedHistory` | 用户已产生新 turn 后 sync 落地 → **抹掉** worker 新轮 | sync 按 turn 合并 / 带 generation / 接受输入前 await sync |
+| R3-C3 | **Critical** | `BOS_QUEUE_MAX` 超限时 `return` — **丢掉的是最新写入**(注释写「丢最旧」) | 高频对话静默丢最近轮;flush 无法挽回 | 丢最旧或本地 WAL 背压;禁止丢最新 |
+| R3-H1 | **High** | `ensureCelld` 健康节点 early-return **不释放 `ensureLock`** | Celld 中途挂掉后自动拉起永久失效 | `run()` 顶层 `finally` 清锁 |
+| R3-H2 | **High** | `bosGet`:先 get body 再 head ETag → **TOCTOU** | CAS 基线错位 → 冲突耗尽丢轮或合并错版本 | GET 与 ETag 同响应获取 |
+| R3-H3 | **High** | ledger:`webhook` 先于 `put` ledger | 崩溃后重放 → 副作用重复(非 crash-safe exactly-once) | 先写 pending 再副作用 |
+| R3-H4 | **High** | 信号 flush 与 pi `exit(0)` 竞态 | 队列未排空即杀进程 → 末轮丢 | 接入 pi dispose 钩子或本地 WAL |
+| R3-M1 | Medium | `seq` 用 `turns.length` 而非 `max(turn)` | 有 gap/remap 时误替换旧轮 | `seq = max(turn)\\|0` |
+| R3-M2 | Medium | worker 单 `setAlarm` 槽:task 覆盖 cron | 定时任务停摆 | `min(所有唤醒点)` 一次 set |
+| R3-M3 | Medium | `globalThis.__celagentSnapshotTurns` 返回活数组 | 序列化中途被 turn_end 突变;/new 切换会话串快照 | 返回 slice 拷贝;按 persistId 隔离 |
+| R3-M4 | Medium | `cwrite` 锁无 TTL | isolate 崩溃后永久 writer-busy | 锁带过期时间 |
+| R3-M5 | Medium | 跨进程 ensureCelld probe→spawn TOCTOU | 双启动争端口/ownership 抖动 | 状态目录文件锁 |
+
+### 12.3 安全威胁模型 — 发现与 PR#1 对照
+
+| ID | 严重度 | 问题 | main 现状 | PR#1(`security-sanitize`) |
+|----|--------|------|-----------|---------------------------|
+| R3-S1 | **Critical** | `curl\|sh` + 无校验和二进制 + 无路径守卫 untar + 未固定 `npx esbuild` | 存在 | 部分(私有 tmp);**仍无 checksum/签名** |
+| R3-S2 | **High** | `bos-tools` 可预测 `/tmp/celagent-*` 名(symlink 覆盖) | 存在 | **已修**(mkdtemp) |
+| R3-S3 | **High** | worker agent API **无鉴权**(本机任意进程可 resume/sync/submit/webhook-test) | 存在 | 未加 auth;webhook 可配置+默认 loopback |
+| R3-S4 | **High** | `ensureCelld` **`readFileSync(~/.aws/credentials)`** 把 SK 读进堆 | 存在 | 需确认是否改掉(对照:应改用 `aws configure get`) |
+| R3-S5 | Medium | checkpoint `msg` 进 **URL query**(日志泄漏对话片段) | 存在 | 仍在 |
+| R3-S6 | Medium | `persistence.endpoint` 无白名单 → 会话 JSON 可被导向恶意 endpoint | 存在 | 仍在 |
+| R3-S7 | Medium | `projectTrusted: true` 默认信任 cwd 项目配置 | 存在 | 仍在 |
+| R3-S8 | Medium | `history_search` 默认可跨会话检索 → prompt 诱导泄密 | 存在 | 仍在 |
+| R3-S9 | Medium | 启动时**清空 bucket 全部 `own.json`** | 存在 | 仍在(共享 bucket 危险) |
+| R3-S10 | Low–Med | settings 写入无 `0600` | 存在 | PR#1 声称 settings 0600 |
+| R3-S11 | Low | `list` 无配置时枚举账号全部 bucket | 存在 | 仍在 |
+
+**已做得好的**(应保留):`execFile` 数组传参防注入;脚本 `env -u` + profile 不混用;`bos.js` randomBytes+0600;celld 默认 loopback;BOS CAS;CI 有 secret 模式扫描;bucket 名随机无 whoami。
+
+### 12.4 依赖与运行时
+
+- `npm audit --omit=dev`: **0 vulnerabilities**(抽样时点)
+- `package.json` engines `>=22` **低于** `@earendil-works/pi-*` / `undici@8` 要求的 `>=22.19.0`(本环境 22.14 已 EBADENGINE)
+- HTML 演示页抽样:会话 ID 已脱敏为 `sess-demo-xxxxxxxx`,未见明文密钥路径
+
+### 12.5 开源协作状态
+
+| PR | 分支 | 作用 | 与本评估关系 |
+|----|------|------|--------------|
+| #1 | `cursor/security-sanitize-2d82` | awsEnv 统一、mkdtemp、session ID 白名单、CI 去 continue-on-error、worker webhook 硬化 | **应优先合入**;合入前补 `!node_modules/**` 否则仍红 |
+| #2 | `cursor/project-deep-eval-0737`(本 PR) | 三轮评估文档 + HANDOFF/architecture 同步 | 文档/决策输入,不改运行时 |
+
+### 12.6 「RPO=0」主张 — 第三轮后的精确表述(建议对外改写)
+
+**当前代码可辩护的保证**:
+
+> 在 BOS 写成功入队且 CAS 提交成功、且恢复走 BOS 全量对象的前提下,assistant 轮次可跨机器恢复。
+
+**当前代码不能声称的**:
+
+- 双向完整对话永不丢(缺 user 轮)
+- 任意崩溃 RPO=0(队列丢最新、信号竞态、flush 超时)
+- worker 热恢复等同完整记忆(200 字截断 + 可覆盖权威)
+- 任务侧 crash-safe exactly-once(ledger 写在副作用之后)
+
+### 12.7 统一优先队列(三轮合并,按执行顺序)
+
+#### 立即(阻塞可信发布)
+
+1. **合入 PR#1** + CI 增加 `--glob '!node_modules/**'`(及 grep `--exclude-dir=node_modules`)
+2. **恢复路径 BOS-first**;禁止截断缓存覆盖权威;修 sync 合并语义
+3. **队列超限丢最旧或 WAL**;注释与行为对齐;信号路径可等待 flush
+4. **修 `ensureLock` finally**;修 doctor `models-store.json`
+5. **user 轮持久化或文档降级主张**
+
+#### 短期(安装/安全闭环)
+
+6. 补 Release:`celld-linux-x64`(+ darwin-x64);重发与 main 一致的 `install.sh`
+7. install 增加 **SHA256 校验**;worker tar 防路径穿越;固定 esbuild 版本
+8. worker 变更 API 加本机共享密钥;移除或门禁 `webhook-test`
+9. 停止 `readFileSync` credentials;endpoint 白名单;`projectTrusted` 默认 false
+10. `engines.node: ">=22.19.0"`
+
+#### 中期(产品化)
+
+11. 拆分 `celagent-tui.mjs`;统一 awsEnv;拆分 bosWarned
+12. history_search 默认限当前会话;settings 合并写;own.json 仅清过期本节点
+13. ledger record-before-side-effect;alarm 统一调度
+14. CI release job(匿名路径 bun build + 上传)
+
+### 12.8 覆盖矩阵(本评估已查 / 未查)
+
+| 域 | 状态 |
+|----|------|
+| 文档↔代码一致性 | ✅ 三轮 |
+| 写路径 CAS/队列 | ✅ |
+| 读路径/恢复/sync | ✅ |
+| CLI/doctor/config | ✅ |
+| install/setup/node/cluster | ✅ |
+| worker 任务/ledger/alarm | ✅ |
+| 安全(凭证/tmp/供应链/本机 API) | ✅ |
+| Release 资产 HTTP | ✅ |
+| 单测/CI 行为 | ✅(无 BOS/celld 真联调) |
+| 真实 BOS 压测 / 多机故障注入 | ❌ 本环境无凭证与 celld |
+| Bun 二进制交叉编译复现 | ❌ 未跑 |
+| Windows 路径 | ❌ 资产缺失 |
+| pi 上游 API 兼容性矩阵 | ❌ 仅锁 v0.84.x |
+
+### 12.9 终局判断
+
+三轮排查后综合分校准为 **6.8/10**。
+
+项目最大资产仍是:**把 durable session 当一等公民的架构选择 + 写路径工程纪律**。  
+最大风险是:**对外 RPO 叙事超前于实现**,叠加 **CI/Release 未闭环** 与 **本机安全默认偏松**。
+
+若只做一个里程碑:「合入 PR#1 → 修 C1/C2/C3/ensureLock/doctor → CI 绿 → 补 celld-linux → 改 README 保证口径」,完成后综合分有望回到 **8-**。
