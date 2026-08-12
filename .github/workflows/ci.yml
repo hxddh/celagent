@@ -40,14 +40,20 @@ jobs:
           set -euo pipefail
           # 拦截密钥形态 + 红线禁止的本机绝对路径
           # 已知泄漏 session 前缀拆开拼接, 避免仓库再出现完整指纹明文
+          # 注意: ripgrep 的 -E 是 --encoding, 不是扩展正则; rg 默认即正则
           LEAKED_SESS="sess-mso""i63et"
-          if command -v rg >/dev/null 2>&1; then
-            SCAN=(rg -n --glob '!package-lock.json' --glob '!.git/**')
-          else
-            SCAN=(grep -RIn --exclude=package-lock.json --exclude-dir=.git)
-          fi
           PATTERN="${LEAKED_SESS}|/Users/[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/(celagent|celld)|ALTAK[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|aws_secret_access_key[[:space:]]*=[[:space:]]*[^[:space:]<$]"
-          if "${SCAN[@]}" -E "$PATTERN" .; then
+          hit=0
+          if command -v rg >/dev/null 2>&1; then
+            if rg -n --glob '!package-lock.json' --glob '!.git/**' -e "$PATTERN" .; then
+              hit=1
+            fi
+          else
+            if grep -RIn --exclude=package-lock.json --exclude-dir=.git -E "$PATTERN" .; then
+              hit=1
+            fi
+          fi
+          if [ "$hit" -eq 1 ]; then
             echo "::error::Secret/PII scan failed — 命中敏感模式"
             exit 1
           fi
