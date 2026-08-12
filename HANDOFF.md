@@ -39,10 +39,26 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
 | `tests/core.test.mjs` | 核心回归(9 用例:需节点在跑;mock 模式 6 pass) |
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
-| `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、60 轮真实数据回放) |
+| `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、33 轮真实对话实录回放, 2026-08-11) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |
 
 ## 2. 开发环境与命令
+
+### 快速上手(新环境,按序执行)
+
+```bash
+# 1. 依赖 (pi 引擎等)
+npm install
+# 2. Celld 运行时 (测试/节点必需; 不在仓库内, 需单独安装)
+curl -fsSL https://celld.dev/install.sh | sh    # 装到 ~/.local/bin/celld
+# 3. BOS 凭证 (测试 BOS 链路必需)
+aws configure --profile bos          # 配 AK/SK/region=bj
+# 4. 启动双节点 + 跑测试
+./scripts/node_mgr.sh start
+node tests/core.test.mjs              # 9 用例全绿
+```
+
+### 常用命令
 
 ```bash
 # 测试 (需节点: 先 scripts/node_mgr.sh start)
@@ -67,12 +83,12 @@ node bin/celagent-tui.mjs task ledger
 
 - **BOS bucket**:开发用 bucket 名**不在本仓库写死**(安全红线)。查询方式:
   - `cat ~/.config/celagent/settings.json` → `persistence.bucket`
-  - 或 `aws s3api list-buckets --profile bos`
+  - 或 `AWS_PROFILE=bos aws s3api list-buckets`(避坑指南: 统一 env 形式)
   - endpoint `https://s3.bj.bcebos.com`,凭证在 `~/.aws/credentials` 的 `[bos]` profile(动态读取)
 - **LLM**:DeepSeek(OpenAI 兼容),key 在 `DEEPSEEK_API_KEY` 环境变量(无值时自动降级 mock)
 - **凭证优先级**:环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` 优先(必须成对);否则用 `~/.aws/credentials` 的 `[bos]` profile(不混用)
 - **install.sh 可配置 env**:`CELAGENT_REPO`(仓库地址)、`CELAGENT_SRC`(开发模式)、`CELAGENT_ROOT`(安装根目录,默认 ~/.local)、`CELAGENT_BUCKET`(强制 bucket)、`CELLD_ESBUILD`(esbuild 路径)
-- **Celld**:开发机本机路径见本机安装位置;发布后随包分发到 `~/.local/bin`
+- **Celld**:不在仓库内,安装方式 `curl -fsSL https://celld.dev/install.sh | sh`(装到 `~/.local/bin/celld`);发布后随 Release 包分发
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
 ## 3. 发布状态(v0.3.0 发布,卡 GitHub 认证)
@@ -80,8 +96,9 @@ node bin/celagent-tui.mjs task ledger
 ### 已完成
 - ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content)
 - ✅ 测试:core 9 用例(节点在跑时全绿)、e2e 真实 LLM 验证
-- ✅ **发布前安全检查(六轮穷尽)**:文件层 + git 历史层 + 对象库层 + 代码逻辑层全部干净;全部提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥/零用户名/零本机路径/零真实 bucket 名
-- ✅ 构建物:`celagent-bin`(75MB Bun 单二进制)mac arm64 已验证可运行(version/help/doctor/list/TUI 完整启动)
+- ✅ **发布前安全检查(十五轮穷尽)**:文件层/历史层/对象库层/提交信息层/发布物层/语义层等全部干净;全部提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥/零用户名/零本机路径/零真实 bucket 名
+- ✅ 构建能力:Bun 单二进制编译通过并实测可运行(version/help/doctor/TUI);⚠️ 旧构建物已废弃
+  (内含本机路径),发布构建必须按 PACKAGING.md 注意 0 在匿名路径/CI 执行
 - ✅ README/install.sh 已指向 `github.com/hxddh/celagent/releases/latest/download/install.sh`
 
 ### 阻塞(唯一)
@@ -109,7 +126,7 @@ node bin/celagent-tui.mjs task ledger
    ```
 5. **install.sh 正式模式端到端**:install.sh 当前正式模式走 `git clone + npm install`(仓库安装),**尚未改成"curl GitHub Release 下载二进制"**——这是发布前最后一个改造点。目标:Release 资产含 `celagent-<平台>` + `celld` 二进制,install.sh 检测平台 → 下载对应二进制 → 装到 `~/.local/bin`
 6. **创建 Release**:`gh release create v0.3.0` → 上传二进制 + celld + install.sh
-7. **端到端验证**:全新机器 `curl -fsSL .../install.sh | sh` 真实走一遍
+7. **端到端验证**:全新机器 `curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh` 真实走一遍
 
 ## 4. 版本与里程碑
 
@@ -132,7 +149,7 @@ node bin/celagent-tui.mjs task ledger
    - 不得提交真实用户名(<local-user>)、本机路径(/Users/、celld-test、celagent-poc)、真实 bucket 名
    - 凭证一律运行时动态获取(env / aws configure)
    - 新增文件默认自检:`grep -rnE 'sk-[a-zA-Z0-9]{20,}|AKIA|ghp_|ALTAK' <文件>`
-5. 提交作者统一 `hxddh <hxddh@users.noreply.github.com>`(git config 已设)
+5. 提交作者统一 `hxddh <hxddh@users.noreply.github.com>`(新环境需自行 `git config user.name/email` 设置,开发机已设)
 6. 改完跑测试:`node tests/core.test.mjs`(节点在跑时)+ 相关脚本 `bash -n` 语法检查
 
 ## 6. 已知技术债/注意点
@@ -140,6 +157,7 @@ node bin/celagent-tui.mjs task ledger
 - `install.sh` 正式模式仍依赖 `git clone`(发布改造点,见发布流程步骤 5)
 - `install.sh` 中 celld 下载走 `https://celld.dev/install.sh`(celld 官方);Release 随包分发后应改为从本仓库 Release 下载(随包分发决策)
 - worker 缓存读路径有 200 字符截断(URL 限制所致),完整数据在 BOS 权威源
-- HTML 演示页数字需与实时 BOS 对齐(演示数据来自 2026-08-10 实测)
+- HTML 演示页数字已按 2026-08-11 实时 BOS 对齐;回放为 33 轮真实会话实录(脱敏后),
+  后续更新数据时保持与 BOS 一致 + 敏感扫描(见红线)
 - ci.yml 的单元测试步骤带 `continue-on-error: true`(无节点时 mock 模式)——CI 全绿要求下应确认该步骤是否应改为必须通过
 - CI 不构建发布二进制(当前跨平台构建为手动 `bun build`,见 PACKAGING)——后续可加 CI release job 自动化构建+上传
