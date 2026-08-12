@@ -54,7 +54,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
    └─▶ BOS 直写队列 (权威源, CAS If-Match 乐观锁 + 幂等去重)
                                 │
                     sessions/<id>.json
-                    轮次: {turn, role, msg, ts}
+                    轮次: {turn, role, msg, ts, content, toolResults}  (完整记忆, 不截断)
 ```
 
 恢复优先级:**BOS 是权威源** — 启动 `celagent <id>` 时从 BOS 读历史注入上下文;`/resume` 从本地 JSONL 恢复完整会话。
@@ -127,9 +127,11 @@ celagent (TUI, bin/celagent-tui.mjs)
 ## 开发
 
 ```bash
-cd ~/celagent
-node bin/celagent-tui.mjs doctor      # 自检
-node tests/core.test.mjs              # 回归测试 (需节点在跑: scripts/node_mgr.sh start)
+cd <仓库路径>
+npm install                            # 依赖 (pi 引擎等)
+CELAGENT_SRC=<仓库路径> ./setup.sh     # 首次: 建 bucket + 部署 worker + 写配置 + 启动节点
+node bin/celagent-tui.mjs doctor       # 自检
+node tests/core.test.mjs               # 回归测试 (需节点在跑: scripts/node_mgr.sh start)
 ./scripts/node_mgr.sh start|stop|status|restart
 ```
 
@@ -138,7 +140,7 @@ node tests/core.test.mjs              # 回归测试 (需节点在跑: scripts/n
 - 回归: core.test.mjs 9 用例 (Celld API / checkpoint+resume / kv / Agent 构造 / 工具 / 持久化完整性;节点未启动时 mock 模式 6 pass)
 - BOS 链路: 写→读→ETag→CAS 冲突→并发写 (无重复无丢失)
 - 20 次高频写压测: 序号连续 1-20 无重复
-- Bug 1-94 修复: 覆盖持久化完整性、并发安全、信号处理、安装部署、worker 部署、凭证混用
+- Bug 1-97 修复: 覆盖持久化完整性、并发安全、信号处理、安装部署、worker 部署、凭证混用、首轮丢失
 
 ## 开发者 / Agent 接手
 

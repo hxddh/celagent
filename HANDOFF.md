@@ -27,7 +27,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 
 | 路径 | 职责 |
 |------|------|
-| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~875 行:命令解析含 task 分布式任务、节点自动启动、turn_end 持久化钩子、会话恢复) |
+| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~880 行:命令解析含 task 分布式任务、节点自动启动、turn_end 持久化钩子、会话恢复) |
 | `src/bos.js` | BOS 直写核心(aws CLI 异步封装、CAS If-Match/If-None-Match、指数退避重试) |
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
 | `worker/src/index.js` | Celld worker(缓存读路径、Sync API、AWS SigV4 手写签名) |
@@ -53,8 +53,10 @@ npm install
 curl -fsSL https://celld.dev/install.sh | sh    # 装到 ~/.local/bin/celld
 # 3. BOS 凭证 (测试 BOS 链路必需)
 aws configure --profile bos          # 配 AK/SK/region=bj
-# 4. 启动双节点 + 跑测试
-./scripts/node_mgr.sh start
+# 4. (仅首次) 一键部署: 建 bucket + 部署 worker + 写 settings.json + 启动双节点
+#    ⚠️ CELAGENT_SRC 必须指向你的仓库路径 (setup.sh 默认找 ~/celagent)
+CELAGENT_SRC=<仓库路径> ./setup.sh
+# 5. 跑测试 (需节点在跑; 无节点时 mock 模式 6 pass)
 node tests/core.test.mjs              # 9 用例全绿
 ```
 
