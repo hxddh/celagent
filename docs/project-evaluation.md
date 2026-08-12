@@ -508,3 +508,97 @@ celagent 不是又一个「包装 LLM 的 CLI」,而是一次把 **durable agent
 最大风险是:**对外 RPO 叙事超前于实现**,叠加 **CI/Release 未闭环** 与 **本机安全默认偏松**。
 
 若只做一个里程碑:「合入 PR#1 → 修 C1/C2/C3/ensureLock/doctor → CI 绿 → 补 celld-linux → 改 README 保证口径」,完成后综合分有望回到 **8-**。
+
+---
+
+## 13. 第四轮排查(UX / 打包 / 演示页 / 可执行证据)
+
+> 范围:CLI UX、`/fork` 持久化、npm 打包、演示页口径、bos-compat 检查数、
+> Critical 逻辑的**可执行最小复现**(`tests/review-logic-proofs.test.mjs`)。
+
+### 13.1 可执行证据(本轮已跑通)
+
+```text
+$ node --test tests/review-logic-proofs.test.mjs
+# 5 pass — 固化:
+#   R3-C3 队列丢最新
+#   R3-M1 length≠max(turn)
+#   同 turn replace 抹 content
+#   R3-H1 ensureLock 早退后仍持锁
+#   /fork 不在 persistId 切换集合内
+```
+
+结构证据:`ensureCelld` 中 `ensureLock = null` **仅 1 处**,落在深层 `try/finally`;
+健康节点 `if (r.ok) return` 与无配置 early-return **绕过 finally** → 锁泄漏成立。
+
+### 13.2 新发现 — `/fork` 串写(High)
+
+| ID | 严重度 | 问题 | 证据 |
+|----|--------|------|------|
+| R4-1 | **High** | `/fork` 不切换 `persistId` | 代码仅处理 `reason === "new" \|\| "resume"`;注释提到 fork「新上下文」却未换 BOS key |
+| R4-2 | **High** | 文档三方口径冲突 | README/architecture §1.4:**BOS-first**; demo HTML + 代码:**worker-first**; demo 还声称截断「安全」 |
+| R4-3 | Medium | `rm` 无非 TTY / `--yes` | `readline.question` 卡住 CI/管道 |
+| R4-4 | Medium | `list` denylist 误伤真实会话名 | `default`/`debug`/`bos-*`/`*-test` 等被隐藏 |
+| R4-5 | Medium | `config set` 无校验 | 可把 `persistence` 写成标量毁掉嵌套 |
+| R4-6 | Medium | npm pack **仅 13 文件**,不含 `docs/` | README 指向的架构/评估文档在 npm 安装物中不存在 |
+| R4-7 | Medium | `engines: >=22` vs 依赖 `>=22.19.0` | 22.14 已 EBADENGINE |
+| R4-8 | Low–Med | `exports` 仅 `./bos` | `bos-tools` 无法被库消费者 import |
+| R4-9 | Low–Med | `worker/wrangler.jsonc` Cloudflare 形态 | 实际 `celld deploy`;易误导贡献者跑 wrangler |
+| R4-10 | Low | bos-compat 写「17 项」,脚本自称「6 项链路」 | 实际 `check()` 约 10 次 + wake 无条件 PASS |
+| R4-11 | Low | doctor `[2/5]` env 凭证也显示「[bos] profile」 | 文案误导 |
+| R4-12 | Low | doctor「缺缺失」错别字 | `缺缺失` |
+
+### 13.3 演示页的双重角色
+
+演示页对实现更诚实(写明 worker 快路径 + 200 截断),但同时:
+
+1. 把 worker-first 包装成「历史完整 RPO=0」→ **产品营销 overlay**
+2. 声称「截断安全,因 BOS 有完整」→ **忽略恢复根本不读 BOS 的热路径**
+3. 与 README「恢复优先级:BOS 是权威源」**直接打架**
+
+**建议**:演示页恢复段改为「当前实现 worker-first(截断风险);目标语义 BOS-first」,或改代码后改回 demo。
+
+### 13.4 打包与分发面
+
+| 渠道 | 内容 | 缺口 |
+|------|------|------|
+| GitHub Release | 二进制 + install + worker + 部分 celld | 缺 linux/darwin-x64 celld、windows;install≠main |
+| npm pack | 13 文件 runtime | 无 docs/HANDOFF/评估;engines 过松 |
+| 源码 clone | 完整 | 依赖 celld 外置 + BOS 凭证 |
+
+### 13.5 四轮后的问题全景(按主题去重)
+
+```
+正确性 ── C1 worker覆盖权威 / C2 sync抹新轮 / C3 丢最新
+           /fork串写 / 仅assistant / seq=length / bosGet TOCTOU
+可用性 ── ensureLock泄漏 / doctor假阴性 / rm非TTY / list误过滤
+安全   ── 无checksum安装 / worker无鉴权 / /tmp(PR1已修) / 凭证读堆
+           endpoint无白名单 / projectTrusted / history跨会话
+工程   ── CI扫node_modules / 测试ENOENT / engines / Release漂移
+文档   ── BOS-first vs worker-first 三方冲突 / 17≠实际检查数
+```
+
+### 13.6 更新优先队列(插入 R4)
+
+在 §12.7「立即」清单中插入:
+
+- **修 `/fork`**:与 `/new` 同等生成独立 `persistId` 并提示用户
+- **统一恢复口径**:改代码 BOS-first *或* 改 README/demo/architecture 三处一致,并撤销「截断安全」断言
+- **把 `tests/review-logic-proofs.test.mjs` 纳入 CI**(零外部依赖,应强制通过)
+
+### 13.7 评分(第四轮后)
+
+| 维度 | R3 | R4 | 变化 |
+|------|----|----|------|
+| 核心持久化正确性 | 6.5 | **6.0** | `/fork` 串写 + 可执行证据固化 C3/replace |
+| 文档一致性 | 7.5 | **7.0** | 确认 README↔demo↔code 三方冲突未解 |
+| 测试与 CI | 4.0 | **4.5** | 新增零依赖 proof 测试(待接入 CI) |
+| **综合** | 6.8 | **6.7** | 问题面更完整,可信度叙事更收紧 |
+
+### 13.8 本轮明确不重复深挖的项
+
+- 真实 BOS/多机故障注入(无凭证)
+- Bun 交叉编译与 Windows
+- pi 上游全版本兼容矩阵
+
+上述仍是「发布前人工验收」清单,不阻塞本评估文档结论。
