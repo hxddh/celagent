@@ -6,7 +6,7 @@
 //   4. 配置单源化 (celagent settings ↔ pi-runtime 同步)
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -43,13 +43,29 @@ async function celld(action, params = {}) {
 // ---- 真实 BOS 链路 (来自 src/bos.js) ----
 let bucket, endpoint;
 before(async () => {
-  // 读配置 (settings.json 单源)
-  const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
-  bucket = cfg.persistence?.bucket;
-  endpoint = cfg.persistence?.endpoint;
-  // 无配置则跳过 BOS 用例 (CI 无凭证时)
+  // 读配置 (settings.json 单源); CI 无配置时跳过 BOS 用例
+  try {
+    const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
+    bucket = cfg.persistence?.bucket;
+    endpoint = cfg.persistence?.endpoint;
+  } catch (e) {
+    bucket = null;
+  }
   if (!bucket) console.log("(无 bucket 配置, BOS 用例将跳过)");
 });
+
+function awsTestEnv() {
+  const env = { ...process.env, AWS_EC2_METADATA_DISABLED: "true" };
+  if (!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)) {
+    delete env.AWS_ACCESS_KEY_ID;
+    delete env.AWS_SECRET_ACCESS_KEY;
+    delete env.AWS_SESSION_TOKEN;
+    env.AWS_PROFILE = "bos";
+  } else {
+    delete env.AWS_PROFILE;
+  }
+  return env;
+}
 
 test("1. Celld 可达 (checkpoint/resume API)", async (t) => {
   if (!celldUp) return t.skip("Celld 节点未运行");
@@ -94,7 +110,7 @@ test("4. BOS 写→读→ETag 往返 (CAS 基础)", async (t) => {
   assert.equal(JSON.parse(get.body).turns.length, 1);
   // 清理
   const { execFileSync: ex } = await import("node:child_process");
-  try { ex("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint], { env: { ...process.env, AWS_PROFILE: "bos" }, stdio: "ignore" }); } catch (e) { /* ignore */ }
+  try { ex("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint], { env: awsTestEnv(), stdio: "ignore" }); } catch (e) { /* ignore */ }
 });
 
 test("5. CAS 冲突检测 (旧 ETag 写 → 412)", async (t) => {
@@ -110,7 +126,7 @@ test("5. CAS 冲突检测 (旧 ETag 写 → 412)", async (t) => {
   const put2 = await bosPut(key, { id: "t", turns: [{ turn: 9 }] }, { bucket, ifMatch: g1.etag, endpoint });
   assert.ok(put2.ok, "正确 ETag 写入成功");
   const { execFileSync: ex } = await import("node:child_process");
-  try { ex("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint], { env: { ...process.env, AWS_PROFILE: "bos" }, stdio: "ignore" }); } catch (e) { /* ignore */ }
+  try { ex("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint], { env: awsTestEnv(), stdio: "ignore" }); } catch (e) { /* ignore */ }
 });
 
 test("6. If-None-Match 首写保护 (Bug 76 回归)", async (t) => {
@@ -126,7 +142,7 @@ test("6. If-None-Match 首写保护 (Bug 76 回归)", async (t) => {
   const g = await bosGet(key, { bucket, endpoint });
   assert.equal(JSON.parse(g.body).turns[0].msg, "first", "首轮未被覆盖");
   const { execFileSync: ex } = await import("node:child_process");
-  try { ex("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint], { env: { ...process.env, AWS_PROFILE: "bos" }, stdio: "ignore" }); } catch (e) { /* ignore */ }
+  try { ex("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint], { env: awsTestEnv(), stdio: "ignore" }); } catch (e) { /* ignore */ }
 });
 
 // ---- CLI 命令 (无外部依赖) ----
@@ -147,9 +163,10 @@ test("8. CLI: 未知 - 参数拒绝 (Bug 80 回归)", async () => {
 });
 
 // ---- 配置单源化 (Bug 87 回归) ----
-test("9. config set model 同步 pi-runtime (Bug 87 回归)", async () => {
+test("9. config set model 同步 pi-runtime (Bug 87 回归)", async (t) => {
   const { execFileSync: ex } = await import("node:child_process");
   const piFile = join(homedir(), ".config", "celagent", "pi-runtime", "settings.json");
+  if (!existsSync(piFile)) return t.skip("无 pi-runtime settings");
   const orig = JSON.parse(readFileSync(piFile, "utf8"));
   try {
     ex("node", ["bin/celagent-tui.mjs", "config", "set", "model", orig.defaultModel], { encoding: "utf8" });
@@ -159,4 +176,36 @@ test("9. config set model 同步 pi-runtime (Bug 87 回归)", async () => {
     // 还原
     writeFileSync(piFile, JSON.stringify(orig, null, 2) + "\n", "utf8");
   }
+});
+
+test("10. awsEnv 不混用凭证 + 会话 ID 白名单", async () => {
+  const { awsEnv } = await import("../src/bos.js");
+  const prevAk = process.env.AWS_ACCESS_KEY_ID;
+  const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+  const prevTok = process.env.AWS_SESSION_TOKEN;
+  const prevProf = process.env.AWS_PROFILE;
+  try {
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    delete process.env.AWS_SESSION_TOKEN;
+    process.env.AWS_PROFILE = "other";
+    const e1 = awsEnv();
+    assert.equal(e1.AWS_PROFILE, "bos");
+    assert.equal(e1.AWS_ACCESS_KEY_ID, undefined);
+    process.env.AWS_ACCESS_KEY_ID = "AKIATEST";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    const e2 = awsEnv();
+    assert.equal(e2.AWS_PROFILE, undefined);
+    assert.equal(e2.AWS_ACCESS_KEY_ID, "AKIATEST");
+  } finally {
+    if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+    if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    if (prevTok === undefined) delete process.env.AWS_SESSION_TOKEN; else process.env.AWS_SESSION_TOKEN = prevTok;
+    if (prevProf === undefined) delete process.env.AWS_PROFILE; else process.env.AWS_PROFILE = prevProf;
+  }
+  const { execFileSync: ex } = await import("node:child_process");
+  let threw = false;
+  try { ex("node", ["bin/celagent-tui.mjs", "export", "../evil"], { encoding: "utf8" }); }
+  catch (e) { threw = true; assert.match(String(e.stderr || e.stdout || ""), /非法/); }
+  assert.ok(threw, "路径穿越 session id 应拒绝");
 });

@@ -6,9 +6,15 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 BUCKET="${1:-$(cat /tmp/celld_e2e_bucket 2>/dev/null || echo celld-bos-test-$(date +%s))}"
 EP="https://s3.bj.bcebos.com"
-export AWS_PROFILE=bos
-# CAS 测试用真实文件 (aws CLI 不接受 /dev/null)
-echo "test-body" > /tmp/celld-body.txt
+# 凭证卫生: 清显式密钥后再用 profile
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export AWS_PROFILE=bos AWS_EC2_METADATA_DISABLED=true
+# CAS 测试用真实文件 (aws CLI 不接受 /dev/null) — 私有临时目录
+_TEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/celagent-bos-test.XXXXXX")
+chmod 700 "$_TEST_TMP"
+echo "test-body" > "$_TEST_TMP/body.txt"
+trap 'rm -rf "$_TEST_TMP"' EXIT
+BODY_FILE="$_TEST_TMP/body.txt"
 NODE1="http://127.0.0.1:18090"
 NODE2="http://127.0.0.1:18091"
 PASS=0; FAIL=0
@@ -47,22 +53,22 @@ fi
 
 # CAS: If-None-Match (创建)
 KEY="cas-test-$(date +%s)"
-aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body /tmp/celld-body.txt --endpoint-url "$EP" >/dev/null 2>&1
+aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY_FILE" --endpoint-url "$EP" >/dev/null 2>&1
 # 已存在 → If-None-Match:* 应 412 (exit 非0)
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body /tmp/celld-body.txt --endpoint-url "$EP" --if-none-match '*' >/dev/null 2>&1; then
+if aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY_FILE" --endpoint-url "$EP" --if-none-match '*' >/dev/null 2>&1; then
   check "If-None-Match 已存在 → 应拒绝" "fail"
 else
   check "If-None-Match 已存在 → 拒绝(412)" "ok"
 fi
 # If-Match: 正确 etag → 成功
 ETAG=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --endpoint-url "$EP" --query ETag --output text 2>/dev/null)
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body /tmp/celld-body.txt --endpoint-url "$EP" --if-match "$ETAG" >/dev/null 2>&1; then
+if aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY_FILE" --endpoint-url "$EP" --if-match "$ETAG" >/dev/null 2>&1; then
   check "If-Match 正确 etag → 成功" "ok"
 else
   check "If-Match 正确 etag → 成功" "fail"
 fi
 # If-Match: 错误 etag → 应拒绝
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body /tmp/celld-body.txt --endpoint-url "$EP" --if-match '"bogus"' >/dev/null 2>&1; then
+if aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY_FILE" --endpoint-url "$EP" --if-match '"bogus"' >/dev/null 2>&1; then
   check "If-Match 错误 etag → 应拒绝" "fail"
 else
   check "If-Match 错误 etag → 拒绝(412)" "ok"
@@ -84,8 +90,8 @@ echo ""
 echo "[3/6] ownership CAS 记录 (own.json)..."
 OWN=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "cells/" --endpoint-url "$EP" --query 'Contents[?ends_with(Key, `own.json`)].Key' --output text 2>/dev/null | head -1)
 if [ -n "$OWN" ]; then
-  aws s3api get-object --bucket "$BUCKET" --key "$OWN" --endpoint-url "$EP" /tmp/own-check.json >/dev/null 2>&1
-  OWN_CONTENT=$(cat /tmp/own-check.json 2>/dev/null | head -c 100)
+  aws s3api get-object --bucket "$BUCKET" --key "$OWN" --endpoint-url "$EP" "$_TEST_TMP/own-check.json" >/dev/null 2>&1
+  OWN_CONTENT=$(cat "$_TEST_TMP/own-check.json" 2>/dev/null | head -c 100)
   if echo "$OWN_CONTENT" | grep -q 'node'; then
     check "own.json 含 ownership (epoch/node)" "ok"
   else

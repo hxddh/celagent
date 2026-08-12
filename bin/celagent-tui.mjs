@@ -358,8 +358,9 @@ async function listSessions() {
         endpoint = cfg.persistence?.endpoint || endpoint;
       } catch (e) { /* 损坏则走降级 */ }
     }
+    const { awsEnv } = await import("../src/bos.js");
     const runAws = (args) => new Promise((resolve) => {
-      execFile("aws", args, { env: { ...process.env, AWS_PROFILE: "bos" }, timeout: 20000, encoding: "utf8" }, (err, stdout) => {
+      execFile("aws", args, { env: awsEnv(), timeout: 20000, encoding: "utf8" }, (err, stdout) => {
         try { resolve(JSON.parse(stdout || "[]")); }
         catch (e) { resolve([]); }
       });
@@ -443,9 +444,18 @@ function loadConfig() {
   try { return JSON.parse(readFileSync(f, "utf8")); } catch (e) { return {}; }
 }
 function saveConfig(cfg) {
-  const { mkdirSync, writeFileSync } = require("node:fs");
-  mkdirSync(join(homedir(), ".config", "celagent"), { recursive: true });
-  writeFileSync(configFile(), JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  const { mkdirSync, writeFileSync, chmodSync } = require("node:fs");
+  mkdirSync(join(homedir(), ".config", "celagent"), { recursive: true, mode: 0o700 });
+  writeFileSync(configFile(), JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  try { chmodSync(configFile(), 0o600); } catch (e) { /* ignore */ }
+}
+// 会话 ID 白名单: 防路径穿越 / 意外对象 key 注入 (export/rm/续写)
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+function assertSafeSessionId(id, label = "会话ID") {
+  if (!id || typeof id !== "string" || !SESSION_ID_RE.test(id) || id.includes("..")) {
+    console.error(`✗ 非法${label}: 仅允许字母数字与 ._- , 最长 128 (例: sess-demo-xxxxxxxx)`);
+    process.exit(1);
+  }
 }
 async function configCommand(args) {
   const [op, key, value] = args;
@@ -534,8 +544,9 @@ async function doctorCommand() {
   console.log(`[3/5] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "✗ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
   // 4. BOS 连通
   if (bucket) {
+    const { awsEnv } = await import("../src/bos.js");
     const probe = await new Promise((resolve) => {
-      execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com", "--query", "Contents[].Key", "--output", "json"], { env: { ...process.env, AWS_PROFILE: "bos" }, timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
+      execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com", "--query", "Contents[].Key", "--output", "json"], { env: awsEnv(), timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
     });
     console.log(`[4/5] BOS 连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
     if (!probe) ok = false;
@@ -627,6 +638,7 @@ async function taskCommand(args) {
 
 async function exportCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent export <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
+  assertSafeSessionId(id);
   const { bucket, endpoint } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { bosGet } = await import("../src/bos.js");
@@ -637,16 +649,18 @@ async function exportCommand(id) {
 }
 async function rmCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent rm <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
+  assertSafeSessionId(id);
   const { bucket, endpoint } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { execFile } = await import("node:child_process");
+  const { awsEnv } = await import("../src/bos.js");
   const confirm = await new Promise((resolve) => {
     const readline = require("node:readline").createInterface({ input: process.stdin, output: process.stdout });
     readline.question(`确定删除会话 "${id}" (BOS 永久删除, 不可恢复)? [y/N] `, (a) => { readline.close(); resolve(/^y/i.test(a.trim())); });
   });
   if (!confirm) { console.log("已取消"); return; }
   await new Promise((resolve) => {
-    execFile("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", `sessions/${id}.json`, "--endpoint-url", endpoint], { env: { ...process.env, AWS_PROFILE: "bos" }, timeout: 15000 }, (err) => resolve());
+    execFile("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", `sessions/${id}.json`, "--endpoint-url", endpoint], { env: awsEnv(), timeout: 15000 }, (err) => resolve());
   });
   console.log(`✓ 已删除会话 ${id}`);
 }
@@ -672,6 +686,7 @@ async function main() {
   // 避免多实例/多用户写入同一 key 造成串扰覆盖
   // 显式传 sessionId 时保留原名 (用户明确想续写该会话)
   const sessionId = process.argv[2] || `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  if (process.argv[2]) assertSafeSessionId(sessionId);
   console.log(`celagent — Pi TUI, 会话 ${sessionId}, Celld RPO=0 持久化\n`);
 
   // 0. Bug 87: celagent settings.json 的 provider/model 是单源配置 —

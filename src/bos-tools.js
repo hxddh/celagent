@@ -1,26 +1,13 @@
 // bos-tools.js — P1 记忆增强: agent 可用的 BOS 记忆工具
 // history_search: 跨会话检索历史记忆 (只读)
 // session_snapshot: 显式记忆锚点 (写 snapshots/ 前缀, 不碰权威数据)
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, existsSync, writeFileSync, unlinkSync, chmodSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, unlinkSync, chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { execFile } from "node:child_process";
+import { awsEnv } from "./bos.js";
 
 const EP = "https://s3.bj.bcebos.com";
-
-function awsEnv() {
-  const env = { ...process.env, AWS_EC2_METADATA_DISABLED: "true" };
-  const hasFullEnv = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
-  if (hasFullEnv) {
-    delete env.AWS_PROFILE;
-  } else {
-    delete env.AWS_ACCESS_KEY_ID;
-    delete env.AWS_SECRET_ACCESS_KEY;
-    delete env.AWS_SESSION_TOKEN;
-    env.AWS_PROFILE = "bos";
-  }
-  return env;
-}
 
 function runAws(args) {
   return new Promise((resolve) => {
@@ -38,6 +25,18 @@ function loadBucket() {
     const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
     return cfg.persistence?.bucket || null;
   } catch (e) { return null; }
+}
+
+function privateTmpSync(name = "body.json") {
+  const dir = mkdtempSync(join(tmpdir(), "celagent-"));
+  try { chmodSync(dir, 0o700); } catch (e) { /* ignore */ }
+  return {
+    dir,
+    path: join(dir, name),
+    cleanup() {
+      try { rmSync(dir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    },
+  };
 }
 
 function textOf(turn) {
@@ -83,15 +82,14 @@ export const history_search = {
 
       const hits = [];
       for (const key of keys) {
-        // 读会话内容 (head-object 拿 ETag, get-object 拿 body)
-        const tmp = `/tmp/celagent-search-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
+        const tmp = privateTmpSync("search.json");
         const dl = await new Promise((resolve) => {
-          execFile("aws", ["s3api", "get-object", "--bucket", bucket, "--key", key, "--endpoint-url", EP, tmp], { env: awsEnv(), timeout: 15000 }, (err) => resolve(!err));
+          execFile("aws", ["s3api", "get-object", "--bucket", bucket, "--key", key, "--endpoint-url", EP, tmp.path], { env: awsEnv(), timeout: 15000 }, (err) => resolve(!err));
         });
-        if (!dl) continue;
-        try { chmodSync(tmp, 0o600); } catch (e) { /* ignore */ }
+        if (!dl) { tmp.cleanup(); continue; }
+        try { chmodSync(tmp.path, 0o600); } catch (e) { /* ignore */ }
         try {
-          const session = JSON.parse(readFileSync(tmp, "utf8"));
+          const session = JSON.parse(readFileSync(tmp.path, "utf8"));
           const sessionId = key.replace("sessions/", "").replace(".json", "");
           for (const turn of (session.turns || [])) {
             const haystack = textOf(turn).toLowerCase();
@@ -102,7 +100,7 @@ export const history_search = {
             }
           }
         } catch (e) { /* 跳过损坏会话 */ }
-        try { unlinkSync(tmp); } catch (e) { /* ignore */ }
+        tmp.cleanup();
         if (hits.length >= limit) break;
       }
 
@@ -147,15 +145,17 @@ export const session_snapshot = {
         name, note, createdAt: Date.now(),
         turns: currentTurns,
       });
-      // 写临时文件再 put
-      const tmp = `/tmp/celagent-snap-${Date.now()}.json`;
-      writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600 });
-      const put = await new Promise((resolve) => {
-        execFile("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", tmp, "--endpoint-url", EP, "--output", "json"], { env: awsEnv(), timeout: 20000 }, (err, stdout) => resolve(!err));
-      });
-      unlinkSync(tmp);
-      if (!put) return { content: [{ type: "text", text: "快照保存失败" }] };
-      return { content: [{ type: "text", text: `已保存会话快照: ${key} (${currentTurns.length} 轮)` }] };
+      const tmp = privateTmpSync("snap.json");
+      try {
+        writeFileSync(tmp.path, body, { encoding: "utf8", mode: 0o600 });
+        const put = await new Promise((resolve) => {
+          execFile("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", tmp.path, "--endpoint-url", EP, "--output", "json"], { env: awsEnv(), timeout: 20000 }, (err, stdout) => resolve(!err));
+        });
+        if (!put) return { content: [{ type: "text", text: "快照保存失败" }] };
+        return { content: [{ type: "text", text: `已保存会话快照: ${key} (${currentTurns.length} 轮)` }] };
+      } finally {
+        tmp.cleanup();
+      }
     } catch (e) {
       return { content: [{ type: "text", text: `session_snapshot 失败: ${e.message}` }] };
     }

@@ -44,6 +44,8 @@ async function signingKey(sk, dateStamp, region, service) {
 }
 
 async function bosPut(env, key, content) {
+  // 直连默认关闭 — 生产走 webhook 代理(零凭证); 需显式 ALLOW_BOS_DIRECT=1
+  if (env.ALLOW_BOS_DIRECT !== '1') return { ok: false, status: 0, error: 'bos-direct-disabled' };
   const bucket = env.BOS_BUCKET;
   const ak = env.BOS_AK;
   const sk = env.BOS_SK;
@@ -80,6 +82,7 @@ async function bosPut(env, key, content) {
 }
 
 async function bosGet(env, key) {
+  if (env.ALLOW_BOS_DIRECT !== '1') return { ok: false, status: 0, error: 'bos-direct-disabled' };
   const bucket = env.BOS_BUCKET;
   const ak = env.BOS_AK;
   const sk = env.BOS_SK;
@@ -118,12 +121,30 @@ async function bosGet(env, key) {
 // ===== v2: 对象存储交互(经 webhook 代理, worker 零凭证) =====
 // 源码确认 v0.1.0 的 worker vars 注入不可用(manifest vars=null),
 // 凭证由 webhook 端点持有(boto3 签名), worker 只发内容 — 安全且真实
-const WEBHOOK_BASE = 'http://127.0.0.1:19090';
-const WEBHOOK_URL = `${WEBHOOK_BASE}/webhook`;
+// WEBHOOK_BASE 可经 env 覆盖; 默认仅 loopback, 非 http(s) 拒绝
+const DEFAULT_WEBHOOK_BASE = 'http://127.0.0.1:19090';
 
-async function bosPutProxy(key, content) {
+function resolveWebhookBase(env) {
+  const raw = (env && env.WEBHOOK_BASE) || DEFAULT_WEBHOOK_BASE;
   try {
-    const resp = await fetch(`${WEBHOOK_BASE}/obj-put`, {
+    const u = new URL(raw);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    // 未显式配置时仅允许 loopback, 防 SSRF 到内网其它主机
+    if (!env?.WEBHOOK_BASE) {
+      const host = u.hostname;
+      if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') return null;
+    }
+    return raw.replace(/\/$/, '');
+  } catch (e) {
+    return null;
+  }
+}
+
+async function bosPutProxy(key, content, env) {
+  const base = resolveWebhookBase(env);
+  if (!base) return { ok: false, status: 0, error: 'webhook-disabled' };
+  try {
+    const resp = await fetch(`${base}/obj-put`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key, content }),
@@ -134,10 +155,12 @@ async function bosPutProxy(key, content) {
     return { ok: false, status: 0, error: String(e) };
   }
 }
-async function webhookCall(tool, payload) {
+async function webhookCall(tool, payload, env) {
+  const base = resolveWebhookBase(env);
+  if (!base) return { error: 'webhook-disabled' };
   const opId = payload.opId;
   try {
-    const resp = await fetch(WEBHOOK_URL, {
+    const resp = await fetch(`${base}/webhook`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -366,7 +389,7 @@ export class AgentRuntime {
       case 'obj-put': {
         const key = url.searchParams.get('key') || `workspace/${agent}/file-${Date.now()}.txt`;
         const content = url.searchParams.get('content') || 'agent-file-content';
-        const result = await bosPutProxy(key, content);
+        const result = await bosPutProxy(key, content, this.env);
         // 记录到 storage(可查询)
         await this.state.storage.put(`obj:${key}`, { key, content, ts: Date.now(), ok: result.ok });
         return new Response(JSON.stringify({ action, key, result }));
@@ -383,7 +406,7 @@ export class AgentRuntime {
       case 'webhook-test': {
         const tool = url.searchParams.get('tool') || 'payment';
         const opId = url.searchParams.get('opId') || `test-${Date.now()}`;
-        const result = await webhookCall(tool, { opId, ts: Date.now() });
+        const result = await webhookCall(tool, { opId, ts: Date.now() }, this.env);
         return new Response(JSON.stringify({ action, opId, result }));
       }
 
@@ -489,7 +512,7 @@ export class AgentRuntime {
       const active = await this.state.storage.get(`agent:${agent}:active_tasks`) || 0;
       await this.state.storage.put(`agent:${agent}:active_tasks`, Math.max(0, active - 1));
       // v3: 任务完成时把产物经 webhook 代理写到 BOS workspace(尽力而为, 失败记入任务)
-      const putResult = await bosPutProxy(`workspace/${agent}/task-${task.id}.json`, JSON.stringify(task));
+      const putResult = await bosPutProxy(`workspace/${agent}/task-${task.id}.json`, JSON.stringify(task), this.env);
       task.bosResult = putResult;
     } else {
       task.status = 'pending';
@@ -508,7 +531,7 @@ export class AgentRuntime {
       return { ...existing, deduped: true };
     }
     // v2: 首次执行 → 真实 webhook 副作用(服务端幂等去重)
-    const webhookResult = await webhookCall(tool, { opId, ...payload });
+    const webhookResult = await webhookCall(tool, { opId, ...payload }, this.env);
     const entry = {
       opId, tool, ts: Date.now(), ...payload, deduped: false, webhookResult
     };

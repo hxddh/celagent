@@ -3,7 +3,9 @@
 # 用法: node_mgr.sh start|stop|status|restart
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-export AWS_PROFILE=bos AWS_REGION=bj
+# 凭证卫生: 清显式密钥后再用 profile, 避免 env AK/SK 覆盖 [bos]
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export AWS_PROFILE=bos AWS_REGION=bj AWS_EC2_METADATA_DISABLED=true
 
 CELLD="${CELLD:-$HOME/.local/bin/celld}"
 # bucket 优先从 celagent 配置读 (与自动启动一致 — Bug 49), 回退旧测试值

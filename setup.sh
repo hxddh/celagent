@@ -29,10 +29,13 @@ _rand() { openssl rand -hex 4 2>/dev/null || od -An -N4 -tx1 /dev/urandom 2>/dev
 EXISTING_BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
 BUCKET="${1:-${EXISTING_BUCKET:-celagent-$(_rand)-$(date +%s)}}"
 echo "[2/4] 创建 bucket: $BUCKET"
-if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
+# 凭证卫生: 清显式密钥后再用 profile
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export AWS_PROFILE=bos AWS_REGION=bj AWS_EC2_METADATA_DISABLED=true
+if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
   echo "  ✓ bucket 已存在"
 else
-  AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" 2>&1 | head -2
+  aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" 2>&1 | head -2
   echo "  ✓ bucket 创建成功"
 fi
 
@@ -54,9 +57,7 @@ echo "  celld: $CELLD"
 SRC_WORKER="${CELAGENT_SRC:-$HOME/celagent}"
 if [ -d "$SRC_WORKER/worker/src" ]; then
   echo "  部署 worker 到 bucket..."
-  # 凭证卫生: 用 AWS_PROFILE, 不把 SK 注入进程环境
-  export AWS_PROFILE=bos AWS_REGION=bj
-  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+  # 凭证卫生: 用 AWS_PROFILE (上文已 unset 显式密钥)
   export CELLD_ESBUILD="${CELLD_ESBUILD:-$SRC_WORKER/node_modules/.bin/esbuild}"
   (cd "$SRC_WORKER/worker" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj 2>&1 | tail -2)
   echo "  ✓ worker 已部署"
@@ -117,6 +118,7 @@ cat > "$CONFIG_DIR/settings.json" <<EOF
   }
 }
 EOF
+chmod 600 "$CONFIG_DIR/settings.json"
 echo "  ✓ 配置已写入 $CONFIG_DIR/settings.json"
 
 echo ""

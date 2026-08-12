@@ -101,10 +101,13 @@ echo "  ✓ BOS 凭证可用"
 _rand() { openssl rand -hex 4 2>/dev/null || od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'; }
 EXISTING_BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
 BUCKET="${CELAGENT_BUCKET:-${EXISTING_BUCKET:-celagent-$(_rand)-$(date +%s)}}"
-if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
+# 凭证卫生: 清显式密钥后再用 profile (避免 env AK/SK 覆盖 [bos])
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export AWS_PROFILE=bos AWS_REGION=bj AWS_EC2_METADATA_DISABLED=true
+if aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
   echo "  ✓ bucket 已存在: $BUCKET"
 else
-  AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" >/dev/null 2>&1
+  aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" >/dev/null 2>&1
   echo "  ✓ bucket 创建: $BUCKET"
 fi
 
@@ -117,15 +120,16 @@ if [ -n "$CELAGENT_SRC" ] && [ -d "${CELAGENT_SRC}/worker/src" ]; then
 else
   echo "  下载 worker 源码包..."
   mkdir -p "${CELAGENT_ROOT}/celagent"
-  if curl -fsSL "${RELEASE_URL}/worker.tar.gz" -o /tmp/celagent-worker.tar.gz 2>/dev/null; then
-    tar -xzf /tmp/celagent-worker.tar.gz -C "${CELAGENT_ROOT}/celagent/"
+  _WTMP=$(mktemp -d "${TMPDIR:-/tmp}/celagent-worker.XXXXXX")
+  chmod 700 "$_WTMP"
+  if curl -fsSL "${RELEASE_URL}/worker.tar.gz" -o "$_WTMP/worker.tar.gz" 2>/dev/null; then
+    tar -xzf "$_WTMP/worker.tar.gz" -C "${CELAGENT_ROOT}/celagent/"
     WORKER_SRC="${CELAGENT_ROOT}/celagent/worker"
   fi
+  rm -rf "$_WTMP"
 fi
 if [ -n "$WORKER_SRC" ] && [ -d "$WORKER_SRC/src" ]; then
-  # 凭证卫生: AWS_PROFILE, 不把 SK 注入进程环境
-  export AWS_PROFILE=bos AWS_REGION=bj
-  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+  # 凭证卫生: AWS_PROFILE, 不把 SK 注入进程环境 (上文已 unset)
   # esbuild: 优先本地 node_modules, 下载模式回退 npx (自动拉取)
   if [ -x "${CELAGENT_ROOT}/celagent/node_modules/.bin/esbuild" ]; then
     export CELLD_ESBUILD="${CELAGENT_ROOT}/celagent/node_modules/.bin/esbuild"
@@ -175,6 +179,7 @@ cat > "$CONFIG_DIR/settings.json" <<EOF
   }
 }
 EOF
+chmod 600 "$CONFIG_DIR/settings.json"
 echo "  ✓ 配置已写入"
 
 echo ""

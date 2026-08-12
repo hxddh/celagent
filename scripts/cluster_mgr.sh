@@ -5,7 +5,9 @@
 #           节点经 BOS 发现彼此, agent 会话可在任意节点访问
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-export AWS_PROFILE=bos AWS_REGION=bj
+# 凭证卫生: 清显式密钥后再用 profile, 避免 env AK/SK 覆盖 [bos]
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export AWS_PROFILE=bos AWS_REGION=bj AWS_EC2_METADATA_DISABLED=true
 
 CELLD="${CELLD:-$HOME/.local/bin/celld}"
 BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)

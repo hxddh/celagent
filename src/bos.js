@@ -7,9 +7,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { writeFile, unlink, readFile, chmod } from "node:fs/promises";
+import { writeFile, readFile, chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
 
 const EP = "https://s3.bj.bcebos.com";
 // aws CLI 调用超时 (Bug 59: 防网络黑洞永久挂起队列, 卡死退出路径)
@@ -21,21 +20,32 @@ function resolveEndpoint(override) {
   return override || EP;
 }
 
-function awsEnv() {
-  const env = { ...process.env, AWS_EC2_METADATA_DISABLED: "true" };
-  // Bug F: 凭证要么全用 env, 要么全用 profile — 不能混用
+/** 凭证要么全用 env, 要么全用 profile — 绝不混用 (env 部分覆盖会签名失败) */
+export function awsEnv(extra = {}) {
+  const env = { ...process.env, AWS_EC2_METADATA_DISABLED: "true", ...extra };
   const hasFullEnvCreds = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
   if (hasFullEnvCreds) {
-    // 用 env 凭证 (确保不残留部分 env 覆盖 profile)
     delete env.AWS_PROFILE;
   } else {
-    // 用 profile: 清除可能的部分 env 凭证, 避免混用
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;
     env.AWS_PROFILE = "bos";
   }
   return env;
+}
+
+/** 0700 私有临时目录 + 0600 文件 — 避免 /tmp/celagent-* 可预测路径 */
+async function privateTmp(name = "body.json") {
+  const dir = await mkdtemp(join(tmpdir(), "celagent-"));
+  try { await chmod(dir, 0o700); } catch (e) { /* ignore */ }
+  return {
+    dir,
+    path: join(dir, name),
+    async cleanup() {
+      try { await rm(dir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    },
+  };
 }
 
 function runAws(args, { timeout = AWS_TIMEOUT_MS } = {}) {
@@ -56,17 +66,16 @@ function runAws(args, { timeout = AWS_TIMEOUT_MS } = {}) {
 export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRetries = 3, endpoint } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
   const ep = resolveEndpoint(endpoint);
-  // 写临时文件 (aws CLI 需要真实文件)
-  const tmp = join(tmpdir(), `celagent-${randomBytes(4).toString("hex")}.json`);
+  const tmp = await privateTmp("put.json");
   const body = typeof content === "string" ? content : JSON.stringify(content);
   // 会话内容可能含敏感对话 — 临时文件权限收紧为 owner-only
-  await writeFile(tmp, body, { encoding: "utf8", mode: 0o600 });
+  await writeFile(tmp.path, body, { encoding: "utf8", mode: 0o600 });
   try {
     const args = [
       "s3api", "put-object",
       "--bucket", bucket,
       "--key", key,
-      "--body", tmp,
+      "--body", tmp.path,
       "--endpoint-url", ep,
       "--output", "json",
     ];
@@ -97,7 +106,7 @@ export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRe
       return { ok: false, error: msg.split("\n").slice(-2).join(" ") };
     }
   } finally {
-    try { await unlink(tmp); } catch (e) { /* ignore */ }
+    await tmp.cleanup();
   }
 }
 
@@ -105,7 +114,7 @@ export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRe
 export async function bosGet(key, { bucket, endpoint } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
   const ep = resolveEndpoint(endpoint);
-  const tmp = join(tmpdir(), `celagent-get-${randomBytes(4).toString("hex")}.json`);
+  const tmp = await privateTmp("get.json");
   try {
     // 1. 下载文件
     const dl = await runAws([
@@ -113,7 +122,7 @@ export async function bosGet(key, { bucket, endpoint } = {}) {
       "--bucket", bucket,
       "--key", key,
       "--endpoint-url", ep,
-      tmp,
+      tmp.path,
     ]);
     if (!dl.ok) {
       // Bug G: 404 检测更准确 (NoSuchKey / 404)
@@ -121,7 +130,7 @@ export async function bosGet(key, { bucket, endpoint } = {}) {
       return { ok: false, error: (msg.includes("404") || msg.includes("NoSuchKey")) ? "not-found" : msg };
     }
     // aws CLI 写出的文件可能过宽权限 — 收紧后再读
-    try { await chmod(tmp, 0o600); } catch (e) { /* ignore */ }
+    try { await chmod(tmp.path, 0o600); } catch (e) { /* ignore */ }
     // 2. 单独 head-object 取 ETag (get-object 的 --query 不适用)
     let etag;
     const head = await runAws([
@@ -133,12 +142,12 @@ export async function bosGet(key, { bucket, endpoint } = {}) {
       "--output", "text",
     ]);
     if (head.ok) etag = head.stdout.trim() || undefined;
-    const body = await readFile(tmp, "utf8");
+    const body = await readFile(tmp.path, "utf8");
     return { ok: true, body, etag };
   } catch (e) {
     const msg = String(e.message || e);
     return { ok: false, error: (msg.includes("404") || msg.includes("NoSuchKey")) ? "not-found" : msg };
   } finally {
-    try { await unlink(tmp); } catch (e) { /* ignore */ }
+    await tmp.cleanup();
   }
 }
