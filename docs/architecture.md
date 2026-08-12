@@ -148,7 +148,10 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **节点 lease 10s**:集群成员 TTL,网络分区时节点可能被误判离线
 - **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失)
 - **CI 不构建发布二进制**:当前手动匿名路径构建(见 PACKAGING 注意 0)
-- **install.sh 正式模式未切 Release 下载**:发布流程步骤 5
+- **install.sh 正式模式已切 Release 下载**(开发模式仍可用 `CELAGENT_SRC`)
+- **恢复读路径实现细节**:`loadHistoryFromBos` 当前优先 worker 缓存再回落 BOS;
+  worker checkpoint 的 msg 经 URL 截断 200 字符 — 与「BOS 权威 / 完整记忆」叙事存在张力,
+  评估与修复见 `docs/project-evaluation.md` §3.3
 
 ## 6. 与分布式部署的关系
 

@@ -2,7 +2,8 @@
 
 > 本文档是**唯一权威交接入口**。任何 agent 或开发者接手本项目,先从本文档开始。
 > 配套文档:`README.md`(用户视角)、**`docs/architecture.md`(架构权威: 数据流/机制/设计决策/扩展点)**、
-> `PACKAGING.md`(打包/发布)、`docs/distributed-deployment.md`(多机部署)。
+> `PACKAGING.md`(打包/发布)、`docs/distributed-deployment.md`(多机部署)、
+> **`docs/project-evaluation.md`(2026-08-12 深度评估: 文档/代码对照、成熟度、优先改进)**。
 
 ## 0. 项目定位
 
@@ -95,44 +96,35 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:不在仓库内,安装方式 `curl -fsSL https://celld.dev/install.sh | sh`(装到 `~/.local/bin/celld`);发布后随 Release 包分发
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(v0.3.0 发布,卡 GitHub 认证)
+## 3. 发布状态(v0.3.0 已发布; 当前阻塞见下)
 
 ### 已完成
-- ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content)
-- ✅ 测试:core 9 用例(节点在跑时全绿)、e2e 真实 LLM 验证
+- ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(BOS 写路径不截断 content)
+- ✅ 仓库与认证: `github.com/hxddh/celagent` 已公开可推送
+- ✅ **Release `v0.3.0` 已创建**(含 `celagent-{darwin-arm64,darwin-x64,linux-x64}`、`celld-darwin-arm64`、`install.sh`、`worker.tar.gz`)
+- ✅ 版本统一为 `0.3.0`(`package.json` / `install.sh` / CLI)
 - ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo` 清除本机用户名/真实 session 指纹/AK 前缀打印;CI 含 Secret/PII 门禁;全部提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥硬编码
-  - `main` / `cursor/security-sanitize-2d82` / tag `v0.3.0` 均已指向净化后提交
   - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容(平台保留孤儿对象);彻底从 github.com 抹掉需向 GitHub Support 申请 purge(仓库内 refs 已无锚点)
 - ✅ 构建能力:Bun 单二进制编译通过并实测可运行(version/help/doctor/TUI);⚠️ 旧构建物已废弃
   (内含本机路径),发布构建必须按 PACKAGING.md 注意 0 在匿名路径/CI 执行
 - ✅ README/install.sh 已指向 `github.com/hxddh/celagent/releases/latest/download/install.sh`
+- ✅ **深度评估**:见 `docs/project-evaluation.md`(文档/代码对照、成熟度评分、P0–P3 改进清单)
 
-### 阻塞(唯一)
-- **GitHub 认证未完成** → 无法建仓/推送/发 Release。两种方案:
-  - **方案 A(推荐)**:`brew install gh` → `gh auth login`(选 GitHub.com → HTTPS → 浏览器 OAuth)→ `cd <本地仓库路径> && gh repo create celagent --public --source . --push`
-  - **方案 B**:https://github.com/settings/tokens 创建 fine-grained PAT(仅授权 celagent repo)→ 网页建仓 → `git remote add origin https://github.com/hxddh/celagent.git` → push
-- 认证完成后立即执行下方"发布流程"
+### 当前阻塞(按优先级)
+1. **CI 全红**: Secret/PII scan 未排除 `node_modules`,误伤上游依赖文本;单元测试步骤仍 `continue-on-error: true`
+2. **恢复读路径与「BOS 权威/完整记忆」叙事不完全一致**:`loadHistoryFromBos` 优先返回 worker 缓存(msg 仅 200 字符截断) — 详见评估报告 §3.3
+3. **Release celld 多平台不全**:目前仅有 `celld-darwin-arm64`;linux/darwin-x64 安装回退 `celld.dev`
+4. **干净环境单测**:无 `~/.config/celagent/settings.json` 时 `tests/core.test.mjs` before hook ENOENT → 9 用例全挂(文档「mock 6 pass」不成立)
 
-### 发布流程(认证后按序执行)
-
-0. ✅ **docs/archive 已删除**(2026-08-11 决策):POC 探索代码(src-legacy/poc-pi-sdk/
-   p0-verify)及 ~72MB 旧二进制不再随公开仓库发布;有价值结论已在 HANDOFF/
-   bos-compat 等文档中
-1. **推送**:建仓 + push(gh repo create --push 或 git push -u origin main)
-2. **CI 首跑**:`.github/workflows/ci.yml` 首次运行,修到全绿(node 20/22 矩阵)
-3. **版本统一**:`install.sh` 的 `VERSION="0.1.0"` 与 `package.json` 的 `"0.2.0"` 不一致 → 统一为发布版本(建议 v0.3.0,因含 P1 记忆增强 + P2 分布式,已超 0.2.0 语义)
-4. **跨平台构建**(⚠️ 必须在匿名路径构建, 见 PACKAGING.md 注意 0 — Bun 嵌入本机绝对路径,
-   仓库目录实测含 `/Users/<user>/<project>/...`; 构建后 `strings <bin> | grep -E '/Users/|/home/[^/]+/|celld-test|celagent-poc'` 必须为空):
-   ```bash
-   # 先按 PACKAGING.md 注意 0 准备 /tmp/anon-build
-   cd /tmp/anon-build
-   bun build bin/celagent-tui.mjs --compile --outfile celagent-darwin-arm64
-   bun build bin/celagent-tui.mjs --compile --target=bun-darwin-x64 --outfile celagent-darwin-x64
-   bun build bin/celagent-tui.mjs --compile --target=bun-linux-x64 --outfile celagent-linux-x64
-   ```
-5. ✅ **install.sh 正式模式**:已改为从 GitHub Release 下载 `celagent-<平台>` / `celld-<平台>` / `worker.tar.gz`(开发模式仍可用 `CELAGENT_SRC`)
-6. **创建 Release**:`gh release create v0.3.0` → 上传二进制 + celld + install.sh
-7. **端到端验证**:全新机器 `curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh` 真实走一遍
+### 发布后仍建议执行
+0. ✅ **docs/archive 已删除**(2026-08-11 决策)
+1. ✅ 建仓 + 推送 + Release v0.3.0
+2. **修 CI 到全绿**(排除 node_modules 扫描;无配置时 CLI 用例必过;再考虑去掉 continue-on-error)
+3. ✅ 版本已统一为 0.3.0
+4. **补齐跨平台 celld 资产**(至少 `celld-linux-x64`;构建仍须匿名路径,见 PACKAGING.md 注意 0)
+5. ✅ **install.sh 正式模式**已走 Release 下载
+6. **修恢复读路径**(BOS-first 或 worker 存完整 body),并同步 `docs/architecture.md` §1.4
+7. **端到端验证**:全新机器 `curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh`
 
 ## 4. 版本与里程碑
 
@@ -141,7 +133,7 @@ node bin/celagent-tui.mjs task ledger
 | v0.1.x | CLI 骨架 + BOS 直写 + 双节点 | ✅ |
 | v0.2.x | 分布式运行时(worker 缓存/sync、休眠唤醒、agent 任务化、cluster_mgr、多机部署文档) | ✅ |
 | P1 记忆增强 | history_search + session_snapshot + 完整记忆(不截断) | ✅ 已并入 |
-| v0.3.0 | **发布版**(含 P1 记忆增强):Release 二进制分发 + celld 随包 + install.sh 下载模式 + CI 全绿 | 🔄 进行中(卡认证) |
+| v0.3.0 | **发布版**(含 P1 记忆增强):Release 二进制分发 + celld 随包 + install.sh 下载模式 | ✅ 已发 Release; 🔄 CI 全绿 / 多平台 celld / 读路径对齐 进行中 |
 
 后续候选方向(未排期):多 provider 认证管理、快照浏览 UI、会话 diff/合并、Bucket 生命周期(降本)。
 
