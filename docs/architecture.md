@@ -30,7 +30,15 @@
 **记忆体系**:`sessions/<id>.json`(权威会话)+ `snapshots/<name>-<ts>.json`(显式记忆锚点,
 由 `session_snapshot` 工具写入,不碰权威数据,可跨会话检索 via `history_search`)。
 
-### 1.2 一次对话的完整旅程
+### 1.2 节点生命周期
+
+- **自动启动**:TUI 启动或首次写时 `ensureCelld()` 检测 18090/18091/19000 无响应
+  → 从配置(bucket/凭证)拉起 celld 节点(进程内互斥锁, Bug 53 防并发重复启动)
+- **运行**:worker 缓存写(2s 超时)+ BOS 直写;节点离线时自动降级(仅 BOS, 警告一次)
+- **退出**:TUI 退出前 `await bosQueue` flush(Bug 17, 不丢最后几轮);节点由 nohup 托管继续运行
+- **多机**:节点经 BOS `nodes/` 注册表(lease 10s)自动发现, 见 distributed-deployment.md
+
+### 1.3 一次对话的完整旅程
 
 ```
 用户输入 → pi 引擎 (LLM 推理 + 工具调用循环) → assistant 回复
@@ -45,7 +53,7 @@
    → 退出前: await bosQueue (Bug 17: flush 队列, 不丢最后几轮)
 ```
 
-### 1.3 恢复路径
+### 1.4 恢复路径
 
 ```
 celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
@@ -62,7 +70,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **celld 状态可丢**:节点强杀 → LTX 复制未完成 → RestoreFailed(见 bos-compat §二.6);
   own.json 残留阻塞接管(§二.8)。celld 是执行层,不是数据层。
 - **BOS 直写不依赖节点**:节点全挂,对话照常持久化(实测验证:节点未启动时 41 轮全落盘)。
-- **代价**:写延迟 ~0.8s(aws CLI 签名+PUT),用**异步队列**隐藏(不阻塞对话)。
+- **代价**:写延迟 ~0.84s(实测均值, aws CLI 签名+PUT),用**异步队列**隐藏(不阻塞对话)。
 
 ### 2.2 并发安全:三级防护
 
@@ -121,7 +129,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 
 | # | 决策 | 理由 | 代价 | 替代方案(为何不用) |
 |---|---|---|---|---|
-| 1 | **BOS 为权威源** | RPO=0、不依赖节点、换机可恢复 | 写延迟 ~0.8s | celld 状态(可丢,见 2.1) |
+| 1 | **BOS 为权威源** | RPO=0、不依赖节点、换机可恢复 | 写延迟 ~0.84s | celld 状态(可丢,见 2.1) |
 | 2 | **BOS 直写不走 celld** | 节点全挂数据不丢 | 双路实现复杂度 | 全走 celld(单点故障) |
 | 3 | **worker 仅缓存** | 快读路径,丢了可重建 | 缓存可能过期 | 缓存做权威(违背 RPO=0) |
 | 4 | **pi 引擎不 fork,库用** | 跟随上游更新,不维护 fork | 受上游 API 约束 | fork(长期维护成本) |
