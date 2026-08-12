@@ -144,7 +144,8 @@ node tests/core.test.mjs               # 回归测试 (需节点在跑: scripts/
 
 ## 开发者 / Agent 接手
 
-- **HANDOFF.md** — 项目交接文档(架构/代码地图/发布状态/工程约定),新 agent 或开发者从它开始
+- **HANDOFF.md** — 项目交接文档(代码地图/发布状态/工程约定),新 agent 或开发者从它开始
+- **docs/architecture.md** — 架构权威(三层模型/数据流/机制原理/设计决策/扩展点)
 - **PACKAGING.md** — 打包与发布流程
 - **docs/distributed-deployment.md** — 多机部署
 

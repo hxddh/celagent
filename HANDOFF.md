@@ -1,13 +1,14 @@
 # HANDOFF — 项目交接文档(给下一个开发者/agent)
 
 > 本文档是**唯一权威交接入口**。任何 agent 或开发者接手本项目,先从本文档开始。
-> 配套文档:`README.md`(用户视角)、`PACKAGING.md`(打包/发布)、`docs/distributed-deployment.md`(多机部署)。
+> 配套文档:`README.md`(用户视角)、**`docs/architecture.md`(架构权威: 数据流/机制/设计决策/扩展点)**、
+> `PACKAGING.md`(打包/发布)、`docs/distributed-deployment.md`(多机部署)。
 
 ## 0. 项目定位
 
 **celagent**:独立开源 agent 产品。基于 Pi TUI 引擎 + Celld 分布式运行时 + BOS 对象存储,核心卖点是**会话永不丢(RPO=0)**——每轮对话经 BOS 权威落盘,崩溃/换机器/节点故障历史一条不丢。
 
-三层架构(BOS 保数据 + Celld 保执行 + agent 可用 BOS):
+**核心心智模型**:BOS 保数据(权威源,RPO=0)+ Celld 保执行(缓存/任务/集群)+ agent 可用 BOS(记忆工具)。
 
 ```
 TUI 交互 (pi-coding-agent 引擎, 全量工具)
@@ -18,10 +19,8 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
                     sessions/<id>.json  (完整 content, 不截断)
 ```
 
-关键设计决策:
-- **BOS 直写不走 celld**——节点全挂时数据不丢(权威源是 BOS,不是 celld 状态)
-- 分发 = **GitHub Release 二进制**(Bun 单文件,~72MB,含 pi 全部依赖),celld 随包分发
-- 凭证全部动态获取(env 或 `~/.aws/credentials` [bos] profile),仓库内零凭证
+**架构细节(数据流时序/机制原理/组件边界/10 项设计决策/扩展点)见 `docs/architecture.md`**——
+改造架构或基于迭代前必读。
 
 ## 1. 代码地图
 
