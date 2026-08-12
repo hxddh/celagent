@@ -5,12 +5,14 @@
 > **已验证 (2026-08-10)**: TUI 版 Bun 单二进制编译通过, 全功能运行正常。
 > - 修复 Bug 84: 动态 import(file://路径) 无法被 Bun 打包 → 改为静态 import,
 >   2984 modules 全部内联
-> - 二进制 `celagent-bin` (75MB) 已重新生成并验证: version/help/doctor/list/TUI 完整启动 ✓
+> - ⚠️ 当时的构建物 `celagent-bin` 已废弃(内含本机绝对路径, 第八轮安全检查发现),
+>   发布构建必须按下方「注意 0」在匿名路径或 CI 执行
 
 ## 验证过的命令
 
-- 二进制: `celagent-bin` (75MB, 含 Bun 运行时 + pi 全部依赖)
-- 命令: `bun build bin/celagent-tui.mjs --compile --outfile celagent-bin`
+- 二进制: 单文件 (75MB, 含 Bun 运行时 + pi 全部依赖);当时构建物 `celagent-bin` 已废弃
+- 命令: `bun build bin/celagent-tui.mjs --compile --outfile <匿名路径>/celagent-<平台>`
+  (⚠️ 必须在匿名路径构建, 见「注意 0」; 禁止在仓库目录直接构建)
 - 已验证功能:
   - version/help/doctor/list ✅
   - TUI 完整启动 (services + 会话 + 渲染) ✅
@@ -50,7 +52,7 @@ GitHub Release:
 
 ## 注意
 
-0. **构建环境规范 (安全红线, 第八轮安全检查发现)**: Bun 编译会把模块绝对路径嵌入二进制
+0. **构建环境规范 (安全红线, 安全检查发现)**: Bun 编译会把模块绝对路径嵌入二进制
    (`__dirname`/模块注释)。**禁止在含用户名/项目名的路径下构建发布物** —
    旧构建实测含 `/Users/<user>/<project>/...`(本机用户名+项目名)。正确做法:
    ```bash
