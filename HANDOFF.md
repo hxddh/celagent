@@ -111,12 +111,12 @@ node bin/celagent-tui.mjs task ledger
 - ✅ **深度评估**:见 `docs/project-evaluation.md`(文档/代码对照、成熟度评分、P0–P3 改进清单)
 
 ### 当前阻塞(按优先级)
-1. **CI 全红**: Secret/PII scan 未排除 `node_modules`,误伤上游依赖文本;单元测试步骤仍 `continue-on-error: true`
-2. **恢复读路径与「BOS 权威/完整记忆」叙事不完全一致**:`loadHistoryFromBos` 优先返回 worker 缓存(msg 仅 200 字符截断) — 详见评估报告 §3.3
-3. **会话语义缺口**:BOS 仅持久化 assistant 轮,不存 user 消息;跨机续写缺用户侧上下文 — 评估 §11.3
-4. **`doctor` 假阴性**:检查 `models.json`,pi 0.84 实际为 `models-store.json`;TUI 可启动时 doctor 仍报无法启动 — 评估 §11.1 R2-1
-5. **Release / 源码漂移**:`v0.3.0` 的 `install.sh` 比当前 main 更严(安全卫生);`celld-linux-x64` 404;安全加固分支 `cursor/security-sanitize-2d82` 尚未合入
-6. **干净环境单测**:无 `~/.config/celagent/settings.json` 时 `tests/core.test.mjs` before hook ENOENT → 9 用例全挂(文档「mock 6 pass」不成立;安全分支已有容错补丁待合入)
+1. **数据正确性 P0**(评估 §12):worker 截断缓存可覆盖 BOS;sync 盲写可抹新轮;队列超限**丢最新**(非最旧);`ensureLock` 早退不释放
+2. **CI 全红**: Secret/PII scan 未排除 `node_modules`;无 settings 时单测 ENOENT;PR#1 去 continue-on-error 后仍会因 scan 红
+3. **会话语义**:仅 assistant 落盘;doctor 查错 `models.json`(应为 `models-store.json`)
+4. **合入 PR#1 安全加固** + 补 checksum/worker 鉴权等残留(评估 §12.3)
+5. **Release**:`celld-linux-x64`/`darwin-x64`/`windows` 404;Release `install.sh` ≠ main
+6. **engines**:声明 `>=22`,依赖要求 `>=22.19.0`
 
 ### 发布后仍建议执行
 0. ✅ **docs/archive 已删除**(2026-08-11 决策)
