@@ -113,8 +113,10 @@ node bin/celagent-tui.mjs task ledger
 ### 当前阻塞(按优先级)
 1. **CI 全红**: Secret/PII scan 未排除 `node_modules`,误伤上游依赖文本;单元测试步骤仍 `continue-on-error: true`
 2. **恢复读路径与「BOS 权威/完整记忆」叙事不完全一致**:`loadHistoryFromBos` 优先返回 worker 缓存(msg 仅 200 字符截断) — 详见评估报告 §3.3
-3. **Release celld 多平台不全**:目前仅有 `celld-darwin-arm64`;linux/darwin-x64 安装回退 `celld.dev`
-4. **干净环境单测**:无 `~/.config/celagent/settings.json` 时 `tests/core.test.mjs` before hook ENOENT → 9 用例全挂(文档「mock 6 pass」不成立)
+3. **会话语义缺口**:BOS 仅持久化 assistant 轮,不存 user 消息;跨机续写缺用户侧上下文 — 评估 §11.3
+4. **`doctor` 假阴性**:检查 `models.json`,pi 0.84 实际为 `models-store.json`;TUI 可启动时 doctor 仍报无法启动 — 评估 §11.1 R2-1
+5. **Release / 源码漂移**:`v0.3.0` 的 `install.sh` 比当前 main 更严(安全卫生);`celld-linux-x64` 404;安全加固分支 `cursor/security-sanitize-2d82` 尚未合入
+6. **干净环境单测**:无 `~/.config/celagent/settings.json` 时 `tests/core.test.mjs` before hook ENOENT → 9 用例全挂(文档「mock 6 pass」不成立;安全分支已有容错补丁待合入)
 
 ### 发布后仍建议执行
 0. ✅ **docs/archive 已删除**(2026-08-11 决策)
