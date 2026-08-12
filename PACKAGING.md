@@ -4,13 +4,13 @@
 
 > **已验证 (2026-08-10)**: TUI 版 Bun 单二进制编译通过, 全功能运行正常。
 > - 修复 Bug 84: 动态 import(file://路径) 无法被 Bun 打包 → 改为静态 import,
->   2984 modules 全部内联
+>   2985 modules 全部内联
 > - ⚠️ 当时的构建物 `celagent-bin` 已废弃(内含本机绝对路径, 第八轮安全检查发现),
 >   发布构建必须按下方「注意 0」在匿名路径或 CI 执行
 
 ## 验证过的命令
 
-- 二进制: 单文件 (75MB, 含 Bun 运行时 + pi 全部依赖);当时构建物 `celagent-bin` 已废弃
+- 二进制: 单文件 (~72MB, 含 Bun 运行时 + pi 全部依赖);当时构建物 `celagent-bin` 已废弃
 - 命令: `bun build bin/celagent-tui.mjs --compile --outfile <匿名路径>/celagent-<平台>`
   (⚠️ 必须在匿名路径构建, 见「注意 0」; 禁止在仓库目录直接构建)
 - 已验证功能:

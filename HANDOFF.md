@@ -20,7 +20,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 
 关键设计决策:
 - **BOS 直写不走 celld**——节点全挂时数据不丢(权威源是 BOS,不是 celld 状态)
-- 分发 = **GitHub Release 二进制**(Bun 单文件,75MB,含 pi 全部依赖),celld 随包分发
+- 分发 = **GitHub Release 二进制**(Bun 单文件,~72MB,含 pi 全部依赖),celld 随包分发
 - 凭证全部动态获取(env 或 `~/.aws/credentials` [bos] profile),仓库内零凭证
 
 ## 1. 代码地图
@@ -112,7 +112,7 @@ node bin/celagent-tui.mjs task ledger
 ### 发布流程(认证后按序执行)
 
 0. ✅ **docs/archive 已删除**(2026-08-11 决策):POC 探索代码(src-legacy/poc-pi-sdk/
-   p0-verify)及 75MB 旧二进制不再随公开仓库发布;有价值结论已在 HANDOFF/
+   p0-verify)及 ~72MB 旧二进制不再随公开仓库发布;有价值结论已在 HANDOFF/
    bos-compat 等文档中
 1. **推送**:建仓 + push(gh repo create --push 或 git push -u origin main)
 2. **CI 首跑**:`.github/workflows/ci.yml` 首次运行,修到全绿(node 20/22 矩阵)

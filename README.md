@@ -80,7 +80,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `celagent export <id>` | 导出 JSON |
 | `celagent rm <id>` | 删除会话(需确认) |
 | `celagent config get/set` | 配置读写 |
-| `celagent doctor` | 四维自检 |
+| `celagent doctor` | 五维自检 |
 | `celagent task submit <type> [steps]` | 提交分布式任务 (celld 状态机, 断点续跑) |
 | `celagent task status [taskId]` | 任务状态 |
 | `celagent task ledger` | 幂等 ledger (exactly-once) |
