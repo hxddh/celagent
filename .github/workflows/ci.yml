@@ -28,8 +28,8 @@ jobs:
           for f in bin/*.mjs src/*.js tests/*.mjs; do node --check "$f" || echo "SYNTAX FAIL: $f"; done
       - name: CLI smoke test (help/version, no celld needed)
         run: |
-          timeout 30 node bin/celagent-tui.mjs help >/dev/null || echo "HELP FAILED exit=$?"
-          timeout 30 node bin/celagent-tui.mjs version | grep -q "celagent v" || echo "VERSION FAILED"
+          timeout 30 node bin/celagent-tui.mjs help >/dev/null || { echo "HELP FAILED exit=$?"; exit 1; }
+          timeout 30 node bin/celagent-tui.mjs version | grep -q "celagent v" || { echo "VERSION FAILED"; exit 1; }
       - name: "Unit tests (no celld, mock mode)"
         run: npm test
         env:
