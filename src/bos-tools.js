@@ -3,7 +3,7 @@
 // session_snapshot: 显式记忆锚点 (写 snapshots/ 前缀, 不碰权威数据)
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, unlinkSync, chmodSync } from "node:fs";
 import { execFile } from "node:child_process";
 
 const EP = "https://s3.bj.bcebos.com";
@@ -89,6 +89,7 @@ export const history_search = {
           execFile("aws", ["s3api", "get-object", "--bucket", bucket, "--key", key, "--endpoint-url", EP, tmp], { env: awsEnv(), timeout: 15000 }, (err) => resolve(!err));
         });
         if (!dl) continue;
+        try { chmodSync(tmp, 0o600); } catch (e) { /* ignore */ }
         try {
           const session = JSON.parse(readFileSync(tmp, "utf8"));
           const sessionId = key.replace("sessions/", "").replace(".json", "");
@@ -148,7 +149,7 @@ export const session_snapshot = {
       });
       // 写临时文件再 put
       const tmp = `/tmp/celagent-snap-${Date.now()}.json`;
-      writeFileSync(tmp, body, "utf8");
+      writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600 });
       const put = await new Promise((resolve) => {
         execFile("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", tmp, "--endpoint-url", EP, "--output", "json"], { env: awsEnv(), timeout: 20000 }, (err, stdout) => resolve(!err));
       });

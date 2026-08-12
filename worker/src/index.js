@@ -13,19 +13,34 @@ const LEDGER_KEY = 'ledger';
 
 // ===== v2: 对象存储直连(SigV4) =====
 // BOS 凭证通过 env 注入(不硬编码), worker 用 crypto.subtle 做 HMAC 签名
-async function hmacSha256(key, data) {
+// 注意: 生产路径走下方 webhook 代理(零凭证); 直连仅在 env 注入 BOS_AK/SK 时启用
+async function hmacSha256Raw(key, data) {
+  // key: string | ArrayBufferView — 链式派生时必须传上一轮的 raw 字节, 不能传 hex 字符串
   const enc = new TextEncoder();
+  const keyBytes = typeof key === 'string' ? enc.encode(key) : key;
+  const dataBytes = typeof data === 'string' ? enc.encode(data) : data;
   const cryptoKey = await crypto.subtle.importKey(
-    'raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
   );
-  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(data));
-  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
+  return await crypto.subtle.sign('HMAC', cryptoKey, dataBytes);
+}
+
+function toHex(buf) {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function sha256Hex(data) {
   const enc = new TextEncoder();
   const hash = await crypto.subtle.digest('SHA-256', enc.encode(data));
-  return [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
+  return toHex(hash);
+}
+
+async function signingKey(sk, dateStamp, region, service) {
+  let k = await hmacSha256Raw(`AWS4${sk}`, dateStamp);
+  k = await hmacSha256Raw(k, region);
+  k = await hmacSha256Raw(k, service);
+  k = await hmacSha256Raw(k, 'aws4_request');
+  return k;
 }
 
 async function bosPut(env, key, content) {
@@ -52,11 +67,8 @@ async function bosPut(env, key, content) {
   const canonicalRequest = ['PUT', path, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
   const scope = `${dateStamp}/bj/s3/aws4_request`;
   const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, await sha256Hex(canonicalRequest)].join('\n');
-  let k = await hmacSha256(`AWS4${sk}`, dateStamp);
-  k = await hmacSha256(k, 'bj');
-  k = await hmacSha256(k, 's3');
-  k = await hmacSha256(k, 'aws4_request');
-  const signature = await hmacSha256(k, stringToSign);
+  const kSigning = await signingKey(sk, dateStamp, 'bj', 's3');
+  const signature = toHex(await hmacSha256Raw(kSigning, stringToSign));
   headers['Authorization'] =
     `AWS4-HMAC-SHA256 Credential=${ak}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
   try {
@@ -90,11 +102,8 @@ async function bosGet(env, key) {
   const canonicalRequest = ['GET', path, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
   const scope = `${dateStamp}/bj/s3/aws4_request`;
   const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, await sha256Hex(canonicalRequest)].join('\n');
-  let k = await hmacSha256(`AWS4${sk}`, dateStamp);
-  k = await hmacSha256(k, 'bj');
-  k = await hmacSha256(k, 's3');
-  k = await hmacSha256(k, 'aws4_request');
-  const signature = await hmacSha256(k, stringToSign);
+  const kSigning = await signingKey(sk, dateStamp, 'bj', 's3');
+  const signature = toHex(await hmacSha256Raw(kSigning, stringToSign));
   headers['Authorization'] =
     `AWS4-HMAC-SHA256 Credential=${ak}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
   try {

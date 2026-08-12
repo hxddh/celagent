@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { writeFile, unlink, readFile } from "node:fs/promises";
+import { writeFile, unlink, readFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 
@@ -59,7 +59,8 @@ export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRe
   // 写临时文件 (aws CLI 需要真实文件)
   const tmp = join(tmpdir(), `celagent-${randomBytes(4).toString("hex")}.json`);
   const body = typeof content === "string" ? content : JSON.stringify(content);
-  await writeFile(tmp, body, "utf8");
+  // 会话内容可能含敏感对话 — 临时文件权限收紧为 owner-only
+  await writeFile(tmp, body, { encoding: "utf8", mode: 0o600 });
   try {
     const args = [
       "s3api", "put-object",
@@ -119,6 +120,8 @@ export async function bosGet(key, { bucket, endpoint } = {}) {
       const msg = dl.error || "";
       return { ok: false, error: (msg.includes("404") || msg.includes("NoSuchKey")) ? "not-found" : msg };
     }
+    // aws CLI 写出的文件可能过宽权限 — 收紧后再读
+    try { await chmod(tmp, 0o600); } catch (e) { /* ignore */ }
     // 2. 单独 head-object 取 ETag (get-object 的 --query 不适用)
     let etag;
     const head = await runAws([
