@@ -6,7 +6,7 @@ set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
-VERSION="0.1.0"
+VERSION="0.3.0"
 echo "=== celagent v${VERSION} 一键安装 (Celld + BOS) ==="
 
 # 1. 前置检查 — Bug 90: jq 是 bucket 复用逻辑的依赖, 缺失时静默新建 bucket
