@@ -430,8 +430,8 @@ function printHelp() {
 
 示例:
   celagent list
-  celagent sess-demo-secondary
-  celagent export sess-demo-secondary > backup.json
+  celagent sess-demo-xxxxxxxx
+  celagent export sess-demo-xxxxxxxx > backup.json
 `);
 }
 
