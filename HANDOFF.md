@@ -38,6 +38,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `scripts/cluster_mgr.sh` | 多机集群管理(add-node/status 等) |
 | `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
 | `tests/core.test.mjs` | 核心回归(9 用例:需节点在跑;mock 模式 6 pass) |
+| `tests/review-logic-proofs.test.mjs` | 评估 Critical 逻辑零依赖证据(队列丢最新/ensureLock/fork 等,5 pass) |
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
 | `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、33 轮真实对话实录回放, 2026-08-11) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |
@@ -111,12 +112,12 @@ node bin/celagent-tui.mjs task ledger
 - ✅ **深度评估**:见 `docs/project-evaluation.md`(文档/代码对照、成熟度评分、P0–P3 改进清单)
 
 ### 当前阻塞(按优先级)
-1. **数据正确性 P0**(评估 §12):worker 截断缓存可覆盖 BOS;sync 盲写可抹新轮;队列超限**丢最新**(非最旧);`ensureLock` 早退不释放
-2. **CI 全红**: Secret/PII scan 未排除 `node_modules`;无 settings 时单测 ENOENT;PR#1 去 continue-on-error 后仍会因 scan 红
-3. **会话语义**:仅 assistant 落盘;doctor 查错 `models.json`(应为 `models-store.json`)
-4. **合入 PR#1 安全加固** + 补 checksum/worker 鉴权等残留(评估 §12.3)
-5. **Release**:`celld-linux-x64`/`darwin-x64`/`windows` 404;Release `install.sh` ≠ main
-6. **engines**:声明 `>=22`,依赖要求 `>=22.19.0`
+1. **数据正确性 P0**(评估 §12–§13):worker 覆盖权威;sync 抹新轮;队列丢最新;`ensureLock` 泄漏;**/fork 串写父会话**
+2. **文档三方冲突**:README 称 BOS-first,代码+demo 为 worker-first(截断风险)
+3. **CI**:扫 `node_modules`;无 settings 挂死;应强制跑 `tests/review-logic-proofs.test.mjs`(5 pass,零依赖)
+4. **合入 PR#1** + checksum/worker 鉴权等残留(§12.3)
+5. **Release**:缺 celld-linux/darwin-x64/windows;install≠main;`engines` 过松
+6. **doctor**:`models.json` 假阴性 + 「缺缺失」文案
 
 ### 发布后仍建议执行
 0. ✅ **docs/archive 已删除**(2026-08-11 决策)
