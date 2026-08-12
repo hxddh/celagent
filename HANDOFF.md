@@ -100,7 +100,9 @@ node bin/celagent-tui.mjs task ledger
 ### 已完成
 - ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content)
 - ✅ 测试:core 9 用例(节点在跑时全绿)、e2e 真实 LLM 验证
-- ✅ **安全净化(2026-08-12)**:当前树 + 全历史已 `filter-repo` 清除本机用户名/真实 session 指纹/AK 前缀打印;CI 含 Secret/PII 门禁;全部提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥硬编码
+- ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo` 清除本机用户名/真实 session 指纹/AK 前缀打印;CI 含 Secret/PII 门禁;全部提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥硬编码
+  - `main` / `cursor/security-sanitize-2d82` / tag `v0.3.0` 均已指向净化后提交
+  - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容(平台保留孤儿对象);彻底从 github.com 抹掉需向 GitHub Support 申请 purge(仓库内 refs 已无锚点)
 - ✅ 构建能力:Bun 单二进制编译通过并实测可运行(version/help/doctor/TUI);⚠️ 旧构建物已废弃
   (内含本机路径),发布构建必须按 PACKAGING.md 注意 0 在匿名路径/CI 执行
 - ✅ README/install.sh 已指向 `github.com/hxddh/celagent/releases/latest/download/install.sh`
