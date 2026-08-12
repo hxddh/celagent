@@ -303,8 +303,77 @@ celagent 不是又一个「包装 LLM 的 CLI」,而是一次把 **durable agent
 
 接手者可直接按此改文档(与代码修复可并行):
 
-1. `HANDOFF.md` §3: 删除「卡 GitHub 认证」;改为「v0.3.0 已发布;当前阻塞=CI 红 + Release celld 多平台不全」
+1. `HANDOFF.md` §3: 删除「卡 GitHub 认证」;改为「v0.3.0 已发布;当前阻塞=CI 红 + Release celld 多平台不全」 — **本 PR 已改**
 2. `docs/architecture.md` §1.4: 按最终代码行为重写恢复优先级;若改代码为 BOS-first,则保留原文并删 worker-first 注释
-3. `docs/architecture.md` §5: 删除「install.sh 未切 Release」
+3. `docs/architecture.md` §5: 删除「install.sh 未切 Release」 — **本 PR 已改**
 4. `README.md` 测试记录: 改为「无 settings 时应 skip BOS;纯 CLI 用例独立」并与测试修复同步
 5. 所有「exactly-once」旁加限定语:「单 cell execution ledger 去重」
+
+---
+
+## 11. 第二轮深度审查(2026-08-12 续)
+
+> 范围:安装/运维脚本、doctor 自检、凭证路径一致性、Release 资产实测、
+> `cursor/security-sanitize-2d82` 分支对照、TUI 冷启动实测。
+
+### 11.1 新发现(按严重度)
+
+| ID | 发现 | 证据 | 严重度 |
+|----|------|------|--------|
+| R2-1 | **`doctor` 假阴性**:检查 `models.json`,但 pi 0.84 实际写 `models-store.json`;缺 `models.json` 时 TUI 仍可启动,doctor 却报「TUI 无法启动」 | 冷启动实测:services/会话就绪;`pi-runtime/` 仅有 `settings.json`/`auth.json`/`models-store.json`;`doctor` 输出 `models.json 缺缺失` | **高**(误导排障) |
+| R2-2 | **持久化只存 assistant 轮**,不存 user 消息;`turn_end` 硬编码 `role: "assistant"` | `bin/celagent-tui.mjs` ~832 行;恢复注入也只拼 assistant `msg` | **高**(「完整会话」名不副实;跨机续写缺用户侧上下文) |
+| R2-3 | **`main` 落后安全加固分支**:`cursor/security-sanitize-2d82` ahead_by=1,含 install 私有临时目录、测试 ENOENT 容错等 | `gh compare main...cursor/security-sanitize-2d82`;Release 上的 `install.sh` 比当前树更严(先 unset AK/SK、`mktemp -d` 700) | **高**(发布物与源码漂移) |
+| R2-4 | **`celld-linux-x64` Release 404** | `curl` 跟随跳转后 HTTP 404;资产列表仅有 `celld-darwin-arm64` | **高**(Linux 正式安装必回退第三方) |
+| R2-5 | CLI 的 `list`/`export`/`rm`/`doctor` BOS 探测 **强制 `AWS_PROFILE=bos`**,无视已成对的 env 凭证 | 与 `src/bos.js` `awsEnv()`「env 优先」策略分裂 | 中 |
+| R2-6 | 全局 `bosWarned` 一把梭:任意一类警告置位后,**后续不同类警告全部静默** | 队列过长 / worker 失败 / 读失败 / 写失败共用一个 flag | 中 |
+| R2-7 | `install.sh`/`setup.sh` **整文件覆盖** `settings.json`,重装会抹掉手改的 provider/model 等 | heredoc `cat > settings.json` | 中 |
+| R2-8 | `cluster_mgr.sh start` **不清理 own.json**,而 `node_mgr.sh`/`ensureCelld`/`setup.sh` 会 — 多机入口行为不一致 | 脚本对照 | 中 |
+| R2-9 | `pkill -f 'celld.*1809'` 过宽,可能误杀无关进程 | install/setup/node_mgr/cluster_mgr | 中 |
+| R2-10 | `listSessions` 巨型硬编码 denylist 过滤测试会话前缀 — 易漏/易误伤真实会话名 | ~391 行超长正则 | 低–中 |
+| R2-11 | `ensureCelld` 启动前用 **`execFileSync` 清 own.json**,阻塞事件循环 | ~85–106 行;与 Bug 59「禁同步 aws」精神冲突 | 低–中 |
+| R2-12 | security 分支修了测试 ENOENT,但 **CI scan 仍未排除 `node_modules`**,且去掉 `continue-on-error` 后会更红 | 分支 ci.yml 仍无 `!node_modules/**` | 中(合并前必修) |
+
+### 11.2 安装体验实测结论
+
+- 开发态 `node bin/celagent-tui.mjs`:无 settings / 无凭证时,**TUI 仍能起来**(降级运行),与 doctor「无法启动」矛盾。
+- pi 引擎会自动在 `~/.config/celagent/pi-runtime/` 落盘最小配置;`install.sh` 不引导 pi-runtime **本身可接受**,但 doctor 检查项必须与 pi 0.84 文件名对齐。
+- Release `celagent-linux-x64`(~102MB)可下载;`strings` 未命中本轮红线路径模式(抽样通过)。
+- Release `install.sh` ≠ 当前 `main`/`本分支` 的 `install.sh`(安全卫生细节 Release 更新)→ **需要把安全分支合入 main 并重发 install.sh 资产**,否则「curl\|sh 最新」与仓库源码分叉。
+
+### 11.3 会话语义再澄清
+
+当前产品实际保证更接近:
+
+> **assistant 轮次的权威落盘 + 摘要级恢复注入**(最近 50 轮 `msg`),不是双向完整对话 transcript。
+
+若产品坚持「会话永不丢」,应明确:
+
+1. 是否要持久化 user 轮(推荐:是,否则跨机续写只能靠本地 JSONL)
+2. 恢复时是否应优先用 BOS 的 `content`/`toolResults` 重建,而非截断 `msg`
+3. `/resume` 本地 JSONL 与 BOS 镜像的权威关系(文档已暗示本地可更完整 — 需写成显式契约)
+
+### 11.4 更新后的优先队列(覆盖 §7)
+
+| 优先级 | 项 | 动作 |
+|--------|----|------|
+| P0 | 合入 `security-sanitize` + CI 排除 `node_modules` | 消除源码/Release 漂移与假红 |
+| P0 | 恢复读路径 BOS-first 或完整 body | 对齐 RPO/完整记忆 |
+| P0 | 修 doctor:`models-store.json` 或改为「可启动/降级」语义 | 去掉假阴性 |
+| P0 | 明确并实现 user 轮持久化(或改文档降级主张) | 会话语义诚实 |
+| P1 | 补 `celld-linux-x64`(及 darwin-x64)到 Release | 正式安装闭环 |
+| P1 | CLI 路径统一 `awsEnv()` | 凭证策略一致 |
+| P1 | 拆分 `bosWarned` / settings 合并写 / cluster own.json | 运维一致性 |
+| P2 | 其余 §7 P2–P3 项 | 可维护性与产品化 |
+
+### 11.5 评分微调
+
+第二轮后,**综合分维持 7.0**,但分项调整:
+
+| 维度 | 首轮 | 次轮 | 变化原因 |
+|------|------|------|----------|
+| 核心持久化正确性 | 7.5 | **7.0** | 确认仅 assistant 落盘 + 读路径截断叠加 |
+| 测试与 CI | 4.5 | **4.0** | 安全分支亦未修 scan;doctor 与测试双假 |
+| 发布与可安装性 | 6.0 | **5.5** | celld-linux 404 + Release/源码 install 漂移 |
+| 文档一致性 | 7.0 | **7.5** | 本 PR 已修正过时阻塞描述 |
+
+**结论不变**:值得继续投入;下一迭代必须先做「语义诚实 + CI/发布闭环」,再谈功能扩展。
