@@ -1,12 +1,12 @@
 # celagent
 
 独立开源 agent — **Pi 完整 TUI + Celld/BOS 对象存储持久化 (RPO=0)**。
-会话经对象存储权威落盘:崩溃、换机器、节点故障,历史一条不丢。
+会话权威落盘在对象存储:CAS 成功后可跨机恢复。恢复读 BOS;worker 仅作 miss 回退。
 
 ## 特性
 
 - **完整 Pi TUI**:复用 pi-coding-agent 引擎(不 fork),bash/read/write/grep/find/edit/ls 全量工具,多模型切换
-- **会话永不丢 (RPO=0)**:每轮对话双写 — worker 缓存 + **BOS 直写**(CAS 乐观锁 + 幂等去重 + 异步队列),BOS 是权威源
+- **会话权威在 BOS (RPO≈0)**:每轮对话双写 — worker 缓存 + **BOS 直写**(CAS 乐观锁 + 幂等去重 + 异步队列);恢复先读 BOS
 - **跨机恢复**:`celagent <id>` 从 BOS 恢复完整历史,换机器/本地数据丢失都能找回
 - **分布式任务**:`celagent task submit/status/ledger` — celld 状态机,断点续跑 + 单 cell ledger 去重(exactly-once 限于同一 cell; 多机见 docs/distributed-deployment.md)
 - **本地会话恢复**:TUI 内 `/resume` 切换本机会话,`/new` 开新会话(自动独立持久化 ID)

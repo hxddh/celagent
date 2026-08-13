@@ -111,7 +111,7 @@ node bin/celagent-tui.mjs task ledger
 - ✅ README/install.sh 已指向 `github.com/hxddh/celagent/releases/latest/download/install.sh`
 - ✅ 版本已统一 `0.3.0`; CI 矩阵 node 22/24
 - ✅ v0.3.0 Release 已有:`celagent-darwin-arm64` / `darwin-x64` / `linux-x64`、`celld-darwin-arm64`、`install.sh`、`worker.tar.gz`
-- ✅ **CI Release job** (`.github/workflows/release.yml`):匿名路径 bun 交叉编译 + 拉取 `denoland/celld` 官方包 + `SHA256SUMS` + 上传
+- ✅ **CI Release job** (`.github/workflows/release.yml`):PR 上构建并挂 artifact; tag / workflow_dispatch 时上传 GitHub Release
 
 ### 当前阻塞(发版资产)
 - **合并本 PR 后跑一次 Release workflow**(Actions → Release → Run workflow, tag=`v0.3.0`)即可补上:

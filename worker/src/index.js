@@ -8,7 +8,7 @@
 //   - 对象存储直连(SigV4 签名,任务产物写 BOS workspace)
 //   - 真实 webhook 副作用(HTTP 端点,服务端幂等去重)
 
-// 工具调用记录(全局去重,验证 exactly-once)
+// 工具调用记录(单 cell ledger 去重, 不是跨节点共识)
 const LEDGER_KEY = 'ledger';
 
 // ===== v2: 对象存储直连(SigV4) =====
