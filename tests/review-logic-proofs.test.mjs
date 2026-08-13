@@ -304,6 +304,7 @@ test("源码锚定: Release 流水线拉 denoland celld 并匿名编译", () => 
   assert.match(prep, /bun-windows-x64/);
   assert.match(wf, /prepare-release-assets\.sh/);
   assert.match(wf, /gh release upload/);
+  assert.match(wf, /GH_REPO:/);
   assert.match(wf, /upload-artifact/);
   assert.match(wf, /pull_request:/);
 });

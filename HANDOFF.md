@@ -121,7 +121,7 @@ node bin/celagent-tui.mjs task ledger
 0. ✅ docs/archive 已删除
 1. ✅ 仓库已推送
 2. ✅ CI 绿 (node 22/24)
-3. 在 `main` 打 tag `v0.3.1` → Release workflow 上传资产(与代码同 SHA)
+3. 在 `main` 打 tag `v0.3.1` → Release workflow 上传资产(与代码同 SHA)。publish job 无 checkout,必须设 `GH_REPO`
 4. ✅ 跨平台 celagent 由 Release workflow 在 `/tmp/anon-build` 编译
 5. ✅ install.sh 正式模式从 GitHub Release 下载,有 `SHA256SUMS` 则校验
 6. 上传后跑 `./scripts/release-smoke.sh v0.3.1`(无 BOS,校验 SHA256 + version/help)
