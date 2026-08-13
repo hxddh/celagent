@@ -38,7 +38,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `scripts/cluster_mgr.sh` | 多机集群管理(add-node/status 等) |
 | `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
 | `tests/core.test.mjs` | 核心回归(9 用例:需节点在跑;mock 模式 6 pass) |
-| `tests/review-logic-proofs.test.mjs` | 评估 Critical 逻辑零依赖证据(队列丢最新/ensureLock/fork 等,5 pass) |
+| `tests/review-logic-proofs.test.mjs` | 评估缺陷源码锚定(9 pass,零依赖;修缺陷后应同步改本文件) |
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
 | `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、33 轮真实对话实录回放, 2026-08-11) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |

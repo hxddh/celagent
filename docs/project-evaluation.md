@@ -442,7 +442,7 @@ celagent 不是又一个「包装 LLM 的 CLI」,而是一次把 **durable agent
 | PR | 分支 | 作用 | 与本评估关系 |
 |----|------|------|--------------|
 | #1 | `cursor/security-sanitize-2d82` | awsEnv 统一、mkdtemp、session ID 白名单、CI 去 continue-on-error、worker webhook 硬化 | **应优先合入**;合入前补 `!node_modules/**` 否则仍红 |
-| #2 | `cursor/project-deep-eval-0737`(本 PR) | 三轮评估文档 + HANDOFF/architecture 同步 | 文档/决策输入,不改运行时 |
+| #2 | `cursor/project-deep-eval-0737`(本 PR) | 五轮评估文档 + architecture 目标/当前对齐 + proof 源码锚定 | 文档/决策;不改运行时行为 |
 
 ### 12.6 「RPO=0」主张 — 第三轮后的精确表述(建议对外改写)
 
