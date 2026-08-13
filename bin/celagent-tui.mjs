@@ -291,6 +291,16 @@ function mergeTurn(session, seq, role, msg, fullContent, fullToolResults) {
   }
   session.updatedAt = Date.now();
 }
+let casGatePromise = null;
+async function ensureStoreCas(store) {
+  if (!casGatePromise) {
+    casGatePromise = (async () => {
+      const { probeStoreCas } = await import("../src/bos.js");
+      return probeStoreCas({ bucket: store.bucket, endpoint: store.endpoint, profile: store.profile });
+    })();
+  }
+  return casGatePromise;
+}
 async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullToolResults) {
   const { bosPut, bosGet } = await import("../src/bos.js");
   const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
@@ -304,6 +314,11 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
   const profile = store.profile;
   if (!bucket) {
     warnOnce("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
+    return;
+  }
+  const cas = await ensureStoreCas(store);
+  if (!cas.ok) {
+    warnOnce("cas", `  (警告: 此存储不能保证 RPO=0,拒绝权威写入: ${cas.message || cas.error})`);
     return;
   }
   const key = `sessions/${sessionId}.json`;
@@ -523,7 +538,7 @@ async function listSessions() {
 }
 
 // ---- 版本/帮助 ----
-const CELAGENT_VERSION = "0.3.3";
+const CELAGENT_VERSION = "0.3.4";
 function printVersion() {
   console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS RPO=0 持久化`);
 }
@@ -538,7 +553,8 @@ function printHelp() {
   celagent rm <id> [--bucket B] [--yes]  删除 BOS 里的会话 (非 TTY 必须 --yes)
   celagent config get <key>   读取配置 (如 persistence.bucket)
   celagent config set <key> <value>  写入配置 (如 model deepseek-v4-flash)
-  celagent doctor             自检: 配置/凭证/节点/BOS 连通性
+  celagent doctor             自检: 配置/凭证/节点/存储连通/CAS
+  celagent cas-probe          探测存储条件写 (RPO=0 门禁)
   celagent task submit <type> [steps]  提交分布式任务 (celld 状态机)
   celagent task status [taskId]        任务状态 (断点续跑)
   celagent task ledger                 幂等 ledger (单 cell 去重)
@@ -667,7 +683,7 @@ async function doctorCommand() {
     : modelsLegacy;
   piStates.push(modelsState);
   const piOk = piStates.every(s => s.state === "✓");
-  console.log(`[0/5] pi-runtime: ${piStates.map(s => `${s.f}${s.state === "✓" ? "" : " " + s.state}`).join(", ")} ${piOk ? "" : "✗ (TUI 可能无法启动)"}`);
+  console.log(`[0/6] pi-runtime: ${piStates.map(s => `${s.f}${s.state === "✓" ? "" : " " + s.state}`).join(", ")} ${piOk ? "" : "✗ (TUI 可能无法启动)"}`);
   if (!piOk) ok = false;
   // 1. 配置
   const cfg = loadConfig();
@@ -678,7 +694,7 @@ async function doctorCommand() {
   }
   const bucket = store.bucket;
   const regionDisp = store.region || "(缺,非 BOS 必须配置)";
-  console.log(`[1/5] 配置: ${bucket ? "✓ bucket=" + bucket : "✗ 缺 persistence.bucket (运行 setup.sh 或 config set)"} endpoint=${store.endpoint} region=${regionDisp} profile=${store.profile}`);
+  console.log(`[1/6] 配置: ${bucket ? "✓ bucket=" + bucket : "✗ 缺 persistence.bucket (运行 setup.sh 或 config set)"} endpoint=${store.endpoint} region=${regionDisp} profile=${store.profile}`);
   if (!bucket) ok = false;
   if (!store.region) ok = false;
   // 2. 凭证
@@ -687,7 +703,7 @@ async function doctorCommand() {
     execFile("aws", ["configure", "get", "aws_access_key_id", "--profile", store.profile], { timeout: 10000, encoding: "utf8" }, (err, stdout) => resolve(err ? null : (stdout || "").trim()));
   });
   const hasEnv = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
-  console.log(`[2/5] 凭证: ${hasEnv ? "✓ 环境变量" : cred ? "✓ [" + store.profile + "] profile" : "✗ 无凭证 (需 ~/.aws/credentials [" + store.profile + "] 或环境变量)"}`);
+  console.log(`[2/6] 凭证: ${hasEnv ? "✓ 环境变量" : cred ? "✓ [" + store.profile + "] profile" : "✗ 无凭证 (需 ~/.aws/credentials [" + store.profile + "] 或环境变量)"}`);
   if (!cred && !hasEnv) ok = false;
   // 3. Celld 节点
   const nodes = [];
@@ -697,7 +713,7 @@ async function doctorCommand() {
       if (r.ok) nodes.push(base);
     } catch (e) { /* down */ }
   }
-  console.log(`[3/5] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "⚠ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
+  console.log(`[3/6] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "⚠ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
   const celldUp = nodes.length > 0;
   for (const port of [18090, 18091]) {
     try {
@@ -707,13 +723,25 @@ async function doctorCommand() {
       console.log(`      :${port + 2}/state occupied=${j.occupied ?? "?"} evicting=${j.evicting ?? "?"} restoring=${j.restoring ?? "?"}`);
     } catch (e) { /* 内部口离线不判失败 */ }
   }
-  // 4. BOS 连通
+  // 4. 存储连通
+  let storeReachable = false;
   if (bucket) {
-    const probe = await new Promise((resolve) => {
+    storeReachable = await new Promise((resolve) => {
       execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", store.endpoint, "--query", "Contents[].Key", "--output", "json"], { env: awsEnv(store.awsExtra), timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
     });
-    console.log(`[4/5] 存储连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
-    if (!probe) ok = false;
+    console.log(`[4/6] 存储连通: ${storeReachable ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
+    if (!storeReachable) ok = false;
+  } else {
+    console.log(`[4/6] 存储连通: ⚠ 跳过 (无 bucket)`);
+  }
+  // 5. CAS — 条件写必须真正执行,不能只看 PUT 200
+  if (bucket && (cred || hasEnv) && storeReachable) {
+    const { probeStoreCas } = await import("../src/bos.js");
+    const cas = await probeStoreCas({ bucket, endpoint: store.endpoint, profile: store.profile });
+    console.log(`[5/6] CAS: ${cas.ok ? "✓ If-Match / If-None-Match / 写后读" : "✗ " + (cas.message || cas.error)}`);
+    if (!cas.ok) ok = false;
+  } else {
+    console.log(`[5/6] CAS: ⚠ 跳过 (先修复配置/凭证/连通)`);
   }
   if (ok && celldUp) console.log("\n结论: ✓ 全部正常");
   else if (ok) console.log("\n结论: ✓ 核心正常 (Celld 离线 — 会话仍可走 BOS; 任务/缓存需 node_mgr.sh start)");
@@ -736,6 +764,17 @@ async function getBucketArg() {
   }
   if (store.bucket) return { bucket: store.bucket, endpoint: store.endpoint, profile: store.profile };
   return { bucket: null, endpoint: store.endpoint, profile: store.profile };
+}
+async function casProbeCommand() {
+  const { bucket, endpoint, profile } = await getBucketArg();
+  if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定或先 setup.sh)"); process.exit(1); }
+  const { probeStoreCas } = await import("../src/bos.js");
+  const cas = await probeStoreCas({ bucket, endpoint, profile });
+  if (!cas.ok) {
+    console.error(`✗ ${cas.message || cas.error}`);
+    process.exit(1);
+  }
+  console.log(`✓ ${cas.message}`);
 }
 // ---- P1: agent 任务化 — 任务状态机 (celld submit/status/ledger) ----
 async function taskCommand(args) {
@@ -857,6 +896,7 @@ async function main() {
   if (cmd === "version" || cmd === "--version" || cmd === "-v") { printVersion(); return; }
   if (cmd === "config") { await configCommand(process.argv.slice(3)); return; }
   if (cmd === "doctor") { await doctorCommand(); return; }
+  if (cmd === "cas-probe") { await casProbeCommand(); return; }
   if (cmd === "export") { await exportCommand(process.argv[3]); return; }
   if (cmd === "rm") { await rmCommand(process.argv[3]); return; }
   if (cmd === "task") { await taskCommand(process.argv.slice(3)); return; }

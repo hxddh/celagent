@@ -1,6 +1,7 @@
 #!/bin/bash
-# celld-bos-test.sh — Celld ↔ BOS 对象存储完整链路测试套件
+# celld-bos-test.sh — Celld ↔ 对象存储完整链路测试套件
 # 验证 6 项链路: bucket连通/CAS语义/RPO=0写路径/ownership/故障恢复/wake索引
+# endpoint/profile 来自 settings(见 store_env.sh)。同义入口: celld-store-test.sh
 # 用法: ./celld-bos-test.sh [bucket名]
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
@@ -74,6 +75,13 @@ if AWS_PROFILE="$STORE_PROFILE" aws s3api put-object --bucket "$BUCKET" --key "$
   check "If-Match 错误 etag → 应拒绝" "fail"
 else
   check "If-Match 错误 etag → 拒绝(412)" "ok"
+fi
+if command -v node >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/../bin/celagent-tui.mjs" ]; then
+  if node "$SCRIPT_DIR/../bin/celagent-tui.mjs" cas-probe --bucket "$BUCKET"; then
+    check "会话路径 CAS 探针 (bos.js)" "ok"
+  else
+    check "会话路径 CAS 探针 (bos.js)" "fail"
+  fi
 fi
 aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --endpoint-url "$EP" >/dev/null 2>&1
 

@@ -83,7 +83,8 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `celagent export <id>` | 导出 JSON |
 | `celagent rm <id>` | 删除会话(需确认) |
 | `celagent config get/set` | 配置读写 |
-| `celagent doctor` | 五维自检 |
+| `celagent doctor` | 六维自检(含 CAS) |
+| `celagent cas-probe` | 探测存储条件写(RPO=0 门禁) |
 | `celagent task submit <type> [steps]` | 提交分布式任务 (celld 状态机, 断点续跑) |
 | `celagent task status [taskId]` | 任务状态 |
 | `celagent task ledger` | 幂等 ledger (单 cell 去重, 非跨节点共识) |

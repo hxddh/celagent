@@ -30,17 +30,18 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `bin/celagent-tui.mjs` | CLI + TUI 主程序(~880 行:命令解析含 task 分布式任务、节点自动启动、turn_end 持久化钩子、会话恢复) |
 | `src/bos.js` | 对象存储直写核心(aws CLI、CAS If-Match/If-None-Match;默认 BOS,见 s3-compat-evaluation) |
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
-| `worker/src/index.js` | Celld worker(缓存读路径、Sync API、AWS SigV4 手写签名) |
+| `worker/src/index.js` | Celld worker(缓存读路径、Sync API、产物走 webhook) |
 | `worker/wrangler.jsonc` | Celld worker 绑定清单(部署走 `celld deploy`, 不是 Cloudflare wrangler) |
 | `install.sh` | 一键安装(正式模式:GitHub Release 下载平台二进制 + celld/worker;开发模式:CELAGENT_SRC) |
 | `setup.sh` | 一键部署(凭证检测→建 bucket→部署 worker→启动双节点→写配置) |
 | `scripts/node_mgr.sh` | 本机双节点管理(start/stop/status/restart,18090/18091) |
 | `scripts/cluster_mgr.sh` | 多机集群管理(add-node/status 等) |
-| `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
+| `scripts/celld-bos-test.sh` | 对象存储链路测试(配置来自 settings;`celld-store-test.sh` 为同义入口) |
 | `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估 + 新特性利用评审(P0 双监听已落地) |
 | `docs/s3-compat-evaluation.md` | 多后端对象存储评估:合格/不合格分界、耦合清单、分阶段计划(未改代码) |
 | `docs/post-v032-evaluation.md` | v0.3.2 之后排期:候选方向取舍、死代码/fail-open/CI 边界 |
 | `docs/v033-scope.md` | v0.3.3 实现合同(已发布: fail-closed + 配置单一来源) |
+| `docs/v034-scope.md` | v0.3.4 实现合同(本版: CAS doctor + 删 SigV4 死代码) |
 | `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取 |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
@@ -149,8 +150,9 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.1 | P0–P5 正确性/安全/发版闭环:BOS-first、user 轮、token、endpoint 白名单、Release 全平台 + SHA256SUMS | ✅ 历史 |
 | v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | ✅ 历史 |
 | v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | ✅ 已发布 |
+| v0.3.4 | CAS doctor、setup/persist 拒绝无条件写存储、删 worker SigV4 死代码 | 本版 |
 
-下一刀:**v0.3.4** CAS doctor + 至少一种非 BOS 实测(见 `docs/s3-compat-evaluation.md`)。不要插队做 provider 认证/快照 TUI/会话合并。
+下一刀:**v0.3.5** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要插队做 provider 认证/快照 TUI/会话合并。不要把本版 CI 内存探针当成「已支持 R2」。
 
 ## 5. 工程约定(接手者必须遵守)
 
@@ -181,4 +183,5 @@ node bin/celagent-tui.mjs task ledger
   后续更新数据时保持与 BOS 一致 + 敏感扫描(见红线)
 - CI 单元测试已去掉 `continue-on-error`; Secret/PII 扫描排除 `node_modules`
 - 发版由 `.github/workflows/release.yml` 在 tag `v*` 时构建并上传;本地可用 `./scripts/prepare-release-assets.sh` / `./scripts/release-smoke.sh`
-- **存储多后端 P0(v0.3.3)**:非法 endpoint fail-closed;脚本读 settings。CAS 实测 / 「已支持 R2」仍未做。
+- **存储多后端 P0(v0.3.3)**:非法 endpoint fail-closed;脚本读 settings。
+- **CAS 门禁(v0.3.4)**:doctor/setup/persist 拒绝忽略 If-Match 的存储。真 R2/S3 联调与「已支持」仍未做。

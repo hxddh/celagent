@@ -2,6 +2,7 @@
 // 用 aws CLI 完成直写 (签名由 aws 处理); 默认 BOS, 合格 S3 兼容 endpoint 可配置
 import { join } from "node:path";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { writeFile, readFile, chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
@@ -211,5 +212,111 @@ export async function bosGet(key, { bucket, endpoint, profile } = {}) {
     return { ok: false, error: (msg.includes("404") || msg.includes("NoSuchKey")) ? "not-found" : msg };
   } finally {
     await tmp.cleanup();
+  }
+}
+
+export async function bosDelete(key, { bucket, endpoint, profile } = {}) {
+  if (!bucket) return { ok: false, error: "no-bucket" };
+  const resolved = resolvePutGetEndpoint(endpoint);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  const r = await runAws([
+    "s3api", "delete-object",
+    "--bucket", bucket,
+    "--key", key,
+    "--endpoint-url", resolved.ep,
+  ], { profile });
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true };
+}
+
+/** 根据探针各步结果判定存储是否真的执行条件写。忽略 If-Match → cas-ignored */
+export function evaluateCasChecks({
+  create,
+  got,
+  ifNoneMatchExisting,
+  ifMatchWrong,
+  ifMatchRight,
+  gotAfter,
+  expectedBody1,
+  expectedBody2,
+} = {}) {
+  const checks = [];
+  const fail = (error, message) => ({ ok: false, error, message, checks });
+  if (!create?.ok) {
+    checks.push({ name: "create", ok: false });
+    return fail("create-failed", create?.error || "CAS 探针无法写入");
+  }
+  checks.push({ name: "create", ok: true });
+  if (!got?.ok || String(got.body) !== String(expectedBody1)) {
+    checks.push({ name: "read-after-write", ok: false });
+    return fail("read-after-write", "PUT 成功后 GET 看不到新内容,此存储不能保证 RPO=0");
+  }
+  checks.push({ name: "read-after-write", ok: true });
+  if (!got.etag) {
+    checks.push({ name: "etag", ok: false });
+    return fail("no-etag", "对象没有稳定 ETag,无法做条件覆盖,此存储不能保证 RPO=0");
+  }
+  checks.push({ name: "etag", ok: true });
+  if (ifNoneMatchExisting?.ok) {
+    checks.push({ name: "if-none-match-existing", ok: false, ignored: true });
+    return fail("cas-ignored", "此存储不能保证 RPO=0: If-None-Match 被忽略");
+  }
+  if (!ifNoneMatchExisting?.conflict) {
+    checks.push({ name: "if-none-match-existing", ok: false });
+    return fail("if-none-match", "已存在对象上 If-None-Match:* 未返回冲突,此存储不能保证 RPO=0");
+  }
+  checks.push({ name: "if-none-match-existing", ok: true });
+  if (ifMatchWrong?.ok) {
+    checks.push({ name: "if-match-wrong", ok: false, ignored: true });
+    return fail("cas-ignored", "此存储不能保证 RPO=0: If-Match 被忽略");
+  }
+  if (!ifMatchWrong?.conflict) {
+    checks.push({ name: "if-match-wrong", ok: false });
+    return fail("if-match-wrong", "错误 ETag 的 If-Match 未返回冲突,此存储不能保证 RPO=0");
+  }
+  checks.push({ name: "if-match-wrong", ok: true });
+  if (!ifMatchRight?.ok) {
+    checks.push({ name: "if-match-right", ok: false });
+    return fail("if-match-right", ifMatchRight?.error || "正确 ETag 的 If-Match 失败");
+  }
+  checks.push({ name: "if-match-right", ok: true });
+  if (!gotAfter?.ok || String(gotAfter.body) !== String(expectedBody2)) {
+    checks.push({ name: "read-after-cas", ok: false });
+    return fail("read-after-write", "条件覆盖后 GET 看不到新内容,此存储不能保证 RPO=0");
+  }
+  checks.push({ name: "read-after-cas", ok: true });
+  return { ok: true, message: "CAS 探针通过 (If-Match / If-None-Match / 写后读)", checks };
+}
+
+/** 对当前 bucket 做会话路径 CAS 门禁。ops 可注入,供无 aws CLI 的测试 */
+export async function probeStoreCas({ bucket, endpoint, profile, ops } = {}) {
+  if (!bucket) return { ok: false, error: "no-bucket", message: "未配置 bucket", checks: [] };
+  const put = ops?.put || ((key, content, extra) => bosPut(key, content, extra));
+  const get = ops?.get || ((key, extra) => bosGet(key, extra));
+  const del = ops?.del || ((key, extra) => bosDelete(key, extra));
+  const id = randomUUID();
+  const key = `celagent-cas-probe/${id}.json`;
+  const expectedBody1 = JSON.stringify({ probe: 1, id });
+  const expectedBody2 = JSON.stringify({ probe: 2, id });
+  const common = { bucket, endpoint, profile };
+  try {
+    const create = await put(key, expectedBody1, common);
+    const got = create.ok ? await get(key, common) : {};
+    let ifNoneMatchExisting = {};
+    let ifMatchWrong = {};
+    let ifMatchRight = {};
+    let gotAfter = {};
+    if (create.ok && got.ok && got.etag) {
+      ifNoneMatchExisting = await put(key, expectedBody2, { ...common, ifNoneMatch: true });
+      ifMatchWrong = await put(key, expectedBody2, { ...common, ifMatch: '"bogus-etag-celagent"' });
+      ifMatchRight = await put(key, expectedBody2, { ...common, ifMatch: got.etag });
+      gotAfter = await get(key, common);
+    }
+    return evaluateCasChecks({
+      create, got, ifNoneMatchExisting, ifMatchWrong, ifMatchRight, gotAfter,
+      expectedBody1, expectedBody2,
+    });
+  } finally {
+    try { await del(key, common); } catch (e) { /* 探针残留不挡结论 */ }
   }
 }

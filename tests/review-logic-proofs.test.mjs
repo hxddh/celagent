@@ -355,8 +355,23 @@ test("源码锚定: doctor Celld 离线不报全部正常", () => {
   assert.match(tui, /核心正常 \(Celld 离线/);
 });
 
-test("源码锚定: 版本 0.3.3 与 release-smoke", () => {
-  assert.match(tui, /CELAGENT_VERSION = "0\.3\.3"/);
+test("源码锚定: doctor 含 CAS 门禁且 persist 拒绝无 CAS 写入", () => {
+  assert.match(tui, /\[5\/6\] CAS:/);
+  assert.match(tui, /cas-probe/);
+  assert.match(tui, /probeStoreCas/);
+  assert.match(tui, /此存储不能保证 RPO=0,拒绝权威写入/);
+  assert.match(tui, /async function ensureStoreCas/);
+});
+
+test("源码锚定: worker 已删除未调用的 SigV4 bosPut", () => {
+  const w = readFileSync(join(root, "worker/src/index.js"), "utf8");
+  assert.doesNotMatch(w, /async function bosPut\(/);
+  assert.doesNotMatch(w, /hmacSha256Raw/);
+  assert.match(w, /async function bosPutProxy/);
+});
+
+test("源码锚定: 版本 0.3.4 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.3\.4"/);
   const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
   assert.match(smoke, /sha256sum --ignore-missing/);
   assert.match(smoke, /celagent-linux-x64/);

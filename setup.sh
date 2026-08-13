@@ -50,6 +50,22 @@ else
   fi
 fi
 
+# 2b. CAS 探针 — 条件写必须真正执行,否则拒绝把会话当权威源
+echo "[2b] CAS 探针 (If-Match / If-None-Match / 写后读)..."
+if command -v celagent >/dev/null 2>&1; then
+  if ! celagent cas-probe --bucket "$BUCKET"; then
+    echo "  ✗ 此存储不能保证 RPO=0 (条件写未生效)。换合格后端或检查权限后再 setup。"
+    exit 1
+  fi
+elif [ -f "$ROOT/bin/celagent-tui.mjs" ]; then
+  if ! node "$ROOT/bin/celagent-tui.mjs" cas-probe --bucket "$BUCKET"; then
+    echo "  ✗ 此存储不能保证 RPO=0 (条件写未生效)。换合格后端或检查权限后再 setup。"
+    exit 1
+  fi
+else
+  echo "  ⚠ 未找到 celagent,跳过 CAS 探针 (随后请运行: celagent doctor)"
+fi
+
 # 3. 启动 BOS 模式 Celld 节点 (18090/18091)
 echo "[3/4] 启动 Celld 节点..."
 # 探测 celld (常见位置)
