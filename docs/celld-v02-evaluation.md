@@ -176,3 +176,78 @@ v0.2 让 cell 历史更难分叉、租约更抗存储抖动、接管更快。这
 - `AWS_PROFILE=bos` 在 v0.2 是否足够
 - 多机 advertise 私网 IP
 - 20s 存储中断是否仍能服务(官方数字,本仓未复现)
+
+## 6. 新特性能不能用(利用评审)
+
+对照 celagent 现有路径(TUI checkpoint/task、worker `fetch` 开关、alarm 任务机、BOS 权威、doctor/node_mgr),不是「新 API 清单」。
+
+### 6.1 已经白嫖(P0 起来之后,不用改业务)
+
+这些是 runtime 默认行为,celagent 的 `await` 密集 worker(checkpoint、webhook、`storage.put`)会直接受益:
+
+| 能力 | 对 celagent 的实际效果 |
+|------|------------------------|
+| 共享 isolate 池 + await 让出 | 双节点上多个 session cell 互不堵;驻留从 ~3.4MB 降到 ~471KB |
+| jemalloc / isolate 回收 | 长跑 TUI 少漏内存 |
+| L1 压缩 + 并发 restore | `/fork`、换节点、任务 cell 冷启动更快,BOS LIST 压力下降 |
+| 接管钉点 | 故障切换后旧 owner 迟到的 LTX 不会把会话/任务历史分叉 |
+| output gate 默认开 | worker `storage.put` ACK 更接近真正 durable;bos-compat「checkpoint 不等 LTX」要改口径 |
+| 租约独立线程 + 剩余窗口续约 | BOS 抖 20s 时执行层更可能还活着,TUI 仍应走 BOS 直写保会话 |
+| RSS shedding(默认 80%) | 笔记本上 cell 太多会自动休眠,不必先上双机 |
+| 满槽 admission wait | 无状态请求不再立刻 503;TUI 2s timeout 仍可能先超时,见 6.2 |
+
+**不要关:**`CELLD_OUTPUT_GATE`、`CELLD_LTX_COMPACTION`(除非混部,而混部本身禁止)。
+
+### 6.2 值得主动接(有产品/运维收益)
+
+按值/成本从高到低。
+
+| # | 新能力 | 接到哪 | 为什么值得 | 成本 | 建议 |
+|---|--------|--------|------------|------|------|
+| 1 | **`CELLD_VAR_*` / wrangler `vars`** | spawn env + `worker/wrangler.jsonc` | worker 注释写死 v0.1 `vars=null`,token 读 `env.CELAGENT_WORKER_TOKEN`,空则 **fail-open**。v0.2 正式支持 vars。现在只把 token 放在 **celld 进程 env**,未必进 DO `env` | 小:spawn 加 `CELLD_VAR_CELAGENT_WORKER_TOKEN`;wrangler 加 `vars` | **下一刀就做** |
+| 2 | **内部 operator API** `/state`、`POST /shutdown?handoff=preserve` | `doctor`、`node_mgr restart` | 数据面只有 health;占用/evict/restore 在内部口。同机重启可保留 ownership,不必扫 `own.json` | 中:doctor 打 `127.0.0.1:18092/state`;stop 改内部 shutdown 或 SIGTERM 等 drain | P1 |
+| 3 | **`celld diagnose`** | `cluster_mgr status`、`doctor` | 签名探测 peer、错误 advertise、协议版本、`restoring=0`。比列 BOS `nodes/` 真 | 小:包一层 CLI,复用现有 bucket/endpoint | P1 |
+| 4 | **`crypto.subtle.timingSafeEqual`**(v0.2 Web Crypto) | `worker` `checkToken` | 现在 `header === expected`,有时序侧信道;官方 compat 已提供 | 极小 | 顺手 |
+| 5 | **W3C `traceparent` + `CELLD_OTEL=1`** | `celldFetch` 带头;spawn 可选 env | checkpoint/alarm/outbound fetch 进同一条 trace,Parquet 写在 **同一 BOS 桶** `telemetry/`,DuckDB 可查慢请求。默认关,零成本 | 中:opt-in `CELAGENT_OTEL=1`;注意桶费用与 5min flush | P2,调试时开 |
+| 6 | **`CELLD_ALARM_RESIDENT_MS`** | spawn | 任务机靠 `setAlarm`;临近闹钟保持驻留,少冷启动。v0.2 才把「idle 默认关」和闹钟驻留拆开 | 极小:设 60000 量级 | P1 调参 |
+| 7 | **`CELLD_ADMISSION_WAIT_MS`** | spawn,对齐 TUI | 默认会等而不是立刻拒;TUI checkpoint timeout=2000,应 ≥ 该值,否则白等 | 极小 | 与 #6 一起 |
+| 8 | **`CELLD_MAX_RESIDENT_CELLS`** | spawn | 内存不再是瓶颈,但笔记本 RSS shedding 前应有硬顶,避免 2500 cell 把机器打满 | 极小:本机 64~256 | P1 调参 |
+| 9 | **桶 key prefix** `s3://bucket/celagent` | `--bucket` | 多 fleet 共享一桶、own.json 清理不再扫别人的 `cells/`。**要搬现有对象**,不能偷偷改默认 | 中,迁移窗口 | 新安装可选,旧桶不动 |
+| 10 | **`gh attestation verify`** | `install.sh` / `prepare-release-assets.sh` | 官方 installer 宣传可验证 celld  provenance;我们现在只 SHA256 随包文件 | 小 | P2 供应链 |
+| 11 | **`ctx.waitUntil`** | worker alarm/webhook | alarm 里 webhook 失败已不阻塞任务;waitUntil 可在 ACK 后补副作用,缩短闹钟占用 isolate 的时间(v0.2 isolate 让出已缓解) | 小 | 可选 |
+
+### 6.3 看着新、现在别接
+
+| 能力 | 为什么不接 |
+|------|------------|
+| **JS RPC / `extends DurableObject` / `js_rpc`** | 官方 RPC 例完整,但 **跨 isolate 不能传 stub/`RpcTarget`**,DO 之间只能 structured clone。celagent `delegate` 已是 `stub.fetch`。改 RPC 是 API 化妆,没有新用户功能;TUI 仍走 HTTP `?action=` |
+| **Worker Loader (Code Mode)** | 实验性。适合「模型写一段工具代码再沙箱跑」。egress 可 `globalOutbound: null`,但 64MiB 代码、无 capability stub,和 pi 的本地 bash 工具重叠。安全模型未设计完 | 
+| **Wasm / workers-rs** | 要把 JS worker 重写成 Rust 才有意义;SigV4/HMAC 现有 `crypto.subtle` 够用。混部旧节点会拒 `wasm-v1` |
+| **`setWebSocketAutoResponse` / 可休眠 WS** | 能做「会话 cell 推 TUI」,等于新交互面,不是利用现有 TUI。ping 免唤醒只在有 WS 后才有用 |
+| **Static assets** | 可把 `docs/celld-bos-architecture-demo.html` 挂到节点上,和「CLI agent」定位无关 |
+| **`gs://` + ADC** | 主路径是 BOS;加 GCS 是新存储后端,不是用 v0.2 增强 BOS |
+| **`CELLD_AI_BINDING` / `CELLD_AI_URL`** | 实验 HTTP AI 适配;celagent 已用 DeepSeek,不要再接一层 |
+| **D1 / Workflows / Queues** | compat 页写 **planned**,v0.2 没有。任务机继续用 DO alarm,不要等 Workflows |
+| **Facets、Cache API、HTMLRewriter、KV/R2 绑定** | 无或不在路线图。R2 binding 方法会 throw |
+| **Docker `ghcr.io/denoland/celld`** | 可作集群部署备选;当前产品是 bun 单二进制 + 随包 celld,不要分裂分发 |
+| **Litestream 旁路读** | celld 内置复制;再接 Litestream 是第二套真相 |
+
+### 6.4 和「会话权威在 BOS」的关系
+
+下列能力 **不能** 用来把 `sessions/*.json` 迁进 cell:
+
+- output gate / 压缩 / 钉点:让 **cell SQLite**(任务、缓存、ledger)更可靠,不是会话 JSON 的替代。
+- OTEL:观察 checkpoint 耗时,不存储对话。
+- RPC/Loader:执行面,不代替 CAS 对象。
+
+会话仍 BOS-first。celld 新能力应花在 **任务/缓存/集群运维/可观测**,以及让 worker token **真的生效**。
+
+### 6.5 建议的利用顺序(P0 监听之后)
+
+1. **Token 真注入:**`CELLD_VAR_CELAGENT_WORKER_TOKEN` + wrangler `vars`;`checkToken` 改 `timingSafeEqual`(空 token 仍 fail-open 仅限本机开发)。
+2. **运维面:**`doctor` 读内部 `/state`;`node_mgr stop/restart` SIGTERM 或 `POST /shutdown`;`cluster_mgr status` 调 `celld diagnose`。
+3. **调参:**`CELLD_IDLE_EVICT_S=30`(已做)、`CELLD_ALARM_RESIDENT_MS`、`CELLD_ADMISSION_WAIT_MS`、`CELLD_MAX_RESIDENT_CELLS`。
+4. **可观测:**`CELAGENT_OTEL=1` → `CELLD_OTEL=1`;TUI `celldFetch` 传 `traceparent`。
+5. **新安装**才考虑桶 prefix;旧用户不迁。
+6. Loader/WS/Wasm/RPC 重写:没有明确产品需求就不动。
+
