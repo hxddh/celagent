@@ -2,7 +2,7 @@
 
 > 评估对象:把数据层从「BOS 专用」扩到「所有兼容 S3 的对象存储」。
 > 依据:celagent 源码对照、[celld 官方文档](https://celld.dev/docs)(Configure object storage + Ownership and fencing)、`docs/bos-compat.md` 实测、`docs/celld-v02-evaluation.md`。
-> **本 PR 只评估,不改运行时代码。**
+> **本文件主体是评估当时的源码对照。** 落地状态(2026-08-13):**P0 = v0.3.3**;P1 门禁/删 SigV4 = **v0.3.4**;P1 真桶实测 = **v0.3.5**(见 `docs/post-v034-evaluation.md` / `docs/v035-scope.md`)。§4 写的「静默退回 BOS」等是评估当时的缺陷,已经在 v0.3.3 修掉。
 
 ## 0. 结论先行
 
@@ -209,8 +209,9 @@ test("resolveEndpoint 拒绝非 BOS https", async () => {
 | 版本 | 内容 |
 |------|------|
 | 本评估(无版本号) | 本文 + 交叉引用 |
-| **v0.3.3**(下一刀,合同见 `docs/v033-scope.md`) | fail-closed、配置单一来源、脚本读 settings、白名单扩合格 host |
-| **v0.3.4** | CAS doctor、R2/S3 至少一种实测、文档改叙事;可删 worker SigV4 死代码 |
+| **v0.3.3** | fail-closed、配置单一来源、脚本读 settings、白名单扩合格 host ✅ |
+| **v0.3.4** | CAS doctor、setup/persist 拒绝无条件写、删 worker SigV4 ✅(原计划含真桶,拆到 v0.3.5) |
+| **v0.3.5** | R2 或 S3 **真桶**实测 + 文档「已实测」;合同见 `docs/v035-scope.md` |
 | 更后 | GCS / prefix / rename |
 
 P0 可独立发版:BOS 用户无感,只修「配了别的云却写到百度」这个缺陷。

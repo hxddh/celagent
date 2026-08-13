@@ -4,7 +4,8 @@
 > 面向:改造架构、基于迭代、新 agent 深入接手。配套:`HANDOFF.md`(交接入口)、
 > `README.md`(用户视角)、`docs/distributed-deployment.md`(多机)、`docs/bos-compat.md`(BOS 边界)、
 > `docs/s3-compat-evaluation.md`(多后端对象存储:合格门禁与迭代计划)、
-> `docs/post-v032-evaluation.md`(v0.3.2 后排期与候选取舍)。
+> `docs/post-v032-evaluation.md`(v0.3.2 后排期与候选取舍)、
+> `docs/post-v034-evaluation.md`(v0.3.4 后:真桶实测才是下一刀)。
 
 ## 1. 系统总览
 

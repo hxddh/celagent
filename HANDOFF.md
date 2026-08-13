@@ -3,7 +3,8 @@
 > 本文档是**唯一权威交接入口**。任何 agent 或开发者接手本项目,先从本文档开始。
 > 配套文档:`README.md`(用户视角)、**`docs/architecture.md`(架构权威: 数据流/机制/设计决策/扩展点)**、
 > `PACKAGING.md`(打包/发布)、`docs/distributed-deployment.md`(多机部署)、
-> `docs/s3-compat-evaluation.md`(多后端对象存储评估)、`docs/post-v032-evaluation.md`(v0.3.2 后排期)。
+> `docs/s3-compat-evaluation.md`(多后端对象存储评估)、`docs/post-v032-evaluation.md`(v0.3.2 后排期)、
+> `docs/post-v034-evaluation.md`(v0.3.4 后下一刀)。
 
 ## 0. 项目定位
 
@@ -42,6 +43,8 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/post-v032-evaluation.md` | v0.3.2 之后排期:候选方向取舍、死代码/fail-open/CI 边界 |
 | `docs/v033-scope.md` | v0.3.3 实现合同(已发布: fail-closed + 配置单一来源) |
 | `docs/v034-scope.md` | v0.3.4 实现合同(已发布: CAS doctor + 删 SigV4 死代码) |
+| `docs/post-v034-evaluation.md` | v0.3.4 后:真桶实测才是 v0.3.5,无凭证不发版 |
+| `docs/v035-scope.md` | v0.3.5 实现合同(R2 或 S3 真桶 + 文档已实测) |
 | `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取 |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
@@ -153,7 +156,7 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | ✅ 历史 |
 | v0.3.4 | CAS doctor、setup/persist 拒绝无条件写存储、删 worker SigV4 死代码 | ✅ 已发布 |
 
-下一刀:**v0.3.5** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要插队做 provider 认证/快照 TUI/会话合并。不要把本版 CI 内存探针当成「已支持 R2」。
+下一刀:**v0.3.5** 至少一种非 BOS 合格后端**真桶**实测(优先 R2,见 `docs/v035-scope.md`)。无凭证不要开实现、不要发版。不要插队做 provider 认证/快照 TUI/会话合并。不要把 CI 内存探针当成「已支持 R2」。
 
 ## 5. 工程约定(接手者必须遵守)
 
