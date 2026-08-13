@@ -239,6 +239,8 @@ test("源码锚定: history_search 默认当前会话", () => {
   const tools = readFileSync(join(root, "src/bos-tools.js"), "utf8");
   assert.match(tools, /__celagentPersistId/);
   assert.match(tools, /rawSession === "\*"/);
+  assert.match(tools, /sessions\/\$\{sessionFilter\}\.json/);
+  assert.match(tools, /--max-items/);
 });
 
 test("源码锚定: worker cwrite 锁 TTL + scheduleNextAlarm", () => {
@@ -314,4 +316,15 @@ test("源码锚定: install 支持 arm64/windows 且缺 SHA256SUMS 会警告", (
 
 test("源码锚定: doctor Celld 离线不报全部正常", () => {
   assert.match(tui, /核心正常 \(Celld 离线/);
+});
+
+test("源码锚定: saveConfig 合并 persistence/worker", () => {
+  assert.match(tui, /out\[k\] = \{ \.\.\.prev, \.\.\.cfg\[k\] \}/);
+});
+
+test("源码锚定: Windows install.ps1 与 checkout v5", () => {
+  const ps = readFileSync(join(root, "install.ps1"), "utf8");
+  assert.match(ps, /celagent-windows-x64\.exe/);
+  const ci = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8");
+  assert.match(ci, /actions\/checkout@v5/);
 });

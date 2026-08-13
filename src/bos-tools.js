@@ -80,11 +80,17 @@ export const history_search = {
       if (!sessionFilter && !cross) {
         return { content: [{ type: "text", text: "未指定会话。默认只搜当前会话; 跨会话请传 session=\"*\"" }] };
       }
+      if (sessionFilter && !/^[A-Za-z0-9._-]{1,128}$/.test(sessionFilter)) {
+        return { content: [{ type: "text", text: "非法会话 ID" }] };
+      }
 
-      let keys = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--query", "Contents[].Key", "--output", "json"]);
-      if (!Array.isArray(keys)) keys = [];
+      let keys;
       if (sessionFilter) {
-        keys = keys.filter(k => k === `sessions/${sessionFilter}.json`);
+        keys = [`sessions/${sessionFilter}.json`];
+      } else {
+        keys = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--max-items", "40", "--query", "Contents[].Key", "--output", "json"]);
+        if (!Array.isArray(keys)) keys = [];
+        keys = keys.filter((k) => typeof k === "string").slice(0, 40);
       }
 
       const hits = [];

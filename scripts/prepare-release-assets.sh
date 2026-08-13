@@ -37,6 +37,7 @@ if tar -tzf "$OUT/worker.tar.gz" | grep -E '(^/)|(^\.\./)|(/\.\./)'; then
 fi
 cp "$ROOT/install.sh" "$OUT/install.sh"
 chmod +x "$OUT/install.sh"
+cp "$ROOT/install.ps1" "$OUT/install.ps1"
 
 if [ "${SKIP_BUN:-}" = "1" ]; then
   echo "SKIP_BUN=1, 跳过 bun 编译"

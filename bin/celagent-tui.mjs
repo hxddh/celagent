@@ -532,8 +532,16 @@ function loadConfig() {
 }
 function saveConfig(cfg) {
   const { mkdirSync, writeFileSync, chmodSync } = require("node:fs");
+  const disk = loadConfig();
+  const out = { ...disk, ...cfg };
+  for (const k of ["persistence", "worker"]) {
+    if (cfg[k] && typeof cfg[k] === "object") {
+      const prev = (disk[k] && typeof disk[k] === "object") ? disk[k] : {};
+      out[k] = { ...prev, ...cfg[k] };
+    }
+  }
   mkdirSync(join(homedir(), ".config", "celagent"), { recursive: true });
-  writeFileSync(configFile(), JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  writeFileSync(configFile(), JSON.stringify(out, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
   try { chmodSync(configFile(), 0o600); } catch (e) { /* ignore */ }
 }
 async function configCommand(args) {

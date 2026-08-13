@@ -16,7 +16,7 @@ hash() {
 
 shopt -s nullglob
 files=()
-for f in celagent-* celld-* install.sh worker.tar.gz; do
+for f in celagent-* celld-* install.sh install.ps1 worker.tar.gz; do
   [ -f "$f" ] || continue
   files+=("$f")
 done

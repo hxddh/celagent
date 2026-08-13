@@ -17,6 +17,7 @@
     "worker/",
     "docs/",
     "install.sh",
+    "install.ps1",
     "setup.sh",
     "README.md",
     "HANDOFF.md",

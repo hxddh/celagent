@@ -19,6 +19,9 @@
 # 一键安装 (GitHub Release 二进制, 含 celld 运行时)
 curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh
 
+# Windows (仅 CLI; 上游 celld 无 Windows 包)
+irm https://github.com/hxddh/celagent/releases/latest/download/install.ps1 | iex
+
 # 或开发模式 (源码目录需含 bin//src//package.json, 软链直指源码改即生效)
 CELAGENT_SRC=~/celagent ./install.sh
 ```
