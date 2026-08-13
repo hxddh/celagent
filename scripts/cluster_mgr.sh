@@ -1,16 +1,19 @@
 #!/bin/bash
 # celagent 多机集群管理 — P2: 分布式 agent 运行时
 # 用法: cluster_mgr.sh start|stop|status|add-node <port> <advertise>
-# 多机原理: 所有节点共享同一 BOS bucket (fleet/nodes/ 注册表 + cell 状态),
-#           节点经 BOS 发现彼此, agent 会话可在任意节点访问
+# 多机原理: 所有节点共享同一对象存储 bucket (fleet/nodes/ 注册表 + cell 状态),
+#           节点经桶发现彼此, agent 会话可在任意节点访问
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-export AWS_PROFILE=bos AWS_REGION=bj
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=store_env.sh
+. "$SCRIPT_DIR/store_env.sh"
+celagent_load_store || exit 1
 
 CELLD="${CELLD:-$HOME/.local/bin/celld}"
-BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
+BUCKET="${STORE_BUCKET:-}"
 [ -z "$BUCKET" ] && BUCKET=$(cat /tmp/celld_e2e_bucket 2>/dev/null)
-EP="https://s3.bj.bcebos.com"
+EP="$STORE_EP"
 STATE_DIR="$HOME/.local/celagent/state"
 mkdir -p "$STATE_DIR"
 
@@ -38,10 +41,10 @@ start_node() {
     CELLD_ALARM_RESIDENT_MS=60000 \
     CELLD_ADMISSION_WAIT_MS=2000 \
     CELLD_MAX_RESIDENT_CELLS=128 \
-    AWS_PROFILE=bos AWS_REGION=bj \
+    AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
     CELAGENT_WORKER_TOKEN="$TOKEN" \
     CELLD_VAR_CELAGENT_WORKER_TOKEN="$TOKEN" \
-    "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
+    "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region "$STORE_REGION" \
     --listen "127.0.0.1:${port}" \
     --internal-listen "$internal_bind" \
     --advertise "$internal_bind" \
@@ -113,7 +116,7 @@ case "${1:-status}" in
     done
     if [ -x "$CELLD" ] && [ -n "$BUCKET" ]; then
       echo "celld diagnose:"
-      "$CELLD" diagnose --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj 2>&1 | sed 's/^/  /' || echo "  (diagnose 失败, 忽略)"
+      "$CELLD" diagnose --bucket "s3://${BUCKET}" --endpoint "$EP" --region "$STORE_REGION" 2>&1 | sed 's/^/  /' || echo "  (diagnose 失败, 忽略)"
     fi
     ;;
   stop)

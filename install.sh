@@ -1,12 +1,12 @@
 #!/bin/bash
-# celagent v0.3.2 一键安装: CLI 二进制 + Celld 运行时 + BOS 对象存储持久化
+# celagent v0.3.3 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
 # 正式模式: 从 GitHub Release 下载对应平台二进制 (含 celld 随包 + worker 源码包)
 # 开发模式: CELAGENT_SRC=<源码目录> ./install.sh (软链直指源码, 改即生效)
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
-VERSION="0.3.2"
+VERSION="0.3.3"
 REPO="https://github.com/hxddh/celagent"
 RELEASE_URL="${CELAGENT_RELEASE_URL:-$REPO/releases/latest/download}"
 
@@ -50,7 +50,7 @@ verify_checksums() {
   fi
 }
 
-echo "=== celagent v${VERSION} 一键安装 (Celld + BOS, ${PLATFORM}) ==="
+echo "=== celagent v${VERSION} 一键安装 (Celld + 对象存储, ${PLATFORM}) ==="
 
 # 1. 前置检查
 for cmd in node curl aws jq; do
@@ -132,28 +132,64 @@ elif [ -z "$CELLD" ]; then
 fi
 [ -n "$CELLD" ] && echo "  ✓ celld: $CELLD"
 
-# 4. 检测 BOS 凭证 + 创建/复用 bucket (只验证存在, 不把 SK 读进 shell 变量)
-echo "[4/5] 配置 BOS 对象存储..."
-if ! aws configure get aws_access_key_id --profile bos >/dev/null 2>&1 \
-  || ! aws configure get aws_secret_access_key --profile bos >/dev/null 2>&1; then
-  echo "  ✗ 未找到 BOS 凭证 (需 ~/.aws/credentials 的 [bos] profile)"
-  echo "  请配置: aws configure --profile bos"
-  exit 1
+# 4. 检测凭证 + 创建/复用 bucket (只验证存在, 不把 SK 读进 shell 变量)
+echo "[4/5] 配置对象存储..."
+STORE_EP_DEFAULT="https://s3.bj.bcebos.com"
+STORE_PROFILE_DEFAULT="bos"
+SETTINGS_FILE="$HOME/.config/celagent/settings.json"
+STORE_EP="$STORE_EP_DEFAULT"
+STORE_PROFILE="$STORE_PROFILE_DEFAULT"
+STORE_REGION=""
+if [ -f "$SETTINGS_FILE" ]; then
+  _ep=$(jq -r '.persistence.endpoint // empty' "$SETTINGS_FILE" 2>/dev/null || true)
+  _pr=$(jq -r '.persistence.profile // empty' "$SETTINGS_FILE" 2>/dev/null || true)
+  _rg=$(jq -r '.persistence.region // empty' "$SETTINGS_FILE" 2>/dev/null || true)
+  [ -n "$_ep" ] && STORE_EP="$_ep"
+  [ -n "$_pr" ] && STORE_PROFILE="$_pr"
+  [ -n "$_rg" ] && STORE_REGION="$_rg"
 fi
-echo "  ✓ BOS 凭证可用"
+if [ -z "$STORE_REGION" ]; then
+  case "$STORE_EP" in
+    *bcebos.com*) STORE_REGION=bj ;;
+    *)
+      echo "  ✗ 非 BOS endpoint 需要 persistence.region (celagent config set persistence.region <region>)"
+      exit 1
+      ;;
+  esac
+fi
+export AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION"
+HAS_ENV=0
+if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then HAS_ENV=1; fi
+if [ "$HAS_ENV" != 1 ]; then
+  if ! aws configure get aws_access_key_id --profile "$STORE_PROFILE" >/dev/null 2>&1 \
+    || ! aws configure get aws_secret_access_key --profile "$STORE_PROFILE" >/dev/null 2>&1; then
+    echo "  ✗ 未找到凭证 (需 ~/.aws/credentials 的 [$STORE_PROFILE] profile)"
+    echo "  请配置: aws configure --profile $STORE_PROFILE"
+    exit 1
+  fi
+fi
+echo "  ✓ 凭证可用 (profile=$STORE_PROFILE endpoint=$STORE_EP)"
 
 # 默认名用随机后缀, 不含 whoami (避免 OS 用户名进入云资源名)
 _rand() { openssl rand -hex 4 2>/dev/null || od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'; }
 EXISTING_BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
 BUCKET="${CELAGENT_BUCKET:-${EXISTING_BUCKET:-celagent-$(_rand)-$(date +%s)}}"
-if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
+if AWS_PROFILE="$STORE_PROFILE" aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$STORE_EP" 2>/dev/null; then
   echo "  ✓ bucket 已存在: $BUCKET"
 else
-  if ! AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com"; then
-    echo "  ✗ bucket 创建失败: $BUCKET"
-    exit 1
-  fi
-  echo "  ✓ bucket 创建: $BUCKET"
+  case "$STORE_EP" in
+    *bcebos.com*)
+      if ! AWS_PROFILE="$STORE_PROFILE" aws s3api create-bucket --bucket "$BUCKET" --region "$STORE_REGION" --endpoint-url "$STORE_EP"; then
+        echo "  ✗ bucket 创建失败: $BUCKET"
+        exit 1
+      fi
+      echo "  ✓ bucket 创建: $BUCKET"
+      ;;
+    *)
+      echo "  ✗ bucket 不存在。非 BOS 请先在控制台建桶: $BUCKET"
+      exit 1
+      ;;
+  esac
 fi
 
 # 5. 部署 worker + 启动双节点 + 写配置
@@ -179,7 +215,7 @@ else
 fi
 if [ -n "$CELLD" ] && [ -n "$WORKER_SRC" ] && [ -d "$WORKER_SRC/src" ]; then
   # 凭证卫生: AWS_PROFILE, 不把 SK 注入进程环境
-  export AWS_PROFILE=bos AWS_REGION=bj
+  export AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION"
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
   # esbuild: 优先本地 node_modules, 下载模式回退 npx (自动拉取)
   if [ -x "${CELAGENT_ROOT}/celagent/node_modules/.bin/esbuild" ]; then
@@ -192,7 +228,7 @@ if [ -n "$CELLD" ] && [ -n "$WORKER_SRC" ] && [ -d "$WORKER_SRC/src" ]; then
     echo "  ⚠️ 未找到 esbuild (设 CELLD_ESBUILD 或安装到 PATH), 跳过 npx 自动拉取"
     export CELLD_ESBUILD=""
   fi
-  if (cd "$WORKER_SRC" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj); then
+  if (cd "$WORKER_SRC" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "$STORE_EP" --region "$STORE_REGION"); then
     echo "  ✓ worker 已部署 (${WORKER_SRC})"
   else
     echo "  ✗ worker 部署失败"
@@ -215,10 +251,10 @@ else
     nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
       CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 \
       CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_MAX_RESIDENT_CELLS=128 \
-      AWS_PROFILE=bos AWS_REGION=bj \
+      AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
       CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
       CELLD_VAR_CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
-      "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
+      "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$STORE_EP" --region "$STORE_REGION" \
       --listen "127.0.0.1:${port}" \
       --internal-listen "127.0.0.1:$((port + 2))" \
       --advertise "127.0.0.1:$((port + 2))" \
@@ -238,27 +274,40 @@ fi
 
 CONFIG_DIR="$HOME/.config/celagent"
 mkdir -p "$CONFIG_DIR"
-cat > "$CONFIG_DIR/settings.json" <<EOF
+SETTINGS="$CONFIG_DIR/settings.json"
+if [ -f "$SETTINGS" ]; then
+  TMP=$(mktemp)
+  jq --arg b "$BUCKET" --arg tok "$WORKER_TOKEN" --arg ep "$STORE_EP" --arg rg "$STORE_REGION" '
+    .provider = (.provider // "deepseek")
+    | .model = (.model // "deepseek-v4-flash")
+    | .persistence = ((.persistence // {}) + {bucket: $b})
+    | .persistence.endpoint = (.persistence.endpoint // $ep)
+    | .persistence.region = (.persistence.region // $rg)
+    | .worker = ((.worker // {}) + {token: $tok})
+  ' "$SETTINGS" > "$TMP" && mv "$TMP" "$SETTINGS"
+else
+  cat > "$SETTINGS" <<EOF
 {
   "provider": "deepseek",
   "model": "deepseek-v4-flash",
   "persistence": {
     "bucket": "$BUCKET",
-    "endpoint": "https://s3.bj.bcebos.com",
-    "region": "bj"
+    "endpoint": "$STORE_EP",
+    "region": "$STORE_REGION"
   },
   "worker": {
     "token": "$WORKER_TOKEN"
   }
 }
 EOF
-chmod 600 "$CONFIG_DIR/settings.json"
+fi
+chmod 600 "$SETTINGS"
 echo "  ✓ 配置已写入"
 
 echo ""
 echo "=== 安装完成 ==="
 echo "  celagent: ${CELAGENT_ROOT}/bin/celagent"
 echo "  bucket:   $BUCKET"
-echo "  节点:     18090 + 18091 (BOS 持久化)"
+echo "  节点:     18090 + 18091 (对象存储持久化)"
 echo ""
 echo "  使用: celagent   (把 ${CELAGENT_ROOT}/bin 加入 PATH)"

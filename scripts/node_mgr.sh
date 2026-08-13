@@ -3,13 +3,16 @@
 # 用法: node_mgr.sh start|stop|status|restart
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-export AWS_PROFILE=bos AWS_REGION=bj
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=store_env.sh
+. "$SCRIPT_DIR/store_env.sh"
+celagent_load_store || exit 1
 
 CELLD="${CELLD:-$HOME/.local/bin/celld}"
 # bucket 优先从 celagent 配置读 (与自动启动一致 — Bug 49), 回退旧测试值
-BUCKET=$(jq -r '.persistence.bucket // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
+BUCKET="${STORE_BUCKET:-}"
 [ -z "$BUCKET" ] && BUCKET=$(cat /tmp/celld_e2e_bucket 2>/dev/null)
-EP="https://s3.bj.bcebos.com"
+EP="$STORE_EP"
 WATCH1="${NODE_DIR:-$HOME/.local/celagent/nodes}/node1-watch"
 WATCH2="${NODE_DIR:-$HOME/.local/celagent/nodes}/node2-watch"
 LOG1="${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log"
@@ -23,7 +26,7 @@ start_node() {
   if [ -f "$log" ]; then
     tail -c 1048576 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log"
   fi
-  # 凭证卫生: AWS_PROFILE=bos, 不把 SK 读进变量/显式注入
+  # 凭证卫生: AWS_PROFILE, 不把 SK 读进变量/显式注入
   # CELLD_VAR_* 才能进 worker env (celld v0.2)
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     CELLD_WATCH="$watch" \
@@ -31,10 +34,10 @@ start_node() {
     CELLD_ALARM_RESIDENT_MS=60000 \
     CELLD_ADMISSION_WAIT_MS=2000 \
     CELLD_MAX_RESIDENT_CELLS=128 \
-    AWS_PROFILE=bos AWS_REGION=bj \
+    AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
     CELAGENT_WORKER_TOKEN="$TOKEN" \
     CELLD_VAR_CELAGENT_WORKER_TOKEN="$TOKEN" \
-    "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
+    "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region "$STORE_REGION" \
     --listen "127.0.0.1:${port}" \
     --internal-listen "127.0.0.1:$((port + 2))" \
     --advertise "127.0.0.1:$((port + 2))" > "$log" 2>&1 &

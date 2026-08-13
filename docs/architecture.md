@@ -122,11 +122,10 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 
 **扩展点(改造/迭代入口)**:
 1. **换 LLM provider**:`config set provider/model` + pi 引擎支持(多模型已内建)
-2. **换存储后端**:当前默认仅允许 `s3.*.bcebos.com` 或本机回环;其他地址需
-   `CELAGENT_ALLOW_ENDPOINT=1`。**非法 endpoint 会静默退回 BOS**(已知缺陷,评估要求
-   改成 fail-closed)。底层是 `src/bos.js` 的 aws CLI 封装;BOS 为唯一实测后端。
-   合格/不合格后端与分阶段计划见 `docs/s3-compat-evaluation.md`——不要把 MinIO/B2
-   当 RPO=0 部署选项
+2. **换存储后端**:`persistence.endpoint` 白名单含 BOS / AWS S3 / R2 / Tigris host 与本机;
+   其它需 `CELAGENT_ALLOW_ENDPOINT=1`。**非法 endpoint fail-closed**(不静默退回 BOS)。
+   非 BOS 必须显式 `persistence.region`。BOS 为唯一实测后端;计划见
+   `docs/s3-compat-evaluation.md` 与 `docs/v033-scope.md`——不要把 MinIO/B2 当 RPO=0 部署选项
 3. **新记忆工具**:在 `src/bos-tools.js` 加函数,注册进 customTools 数组
 4. **任务类型**:worker 的 `action=submit` switch 加分支(状态机已内建)
 5. **集群拓扑**:`cluster_mgr.sh` + nodes/ 注册表(节点自动发现,无需手动 peer)
@@ -157,7 +156,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失);拉起节点另有 `ensure.lock`
 - **CI Release job**:`.github/workflows/release.yml` 在 tag / workflow_dispatch 时匿名路径构建并上传
 - **Release 资产**:v0.3.2 含 celagent 五平台、celld linux/darwin-arm64、SHA256SUMS;上游 celld 无 darwin-x64/Windows
-- **存储后端耦合**:运维脚本硬编码 BOS endpoint/profile/region;`resolveEndpoint` 对非白名单 URL 静默回退 BOS。扩后端计划见 `docs/s3-compat-evaluation.md`
+- **存储后端**:运维脚本从 settings 读 endpoint/region/profile;`resolveEndpoint` 对非白名单 URL **fail-closed**。CAS 实测与「已支持 R2」见 v0.3.4 / `docs/s3-compat-evaluation.md`
 
 ## 6. 与分布式部署的关系
 

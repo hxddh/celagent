@@ -106,7 +106,9 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 }
 ```
 
-凭证:环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,或 `~/.aws/credentials` 的 `[bos]` profile(自动读取,两者不混用)。
+凭证:环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,或 `~/.aws/credentials` 的 profile(默认 `[bos]`,可用 `persistence.profile` 覆盖;两者不混用)。
+
+非 BOS 合格 endpoint(AWS S3 / Cloudflare R2 / Tigris 的 https host)可以 `config set persistence.endpoint`,并必须显式 `persistence.region`(R2 一般为 `auto`)。这只表示配置能写进去;**不表示该后端已实测 CAS**。非法地址会报错,不会静默写到百度 BOS。
 
 install.sh 可配置环境变量(全部有默认值):
 

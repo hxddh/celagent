@@ -40,7 +40,8 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估 + 新特性利用评审(P0 双监听已落地) |
 | `docs/s3-compat-evaluation.md` | 多后端对象存储评估:合格/不合格分界、耦合清单、分阶段计划(未改代码) |
 | `docs/post-v032-evaluation.md` | v0.3.2 之后排期:候选方向取舍、死代码/fail-open/CI 边界 |
-| `docs/v033-scope.md` | **v0.3.3 实现合同**(fail-closed + 配置单一来源;未落地) |
+| `docs/v033-scope.md` | v0.3.3 实现合同(本版落地: fail-closed + 配置单一来源) |
+| `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取 |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
@@ -146,10 +147,9 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.0 | 首次公开 Release(tag 钉在 `31d12a4`; 资产后来被刷新) | ✅ 历史 |
 | v0.3.1 | P0–P5 正确性/安全/发版闭环:BOS-first、user 轮、token、endpoint 白名单、Release 全平台 + SHA256SUMS | ✅ 历史 |
 | v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | ✅ 已发布 |
-| v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | **下一刀**,合同 `docs/v033-scope.md` |
+| v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | 本版 |
 
-下一刀实现:**v0.3.3**(`docs/v033-scope.md`)。不要插队做 provider 认证/快照 TUI/会话合并。
-HANDOFF 旧候选取舍见 `docs/post-v032-evaluation.md`。
+下一刀:**v0.3.4** CAS doctor + 至少一种非 BOS 实测(见 `docs/s3-compat-evaluation.md`)。不要插队做 provider 认证/快照 TUI/会话合并。
 
 ## 5. 工程约定(接手者必须遵守)
 
@@ -180,5 +180,4 @@ HANDOFF 旧候选取舍见 `docs/post-v032-evaluation.md`。
   后续更新数据时保持与 BOS 一致 + 敏感扫描(见红线)
 - CI 单元测试已去掉 `continue-on-error`; Secret/PII 扫描排除 `node_modules`
 - 发版由 `.github/workflows/release.yml` 在 tag `v*` 时构建并上传;本地可用 `./scripts/prepare-release-assets.sh` / `./scripts/release-smoke.sh`
-- **存储多后端**(评估未落地):脚本硬编码 BOS endpoint/`AWS_PROFILE=bos`/`region=bj`;`resolveEndpoint` 对非白名单 URL **静默退回 BOS**。计划见 `docs/s3-compat-evaluation.md`(P0: fail-closed + 配置单一来源)
-- **v0.3.2 后排期**见 `docs/post-v032-evaluation.md`:下一刀仍是存储 P0;自研 provider 认证/快照 TUI/会话合并/自动删桶 **不做产品**
+- **存储多后端 P0(v0.3.3)**:非法 endpoint fail-closed;脚本读 settings。CAS 实测 / 「已支持 R2」仍未做。

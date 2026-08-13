@@ -208,15 +208,29 @@ test("源码锚定: snapshot 返回 slice 拷贝", () => {
   assert.match(tui, /__celagentSnapshotTurns = \(\) => snapshotTurns\.slice\(\)/);
 });
 
-test("resolveEndpoint 拒绝非 BOS https", async () => {
-  const { resolveEndpoint, isAllowedEndpoint } = await import("../src/bos.js");
+test("resolveEndpoint fail-closed 且白名单扩合格 host", async () => {
+  delete process.env.CELAGENT_ALLOW_ENDPOINT;
+  const { resolveEndpoint, isAllowedEndpoint, defaultRegion, DEFAULT_ENDPOINT, bosPut } = await import("../src/bos.js");
   assert.equal(isAllowedEndpoint("https://s3.bj.bcebos.com"), true);
   assert.equal(isAllowedEndpoint("https://s3.gz.bcebos.com"), true);
+  assert.equal(isAllowedEndpoint("https://s3.us-east-1.amazonaws.com"), true);
+  assert.equal(isAllowedEndpoint("https://s3.amazonaws.com"), true);
+  assert.equal(isAllowedEndpoint("https://abc.r2.cloudflarestorage.com"), true);
+  assert.equal(isAllowedEndpoint("https://fly.storage.tigris.dev"), true);
+  assert.equal(isAllowedEndpoint("https://t3.storage.dev"), true);
   assert.equal(isAllowedEndpoint("http://127.0.0.1:9000"), true);
   assert.equal(isAllowedEndpoint("https://evil.example/"), false);
   assert.equal(isAllowedEndpoint("http://evil.example"), false);
-  assert.equal(resolveEndpoint("https://evil.example"), "https://s3.bj.bcebos.com");
+  assert.equal(resolveEndpoint(), DEFAULT_ENDPOINT);
+  assert.equal(resolveEndpoint(""), DEFAULT_ENDPOINT);
   assert.equal(resolveEndpoint("https://s3.gz.bcebos.com"), "https://s3.gz.bcebos.com");
+  assert.throws(() => resolveEndpoint("https://evil.example"), (err) => err && err.code === "endpoint-not-allowed");
+  assert.notEqual(resolveEndpoint("https://s3.gz.bcebos.com"), DEFAULT_ENDPOINT);
+  assert.equal(defaultRegion("https://s3.bj.bcebos.com"), "bj");
+  assert.equal(defaultRegion("https://abc.r2.cloudflarestorage.com"), undefined);
+  const put = await bosPut("k", "x", { bucket: "b", endpoint: "https://evil.example" });
+  assert.equal(put.ok, false);
+  assert.equal(put.error, "endpoint-not-allowed");
 });
 
 test("源码锚定: list 不再隐藏 default/debug/bos-*", () => {
@@ -341,11 +355,21 @@ test("源码锚定: doctor Celld 离线不报全部正常", () => {
   assert.match(tui, /核心正常 \(Celld 离线/);
 });
 
-test("源码锚定: 版本 0.3.2 与 release-smoke", () => {
-  assert.match(tui, /CELAGENT_VERSION = "0\.3\.2"/);
+test("源码锚定: 版本 0.3.3 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.3\.3"/);
   const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
   assert.match(smoke, /sha256sum --ignore-missing/);
   assert.match(smoke, /celagent-linux-x64/);
+});
+
+test("源码锚定: 运维脚本读 store_env 而非写死 BOS endpoint", () => {
+  const nm = readFileSync(join(root, "scripts/node_mgr.sh"), "utf8");
+  assert.match(nm, /store_env\.sh/);
+  assert.match(nm, /celagent_load_store/);
+  assert.doesNotMatch(nm, /EP="https:\/\/s3\.bj\.bcebos\.com"/);
+  const cm = readFileSync(join(root, "scripts/cluster_mgr.sh"), "utf8");
+  assert.match(cm, /store_env\.sh/);
+  assert.doesNotMatch(cm, /EP="https:\/\/s3\.bj\.bcebos\.com"/);
 });
 
 test("源码锚定: celld v0.2 token vars 与 timingSafeEqual", () => {

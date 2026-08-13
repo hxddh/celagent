@@ -5,8 +5,12 @@
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 BUCKET="${1:-$(cat /tmp/celld_e2e_bucket 2>/dev/null || echo celld-bos-test-$(date +%s))}"
-EP="https://s3.bj.bcebos.com"
-export AWS_PROFILE=bos
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=store_env.sh
+. "$SCRIPT_DIR/store_env.sh"
+celagent_load_store || exit 1
+EP="$STORE_EP"
+[ -n "$1" ] && BUCKET="$1"
 BODY=$(mktemp "${TMPDIR:-/tmp}/celagent-cas.XXXXXX")
 echo "test-body" > "$BODY"
 trap 'rm -f "$BODY"' EXIT
@@ -53,20 +57,20 @@ fi
 KEY="cas-test-$(date +%s)"
 aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" >/dev/null 2>&1
 # 已存在 → If-None-Match:* 应 412 (exit 非0)
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-none-match '*' >/dev/null 2>&1; then
+if AWS_PROFILE="$STORE_PROFILE" aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-none-match '*' >/dev/null 2>&1; then
   check "If-None-Match 已存在 → 应拒绝" "fail"
 else
   check "If-None-Match 已存在 → 拒绝(412)" "ok"
 fi
 # If-Match: 正确 etag → 成功
 ETAG=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --endpoint-url "$EP" --query ETag --output text 2>/dev/null)
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-match "$ETAG" >/dev/null 2>&1; then
+if AWS_PROFILE="$STORE_PROFILE" aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-match "$ETAG" >/dev/null 2>&1; then
   check "If-Match 正确 etag → 成功" "ok"
 else
   check "If-Match 正确 etag → 成功" "fail"
 fi
 # If-Match: 错误 etag → 应拒绝
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-match '"bogus"' >/dev/null 2>&1; then
+if AWS_PROFILE="$STORE_PROFILE" aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-match '"bogus"' >/dev/null 2>&1; then
   check "If-Match 错误 etag → 应拒绝" "fail"
 else
   check "If-Match 错误 etag → 拒绝(412)" "ok"
@@ -141,10 +145,10 @@ if [ -n "$NODE1_PID" ]; then
   # 恢复节点1 (凭证卫生: AWS_PROFILE, 不物化 SK; 传入 worker token 与 node_mgr 一致)
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     CELLD_IDLE_EVICT_S=30 CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_MAX_RESIDENT_CELLS=128 \
-    AWS_PROFILE=bos AWS_REGION=bj \
+    AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
     CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$TOKEN}" \
     CELLD_VAR_CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$TOKEN}" \
-    "${CELLD:-$HOME/.local/bin/celld}" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
+    "${CELLD:-$HOME/.local/bin/celld}" --bucket "s3://${BUCKET}" --endpoint "$EP" --region "$STORE_REGION" \
     --listen 127.0.0.1:18090 --internal-listen 127.0.0.1:18092 --advertise 127.0.0.1:18092 > "${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log" 2>&1 &
   sleep 6
 else

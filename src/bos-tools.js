@@ -1,4 +1,4 @@
-// bos-tools.js — P1 记忆增强: agent 可用的 BOS 记忆工具
+// bos-tools.js — P1 记忆增强: agent 可用的对象存储记忆工具
 // history_search: 跨会话检索历史记忆 (只读)
 // session_snapshot: 显式记忆锚点 (写 snapshots/ 前缀, 不碰权威数据)
 import { homedir, tmpdir } from "node:os";
@@ -8,9 +8,9 @@ import { execFile } from "node:child_process";
 import { writeFile, readFile, chmod, mkdtemp, rm } from "node:fs/promises";
 import { awsEnv, resolveEndpoint } from "./bos.js";
 
-function runAws(args) {
+function runAws(args, profile) {
   return new Promise((resolve) => {
-    execFile("aws", args, { env: awsEnv(), timeout: 20000, encoding: "utf8" }, (err, stdout) => {
+    execFile("aws", args, { env: awsEnv({ AWS_PROFILE: profile || "bos" }), timeout: 20000, encoding: "utf8" }, (err, stdout) => {
       try { resolve(JSON.parse(stdout || "[]")); }
       catch (e) { resolve([]); }
     });
@@ -24,7 +24,9 @@ function loadPersistence() {
     const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
     const bucket = cfg.persistence?.bucket || null;
     if (!bucket) return null;
-    return { bucket, endpoint: resolveEndpoint(cfg.persistence?.endpoint) };
+    const endpoint = resolveEndpoint(cfg.persistence?.endpoint);
+    const profile = String(cfg.persistence?.profile || "").trim() || "bos";
+    return { bucket, endpoint, profile };
   } catch (e) { return null; }
 }
 
@@ -56,7 +58,7 @@ function textOf(turn) {
 // ---- 工具 1: history_search — 跨会话检索记忆 ----
 export const history_search = {
   name: "history_search",
-  description: "在 BOS 云端历史中搜索记忆。默认只搜当前会话; 传 session=\"*\" 才跨会话。返回匹配轮次片段。",
+  description: "在对象存储历史中搜索记忆。默认只搜当前会话; 传 session=\"*\" 才跨会话。返回匹配轮次片段。",
   parameters: {
     type: "object",
     properties: {
@@ -69,8 +71,8 @@ export const history_search = {
   execute: async (toolCallId, params) => {
     try {
       const pers = loadPersistence();
-      if (!pers) return { content: [{ type: "text", text: "未配置 BOS bucket, 无法搜索历史" }] };
-      const { bucket, endpoint } = pers;
+      if (!pers) return { content: [{ type: "text", text: "未配置 persistence.bucket, 无法搜索历史" }] };
+      const { bucket, endpoint, profile } = pers;
       const query = String(params.query || "").toLowerCase();
       const limit = Math.min(Number(params.limit) || 5, 20);
       const persistId = typeof globalThis.__celagentPersistId === "string" ? globalThis.__celagentPersistId : null;
@@ -88,7 +90,7 @@ export const history_search = {
       if (sessionFilter) {
         keys = [`sessions/${sessionFilter}.json`];
       } else {
-        keys = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--max-items", "40", "--query", "Contents[].Key", "--output", "json"]);
+        keys = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--max-items", "40", "--query", "Contents[].Key", "--output", "json"], profile);
         if (!Array.isArray(keys)) keys = [];
         keys = keys.filter((k) => typeof k === "string").slice(0, 40);
       }
@@ -98,7 +100,7 @@ export const history_search = {
         const tmp = await privateTmp("search.json");
         try {
           const dl = await new Promise((resolve) => {
-            execFile("aws", ["s3api", "get-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint, tmp.path], { env: awsEnv(), timeout: 15000 }, (err) => resolve(!err));
+            execFile("aws", ["s3api", "get-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint, tmp.path], { env: awsEnv({ AWS_PROFILE: profile }), timeout: 15000 }, (err) => resolve(!err));
           });
           if (!dl) continue;
           try { await chmod(tmp.path, 0o600); } catch (e) { /* ignore */ }
@@ -136,7 +138,7 @@ export const history_search = {
 // ---- 工具 2: session_snapshot — 显式记忆锚点 ----
 export const session_snapshot = {
   name: "session_snapshot",
-  description: "将当前会话的关键状态保存为 BOS 快照(显式记忆锚点)。用于在重要节点主动保存,之后可用 celagent export 或恢复时引用。参数: name 必填(快照名称, 如 '架构决策-20260810'), 可选 note(备注说明)。",
+  description: "将当前会话的关键状态保存为对象存储快照(显式记忆锚点)。用于在重要节点主动保存,之后可用 celagent export 或恢复时引用。参数: name 必填(快照名称, 如 '架构决策-20260810'), 可选 note(备注说明)。",
   parameters: {
     type: "object",
     properties: {
@@ -148,8 +150,8 @@ export const session_snapshot = {
   execute: async (toolCallId, params) => {
     try {
       const pers = loadPersistence();
-      if (!pers) return { content: [{ type: "text", text: "未配置 BOS bucket, 无法保存快照" }] };
-      const { bucket, endpoint } = pers;
+      if (!pers) return { content: [{ type: "text", text: "未配置 persistence.bucket, 无法保存快照" }] };
+      const { bucket, endpoint, profile } = pers;
       const name = String(params.name || "").trim();
       if (!name) return { content: [{ type: "text", text: "缺少快照名称" }] };
       const note = params.note ? String(params.note) : "";
@@ -165,7 +167,7 @@ export const session_snapshot = {
       try {
         await writeFile(tmp.path, body, { encoding: "utf8", mode: 0o600 });
         const put = await new Promise((resolve) => {
-          execFile("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", tmp.path, "--endpoint-url", endpoint, "--output", "json"], { env: awsEnv(), timeout: 20000 }, (err, stdout) => resolve(!err));
+          execFile("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", tmp.path, "--endpoint-url", endpoint, "--output", "json"], { env: awsEnv({ AWS_PROFILE: profile }), timeout: 20000 }, (err, stdout) => resolve(!err));
         });
         if (!put) return { content: [{ type: "text", text: "快照保存失败" }] };
         return { content: [{ type: "text", text: `已保存会话快照: ${key} (${currentTurns.length} 轮)` }] };

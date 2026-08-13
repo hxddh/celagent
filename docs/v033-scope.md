@@ -1,7 +1,7 @@
 # v0.3.3 范围(下一刀实现)
 
 > 版本号 **`0.3.3`**。依据 `docs/s3-compat-evaluation.md` P0 + `docs/post-v032-evaluation.md`。
-> **本文件是实现合同**:做完这些就打 tag,多做的不算本版失败,少做的不算发版。
+> **本文件是实现合同**。实现 PR 已按此落地。
 > 默认仍是 BOS;`[bos]` profile / `bj` / `s3.bj.bcebos.com` 用户应无感。
 
 ## 用户能感知什么

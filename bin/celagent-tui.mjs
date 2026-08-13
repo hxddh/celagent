@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url);
 // 动态 import(file://路径) 无法被 Bun 打包, 单二进制运行时找不到 chalk 等嵌套依赖。
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
-import { awsEnv, resolveEndpoint, isAllowedEndpoint } from "../src/bos.js";
+import { awsEnv, resolveEndpoint, isAllowedEndpoint, resolveRegion } from "../src/bos.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
@@ -116,18 +116,27 @@ async function ensureCelld() {
     try {
       const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
       const bucket = cfg.persistence?.bucket;
+      let store;
+      try { store = storeFromCfg(cfg); } catch (e) {
+        warnOnce("persist", `  (警告: ${e.message})`);
+        return;
+      }
+      if (!store.region) {
+        warnOnce("persist", "  (警告: 非 BOS 需 config set persistence.region, 如 auto 或 us-east-1)");
+        return;
+      }
       const hasFullEnv = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
       let hasBosProfile = false;
       if (!hasFullEnv) {
         try {
           const { execFileSync } = await import("node:child_process");
-          const ak = execFileSync("aws", ["configure", "get", "aws_access_key_id", "--profile", "bos"], {
+          const ak = execFileSync("aws", ["configure", "get", "aws_access_key_id", "--profile", store.profile], {
             encoding: "utf8", timeout: 8000, stdio: ["ignore", "pipe", "ignore"],
           });
           hasBosProfile = !!(ak && String(ak).trim());
         } catch (e) { hasBosProfile = false; }
       }
-      const bosChildEnv = () => awsEnv({ AWS_REGION: cfg.persistence?.region || "bj" });
+      const bosChildEnv = () => awsEnv(store.awsExtra);
       if (bucket && (hasFullEnv || hasBosProfile)) {
         console.log("  (自动启动 Celld 节点, bucket=" + bucket + ")...");
         const { spawn } = await import("node:child_process");
@@ -156,7 +165,7 @@ async function ensureCelld() {
               "s3api", "list-objects-v2",
               "--bucket", bucket,
               "--prefix", "cells/",
-              "--endpoint-url", resolveEndpoint(cfg.persistence?.endpoint),
+              "--endpoint-url", store.endpoint,
               "--query", "Contents[?ends_with(Key, `own.json`)].Key",
               "--output", "json",
             ], { env: bosChildEnv(), encoding: "utf8" });
@@ -167,7 +176,7 @@ async function ensureCelld() {
                   "s3api", "delete-object",
                   "--bucket", bucket,
                   "--key", k,
-                  "--endpoint-url", resolveEndpoint(cfg.persistence?.endpoint),
+                  "--endpoint-url", store.endpoint,
                 ], { env: bosChildEnv(), stdio: "ignore" });
               }
               console.log(`  (已清理 ${ownKeys.length} 个残留 ownership)`);
@@ -191,8 +200,8 @@ async function ensureCelld() {
             const workerToken = ensureWorkerToken();
             const child = spawn(celldBin, [
               "--bucket", `s3://${bucket}`,
-              "--endpoint", resolveEndpoint(cfg.persistence?.endpoint),
-              "--region", cfg.persistence?.region || "bj",
+              "--endpoint", store.endpoint,
+              "--region", store.region,
               "--listen", `127.0.0.1:${port}`,
               "--internal-listen", `127.0.0.1:${internalPort}`,
               "--advertise", `127.0.0.1:${internalPort}`,
@@ -285,8 +294,14 @@ function mergeTurn(session, seq, role, msg, fullContent, fullToolResults) {
 async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullToolResults) {
   const { bosPut, bosGet } = await import("../src/bos.js");
   const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
-  const bucket = cfg.persistence?.bucket;
-  const endpoint = resolveEndpoint(cfg.persistence?.endpoint);
+  let store;
+  try { store = storeFromCfg(cfg); } catch (e) {
+    warnOnce("persist", `  (警告: ${e.message})`);
+    return;
+  }
+  const bucket = store.bucket;
+  const endpoint = store.endpoint;
+  const profile = store.profile;
   if (!bucket) {
     warnOnce("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
     return;
@@ -295,7 +310,7 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
   for (let attempt = 0; attempt < 3; attempt++) {
     let session = { id: sessionId, turns: [] };
     let etag = undefined;
-    const existing = await bosGet(key, { bucket, endpoint });
+    const existing = await bosGet(key, { bucket, endpoint, profile });
     if (existing.ok) {
       try {
         session = JSON.parse(existing.body);
@@ -308,7 +323,7 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
     } else if (existing.error === "not-found") {
       session.turns.push(makeTurnEntry(sessionId, seq, role, msg, fullContent, fullToolResults));
       session.updatedAt = Date.now();
-      const put = await bosPut(key, session, { bucket, endpoint, ifNoneMatch: true });
+      const put = await bosPut(key, session, { bucket, endpoint, profile, ifNoneMatch: true });
       if (put.ok) return;
       if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; }
       warnOnce("persist", `  (警告: BOS 首写失败: ${put.error || "未知错误"})`);
@@ -318,7 +333,7 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
       return;
     }
     mergeTurn(session, seq, role, msg, fullContent, fullToolResults);
-    const put = await bosPut(key, session, { bucket, ifMatch: etag, endpoint });
+    const put = await bosPut(key, session, { bucket, ifMatch: etag, endpoint, profile });
     if (put.ok) return;
     if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; }
     warnOnce("persist", `  (警告: BOS 持久化失败: ${put.error || "未知错误"})`);
@@ -400,10 +415,11 @@ async function loadHistoryFromBos(sessionId) {
     if (existsSync(cfgFile)) {
       try {
         const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
-        const bucket = cfg.persistence?.bucket;
-        const endpoint = resolveEndpoint(cfg.persistence?.endpoint);
+        const store = storeFromCfg(cfg);
+        const bucket = store.bucket;
+        const endpoint = store.endpoint;
         if (bucket) {
-          const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint });
+          const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint, profile: store.profile });
           if (existing.ok) {
             try {
               const session = JSON.parse(existing.body);
@@ -437,23 +453,23 @@ async function listSessions() {
   // 保证“本地数据全丢, 只要凭证还在”仍能找回会话
   try {
     const { execFile } = await import("node:child_process");
-    const cfgFile = join(homedir(), ".config", "celagent", "settings.json");
+    const cfg = loadConfig();
+    let store;
+    try { store = storeFromCfg(cfg); } catch (e) {
+      console.error(`✗ ${e.message}`);
+      return;
+    }
     let bucket = null;
-    let endpoint = "https://s3.bj.bcebos.com";
+    let endpoint = store.endpoint;
     // 1) 命令行显式指定 (最高优先): celagent list --bucket <name>
     const argvIdx = process.argv.indexOf("--bucket");
     if (argvIdx > 0 && process.argv[argvIdx + 1]) {
       bucket = process.argv[argvIdx + 1];
-    } else if (existsSync(cfgFile)) {
-      // 2) settings.json (正常路径)
-      try {
-        const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
-        bucket = cfg.persistence?.bucket || null;
-        endpoint = resolveEndpoint(cfg.persistence?.endpoint);
-      } catch (e) { /* 损坏则走降级 */ }
+    } else {
+      bucket = store.bucket;
     }
     const runAws = (args) => new Promise((resolve) => {
-      execFile("aws", args, { env: awsEnv(), timeout: 20000, encoding: "utf8" }, (err, stdout) => {
+      execFile("aws", args, { env: awsEnv(store.awsExtra), timeout: 20000, encoding: "utf8" }, (err, stdout) => {
         try { resolve(JSON.parse(stdout || "[]")); }
         catch (e) { resolve([]); }
       });
@@ -507,7 +523,7 @@ async function listSessions() {
 }
 
 // ---- 版本/帮助 ----
-const CELAGENT_VERSION = "0.3.2";
+const CELAGENT_VERSION = "0.3.3";
 function printVersion() {
   console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS RPO=0 持久化`);
 }
@@ -557,6 +573,18 @@ function saveConfig(cfg) {
   writeFileSync(configFile(), JSON.stringify(out, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
   try { chmodSync(configFile(), 0o600); } catch (e) { /* ignore */ }
 }
+function storeFromCfg(cfg = loadConfig()) {
+  const endpoint = resolveEndpoint(cfg.persistence?.endpoint);
+  const region = resolveRegion(endpoint, cfg.persistence?.region);
+  const profile = String(cfg.persistence?.profile || "").trim() || "bos";
+  return {
+    bucket: cfg.persistence?.bucket || null,
+    endpoint,
+    region,
+    profile,
+    awsExtra: { AWS_PROFILE: profile, ...(region ? { AWS_REGION: region } : {}) },
+  };
+}
 async function configCommand(args) {
   const [op, key, value] = args;
   const cfg = loadConfig();
@@ -578,7 +606,7 @@ async function configCommand(args) {
     }
     if (key === "persistence.endpoint") {
       if (!isAllowedEndpoint(value)) {
-        console.error("✗ persistence.endpoint 仅允许 https://s3.<region>.bcebos.com 或本机; 或设 CELAGENT_ALLOW_ENDPOINT=1");
+        console.error("✗ persistence.endpoint 不允许 (合格 https host / 本机; 或设 CELAGENT_ALLOW_ENDPOINT=1)");
         process.exit(1);
       }
     }
@@ -643,16 +671,23 @@ async function doctorCommand() {
   if (!piOk) ok = false;
   // 1. 配置
   const cfg = loadConfig();
-  const bucket = cfg.persistence?.bucket;
-  console.log(`[1/5] 配置: ${bucket ? "✓ bucket=" + bucket : "✗ 缺 persistence.bucket (运行 setup.sh 或 config set)"}`);
+  let store;
+  try { store = storeFromCfg(cfg); } catch (e) {
+    console.log(`[1/5] 配置: ✗ ${e.message}`);
+    process.exit(1);
+  }
+  const bucket = store.bucket;
+  const regionDisp = store.region || "(缺,非 BOS 必须配置)";
+  console.log(`[1/5] 配置: ${bucket ? "✓ bucket=" + bucket : "✗ 缺 persistence.bucket (运行 setup.sh 或 config set)"} endpoint=${store.endpoint} region=${regionDisp} profile=${store.profile}`);
   if (!bucket) ok = false;
-  // 2. BOS 凭证
+  if (!store.region) ok = false;
+  // 2. 凭证
   const { execFile } = await import("node:child_process");
   const cred = await new Promise((resolve) => {
-    execFile("aws", ["configure", "get", "aws_access_key_id", "--profile", "bos"], { timeout: 10000, encoding: "utf8" }, (err, stdout) => resolve(err ? null : (stdout || "").trim()));
+    execFile("aws", ["configure", "get", "aws_access_key_id", "--profile", store.profile], { timeout: 10000, encoding: "utf8" }, (err, stdout) => resolve(err ? null : (stdout || "").trim()));
   });
   const hasEnv = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
-  console.log(`[2/5] 凭证: ${hasEnv ? "✓ 环境变量" : cred ? "✓ [bos] profile" : "✗ 无凭证 (需 ~/.aws/credentials [bos] 或环境变量)"}`);
+  console.log(`[2/5] 凭证: ${hasEnv ? "✓ 环境变量" : cred ? "✓ [" + store.profile + "] profile" : "✗ 无凭证 (需 ~/.aws/credentials [" + store.profile + "] 或环境变量)"}`);
   if (!cred && !hasEnv) ok = false;
   // 3. Celld 节点
   const nodes = [];
@@ -675,9 +710,9 @@ async function doctorCommand() {
   // 4. BOS 连通
   if (bucket) {
     const probe = await new Promise((resolve) => {
-      execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", resolveEndpoint(cfg.persistence?.endpoint), "--query", "Contents[].Key", "--output", "json"], { env: awsEnv(), timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
+      execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", store.endpoint, "--query", "Contents[].Key", "--output", "json"], { env: awsEnv(store.awsExtra), timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
     });
-    console.log(`[4/5] BOS 连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
+    console.log(`[4/5] 存储连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
     if (!probe) ok = false;
   }
   if (ok && celldUp) console.log("\n结论: ✓ 全部正常");
@@ -688,15 +723,19 @@ async function doctorCommand() {
 
 // ---- 导出/删除会话 ----
 async function getBucketArg() {
-  // 返回 { bucket, endpoint } — 显式 --bucket > settings.json > 自动扫描 (复用 listSessions 逻辑简化版)
+  // 返回 { bucket, endpoint, profile } — 显式 --bucket > settings.json
+  const cfg = loadConfig();
+  let store;
+  try { store = storeFromCfg(cfg); } catch (e) {
+    console.error(`✗ ${e.message}`);
+    process.exit(1);
+  }
   const argvIdx = process.argv.indexOf("--bucket");
   if (argvIdx > 0 && process.argv[argvIdx + 1]) {
-    const cfg = loadConfig();
-    return { bucket: process.argv[argvIdx + 1], endpoint: resolveEndpoint(cfg.persistence?.endpoint) };
+    return { bucket: process.argv[argvIdx + 1], endpoint: store.endpoint, profile: store.profile };
   }
-  const cfg = loadConfig();
-  if (cfg.persistence?.bucket) return { bucket: cfg.persistence.bucket, endpoint: resolveEndpoint(cfg.persistence.endpoint) };
-  return { bucket: null, endpoint: resolveEndpoint() };
+  if (store.bucket) return { bucket: store.bucket, endpoint: store.endpoint, profile: store.profile };
+  return { bucket: null, endpoint: store.endpoint, profile: store.profile };
 }
 // ---- P1: agent 任务化 — 任务状态机 (celld submit/status/ledger) ----
 async function taskCommand(args) {
@@ -776,10 +815,10 @@ function assertSafeSessionId(id) {
 async function exportCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent export <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
   assertSafeSessionId(id);
-  const { bucket, endpoint } = await getBucketArg();
+  const { bucket, endpoint, profile } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { bosGet } = await import("../src/bos.js");
-  const r = await bosGet(`sessions/${id}.json`, { bucket, endpoint });
+  const r = await bosGet(`sessions/${id}.json`, { bucket, endpoint, profile });
   if (!r.ok) { console.error(`✗ 会话不存在或读取失败: ${r.error}`); process.exit(1); }
   const session = JSON.parse(r.body);
   console.log(JSON.stringify({ id, exportedAt: new Date().toISOString(), turns: session.turns || [] }, null, 2));
@@ -787,7 +826,7 @@ async function exportCommand(id) {
 async function rmCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent rm <会话ID> [--bucket B] [--yes] (ID 可用 celagent list 查看)"); process.exit(1); }
   assertSafeSessionId(id);
-  const { bucket, endpoint } = await getBucketArg();
+  const { bucket, endpoint, profile } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { execFile } = await import("node:child_process");
   const force = process.argv.includes("--yes") || process.argv.includes("-y");
@@ -804,7 +843,7 @@ async function rmCommand(id) {
   }
   if (!confirm) { console.log("已取消"); return; }
   await new Promise((resolve) => {
-    execFile("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", `sessions/${id}.json`, "--endpoint-url", endpoint], { env: awsEnv(), timeout: 15000 }, (err) => resolve());
+    execFile("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", `sessions/${id}.json`, "--endpoint-url", endpoint], { env: awsEnv({ AWS_PROFILE: profile }), timeout: 15000 }, (err) => resolve());
   });
   console.log(`✓ 已删除会话 ${id}`);
 }
