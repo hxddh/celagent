@@ -209,9 +209,9 @@ test("resolveEndpoint 拒绝非 BOS https", async () => {
 | 版本 | 内容 |
 |------|------|
 | 本评估(无版本号) | 本文 + 交叉引用 |
-| **v0.3.3 或 v0.4.0 P0** | fail-closed、配置单一来源、脚本读 settings、白名单扩合格 host |
-| **下一版 P1** | CAS doctor、R2/S3 至少一种实测、文档改叙事 |
-| 更后 P2 | GCS / prefix / rename |
+| **v0.3.3**(下一刀,合同见 `docs/v033-scope.md`) | fail-closed、配置单一来源、脚本读 settings、白名单扩合格 host |
+| **v0.3.4** | CAS doctor、R2/S3 至少一种实测、文档改叙事;可删 worker SigV4 死代码 |
+| 更后 | GCS / prefix / rename |
 
 P0 可独立发版:BOS 用户无感,只修「配了别的云却写到百度」这个缺陷。
 

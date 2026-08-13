@@ -137,9 +137,9 @@ CI:`node --check`、help/version、`npm test`(无节点则 skip Celld/BOS)、sec
 ## 5. 推荐排期
 
 ```
-现在(评估 PR)     文档:存储评估 + 本文 + HANDOFF Latest=v0.3.2
-下一刀实现        存储 P0:fail-closed、settings 单一来源、脚本读配置
-再下一刀          存储 P1:CAS doctor + 删 SigV4 死代码;可选 snapshot list CLI
+现在(评估 PR)     文档:存储评估 + 本文 + v0.3.3 范围合同
+下一刀实现        **v0.3.3** — `docs/v033-scope.md`
+再下一刀          v0.3.4:CAS doctor + 删 SigV4 死代码;可选 snapshot list CLI
 更后 / 有人要     R2 实测、OTEL opt-in、celld 桶 prefix(不搬会话)、
                   doctor 查 pi auth 有无、attestation verify
 不要排期          自研 provider 认证、快照 TUI、会话 merge、自动删 sessions/、

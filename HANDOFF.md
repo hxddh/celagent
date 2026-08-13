@@ -40,6 +40,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估 + 新特性利用评审(P0 双监听已落地) |
 | `docs/s3-compat-evaluation.md` | 多后端对象存储评估:合格/不合格分界、耦合清单、分阶段计划(未改代码) |
 | `docs/post-v032-evaluation.md` | v0.3.2 之后排期:候选方向取舍、死代码/fail-open/CI 边界 |
+| `docs/v033-scope.md` | **v0.3.3 实现合同**(fail-closed + 配置单一来源;未落地) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
@@ -145,9 +146,10 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.0 | 首次公开 Release(tag 钉在 `31d12a4`; 资产后来被刷新) | ✅ 历史 |
 | v0.3.1 | P0–P5 正确性/安全/发版闭环:BOS-first、user 轮、token、endpoint 白名单、Release 全平台 + SHA256SUMS | ✅ 历史 |
 | v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | ✅ 已发布 |
+| v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | **下一刀**,合同 `docs/v033-scope.md` |
 
-下一刀实现:**对象存储多后端 P0**(fail-closed + 配置单一来源,见 `docs/s3-compat-evaluation.md`)。
-HANDOFF 旧候选(多 provider 认证、快照 UI、会话合并、Bucket 生命周期)的取舍见 `docs/post-v032-evaluation.md`——其中三项建议不做产品。
+下一刀实现:**v0.3.3**(`docs/v033-scope.md`)。不要插队做 provider 认证/快照 TUI/会话合并。
+HANDOFF 旧候选取舍见 `docs/post-v032-evaluation.md`。
 
 ## 5. 工程约定(接手者必须遵守)
 
