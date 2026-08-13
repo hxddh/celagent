@@ -288,4 +288,29 @@ test("源码锚定: HANDOFF 不再把认证当唯一阻塞", () => {
   assert.doesNotMatch(handoff, /阻塞\(唯一\)/);
   assert.match(handoff, /SHA256SUMS/);
   assert.match(handoff, /celld-linux-x64/);
+  assert.match(handoff, /release\.yml/);
+});
+
+test("源码锚定: Release 流水线拉 denoland celld 并匿名编译", () => {
+  const prep = readFileSync(join(root, "scripts/prepare-release-assets.sh"), "utf8");
+  const wf = readFileSync(join(root, ".github/workflows/release.yml"), "utf8");
+  assert.match(prep, /celld-x86_64-unknown-linux-gnu\.gz/);
+  assert.match(prep, /celld-linux-x64/);
+  assert.match(prep, /\/tmp\/anon-build/);
+  assert.match(prep, /bun-windows-x64/);
+  assert.match(wf, /prepare-release-assets\.sh/);
+  assert.match(wf, /gh release upload/);
+  assert.match(wf, /contents: write/);
+});
+
+test("源码锚定: install 支持 arm64/windows 且缺 SHA256SUMS 会警告", () => {
+  const sh = readFileSync(join(root, "install.sh"), "utf8");
+  assert.match(sh, /linux-arm64/);
+  assert.match(sh, /windows-x64/);
+  assert.match(sh, /CELAGENT_REQUIRE_CHECKSUM/);
+  assert.match(sh, /verify_checksums\(\) \{/);
+});
+
+test("源码锚定: doctor Celld 离线不报全部正常", () => {
+  assert.match(tui, /核心正常 \(Celld 离线/);
 });

@@ -98,7 +98,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 |---|---|
 | `checkpoint` / `resume` | 会话轮次写入 / 读取(缓存层, 双写路径用) |
 | `sync` | 会话同步(节点间/与 BOS 对齐) |
-| `submit` / `status` / `ledger` | 任务状态机(断点续跑, exactly-once) |
+| `submit` / `status` / `ledger` | 任务状态机(断点续跑, 单 cell ledger 去重) |
 | `schedule` / `delegate` | 定时任务 / 跨 cell 委托 |
 | `hibernate` / `wake` / `hibernate-status` | 休眠唤醒(会话即 cell, 空闲回收) |
 | `kv-put/get/list/delete` | 通用 KV(缓存/协调) |
@@ -149,13 +149,12 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **own.json 残留**:强杀节点后阻塞接管,运维脚本需清理(见 setup.sh Bug 94);仅 `celagent-*` bucket 默认清理
 - **节点 lease 10s**:集群成员 TTL,网络分区时节点可能被误判离线
 - **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失);拉起节点另有 `ensure.lock`
-- **CI 不构建发布二进制**:当前手动匿名路径构建(见 PACKAGING 注意 0)
-- **Release 资产不完整**:v0.3.0 缺 `celld-linux-x64` / `celld-darwin-x64` / Windows 与 `SHA256SUMS`;
-  `install.sh` 正式模式已走 Release,缺 celld 平台包时回退 celld.dev
+- **CI Release job**:`.github/workflows/release.yml` 在 tag / workflow_dispatch 时匿名路径构建并上传
+- **Release 资产**:合并后跑 Release workflow 补 `celld-linux-*` 与 `SHA256SUMS`;上游 celld 无 darwin-x64/Windows
 
 ## 6. 与分布式部署的关系
 
 - 单机 = 双节点(18090/18091);多机 = cluster_mgr 加节点(见 distributed-deployment.md)
 - 多机共享同一 bucket → 会话跨机器可见(BOS 权威)
 - 节点经 BOS `nodes/` 注册表自动发现,无手动 peer 配置
-- 任务状态机 submit/status/ledger 跨节点断点续跑(exactly-once)
+- 任务状态机 submit/status/ledger 跨节点断点续跑(单 cell ledger 去重, 不是跨节点共识)

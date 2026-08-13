@@ -512,7 +512,7 @@ function printHelp() {
   celagent doctor             自检: 配置/凭证/节点/BOS 连通性
   celagent task submit <type> [steps]  提交分布式任务 (celld 状态机)
   celagent task status [taskId]        任务状态 (断点续跑)
-  celagent task ledger                 幂等 ledger (exactly-once)
+  celagent task ledger                 幂等 ledger (单 cell 去重)
   celagent version            显示版本
   celagent help               显示帮助
 
@@ -642,6 +642,7 @@ async function doctorCommand() {
     } catch (e) { /* down */ }
   }
   console.log(`[3/5] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "⚠ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
+  const celldUp = nodes.length > 0;
   // 4. BOS 连通
   if (bucket) {
     const probe = await new Promise((resolve) => {
@@ -650,7 +651,9 @@ async function doctorCommand() {
     console.log(`[4/5] BOS 连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
     if (!probe) ok = false;
   }
-  console.log(`\n结论: ${ok ? "✓ 全部正常" : "✗ 存在异常, 按上面 ✗ 项处理"}`);
+  if (ok && celldUp) console.log("\n结论: ✓ 全部正常");
+  else if (ok) console.log("\n结论: ✓ 核心正常 (Celld 离线 — 会话仍可走 BOS; 任务/缓存需 node_mgr.sh start)");
+  else console.log("\n结论: ✗ 存在异常, 按上面 ✗ 项处理");
   process.exit(ok ? 0 : 1);
 }
 
@@ -709,7 +712,7 @@ async function taskCommand(args) {
     process.exit(1);
   }
   if (op === "ledger") {
-    // 幂等 ledger — exactly-once 验证
+    // 幂等 ledger — 单 cell 去重 (不是跨节点共识)
     let lastErr = null;
     for (const base of CELD_NODES) {
       try {
@@ -721,7 +724,7 @@ async function taskCommand(args) {
           const byTool = {};
           for (const e of j) byTool[e.tool] = (byTool[e.tool] || 0) + 1;
           console.log(`  工具调用: ${JSON.stringify(byTool)}`);
-          console.log(`  去重命中: ${dedup} 次 (exactly-once 保护)`);
+          console.log(`  去重命中: ${dedup} 次 (单 cell ledger)`);
           return;
         }
         lastErr = JSON.stringify(j);

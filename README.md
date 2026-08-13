@@ -8,7 +8,7 @@
 - **完整 Pi TUI**:复用 pi-coding-agent 引擎(不 fork),bash/read/write/grep/find/edit/ls 全量工具,多模型切换
 - **会话永不丢 (RPO=0)**:每轮对话双写 — worker 缓存 + **BOS 直写**(CAS 乐观锁 + 幂等去重 + 异步队列),BOS 是权威源
 - **跨机恢复**:`celagent <id>` 从 BOS 恢复完整历史,换机器/本地数据丢失都能找回
-- **分布式任务**:`celagent task submit/status/ledger` — celld 状态机,断点续跑 + exactly-once(多机见 docs/distributed-deployment.md)
+- **分布式任务**:`celagent task submit/status/ledger` — celld 状态机,断点续跑 + 单 cell ledger 去重(exactly-once 限于同一 cell; 多机见 docs/distributed-deployment.md)
 - **本地会话恢复**:TUI 内 `/resume` 切换本机会话,`/new` 开新会话(自动独立持久化 ID)
 - **一键部署**:setup.sh 检测凭证 → 建 bucket → 部署 worker → 启动双节点 → 写配置
 - **settings 配置**:`~/.config/celagent/settings.json` 自定义
@@ -38,7 +38,7 @@ celagent config get persistence.bucket
 celagent config set model deepseek-v4-flash
 celagent task submit write-report 5   # 提交分布式任务 (celld 状态机, 断点续跑)
 celagent task status <taskId>         # 任务状态
-celagent task ledger                  # 幂等 ledger (exactly-once)
+celagent task ledger                  # 幂等 ledger (单 cell 去重)
 celagent version           # 显示版本
 celagent help              # 全部命令
 ```
@@ -83,7 +83,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `celagent doctor` | 五维自检 |
 | `celagent task submit <type> [steps]` | 提交分布式任务 (celld 状态机, 断点续跑) |
 | `celagent task status [taskId]` | 任务状态 |
-| `celagent task ledger` | 幂等 ledger (exactly-once) |
+| `celagent task ledger` | 幂等 ledger (单 cell 去重, 非跨节点共识) |
 | `/resume` (TUI 内) | 切换本地会话 |
 | `/new` (TUI 内) | 新会话,打印持久化 ID |
 

@@ -70,13 +70,10 @@ GitHub Release:
 1. 二进制不含 API key — 凭证运行时从环境变量 (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) 或 ~/.aws/credentials 的 [bos] profile 动态读取
 2. Celld 运行时独立下载 (install.sh 处理), 不打包进 celagent 二进制
 3. TUI 版动态 import: 需重新验证 Bun 编译 (打包前必做)
-4. **发布前置**: 仓库已是 `https://github.com/hxddh/celagent.git`。当前 CI 仅 test/build (npm pack dry-run), 无 release 构建 job —
-   二进制构建为手动 bun build (见上), 后续可加 CI release job 自动化
-5. **v0.3.0 Release 缺口**(2026-08 实测): 已有 `celagent-{darwin-arm64,darwin-x64,linux-x64}`、
-   `celld-darwin-arm64`、`install.sh`、`worker.tar.gz`。**缺** `celld-linux-x64` /
-   `celld-darwin-x64` / Windows,以及 `SHA256SUMS`。生成校验和:
-   ```bash
-   ./scripts/sha256sums.sh /path/to/release-assets
-   ```
-   `install.sh` 正式模式会下载 `SHA256SUMS` 并 `sha256sum -c`; 文件不存在则跳过校验。
-   Linux/Windows 用户安装 celld 会回退 `https://celld.dev/install.sh`。
+4. **发布前置**: 仓库已是 `https://github.com/hxddh/celagent.git`。CI 含 test/build,以及 **Release job**
+   (`.github/workflows/release.yml`): tag `v*` 或 workflow_dispatch 时在 `/tmp/anon-build` bun 交叉编译,
+   拉取 `denoland/celld` 官方 gzip,打包 `worker.tar.gz`,生成 `SHA256SUMS` 并 `gh release upload --clobber`。
+   本地:`./scripts/prepare-release-assets.sh dist/release`
+5. **上游 celld 平台**(denoland/celld v0.2.0): 有 linux-x64 / linux-arm64 / darwin-arm64。
+   **无** darwin-x64 / Windows — `install.sh` 这两平台回退 celld.dev 或跳过。
+   `install.sh` 正式模式下载 `SHA256SUMS` 并校验; 文件不存在则警告(可 `CELAGENT_REQUIRE_CHECKSUM=1` 强制失败)。

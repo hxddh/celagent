@@ -1,0 +1,48 @@
+name: Release
+
+# 编译 celagent 全平台二进制、拉取 denoland/celld、生成 SHA256SUMS 并上传到 GitHub Release。
+# 合并到 main 后: Actions → Release → Run workflow (tag=v0.3.0) 即可刷新资产。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要更新的 Release tag'
+        required: true
+        default: 'v0.3.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: npm ci
+      - name: Prepare release assets
+        run: |
+          chmod +x scripts/prepare-release-assets.sh scripts/sha256sums.sh
+          ./scripts/prepare-release-assets.sh dist/release
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/release/* --clobber
+          else
+            gh release create "$TAG" dist/release/* --title "$TAG" --generate-notes
+          fi
+          echo "uploaded to $TAG"
+          ls -lh dist/release

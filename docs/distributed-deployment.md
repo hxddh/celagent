@@ -9,14 +9,14 @@
 ┌────────────────────────────────────────────────────┐
 │ 客户端: celagent CLI (任意机器)                     │
 │   - 对话 / 工具 (本地文件系统)                      │
-│   - 恢复: worker 缓存快路径 → BOS 权威              │
+│   - 恢复: BOS 权威 → worker 仅 miss 回退              │
 └──────────────┬─────────────────────────────────────┘
                │ HTTP (任一节点)
 ┌──────────────▼─────────────────────────────────────┐
 │ 执行层: celld 集群 (多机, 经 BOS 发现彼此)          │
 │   - 节点注册: BOS nodes/ (addr/负载/所有权代数)      │
 │   - 会话即 cell: session:<id> 状态 (休眠/唤醒/迁移)  │
-│   - 任务状态机: submit/status/ledger (exactly-once) │
+│   - 任务状态机: submit/status/ledger (单 cell 去重) │
 │   - 跨 cell 委托: delegate (agent A → B)            │
 └──────────────┬─────────────────────────────────────┘
                │ 权威落盘
@@ -82,7 +82,7 @@ celagent my-session          # 在 B 上恢复 — 历史完整
 | 多节点注册 (BOS nodes/) | ✓ 节点经 BOS 发现 |
 | 跨节点会话访问 | ✓ 18090 写 → 19000 读 2 轮 |
 | 休眠/唤醒 (hibernate/wake) | ✓ 2 轮完整恢复 |
-| 任务状态机 (submit/status) | ✓ 5/5 步骤完成, ledger exactly-once |
+| 任务状态机 (submit/status) | ✓ 5/5 步骤完成, ledger 单 cell 去重 |
 | 会话级单写者 (epoch fencing) | ✓ BOS CAS (ETag+If-Match), 并发 412 拒绝 |
 | agent 直连 BOS 产物 (obj-put) | ✓ 经 webhook 代理写入 (worker 零凭证) |
 | 跨 cell 委托 (delegate) | ✓ API 就绪 (celagent task 未接, 测试语义) |

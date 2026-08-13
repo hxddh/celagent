@@ -111,11 +111,13 @@ node bin/celagent-tui.mjs task ledger
 - ✅ README/install.sh 已指向 `github.com/hxddh/celagent/releases/latest/download/install.sh`
 - ✅ 版本已统一 `0.3.0`; CI 矩阵 node 22/24
 - ✅ v0.3.0 Release 已有:`celagent-darwin-arm64` / `darwin-x64` / `linux-x64`、`celld-darwin-arm64`、`install.sh`、`worker.tar.gz`
+- ✅ **CI Release job** (`.github/workflows/release.yml`):匿名路径 bun 交叉编译 + 拉取 `denoland/celld` 官方包 + `SHA256SUMS` + 上传
 
-### 当前阻塞(发版资产, 非认证)
-- Release **缺** `celld-linux-x64` / `celld-darwin-x64` / Windows;`install.sh` 会回退 `celld.dev/install.sh`
-- **无 `SHA256SUMS`**:`install.sh` 已支持校验,文件缺失则跳过;`scripts/sha256sums.sh` 可生成
-- P0–P3 代码修复(PR)合并后需**重发** `install.sh` / `worker.tar.gz`(当前 Release 仍是修复前快照)
+### 当前阻塞(发版资产)
+- **合并本 PR 后跑一次 Release workflow**(Actions → Release → Run workflow, tag=`v0.3.0`)即可补上:
+  `celld-linux-x64` / `celld-linux-arm64` / `celld-darwin-arm64`(官方 denoland v0.2.0)、
+  `celagent-linux-arm64` / `celagent-windows-x64.exe`、`SHA256SUMS`,并刷新 `install.sh` / `worker.tar.gz`
+- 上游 `denoland/celld` **没有** Intel Mac (`darwin-x64`) 与 Windows 包 — 不是本仓库能编出来的;`install.sh` 在这两平台回退 `celld.dev` / 跳过 celld
 
 ### 后续发布步骤
 
@@ -133,7 +135,7 @@ node bin/celagent-tui.mjs task ledger
    # celld 二进制不在本仓库, 从本机构建产物或 celld 发行渠道拷入后上传
    ```
 5. ✅ **install.sh 正式模式**已从 GitHub Release 下载 `celagent-<平台>` / `celld-<平台>` / `worker.tar.gz`
-6. **补传 Release 资产**:`celld-linux-x64` / `celld-darwin-x64` + `SHA256SUMS`(`./scripts/sha256sums.sh <资产目录>`);PR 合并后重传 `install.sh` / `worker.tar.gz`
+6. **补传 Release 资产**:合并后跑 `.github/workflows/release.yml`(workflow_dispatch tag=v0.3.0)。本地等价:`./scripts/prepare-release-assets.sh dist/release`
 7. **端到端验证**:全新机器 `curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh` 真实走一遍
 
 ## 4. 版本与里程碑
@@ -143,7 +145,7 @@ node bin/celagent-tui.mjs task ledger
 | v0.1.x | CLI 骨架 + BOS 直写 + 双节点 | ✅ |
 | v0.2.x | 分布式运行时(worker 缓存/sync、休眠唤醒、agent 任务化、cluster_mgr、多机部署文档) | ✅ |
 | P1 记忆增强 | history_search + session_snapshot + 完整记忆(不截断) | ✅ 已并入 |
-| v0.3.0 | **发布版**(含 P1 记忆增强):Release 二进制分发 + celld 随包 + install.sh 下载模式 + CI 全绿 | 🔄 进行中(缺 celld 跨平台资产 + SHA256SUMS; 代码修复见 PR) |
+| v0.3.0 | **发布版**(含 P1 记忆增强):Release 二进制分发 + celld 随包 + install.sh 下载模式 + CI 全绿 | 🔄 合并后跑 Release workflow 刷新资产 |
 
 后续候选方向(未排期):多 provider 认证管理、快照浏览 UI、会话 diff/合并、Bucket 生命周期(降本)。
 
@@ -171,6 +173,7 @@ node bin/celagent-tui.mjs task ledger
 - P1(2026-08):user 轮一并落盘; worker `sync` 按 turn 合并; checkpoint 改 POST body; 本机 worker token(无 token 时 fail-open); ledger 先 pending 再 webhook; `rm --yes`
 - P2(2026-08):endpoint 白名单; own.json 仅 `celagent-*` bucket 清理; list `--scan`; config 嵌套保护; history_search 默认当前会话; cwrite 锁 TTL; alarm 取最近唤醒点
 - P3(2026-08):跨进程 `ensure.lock`; CI `node --check` 失败即失败; failover 测试 resume 原会话; HANDOFF/架构文档与 Release 资产对齐; `cluster_mgr` 传 worker token
+- P4(2026-08):CI Release job 编译全平台 celagent + 拉取 denoland/celld + SHA256SUMS; install 支持 linux-arm64/windows; doctor Celld 离线不再报「全部正常」
 - HTML 演示页数字已按 2026-08-11 实时 BOS 对齐;回放为 33 轮真实会话实录(脱敏后),
   后续更新数据时保持与 BOS 一致 + 敏感扫描(见红线)
 - CI 单元测试已去掉 `continue-on-error`; Secret/PII 扫描排除 `node_modules`
