@@ -57,7 +57,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
                     轮次: {turn, role, msg, ts, content, toolResults}  (完整记忆, 不截断)
 ```
 
-恢复优先级:**BOS 是权威源** — 启动 `celagent <id>` 先从 BOS 读完整历史,仅 BOS miss 时才回退 worker 缓存(可能截断)。`/resume` 从本地 JSONL 恢复;`/new` 与 `/fork` 均分配独立持久化 ID。
+恢复优先级:**BOS 是权威源** — 启动 `celagent <id>` 先从 BOS 读完整历史,仅 BOS miss 时才回退 worker 缓存。BOS 同时持久化 **user 与 assistant** 轮;`/resume` 从本地 JSONL 恢复;`/new` 与 `/fork` 均分配独立持久化 ID。
 
 ## agent 内置 BOS 记忆工具 (P1)
 

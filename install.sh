@@ -62,6 +62,15 @@ else
   }
   chmod +x "${CELAGENT_ROOT}/bin/celagent"
   echo "  ✓ celagent 已安装 (${CELAGENT_ROOT}/bin/celagent, $(du -h "${CELAGENT_ROOT}/bin/celagent" | cut -f1))"
+  if curl -fsSL "${RELEASE_URL}/SHA256SUMS" -o "${CELAGENT_ROOT}/bin/.SHA256SUMS" 2>/dev/null \
+    && [ -s "${CELAGENT_ROOT}/bin/.SHA256SUMS" ] && command -v sha256sum >/dev/null 2>&1; then
+    if (cd "${CELAGENT_ROOT}/bin" && sha256sum --ignore-missing -c .SHA256SUMS); then
+      echo "  ✓ 校验和通过"
+    else
+      echo "  ✗ 校验和失败"
+      exit 1
+    fi
+  fi
 fi
 
 # 3. 安装 celld 运行时 (Release 随包优先, 回退 celld.dev 官方)
@@ -150,9 +159,13 @@ mkdir -p "$STATE_DIR"
 pkill -f 'celld.*1809' 2>/dev/null || true
 sleep 2
 
+EXISTING_TOKEN=$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
+WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-${EXISTING_TOKEN:-$(_rand)$(_rand)}}"
+
 for port in 18090 18091; do
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
+    CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
     --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" \
     > "$STATE_DIR/node$port.log" 2>&1 &
@@ -179,9 +192,13 @@ cat > "$CONFIG_DIR/settings.json" <<EOF
     "bucket": "$BUCKET",
     "endpoint": "https://s3.bj.bcebos.com",
     "region": "bj"
+  },
+  "worker": {
+    "token": "$WORKER_TOKEN"
   }
 }
 EOF
+chmod 600 "$CONFIG_DIR/settings.json"
 echo "  ✓ 配置已写入"
 
 echo ""

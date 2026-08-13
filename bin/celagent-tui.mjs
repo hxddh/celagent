@@ -25,6 +25,46 @@ function warnOnce(ch, msg) {
   console.warn(msg);
 }
 
+function loadWorkerToken() {
+  if (process.env.CELAGENT_WORKER_TOKEN) return process.env.CELAGENT_WORKER_TOKEN;
+  const t = loadConfig().worker?.token;
+  return (typeof t === "string" && t.length >= 8) ? t : "";
+}
+function ensureWorkerToken() {
+  let t = loadWorkerToken();
+  if (t) return t;
+  try {
+    const { randomBytes } = require("node:crypto");
+    t = randomBytes(24).toString("base64url");
+    const cfg = loadConfig();
+    cfg.worker = { ...(cfg.worker && typeof cfg.worker === "object" ? cfg.worker : {}), token: t };
+    saveConfig(cfg);
+    return t;
+  } catch (e) {
+    return "";
+  }
+}
+function workerHeaders(extra = {}) {
+  const headers = { ...extra };
+  const t = loadWorkerToken();
+  if (t) headers["X-Celagent-Token"] = t;
+  return headers;
+}
+async function celldFetch(base, action, { search = {}, json, timeout = 2000 } = {}) {
+  const u = new URL(`${base}/agent/celagent`);
+  u.searchParams.set("action", action);
+  for (const [k, v] of Object.entries(search)) {
+    if (v !== undefined && v !== null && v !== "") u.searchParams.set(k, String(v));
+  }
+  const init = { signal: AbortSignal.timeout(timeout), headers: workerHeaders() };
+  if (json !== undefined) {
+    init.method = "POST";
+    init.headers = workerHeaders({ "Content-Type": "application/json" });
+    init.body = JSON.stringify(json);
+  }
+  return fetch(u, init);
+}
+
 // ---- Celld 自动启动 (检测无节点 → 从配置拉起 BOS 节点) ----
 let ensureRan = false;
 let ensureTime = 0;
@@ -115,7 +155,7 @@ async function ensureCelld() {
               "--listen", `127.0.0.1:${port}`,
               "--advertise", `127.0.0.1:${port}`,
             ], {
-              env: { ...bosChildEnv(), CELLD_WATCH: join(stateDir, `node${port}`) },
+              env: { ...bosChildEnv(), CELLD_WATCH: join(stateDir, `node${port}`), CELAGENT_WORKER_TOKEN: ensureWorkerToken() },
               stdio: "ignore",
               detached: true,
             });
@@ -263,20 +303,19 @@ function queueBosWrite(sessionId, seq, role, msg, opts = {}) {
 // ---- Celld 镜像 (worker 同步 + BOS 异步, 不阻塞对话) ----
 async function celldCheckpoint(sessionId, seq, role, content, opts = {}) {
   const msg = typeof content === "string" ? content : JSON.stringify(content ?? "");
-  // 完整记忆 (方案 A): fullContent/fullToolResults 全量存 BOS (权威源),
-  // worker 缓存只存摘要 msg (URL 截断 200 字符)
+  // 完整记忆: fullContent/fullToolResults 全量存 BOS; worker 缓存走 POST body (不再把 msg 放进 URL)
   const { fullContent = null, fullToolResults = null } = opts;
 
-  // 1. worker SQLite (即时缓存 — Bug 52: 异步 fire-and-forget, 不阻塞对话;
-  //    超时 2s (worker 只是缓存, BOS 是权威源, 丢了可重建))
   ensureCelld();
   void (async () => {
     let workerOk = false;
     for (const base of CELD_NODES) {
       try {
-        // Bug D: sessionId 和 msg 都编码
-        const url = `${base}/agent/celagent?action=checkpoint&session=${encodeURIComponent(sessionId)}&turn=${seq}&role=${encodeURIComponent(role)}&msg=${encodeURIComponent(msg.slice(0, 200))}`;
-        const resp = await fetch(url, { signal: AbortSignal.timeout(2000) });
+        const resp = await celldFetch(base, "checkpoint", {
+          search: { session: sessionId },
+          json: { turn: seq, role, msg: msg.slice(0, 8000) },
+          timeout: 2000,
+        });
         const data = await resp.json();
         if (data.ok) { workerOk = true; break; }
       } catch (e) { /* try next */ }
@@ -328,7 +367,7 @@ async function loadHistoryFromBos(sessionId) {
     for (const base of CELD_NODES) {
       try {
         const url = `${base}/agent/celagent?action=resume&session=${encodeURIComponent(sessionId)}`;
-        const resp = await fetch(url, { signal: AbortSignal.timeout(1500) });
+        const resp = await fetch(url, { headers: workerHeaders(), signal: AbortSignal.timeout(1500) });
         const data = await resp.json();
         if (data.ok && data.session && data.session.turns && data.session.turns.length > 0) {
           return data.session.turns;
@@ -421,7 +460,7 @@ function printHelp() {
   celagent <id>                续写指定会话 (从 BOS 恢复历史)
   celagent list [--bucket B]   列出 BOS 里所有可恢复会话 (settings 丢失时自动扫描 bucket)
   celagent export <id> [--bucket B]  导出会话到 JSON (stdout)
-  celagent rm <id> [--bucket B]      删除 BOS 里的会话 (需确认)
+  celagent rm <id> [--bucket B] [--yes]  删除 BOS 里的会话 (非 TTY 必须 --yes)
   celagent config get <key>   读取配置 (如 persistence.bucket)
   celagent config set <key> <value>  写入配置 (如 model deepseek-v4-flash)
   celagent doctor             自检: 配置/凭证/节点/BOS 连通性
@@ -531,7 +570,7 @@ async function doctorCommand() {
     execFile("aws", ["configure", "get", "aws_access_key_id", "--profile", "bos"], { timeout: 10000, encoding: "utf8" }, (err, stdout) => resolve(err ? null : (stdout || "").trim()));
   });
   const hasEnv = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
-  console.log(`[2/5] 凭证: ${(cred || hasEnv) ? "✓ [bos] profile" + (hasEnv ? " (env)" : "") : "✗ 无凭证 (需 ~/.aws/credentials [bos] 或环境变量)"}`);
+  console.log(`[2/5] 凭证: ${hasEnv ? "✓ 环境变量" : cred ? "✓ [bos] profile" : "✗ 无凭证 (需 ~/.aws/credentials [bos] 或环境变量)"}`);
   if (!cred && !hasEnv) ok = false;
   // 3. Celld 节点
   const nodes = [];
@@ -576,7 +615,7 @@ async function taskCommand(args) {
     let lastErr = null;
     for (const base of CELD_NODES) {
       try {
-        const r = await fetch(`${base}/agent/celagent?action=submit&type=${type}&steps=${steps}`, { signal: AbortSignal.timeout(3000) });
+        const r = await celldFetch(base, "submit", { search: { type, steps }, timeout: 3000 });
         const j = await r.json();
         if (j.taskId) {
           console.log(`✓ 任务已提交: ${j.taskId} (type=${j.type || type}, steps=${j.steps})`);
@@ -591,11 +630,10 @@ async function taskCommand(args) {
   }
   if (op === "status") {
     const taskId = rest[0] || "";
-    const q = taskId ? `&task=${encodeURIComponent(taskId)}` : "";
     let lastErr = null;
     for (const base of CELD_NODES) {
       try {
-        const r = await fetch(`${base}/agent/celagent?action=status${q}`, { signal: AbortSignal.timeout(3000) });
+        const r = await celldFetch(base, "status", { search: taskId ? { task: taskId } : {}, timeout: 3000 });
         const j = await r.json();
         if (Array.isArray(j)) {
           console.log(`任务列表 (${j.length}):`);
@@ -614,7 +652,7 @@ async function taskCommand(args) {
     let lastErr = null;
     for (const base of CELD_NODES) {
       try {
-        const r = await fetch(`${base}/agent/celagent?action=ledger`, { signal: AbortSignal.timeout(3000) });
+        const r = await celldFetch(base, "ledger", { timeout: 3000 });
         const j = await r.json();
         if (Array.isArray(j)) {
           console.log(`execution ledger (${j.length} 条):`);
@@ -654,15 +692,23 @@ async function exportCommand(id) {
   console.log(JSON.stringify({ id, exportedAt: new Date().toISOString(), turns: session.turns || [] }, null, 2));
 }
 async function rmCommand(id) {
-  if (!id || id.startsWith("-")) { console.error("用法: celagent rm <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
+  if (!id || id.startsWith("-")) { console.error("用法: celagent rm <会话ID> [--bucket B] [--yes] (ID 可用 celagent list 查看)"); process.exit(1); }
   assertSafeSessionId(id);
   const { bucket, endpoint } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { execFile } = await import("node:child_process");
-  const confirm = await new Promise((resolve) => {
-    const readline = require("node:readline").createInterface({ input: process.stdin, output: process.stdout });
-    readline.question(`确定删除会话 "${id}" (BOS 永久删除, 不可恢复)? [y/N] `, (a) => { readline.close(); resolve(/^y/i.test(a.trim())); });
-  });
+  const force = process.argv.includes("--yes") || process.argv.includes("-y");
+  let confirm = force;
+  if (!confirm) {
+    if (!process.stdin.isTTY) {
+      console.error("✗ 非交互删除需要 --yes");
+      process.exit(1);
+    }
+    confirm = await new Promise((resolve) => {
+      const readline = require("node:readline").createInterface({ input: process.stdin, output: process.stdout });
+      readline.question(`确定删除会话 "${id}" (BOS 永久删除, 不可恢复)? [y/N] `, (a) => { readline.close(); resolve(/^y/i.test(a.trim())); });
+    });
+  }
   if (!confirm) { console.log("已取消"); return; }
   await new Promise((resolve) => {
     execFile("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", `sessions/${id}.json`, "--endpoint-url", endpoint], { env: awsEnv(), timeout: 15000 }, (err) => resolve());
@@ -713,6 +759,7 @@ async function main() {
   } catch (e) { /* 同步失败不阻塞 */ }
 
   // 0. 确保 Celld 节点在跑 (自动启动)
+  ensureWorkerToken();
   await ensureCelld();
 
   // 0.5 从 BOS 恢复历史 (权威源, 重启不丢) — 只读一次, 传给会话注入用
@@ -727,11 +774,10 @@ async function main() {
     void (async () => {
       for (const base of CELD_NODES) {
         try {
-          await fetch(`${base}/agent/celagent?action=sync&session=${encodeURIComponent(sessionId)}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ turns: savedHistory }),
-            signal: AbortSignal.timeout(2000),
+          await celldFetch(base, "sync", {
+            search: { session: sessionId },
+            json: { turns: savedHistory },
+            timeout: 2000,
           });
           break;
         } catch (e) { /* try next */ }
@@ -831,8 +877,16 @@ async function main() {
       let seq = maxTurn(persistHistory);
       // P1: 维护当前会话 turns 快照缓存 (供 session_snapshot 工具保存用)
       let snapshotTurns = (persistHistory || []).map(t => ({ turn: t.turn, role: t.role || "assistant", msg: t.msg, ts: t.ts }));
-      globalThis.__celagentSnapshotTurns = () => snapshotTurns;
+      globalThis.__celagentSnapshotTurns = () => snapshotTurns.slice();
       result.session.subscribe(async (event) => {
+        if (event?.type === "message_end" && event.message?.role === "user") {
+          seq++;
+          const text = extractText(event.message?.content);
+          const fullContent = Array.isArray(event.message?.content) ? event.message.content : [];
+          void celldCheckpoint(persistId, seq, "user", text || "(无文本)", { fullContent });
+          snapshotTurns.push({ turn: seq, role: "user", msg: text || "(无文本)", ts: Date.now() });
+          return;
+        }
         if (event?.type === "turn_end") {
           seq++;
           const text = extractText(event.message?.content);

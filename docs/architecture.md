@@ -61,6 +61,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
    → 取最近 50 轮 (MAX_INJECT_TURNS, Bug 78: 防超长会话撑爆模型上下文)
    → result.session.steer(...) 注入 content 文本块 (缺省回退 t.msg) + 真实 t.role
    → seq 续写起点 = max(turn) (非 turns.length, 防 gap 覆盖)
+   → 运行中 message_end(user) + turn_end(assistant) 双角色落盘
 优先级: BOS 权威源 > worker 缓存 (恢复先读 BOS, 不依赖节点)
 ```
 

@@ -128,3 +128,81 @@ test("源码锚定: 会话 ID 白名单", () => {
   assert.match(tui, /function assertSafeSessionId/);
   assert.match(tui, /A-Za-z0-9\._-\]\{1,128\}/);
 });
+
+test("sync 按 turn 合并: 不覆盖更新/更完整的 worker 轮", () => {
+  function mergeTurns(existingTurns, incomingTurns) {
+    const byTurn = new Map();
+    for (const t of existingTurns || []) {
+      const n = Number(t?.turn);
+      if (Number.isFinite(n)) byTurn.set(n, t);
+    }
+    for (const t of incomingTurns || []) {
+      const n = Number(t?.turn);
+      if (!Number.isFinite(n)) continue;
+      const prev = byTurn.get(n);
+      if (!prev) { byTurn.set(n, t); continue; }
+      const merged = { ...prev, ...t, turn: n };
+      if (prev.content && !t.content) merged.content = prev.content;
+      if (prev.toolResults && !t.toolResults) merged.toolResults = prev.toolResults;
+      if ((t.msg || "").length < (prev.msg || "").length) merged.msg = prev.msg;
+      byTurn.set(n, merged);
+    }
+    return [...byTurn.values()].sort((a, b) => Number(a.turn) - Number(b.turn));
+  }
+  const existing = [
+    { turn: 1, msg: "old-short" },
+    { turn: 2, msg: "worker-newer-and-long", content: [{ type: "text", text: "full" }] },
+  ];
+  const incoming = [
+    { turn: 1, msg: "bos-longer-message" },
+    { turn: 2, msg: "trunc" },
+    { turn: 3, msg: "new" },
+  ];
+  const out = mergeTurns(existing, incoming);
+  assert.equal(out.length, 3);
+  assert.equal(out[0].msg, "bos-longer-message");
+  assert.equal(out[1].msg, "worker-newer-and-long");
+  assert.ok(Array.isArray(out[1].content));
+  assert.equal(out[2].msg, "new");
+});
+
+const worker = readFileSync(join(root, "worker/src/index.js"), "utf8");
+
+test("源码锚定: worker sync 调用 mergeTurns", () => {
+  assert.match(worker, /function mergeTurns\(/);
+  assert.match(worker, /const turns = mergeTurns\(existing\.turns, body\.turns\)/);
+});
+
+test("源码锚定: 持久化 user 轮 (message_end)", () => {
+  assert.match(tui, /event\?\.type === "message_end" && event\.message\?\.role === "user"/);
+  assert.match(tui, /celldCheckpoint\(persistId, seq, "user"/);
+});
+
+test("源码锚定: checkpoint 走 POST JSON 而非 URL msg", () => {
+  assert.match(tui, /celldFetch\(base, "checkpoint"/);
+  assert.doesNotMatch(tui, /action=checkpoint&session=.*&msg=/);
+});
+
+test("源码锚定: worker 先写 ledger pending 再 webhook", () => {
+  const fn = worker.slice(worker.indexOf("async recordToolCall"), worker.indexOf("return entry;"));
+  const pendingIdx = fn.indexOf("status: 'pending'");
+  const webhookIdx = fn.indexOf("webhookCall");
+  assert.ok(pendingIdx >= 0 && webhookIdx > pendingIdx, "pending 写入在 webhookCall 之前");
+});
+
+test("源码锚定: worker token 鉴权 + webhook 默认 loopback", () => {
+  assert.match(worker, /function checkToken/);
+  assert.match(worker, /CELAGENT_WORKER_TOKEN/);
+  assert.match(worker, /function webhookBase/);
+  assert.match(tui, /X-Celagent-Token/);
+  assert.match(tui, /function ensureWorkerToken/);
+});
+
+test("源码锚定: rm 非 TTY 需要 --yes", () => {
+  assert.match(tui, /非交互删除需要 --yes/);
+  assert.match(tui, /process\.argv\.includes\("--yes"\)/);
+});
+
+test("源码锚定: snapshot 返回 slice 拷贝", () => {
+  assert.match(tui, /__celagentSnapshotTurns = \(\) => snapshotTurns\.slice\(\)/);
+});

@@ -118,12 +118,54 @@ async function bosGet(env, key) {
 // ===== v2: 对象存储交互(经 webhook 代理, worker 零凭证) =====
 // 源码确认 v0.1.0 的 worker vars 注入不可用(manifest vars=null),
 // 凭证由 webhook 端点持有(boto3 签名), worker 只发内容 — 安全且真实
-const WEBHOOK_BASE = 'http://127.0.0.1:19090';
-const WEBHOOK_URL = `${WEBHOOK_BASE}/webhook`;
+function isLoopbackHost(hostname) {
+  return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
+}
 
-async function bosPutProxy(key, content) {
+function webhookBase(env) {
+  const raw = (env && env.CELAGENT_WEBHOOK_BASE) || 'http://127.0.0.1:19090';
   try {
-    const resp = await fetch(`${WEBHOOK_BASE}/obj-put`, {
+    const u = new URL(raw);
+    const allowRemote = env && (env.CELAGENT_WEBHOOK_ALLOW_REMOTE === '1' || env.CELAGENT_WEBHOOK_ALLOW_REMOTE === 'true');
+    if (!isLoopbackHost(u.hostname) && !allowRemote) return 'http://127.0.0.1:19090';
+    return String(raw).replace(/\/$/, '');
+  } catch (e) {
+    return 'http://127.0.0.1:19090';
+  }
+}
+
+function mergeTurns(existingTurns, incomingTurns) {
+  const byTurn = new Map();
+  for (const t of existingTurns || []) {
+    const n = Number(t?.turn);
+    if (Number.isFinite(n)) byTurn.set(n, t);
+  }
+  for (const t of incomingTurns || []) {
+    const n = Number(t?.turn);
+    if (!Number.isFinite(n)) continue;
+    const prev = byTurn.get(n);
+    if (!prev) { byTurn.set(n, t); continue; }
+    const merged = { ...prev, ...t, turn: n };
+    if (prev.content && !t.content) merged.content = prev.content;
+    if (prev.toolResults && !t.toolResults) merged.toolResults = prev.toolResults;
+    if ((t.msg || '').length < (prev.msg || '').length) merged.msg = prev.msg;
+    byTurn.set(n, merged);
+  }
+  return [...byTurn.values()].sort((a, b) => Number(a.turn) - Number(b.turn));
+}
+
+function checkToken(req, env) {
+  const expected = env && env.CELAGENT_WORKER_TOKEN;
+  if (!expected) return true;
+  const header = req.headers.get('X-Celagent-Token') || '';
+  const auth = req.headers.get('Authorization') || '';
+  const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
+  return header === expected || bearer === expected;
+}
+
+async function bosPutProxy(env, key, content) {
+  try {
+    const resp = await fetch(`${webhookBase(env)}/obj-put`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key, content }),
@@ -134,10 +176,10 @@ async function bosPutProxy(key, content) {
     return { ok: false, status: 0, error: String(e) };
   }
 }
-async function webhookCall(tool, payload) {
+async function webhookCall(env, tool, payload) {
   const opId = payload.opId;
   try {
-    const resp = await fetch(WEBHOOK_URL, {
+    const resp = await fetch(`${webhookBase(env)}/webhook`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -172,6 +214,9 @@ export class AgentRuntime {
     const url = new URL(req.url);
     const action = url.searchParams.get('action') || 'status';
     const agent = url.searchParams.get('agent') || 'default';
+    if (!checkToken(req, this.env)) {
+      return new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), { status: 401 });
+    }
 
     switch (action) {
       case 'submit': {
@@ -242,17 +287,20 @@ export class AgentRuntime {
 
       // ===== checkpoint 桥: Pi 风格会话持久化 =====
       case 'checkpoint': {
-        // 每轮对话后, 客户端把完整会话状态写到这里 (RPO=0)
+        // 每轮对话后, 客户端把会话状态写到这里 (RPO=0)
+        // 优先 POST JSON body (避免 msg 进 URL/日志); query 仅兼容旧客户端
         const sessionId = url.searchParams.get('session') || 'default';
-        // Bug 91: turn 必须校验 — 非数字/负数/NaN 会写入脏数据,
-        // 导致恢复时 Math.max(...turns) = NaN 序号链断裂
-        const rawTurn = url.searchParams.get('turn') || '0';
-        const turn = Number.parseInt(rawTurn, 10);
+        let body = {};
+        if (req.method === 'POST') {
+          body = await req.json().catch(() => ({})) || {};
+        }
+        const rawTurn = body.turn ?? url.searchParams.get('turn') ?? '0';
+        const turn = Number.parseInt(String(rawTurn), 10);
         if (!Number.isFinite(turn) || turn < 0) {
           return new Response(JSON.stringify({ ok: false, error: 'invalid-turn', turn: rawTurn }), { status: 400 });
         }
-        const msg = url.searchParams.get('msg') || '';
-        const role = url.searchParams.get('role') || 'assistant';
+        const msg = String(typeof body.msg === 'string' ? body.msg : (url.searchParams.get('msg') || '')).slice(0, 8000);
+        const role = body.role || url.searchParams.get('role') || 'assistant';
         const key = `session:${sessionId}`;
         const existing = await this.state.storage.get(key) || { id: sessionId, turns: [] };
         // 按 turn 去重: 同 turn 替换; 不同 turn 追加到末尾(续写, 不覆盖旧数据)
@@ -270,16 +318,17 @@ export class AgentRuntime {
       }
 
       case 'sync': {
-        // P0: 会话全量同步 — 客户端把权威会话状态(BOS 读回)推给 cell,
-        // 使 worker 缓存与 BOS 一致 (迁移/冷启动后对齐用)
+        // 冷启动对齐: 按 turn 合并, 禁止盲写覆盖 worker 上更新的轮次
         const sessionId = url.searchParams.get('session') || 'default';
         const body = await req.json().catch(() => null);
         if (!body || !Array.isArray(body.turns)) {
           return new Response(JSON.stringify({ ok: false, error: 'invalid-body' }), { status: 400 });
         }
         const key = `session:${sessionId}`;
-        await this.state.storage.put(key, { id: sessionId, turns: body.turns, updatedAt: Date.now() });
-        return new Response(JSON.stringify({ ok: true, sessionId, turns: body.turns.length }));
+        const existing = await this.state.storage.get(key) || { id: sessionId, turns: [] };
+        const turns = mergeTurns(existing.turns, body.turns);
+        await this.state.storage.put(key, { id: sessionId, turns, updatedAt: Date.now() });
+        return new Response(JSON.stringify({ ok: true, sessionId, turns: turns.length }));
       }
 
       case 'resume': {
@@ -366,7 +415,7 @@ export class AgentRuntime {
       case 'obj-put': {
         const key = url.searchParams.get('key') || `workspace/${agent}/file-${Date.now()}.txt`;
         const content = url.searchParams.get('content') || 'agent-file-content';
-        const result = await bosPutProxy(key, content);
+        const result = await bosPutProxy(this.env, key, content);
         // 记录到 storage(可查询)
         await this.state.storage.put(`obj:${key}`, { key, content, ts: Date.now(), ok: result.ok });
         return new Response(JSON.stringify({ action, key, result }));
@@ -383,7 +432,7 @@ export class AgentRuntime {
       case 'webhook-test': {
         const tool = url.searchParams.get('tool') || 'payment';
         const opId = url.searchParams.get('opId') || `test-${Date.now()}`;
-        const result = await webhookCall(tool, { opId, ts: Date.now() });
+        const result = await webhookCall(this.env, tool, { opId, ts: Date.now() });
         return new Response(JSON.stringify({ action, opId, result }));
       }
 
@@ -489,7 +538,7 @@ export class AgentRuntime {
       const active = await this.state.storage.get(`agent:${agent}:active_tasks`) || 0;
       await this.state.storage.put(`agent:${agent}:active_tasks`, Math.max(0, active - 1));
       // v3: 任务完成时把产物经 webhook 代理写到 BOS workspace(尽力而为, 失败记入任务)
-      const putResult = await bosPutProxy(`workspace/${agent}/task-${task.id}.json`, JSON.stringify(task));
+      const putResult = await bosPutProxy(this.env, `workspace/${agent}/task-${task.id}.json`, JSON.stringify(task));
       task.bosResult = putResult;
     } else {
       task.status = 'pending';
@@ -498,21 +547,23 @@ export class AgentRuntime {
     return result;
   }
 
-  // 幂等工具调用记录(execution ledger) — v2: 首次调用触发真实 webhook
+  // 幂等工具调用记录(execution ledger) — 先写 pending 再副作用, 崩溃重放靠 X-Idempotency-Key
   async recordToolCall(tool, payload) {
     const ledger = await this.state.storage.get(LEDGER_KEY) || [];
     const opId = payload.opId || `${Date.now()}:${tool}:${Math.random().toString(36).slice(2, 8)}`;
-    // 幂等: 相同 opId 不重复执行
     const existing = ledger.find(e => e.opId === opId);
-    if (existing) {
+    if (existing && existing.status !== 'pending') {
       return { ...existing, deduped: true };
     }
-    // v2: 首次执行 → 真实 webhook 副作用(服务端幂等去重)
-    const webhookResult = await webhookCall(tool, { opId, ...payload });
-    const entry = {
-      opId, tool, ts: Date.now(), ...payload, deduped: false, webhookResult
-    };
-    ledger.push(entry);
+    let entry = existing;
+    if (!entry) {
+      entry = { opId, tool, ts: Date.now(), ...payload, status: 'pending', deduped: false };
+      ledger.push(entry);
+      await this.state.storage.put(LEDGER_KEY, ledger);
+    }
+    const webhookResult = await webhookCall(this.env, tool, { opId, ...payload });
+    entry.status = 'done';
+    entry.webhookResult = webhookResult;
     await this.state.storage.put(LEDGER_KEY, ledger);
     return entry;
   }

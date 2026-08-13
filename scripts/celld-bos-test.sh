@@ -11,6 +11,9 @@ export AWS_PROFILE=bos
 echo "test-body" > /tmp/celld-body.txt
 NODE1="http://127.0.0.1:18090"
 NODE2="http://127.0.0.1:18091"
+TOKEN=$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
+AUTH=()
+[ -n "$TOKEN" ] && AUTH=(-H "X-Celagent-Token: $TOKEN")
 PASS=0; FAIL=0
 
 check() {
@@ -73,7 +76,7 @@ aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --endpoint-url "$EP" >/d
 echo ""
 echo "[2/6] RPO=0 写路径 (SQLite → LTX → BOS)..."
 SID="bos-test-$(date +%s)"
-RES=$(curl -s -m 8 "$NODE1/agent/celagent?action=checkpoint&session=$SID&turn=1&msg=test" | jq -r '.ok' 2>/dev/null)
+RES=$(curl -s -m 8 "${AUTH[@]}" "$NODE1/agent/celagent?action=checkpoint&session=$SID&turn=1&msg=test" | jq -r '.ok' 2>/dev/null)
 check "checkpoint 写成功 (ok=$RES)" "$([ "$RES" = "true" ] && echo ok || echo fail)"
 sleep 8  # 等待 LTX 复制到 BOS
 LTX_CNT=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "cells/" --endpoint-url "$EP" --query 'length(Contents)' --output text --no-paginate 2>/dev/null | head -1 || echo 0)
@@ -120,7 +123,7 @@ if [ -n "$NODE1_PID" ]; then
   RES=""
   for i in $(seq 1 10); do
     # 节点2 接管后应能写新会话 (接管成功 = 恢复成功)
-    RES=$(curl -s -m 15 "$NODE2/agent/celagent?action=checkpoint&session=failover-check-$i&turn=1&msg=takeover" 2>/dev/null | jq -r '.ok' 2>/dev/null)
+    RES=$(curl -s -m 15 "${AUTH[@]}" "$NODE2/agent/celagent?action=checkpoint&session=failover-check-$i&turn=1&msg=takeover" 2>/dev/null | jq -r '.ok' 2>/dev/null)
     [ "$RES" = "true" ] && break
     sleep 3
   done

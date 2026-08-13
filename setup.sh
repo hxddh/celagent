@@ -86,10 +86,14 @@ done
 # deploy/current.json 加载 worker (上面 celld deploy 已部署), 本地 worker.js
 # 从未被引用; 原逻辑 esbuild 失败还会错误地 exit 1 中止已成功的部署。
 
+EXISTING_TOKEN=$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
+WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-${EXISTING_TOKEN:-$(_rand)$(_rand)}}"
+
 for port in 18090 18091; do
   # 凭证卫生: celld 走 AWS_PROFILE=bos, 清除可能残留的显式密钥 env
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
+    CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
     --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" \
     > "$STATE_DIR/node$port.log" 2>&1 &
@@ -120,9 +124,13 @@ cat > "$CONFIG_DIR/settings.json" <<EOF
     "bucket": "$BUCKET",
     "endpoint": "https://s3.bj.bcebos.com",
     "region": "bj"
+  },
+  "worker": {
+    "token": "$WORKER_TOKEN"
   }
 }
 EOF
+chmod 600 "$CONFIG_DIR/settings.json"
 echo "  ✓ 配置已写入 $CONFIG_DIR/settings.json"
 
 echo ""
