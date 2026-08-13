@@ -36,7 +36,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `scripts/node_mgr.sh` | 本机双节点管理(start/stop/status/restart,18090/18091) |
 | `scripts/cluster_mgr.sh` | 多机集群管理(add-node/status 等) |
 | `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
-| `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估(P0 双监听已落地;P1 drain/diagnose 未做) |
+| `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估 + 新特性利用评审(P0 双监听已落地) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
