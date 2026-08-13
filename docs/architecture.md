@@ -13,7 +13,7 @@
 │ 交互层: celagent TUI (pi-coding-agent 引擎, 不 fork)          │
 │   - 对话/工具/多模型 (bash/read/write/grep/find/edit/ls 全量) │
 │   - turn_end 钩子 → 双写 (worker 缓存 + BOS 直写)             │
-│   - 会话恢复 (BOS 权威 → steer 注入上下文)                    │
+│   - 会话恢复 (目标: BOS 权威; 当前实现: worker 快路径优先)     │
 └──────────────┬──────────────────────────────┬────────────────┘
                │ HTTP checkpoint/resume       │ aws s3api 直连
 ┌──────────────▼──────────────┐  ┌────────────▼─────────────────┐
@@ -47,7 +47,8 @@
        ① worker 缓存: HTTP checkpoint 到任一 celld 节点
           (fire-and-forget, 2s 超时, 失败仅警告 — 缓存可重建)
        ② BOS 直写: 入异步队列 queueBosWrite (串行执行, 限长 50 —
-          BOS_QUEUE_MAX, Bug E 防内存泄漏, 超出丢最旧任务)
+          BOS_QUEUE_MAX, Bug E 防内存泄漏;
+          ⚠️ 当前实现超限时丢弃新入队任务, 与注释「丢最旧」不符 — 见评估 §12/§14)
           → bosGet 读当前对象 + ETag → 合并轮次 → If-Match CAS 写
           → 冲突(412)重读重试 ×3 → 失败警告但不阻塞对话
    → 退出前: await bosQueue (Bug 17: flush 队列, 不丢最后几轮)
@@ -56,11 +57,14 @@
 ### 1.4 恢复路径
 
 ```
-celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
-   → 取最近 50 轮 (MAX_INJECT_TURNS, Bug 78: 防超长会话撑爆模型上下文)
-   → result.session.steer("以下是本会话之前的对话历史...")  (Bug 24: 标注 assistant 轮)
-   → seq 续写起点 = BOS 历史长度 (防二次 resume 覆盖旧轮)
-优先级: BOS 权威源 > worker 缓存 (恢复读 BOS, 不依赖节点)
+目标语义:
+  celagent <id> → bosGet sessions/<id>.json → 注入完整 content
+当前实现 (loadHistoryFromBos):
+  ① 任一节点 resume, turns.length>0 即返回 (msg 仅 200 字, 无 content)
+  ② miss 才 bosGet
+  ③ steer 只用 t.msg, 不用 content/toolResults; 一律标成 assistant
+  ④ seq = persistHistory.length (非 max(turn))
+优先级(文档曾写 BOS-first): 与代码不一致, 见 docs/project-evaluation.md
 ```
 
 ## 2. 核心机制原理
@@ -84,8 +88,8 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 ### 2.3 双写一致性(worker 缓存 vs BOS)
 
 - **写**:两路并行,worker 失败不影响 BOS(缓存丢了可重建)。
-- **读**:恢复只读 BOS 权威;worker 缓存是快路径(148ms),截断 200 字符(URL 限制),
-  完整数据永远在 BOS。
+- **读(目标)**:恢复只读 BOS 权威。
+- **读(当前)**:`loadHistoryFromBos` 优先 worker(148ms, 截断 200 字符);完整 `content` 在 BOS 但 **steer 注入不用它**。
 - **一致性模型**:BOS 为准,缓存可过期/缺失,无强一致要求。
 
 ## 3. 组件职责边界(为什么这样划分)

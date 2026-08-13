@@ -67,7 +67,40 @@ test("R3-H1: 健康早退后 ensureLock 仍被持有", async () => {
 });
 
 // ---- /fork 未切换 persistId 的分支覆盖缺口 ----
-test("/fork: 仅 new/resume 改 persistId, fork 会沿用父会话", () => {
-  const handled = new Set(["new", "resume"]);
-  assert.equal(handled.has("fork"), false);
+// 源码锚定: 生产文件仍包含已知缺陷形态时这些断言成立;
+// 修复对应缺陷后应同步改/删本文件, 避免「模型测试」与实现脱节。
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const tui = readFileSync(join(root, "bin/celagent-tui.mjs"), "utf8");
+
+test("源码锚定: 队列超限是 return 而非丢最旧", () => {
+  assert.match(tui, /if \(bosQueueLen >= BOS_QUEUE_MAX\)/);
+  const block = tui.slice(tui.indexOf("if (bosQueueLen >= BOS_QUEUE_MAX)"), tui.indexOf("bosQueueLen++;"));
+  assert.match(block, /return;/);
+  assert.doesNotMatch(block, /shift\(|丢弃最旧任务[^]*bosQueue\s*=/);
+});
+
+test("源码锚定: persistId 只处理 new/resume, 无 fork 分支", () => {
+  assert.match(tui, /startReason === "new"/);
+  assert.match(tui, /startReason === "resume"/);
+  assert.doesNotMatch(tui, /startReason === "fork"/);
+});
+
+test("源码锚定: BOS JSON parse 失败走覆盖", () => {
+  assert.match(tui, /JSON\.parse\(existing\.body\).*catch[\s\S]{0,40}覆盖/);
+});
+
+test("源码锚定: steer 注入只用 t.msg", () => {
+  assert.match(tui, /\$\{t\.msg\}/);
+  assert.doesNotMatch(tui, /t\.content/);
+});
+
+test("源码锚定: loadHistoryFromBos 先 resume worker", () => {
+  const fn = tui.slice(tui.indexOf("async function loadHistoryFromBos"), tui.indexOf("async function listSessions"));
+  const workerIdx = fn.indexOf("action=resume");
+  const bosIdx = fn.indexOf("bosGet");
+  assert.ok(workerIdx >= 0 && bosIdx > workerIdx, "resume 出现在 bosGet 之前");
 });

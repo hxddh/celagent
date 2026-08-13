@@ -22,7 +22,7 @@
 | 文档质量与一致性 | 7.5 | 体系优秀; 本评估 PR 已修过时阻塞; 语义口径仍偏乐观 |
 | 发布与可安装性 | **5.5** | 缺 celld-linux/windows; Release install ≠ main |
 | 安全与卫生 | **7.0** | 红线好; 无校验下载、/tmp、无鉴权 worker、凭证读入堆 |
-| **综合** | **6.7** | 四轮排查后叙事收紧;先修正确性+合入安全 PR |
+| **综合** | **6.5** | 五轮复审收紧;完整记忆对 LLM 不可见 + 安装假成功 |
 
 ---
 
@@ -602,3 +602,87 @@ $ node --test tests/review-logic-proofs.test.mjs
 - pi 上游全版本兼容矩阵
 
 上述仍是「发布前人工验收」清单,不阻塞本评估文档结论。
+
+---
+
+## 14. 第五轮全量复审(2026-08-13)
+
+> 基线仍为 `origin/main` @ `31d12a4`(相对第四轮无新功能提交)。  
+> 方法:重读写/读/注入/安装主路径 + 对照 architecture 权威段是否仍在撒谎 + 加强 proof 测试锚定源码。
+
+### 14.1 本轮新发现(前四轮未钉死)
+
+| ID | 严重度 | 问题 | 证据 | 影响 |
+|----|--------|------|------|------|
+| R5-1 | **High** | **完整记忆只写不读**:BOS 存 `content`/`toolResults`,恢复 steer **只用 `t.msg`**,且硬编码 `(assistant)` | `queueBosWrite` 写 content;注入 `map(t => ... t.msg)` ~771–775 | 即使改成 BOS-first,模型仍看不到 thinking/工具原文;「完整记忆」对 LLM 不可见 |
+| R5-2 | **High** | BOS JSON **parse 失败当空会话继续 CAS 写** | `JSON.parse(existing.body) catch { /* 覆盖 */ }` 后仍用该 etag `If-Match` PUT | 半截下载/损坏对象 → **整份历史被一轮覆盖** |
+| R5-3 | **High** | `install.sh`/`setup` **失败当成功**:`create-bucket` 与 `celld deploy` 均 `>/dev/null 2>&1` 后无条件打印 ✓ | install.sh ~107–108, ~135–136 | 用户以为 bucket/worker 已就绪,实际后续全失败 |
+| R5-4 | Medium | `CELAGENT_MOCK=1` **从未被测试代码读取** | 仅 CI yaml 设置;tests/ 无引用 | 「mock 模式 6 pass」是文档/CI 幻觉 |
+| R5-5 | Medium | `npm test` **不跑** `review-logic-proofs.test.mjs` | package.json `"test": "node --test tests/core.test.mjs"` | proof 测试进不了默认 CI |
+| R5-6 | Medium | doctor `[3/5]` Celld 离线 **不拉低结论** | 仅打印 ✗,`ok` 不变 | 可出现「[3/5] ✗」同时「结论: ✓ 全部正常」 |
+| R5-7 | Medium | `celld-bos-test.sh` 故障恢复 **不读原会话** | kill 后对新 session 做 checkpoint;LTX 只断言 `≥1` | 测的是「节点2 还能写」,不是「原会话可恢复」 |
+| R5-8 | Low | `bos.js` 未使用 import:`homedir`/`readFileSync`/`existsSync` | 文件头 | 噪音;Bun 打包可能仍打进 |
+| R5-9 | Low | 评估 proof 测试 **不 import 生产函数**(第四轮形态) | 复制逻辑模型 | 修了生产代码测试仍绿 — 本轮改为源码锚定 |
+| R5-10 | 文档 | architecture §1.3/§1.4/§2.3 在第四轮后 **仍写丢最旧 + BOS-first** | 权威段与 §5 脚注矛盾 | **本轮已改为「目标 vs 当前」** |
+
+### 14.2 注入路径的精确数据流(补强 R5-1)
+
+```
+turn_end
+  → msg = extractText + 工具名摘要(call 100 字 / result 300 字)
+  → worker URL: msg.slice(0,200)
+  → BOS: { msg, content: fullContent, toolResults }
+恢复
+  → 若 worker 命中: 只有截断 msg
+  → 若 BOS: 有 content, 但 steer 仍拼 t.msg
+  → 模型上下文 = 摘要, 不是完整记忆
+history_search
+  → textOf() 会扫 content/thinking  ← 唯一用到完整字段的读路径
+```
+
+结论:P1「完整记忆」对 **检索** 成立,对 **续写注入** 不成立。
+
+### 14.3 安装脚本静默成功(R5-3)的连锁
+
+1. `create-bucket` 失败(权限/重名/网络)仍打印「✓ bucket 创建」
+2. 随后 `celld deploy` 再失败仍打印「✓ worker 已部署」
+3. `settings.json` 仍写入该 bucket 名
+4. TUI 启动后 BOS 写全部 skip/警告一次 — 用户以为 RPO=0 已生效
+
+这是「一键安装」可信度问题,与二进制缺失同级。
+
+### 14.4 文档权威段(本轮已改 architecture)
+
+| 位置 | 第四轮结束时 | 第五轮 |
+|------|-------------|--------|
+| architecture §1.1 恢复 | 「BOS 权威 → steer」 | 标明目标 vs 当前 worker-first |
+| architecture §1.3 队列 | 「超出丢最旧」 | 标明当前丢新入队 |
+| architecture §1.4 | 伪时序 bosGet-first | 拆成目标/当前四步 |
+| architecture §2.3 读 | 「恢复只读 BOS」 | 目标 vs 当前 + steer 不用 content |
+| README 恢复优先级 | 仍写 BOS 是权威源 | **未改**(用户向,建议随代码修复或单独改口径) |
+| demo HTML | worker-first +「截断安全」 | **未改** |
+
+### 14.5 评分(第五轮)
+
+| 维度 | R4 | R5 | 变化 |
+|------|----|----|------|
+| 核心持久化正确性 | 6.0 | **5.8** | 完整记忆对 LLM 不可见;损坏 JSON 可覆盖全历史 |
+| 发布与可安装性 | 5.5 | **5.2** | 安装脚本失败当成功 |
+| 文档一致性 | 7.0 | **7.3** | architecture 权威段改为目标/当前(本 PR) |
+| 测试与 CI | 4.5 | **4.7** | proof 锚定源码;仍未进 npm test |
+| **综合** | 6.7 | **6.5** | 复审收紧,无新功能债被粉饰 |
+
+### 14.6 复审后仍成立的结论
+
+四轮 Critical(C1–C3、ensureLock、/fork)全部仍在 `main` 代码中。  
+第五轮补上「存了不用」和「坏 JSON 当空写」两条,RPO 叙事需要再降一档:
+
+> 成功 CAS 的 assistant **摘要**(`msg`)可跨机找回;完整 `content` 主要供 `history_search`;热恢复可能是 200 字截断;损坏对象有被一轮覆盖的风险。
+
+### 14.7 建议的代码修复顺序(不变,插入 R5)
+
+1. 合入 PR#1 + CI 排除 node_modules + `npm test` 改为 `node --test tests/*.test.mjs`(或至少加上 proof)
+2. BOS-first + steer 使用 `content` 回退 `msg`;禁止 parse 失败后覆盖
+3. 队列/ensureLock/fork/doctor
+4. install 检查 create-bucket/deploy 退出码
+5. 再改 README/demo 口径
