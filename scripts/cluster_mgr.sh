@@ -22,6 +22,7 @@ start_node() {
   # 凭证卫生: AWS_PROFILE=bos, 不把 SK 读进变量/显式注入
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
+    CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)}" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
     --listen "127.0.0.1:${port}" --advertise "$advertise" \
     > "$STATE_DIR/node$port.log" 2>&1 &

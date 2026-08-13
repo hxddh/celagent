@@ -96,6 +96,7 @@ test("ensureLock: finally 在健康早退后释放", async () => {
 test("源码锚定: ensureCelld 外层 finally 清 ensureLock", () => {
   const fn = tui.slice(tui.indexOf("async function ensureCelld"), tui.indexOf("// ---- BOS 直写队列"));
   assert.match(fn, /} finally \{\s*ensureLock = null/);
+  assert.match(fn, /releaseEnsureFileLock/);
 });
 
 // ---- /fork 独立 persistId ----
@@ -248,4 +249,43 @@ test("源码锚定: worker cwrite 锁 TTL + scheduleNextAlarm", () => {
 
 test("源码锚定: projectTrusted 默认 false", () => {
   assert.match(tui, /projectTrusted: false/);
+});
+
+test("源码锚定: ensureCelld 跨进程 ensure.lock", () => {
+  assert.match(tui, /function tryEnsureFileLock/);
+  assert.match(tui, /ensure\.lock/);
+  assert.match(tui, /openSync\(lockPath, "wx"\)/);
+  assert.match(tui, /releaseEnsureFileLock/);
+  const fn = tui.slice(tui.indexOf("async function ensureCelld"), tui.indexOf("// ---- BOS 直写队列"));
+  assert.match(fn, /releaseEnsureFileLock\(fileLockDir\)/);
+});
+
+test("源码锚定: CI syntax check 失败即失败且覆盖 worker", () => {
+  const ci = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8");
+  assert.match(ci, /set -euo pipefail/);
+  assert.match(ci, /SYNTAX FAIL/);
+  assert.match(ci, /worker\/src\/\*\.js/);
+  assert.match(ci, /exit "\$fail"/);
+});
+
+test("源码锚定: failover 测试 resume 原会话且传 token", () => {
+  const sh = readFileSync(join(root, "scripts/celld-bos-test.sh"), "utf8");
+  assert.match(sh, /action=resume&session=\$SID/);
+  assert.doesNotMatch(sh, /failover-check-\$/);
+  assert.match(sh, /CELAGENT_WORKER_TOKEN=/);
+  assert.match(sh, /Content-Type: application\/json/);
+  assert.doesNotMatch(sh, /action=checkpoint&session=.*&msg=/);
+});
+
+test("源码锚定: cluster_mgr 传入 worker token", () => {
+  const sh = readFileSync(join(root, "scripts/cluster_mgr.sh"), "utf8");
+  assert.match(sh, /CELAGENT_WORKER_TOKEN=/);
+});
+
+test("源码锚定: HANDOFF 不再把认证当唯一阻塞", () => {
+  const handoff = readFileSync(join(root, "HANDOFF.md"), "utf8");
+  assert.doesNotMatch(handoff, /卡 GitHub 认证/);
+  assert.doesNotMatch(handoff, /阻塞\(唯一\)/);
+  assert.match(handoff, /SHA256SUMS/);
+  assert.match(handoff, /celld-linux-x64/);
 });

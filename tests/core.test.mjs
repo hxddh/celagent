@@ -27,13 +27,38 @@ before(async () => {
   if (!celldUp) console.log("(Celld 节点未运行, Celld 用例将 skip — node_mgr.sh start 可启动)");
 });
 
+function workerToken() {
+  if (process.env.CELAGENT_WORKER_TOKEN) return process.env.CELAGENT_WORKER_TOKEN;
+  try {
+    const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
+    const t = cfg.worker?.token;
+    return (typeof t === "string" && t.length >= 8) ? t : "";
+  } catch {
+    return "";
+  }
+}
+
 async function celld(action, params = {}) {
-  const q = new URLSearchParams(params).toString();
+  const tok = workerToken();
+  const headers = {};
+  if (tok) headers["X-Celagent-Token"] = tok;
+  const postBody = action === "checkpoint" || action === "sync";
   for (const base of NODES) {
     try {
-      const resp = await fetch(`${base}/agent/${AGENT}?action=${action}&${q}`, {
-        signal: AbortSignal.timeout(8000),
-      });
+      const u = new URL(`${base}/agent/${AGENT}`);
+      u.searchParams.set("action", action);
+      const init = { signal: AbortSignal.timeout(8000), headers: { ...headers } };
+      if (postBody) {
+        if (params.session) u.searchParams.set("session", String(params.session));
+        init.method = "POST";
+        init.headers["Content-Type"] = "application/json";
+        init.body = JSON.stringify(params);
+      } else {
+        for (const [k, v] of Object.entries(params)) {
+          if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
+        }
+      }
+      const resp = await fetch(u, init);
       return await resp.json();
     } catch (e) { /* try next */ }
   }

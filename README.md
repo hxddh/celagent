@@ -132,13 +132,13 @@ node --version                         # 需 >= 22 (pi 依赖链 undici 8.x 要�
 npm install                            # 依赖 (pi 引擎等)
 CELAGENT_SRC=<仓库路径> ./setup.sh     # 首次: 建 bucket + 部署 worker + 写配置 + 启动节点
 node bin/celagent-tui.mjs doctor       # 自检
-node tests/core.test.mjs               # 回归测试 (需节点在跑: scripts/node_mgr.sh start)
+npm test                               # 回归 (core + proof; Celld 用例需: scripts/node_mgr.sh start)
 ./scripts/node_mgr.sh start|stop|status|restart
 ```
 
 ## 测试记录
 
-- 回归: core.test.mjs 9 用例 (Celld API / checkpoint+resume / kv / Agent 构造 / 工具 / 持久化完整性;节点未启动时 mock 模式 6 pass)
+- 回归: `npm test` (core CLI + proof 源码锚定; Celld/BOS 用例无节点时 skip)
 - BOS 链路: 写→读→ETag→CAS 冲突→并发写 (无重复无丢失)
 - 20 次高频写压测: 序号连续 1-20 无重复
 - Bug 1-97 修复: 覆盖持久化完整性、并发安全、信号处理、安装部署、worker 部署、凭证混用、首轮丢失

@@ -7,8 +7,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 BUCKET="${1:-$(cat /tmp/celld_e2e_bucket 2>/dev/null || echo celld-bos-test-$(date +%s))}"
 EP="https://s3.bj.bcebos.com"
 export AWS_PROFILE=bos
-# CAS 测试用真实文件 (aws CLI 不接受 /dev/null)
-echo "test-body" > /tmp/celld-body.txt
+BODY=$(mktemp "${TMPDIR:-/tmp}/celagent-cas.XXXXXX")
+echo "test-body" > "$BODY"
+trap 'rm -f "$BODY"' EXIT
 NODE1="http://127.0.0.1:18090"
 NODE2="http://127.0.0.1:18091"
 TOKEN=$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)
@@ -50,22 +51,22 @@ fi
 
 # CAS: If-None-Match (创建)
 KEY="cas-test-$(date +%s)"
-aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body /tmp/celld-body.txt --endpoint-url "$EP" >/dev/null 2>&1
+aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" >/dev/null 2>&1
 # 已存在 → If-None-Match:* 应 412 (exit 非0)
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body /tmp/celld-body.txt --endpoint-url "$EP" --if-none-match '*' >/dev/null 2>&1; then
+if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-none-match '*' >/dev/null 2>&1; then
   check "If-None-Match 已存在 → 应拒绝" "fail"
 else
   check "If-None-Match 已存在 → 拒绝(412)" "ok"
 fi
 # If-Match: 正确 etag → 成功
 ETAG=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --endpoint-url "$EP" --query ETag --output text 2>/dev/null)
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body /tmp/celld-body.txt --endpoint-url "$EP" --if-match "$ETAG" >/dev/null 2>&1; then
+if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-match "$ETAG" >/dev/null 2>&1; then
   check "If-Match 正确 etag → 成功" "ok"
 else
   check "If-Match 正确 etag → 成功" "fail"
 fi
 # If-Match: 错误 etag → 应拒绝
-if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body /tmp/celld-body.txt --endpoint-url "$EP" --if-match '"bogus"' >/dev/null 2>&1; then
+if AWS_PROFILE=bos aws s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$BODY" --endpoint-url "$EP" --if-match '"bogus"' >/dev/null 2>&1; then
   check "If-Match 错误 etag → 应拒绝" "fail"
 else
   check "If-Match 错误 etag → 拒绝(412)" "ok"
@@ -76,7 +77,9 @@ aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --endpoint-url "$EP" >/d
 echo ""
 echo "[2/6] RPO=0 写路径 (SQLite → LTX → BOS)..."
 SID="bos-test-$(date +%s)"
-RES=$(curl -s -m 8 "${AUTH[@]}" "$NODE1/agent/celagent?action=checkpoint&session=$SID&turn=1&msg=test" | jq -r '.ok' 2>/dev/null)
+RES=$(curl -s -m 8 "${AUTH[@]}" -X POST -H "Content-Type: application/json" \
+  -d '{"turn":1,"msg":"test","role":"user"}' \
+  "$NODE1/agent/celagent?action=checkpoint&session=$SID" | jq -r '.ok' 2>/dev/null)
 check "checkpoint 写成功 (ok=$RES)" "$([ "$RES" = "true" ] && echo ok || echo fail)"
 sleep 8  # 等待 LTX 复制到 BOS
 LTX_CNT=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "cells/" --endpoint-url "$EP" --query 'length(Contents)' --output text --no-paginate 2>/dev/null | head -1 || echo 0)
@@ -121,20 +124,24 @@ if [ -n "$NODE1_PID" ]; then
   # 等待 lease 过期 + 接管 + 从 BOS 恢复 (最多 30s)
   echo "  等待接管恢复 (最多 30s)..."
   RES=""
+  MSG=""
   for i in $(seq 1 10); do
-    # 节点2 接管后应能写新会话 (接管成功 = 恢复成功)
-    RES=$(curl -s -m 15 "${AUTH[@]}" "$NODE2/agent/celagent?action=checkpoint&session=failover-check-$i&turn=1&msg=takeover" 2>/dev/null | jq -r '.ok' 2>/dev/null)
-    [ "$RES" = "true" ] && break
+    # 节点2 必须 resume 原会话 $SID (不是另写 failover-check-* 新会话)
+    GOT=$(curl -s -m 15 "${AUTH[@]}" "$NODE2/agent/celagent?action=resume&session=$SID" 2>/dev/null)
+    RES=$(echo "$GOT" | jq -r '.ok' 2>/dev/null)
+    MSG=$(echo "$GOT" | jq -r '.session.turns[0].msg // empty' 2>/dev/null)
+    [ "$RES" = "true" ] && [ -n "$MSG" ] && break
     sleep 3
   done
-  check "节点2 接管服务 (写成功, ok=$RES)" "$([ "$RES" = "true" ] && echo ok || echo fail)"
+  check "节点2 resume 原会话 $SID (ok=$RES)" "$([ "$RES" = "true" ] && [ -n "$MSG" ] && echo ok || echo fail)"
   # 验证数据在 BOS (RPO=0: 原会话的 LTX 应仍在)
   sleep 5
   LTX_AFTER=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "cells/" --endpoint-url "$EP" --query 'length(Contents)' --output text --no-paginate 2>/dev/null | head -1 || echo 0)
   check "原会话 LTX 保留在 BOS (≥1)" "$([ "$LTX_AFTER" -gt 0 ] 2>/dev/null && echo ok || echo fail)"
-  # 恢复节点1 (凭证卫生: AWS_PROFILE, 不物化 SK)
+  # 恢复节点1 (凭证卫生: AWS_PROFILE, 不物化 SK; 传入 worker token 与 node_mgr 一致)
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
+    CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$TOKEN}" \
     "${CELLD:-$HOME/.local/bin/celld}" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
     --listen 127.0.0.1:18090 --advertise 127.0.0.1:18090 > "${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log" 2>&1 &
   sleep 6

@@ -70,6 +70,32 @@ let ensureRan = false;
 let ensureTime = 0;
 const ENSURE_COOLDOWN_MS = 30000;  // 30s 冷却, 避免频繁尝试
 let ensureLock = null;  // Bug 53: 进程内互斥 — 并发调用 ensureCelld 只执行一次自动启动
+function tryEnsureFileLock(stateDir) {
+  const { openSync, closeSync, unlinkSync, statSync, writeSync } = require("node:fs");
+  const lockPath = join(stateDir, "ensure.lock");
+  const staleMs = 60000;
+  const acquire = () => {
+    try {
+      const fd = openSync(lockPath, "wx");
+      try { writeSync(fd, String(process.pid)); } finally { closeSync(fd); }
+      return true;
+    } catch (e) {
+      if (e.code !== "EEXIST") return true;
+      try {
+        const st = statSync(lockPath);
+        if (Date.now() - st.mtimeMs > staleMs) {
+          unlinkSync(lockPath);
+          return acquire();
+        }
+      } catch (e2) { /* ignore */ }
+      return false;
+    }
+  };
+  return acquire();
+}
+function releaseEnsureFileLock(stateDir) {
+  try { require("node:fs").unlinkSync(join(stateDir, "ensure.lock")); } catch (e) { /* ignore */ }
+}
 async function ensureCelld() {
   const now = Date.now();
   if (ensureRan && now - ensureTime < ENSURE_COOLDOWN_MS) return;
@@ -77,6 +103,7 @@ async function ensureCelld() {
   ensureRan = true;
   ensureTime = now;
   const run = async () => {
+    let fileLockDir = null;
     try {
     for (const base of CELD_NODES) {
       try {
@@ -112,6 +139,11 @@ async function ensureCelld() {
           if (existsSync(cand)) { celldBin = cand; break; }
         }
         if (celldBin) {
+          if (!tryEnsureFileLock(stateDir)) {
+            console.log("  (另一进程正在拉起 Celld, 跳过重复启动)");
+            return;
+          }
+          fileLockDir = stateDir;
           // Bug 50: 先清理残留 own.json (旧节点被强杀后, own.json 指向已死节点,
           // 会阻塞新节点接管导致 RestoreFailed) — 必须在启动节点之前清理
           // (之前顺序是"启动→等待→清理", 已失败的节点不会自动重试接管)
@@ -197,6 +229,7 @@ async function ensureCelld() {
     }
     } finally {
       ensureLock = null;  // 健康早退 / 无配置 / 拉起完成 都必须释放
+      if (fileLockDir) releaseEnsureFileLock(fileLockDir);
     }
   };
   ensureLock = run();
@@ -346,8 +379,8 @@ function extractText(content) {
 
 // ---- 从 BOS 读历史 (权威源, 重启后恢复) ----
 async function loadHistoryFromBos(sessionId) {
-  // BOS-first: worker 缓存会截断 msg 到 200 字符, 命中后覆盖完整 BOS 轮会丢记忆。
-  // 仅在 BOS miss / 无配置时才回退 worker。
+  // BOS-first: worker 缓存只存 msg 摘要(POST 上限 8000), 不含完整 content/toolResults。
+  // 仅在 BOS miss / 无配置时才回退 worker, 避免用缓存覆盖权威轮次。
   try {
     const { bosGet } = await import("../src/bos.js");
     const cfgFile = join(homedir(), ".config", "celagent", "settings.json");

@@ -23,9 +23,14 @@ jobs:
         run: npm ci
       - name: Syntax check all sources
         run: |
+          set -euo pipefail
           node --version
-          ls -la bin/ src/ tests/
-          for f in bin/*.mjs src/*.js tests/*.mjs; do node --check "$f" || echo "SYNTAX FAIL: $f"; done
+          fail=0
+          for f in bin/*.mjs src/*.js tests/*.mjs worker/src/*.js; do
+            [ -f "$f" ] || continue
+            node --check "$f" || { echo "SYNTAX FAIL: $f"; fail=1; }
+          done
+          exit "$fail"
       - name: CLI smoke test (help/version, no celld needed)
         run: |
           timeout 30 node bin/celagent-tui.mjs help >/dev/null || { echo "HELP FAILED exit=$?"; exit 1; }
