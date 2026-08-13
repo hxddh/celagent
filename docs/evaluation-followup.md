@@ -12,6 +12,6 @@ PR [#2](https://github.com/hxddh/celagent/pull/2) 的深度评估结论已在 **
 | HANDOFF 卡认证; install 失败当成功 | 已改; create-bucket/deploy 检查退出码 |
 | Release 缺 celld-linux / SHA256SUMS | v0.3.1 已含 linux/darwin-arm64 celld + SHA256SUMS |
 | worker 无鉴权; endpoint 任意; history 跨会话 | token fail-open; 白名单; 默认当前会话 |
-| tag 与资产不一致 | **v0.3.1** 对齐 main |
+| tag 与资产不一致 | **v0.3.1** tag 与 Release 资产对齐(`6790e99`);main 另含 #5 `GH_REPO` |
 
-评估原文仍在 PR #2 分支 `docs/project-evaluation.md`(不合并进 main,避免把已修复问题写成现状)。
+评估原文见已关闭的 [PR #2](https://github.com/hxddh/celagent/pull/2)(`docs/project-evaluation.md`),不合并进 main,避免把已修复问题写成现状。
