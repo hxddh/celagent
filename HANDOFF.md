@@ -3,7 +3,7 @@
 > 本文档是**唯一权威交接入口**。任何 agent 或开发者接手本项目,先从本文档开始。
 > 配套文档:`README.md`(用户视角)、**`docs/architecture.md`(架构权威: 数据流/机制/设计决策/扩展点)**、
 > `PACKAGING.md`(打包/发布)、`docs/distributed-deployment.md`(多机部署)、
-> `docs/s3-compat-evaluation.md`(多后端对象存储评估)。
+> `docs/s3-compat-evaluation.md`(多后端对象存储评估)、`docs/post-v032-evaluation.md`(v0.3.2 后排期)。
 
 ## 0. 项目定位
 
@@ -39,6 +39,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
 | `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估 + 新特性利用评审(P0 双监听已落地) |
 | `docs/s3-compat-evaluation.md` | 多后端对象存储评估:合格/不合格分界、耦合清单、分阶段计划(未改代码) |
+| `docs/post-v032-evaluation.md` | v0.3.2 之后排期:候选方向取舍、死代码/fail-open/CI 边界 |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
@@ -101,12 +102,12 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:不在仓库内;发布随包 **v0.2.0**(linux-x64/arm64、darwin-arm64)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。评估见 `docs/celld-v02-evaluation.md`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(v0.3.1 已发布)
+## 3. 发布状态(v0.3.2 已发布)
 
-仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.1](https://github.com/hxddh/celagent/releases/tag/v0.3.1)。
+仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.2](https://github.com/hxddh/celagent/releases/tag/v0.3.2)。
 
-- **tag `v0.3.1`** 指向 `6790e99`(PR #4 合并提交);Release 资产由此 SHA 构建
-- **`main`** 另含 PR #5:`.github/workflows/release.yml` 的 publish 设 `GH_REPO`(无 checkout 时 `gh` 才能上传)。不影响已发布二进制
+- **tag `v0.3.2`** 指向 `e5ae737`(PR #7 合并提交);Release 资产由此 SHA 构建
+- **v0.3.1**(`6790e99`)仍可用,但 spawn 参数按 celld v0.1,配随包 0.2.0 二进制会拒启
 - 旧 tag **`v0.3.0`** 仍指向 `31d12a4`;不要用 `git checkout v0.3.0` 当当前代码
 
 ### 已完成
@@ -115,7 +116,7 @@ node bin/celagent-tui.mjs task ledger
 - ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo`;CI 含 Secret/PII 门禁;零密钥硬编码
   - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容;彻底抹掉需向 GitHub Support 申请 purge
 - ✅ 构建:`.github/workflows/release.yml` 匿名路径 bun 交叉编译 + 拉取 `denoland/celld` + `SHA256SUMS`
-- ✅ **v0.3.1 资产清单**(Release workflow 上传):celagent 五平台(含 windows-x64.exe); celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS
+- ✅ **v0.3.2 资产清单**(形态同 v0.3.1):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是节点按 v0.2 双监听启动**
 - ✅ 安装校验:`scripts/release-smoke.sh` 下载 linux 包、核对 SHA256、跑 `version`/`help`(不需要 BOS/celld)
 
 ### 已知边界(不是本仓库能补的)
@@ -129,10 +130,10 @@ node bin/celagent-tui.mjs task ledger
 0. ✅ docs/archive 已删除
 1. ✅ 仓库已推送
 2. ✅ CI 绿 (node 22/24)
-3. ✅ tag `v0.3.1` 已推送,资产已上传;`main` 已设 `GH_REPO` 供后续 tag
+3. ✅ tag `v0.3.2` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
 4. ✅ 跨平台 celagent 由 Release workflow 在 `/tmp/anon-build` 编译
 5. ✅ install.sh 正式模式从 GitHub Release 下载,有 `SHA256SUMS` 则校验
-6. ✅ `./scripts/release-smoke.sh v0.3.1` 与 `latest` 通过(无 BOS,校验 SHA256 + version/help)
+6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.3.2` 或 `latest`(SHA256 + version/help)
 
 ## 4. 版本与里程碑
 
@@ -143,9 +144,10 @@ node bin/celagent-tui.mjs task ledger
 | P1 记忆增强 | history_search + session_snapshot + 完整记忆(不截断) | ✅ 已并入 |
 | v0.3.0 | 首次公开 Release(tag 钉在 `31d12a4`; 资产后来被刷新) | ✅ 历史 |
 | v0.3.1 | P0–P5 正确性/安全/发版闭环:BOS-first、user 轮、token、endpoint 白名单、Release 全平台 + SHA256SUMS | ✅ 历史 |
-| v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | 本版 |
+| v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | ✅ 已发布 |
 
-后续候选方向(未排期):**对象存储多后端 P0**(fail-closed + 配置单一来源,见 `docs/s3-compat-evaluation.md`)、多 provider 认证管理、快照浏览 UI、会话 diff/合并、Bucket 生命周期(降本)。
+下一刀实现:**对象存储多后端 P0**(fail-closed + 配置单一来源,见 `docs/s3-compat-evaluation.md`)。
+HANDOFF 旧候选(多 provider 认证、快照 UI、会话合并、Bucket 生命周期)的取舍见 `docs/post-v032-evaluation.md`——其中三项建议不做产品。
 
 ## 5. 工程约定(接手者必须遵守)
 
@@ -177,3 +179,4 @@ node bin/celagent-tui.mjs task ledger
 - CI 单元测试已去掉 `continue-on-error`; Secret/PII 扫描排除 `node_modules`
 - 发版由 `.github/workflows/release.yml` 在 tag `v*` 时构建并上传;本地可用 `./scripts/prepare-release-assets.sh` / `./scripts/release-smoke.sh`
 - **存储多后端**(评估未落地):脚本硬编码 BOS endpoint/`AWS_PROFILE=bos`/`region=bj`;`resolveEndpoint` 对非白名单 URL **静默退回 BOS**。计划见 `docs/s3-compat-evaluation.md`(P0: fail-closed + 配置单一来源)
+- **v0.3.2 后排期**见 `docs/post-v032-evaluation.md`:下一刀仍是存储 P0;自研 provider 认证/快照 TUI/会话合并/自动删桶 **不做产品**

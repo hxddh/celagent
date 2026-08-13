@@ -32,20 +32,21 @@ setup / node_mgr / cluster
 ensureCelld                  ──celld CLI──▶  cells/*/ltx
                                             nodes/  fleet/  wake/
                                             deploy/              ← 执行层 (celld 自己的 RPO)
-worker obj-put(可选直连)     ──手写 SigV4──▶  workspace/*         ← 非权威,webhook 才是生产路径
+worker obj-put / 任务产物    ──webhook──▶    workspace/*         ← 非权威,worker 零凭证
 ```
 
 | 消费者 | 协议 | 条件写 | 失败后果 |
 |--------|------|--------|----------|
 | **会话权威**(`src/bos.js`) | aws CLI `s3api` + `--if-match` / `--if-none-match` | 必须 | 并发覆盖会话、首写互踩、RPO=0 作废 |
 | **执行层**(celld) | Rust `object_store`;S3 方言或 `gs://` XML | 必须 | 双 owner、历史分叉、接管读到未 ACK 的尾 |
-| **worker 直连 SigV4** | 手写 virtual-hosted + region=`bj` | 无 CAS | 仅任务产物尽力而为;生产走 webhook,零凭证 |
+
+`worker/src/index.js` 里的 `bosPut`/`bosGet`(手写 virtual-hosted SigV4,host 绑 `s3.bj.bcebos.com`) **没有任何调用点**;`obj-put` 与任务产物走 `bosPutProxy` → 本地 webhook。这是死代码,不是第三条存储消费者,扩后端时不要去适配它(删掉即可,见 `docs/post-v032-evaluation.md`)。
 
 架构分层 **仍然成立**,而且扩后端时更该守住:
 
 - 会话 JSON 继续走 celagent 直写,不依赖节点,不塞进 cell SQLite。
 - celld 继续只当执行层。它已经能说多种存储,但 **celagent 的拉起/运维脚本还不会**。
-- 两套消费者应对 **同一合格 bucket**(或同一桶的不同 prefix)。不要做成「会话在 MinIO、celld 在 R2」——运维面翻倍,跨机恢复心智碎掉。
+- 两套消费者应对 **同一合格 bucket**(celld 可用 key prefix 自隔离,会话仍可在桶根 `sessions/`)。不要做成「会话在 MinIO、celld 在 R2」——运维面翻倍,跨机恢复心智碎掉。
 
 ## 2. 桶必须提供什么(门禁,不是清单)
 
@@ -113,7 +114,7 @@ celld [Ownership and fencing](https://github.com/denoland/celld/blob/main/docs/f
 | `config set persistence.endpoint` | 拒绝非 BOS https | 合法合格后端配不进去(除非绕 env) |
 | `doctor` | 只查 `[bos]` profile | R2/S3 用户永远「无凭证」 |
 | `src/bos-tools.js` | 经 `resolveEndpoint` | 记忆工具跟着静默回退 |
-| `worker/src/index.js` `bosPut/bosGet` | host=`${bucket}.s3.bj.bcebos.com`,region=`bj` | 直连路径 **只可能是 BOS virtual-hosted**;生产 webhook 不受影响 |
+| `worker/src/index.js` `bosPut/bosGet` | host=`${bucket}.s3.bj.bcebos.com`,region=`bj` | **死代码,无调用**;产物走 `bosPutProxy` |
 
 ### 4.2 运维脚本(全部忽略 settings 里的 endpoint)
 
@@ -158,7 +159,7 @@ test("resolveEndpoint 拒绝非 BOS https", async () => {
 | C | **会话路径继续 aws CLI**(S3 方言);GCS 另开客户端 | BOS/S3/R2/Tigris 一条路径;GCS 不认 PUT If-Match | 用 boto3(BOS 已证明签名失败) |
 | D | **配置单一来源**:`persistence.{bucket,endpoint,region,profile}` | 脚本与 TUI 不再各写各的 | 环境变量与 settings 再发明一套平行配置 |
 | E | **默认仍是 BOS** | 现有用户/凭证/`[bos]` profile 零迁移 | 为了「通用」改默认 endpoint |
-| F | **worker 手写 SigV4 不作为多后端入口** | 已绑 BOS virtual-hosted;生产是 webhook | 为 R2 重写一份签名还要处理 path-style |
+| F | **不把 worker 手写 SigV4 当存储入口** | 函数无调用点;产物已走 webhook | 为死代码做多云适配 |
 | G | **celld `--bucket` 继续 `s3://`**,直到做 GCS | 与当前 spawn 一致 | 本阶段引入 `gs://`(会话层接不住) |
 | H | **改名可滞后**:文件仍叫 `bos.js`,对外叙事改成「对象存储权威源」 | 重命名爆破 tests/exports/文档 | 评估阶段就全局 rename |
 
@@ -181,7 +182,7 @@ test("resolveEndpoint 拒绝非 BOS https", async () => {
 6. **doctor**:按 profile/env 查凭证;打印实际 endpoint/region;发现「配置了非 BOS 但 resolve 会回退」这类状态(P0 落地后不应再出现)。
 7. **proof 测试**:`resolveEndpoint("https://evil.example")` 不再等于 BOS URL;改为断言拒绝。
 
-不在 P0:接 R2 实测、改 worker SigV4、rename `bos.js`、GCS。
+不在 P0:接 R2 实测、rename `bos.js`、GCS。worker 手写 SigV4 是死代码,扩后端不必碰。
 
 ### P1 — CAS 门禁 + 第一批合格后端文档(需真桶)
 
@@ -194,12 +195,12 @@ test("resolveEndpoint 拒绝非 BOS https", async () => {
 2. 参数化 `scripts/celld-bos-test.sh` → `scripts/celld-store-test.sh`(保留旧名 wrapper)。endpoint/profile/region 来自 settings。
 3. **文档化第一批**:BOS(默认,已测)、AWS S3、R2、Tigris 的 settings 样例与凭证。README 心智模型改为「对象存储权威源」,例子仍用 BOS。
 4. **在 R2 或 S3 上跑一遍** 会话 CAS + `ensureCelld` + 双节点 health。未跑过的后端保持「候选,未测」,不写「已支持」。
-5. worker 直连 `bosPut`:加注释「BOS-only,非多后端路径」;不扩 host 拼接。若无调用方可考虑后续删,不挡 P1。
+5. 删掉 worker 未调用的 `bosPut`/`bosGet`(死代码),不要参数化那条路径。
 
 ### P2 — GCS / prefix / 叙事收口
 
 1. **GCS**:仅当明确要做。会话客户端走 generation precondition,与 celld `gs://` 对齐;spawn `--bucket gs://…`,无 `S3_ENDPOINT`。工作量是新客户端,不是配置项。
-2. **桶 prefix**(`s3://bucket/celagent`):celld v0.2 已支持;会话 key 要加同一前缀,否则 celld 与 sessions/ 看不见对方的「同桶」。迁移要搬对象。
+2. **桶 prefix**(`s3://bucket/celagent`):celld v0.2 已支持,且 **只影响 celld 自己的对象**(cells/nodes/deploy/…)。会话权威继续读桶根 `sessions/*`,两套消费者从不互相 LIST。新安装可给 celld 加 prefix 做 fleet 隔离,**不必搬迁已有会话对象**。不要把「同桶」理解成「同一 key 前缀」。
 3. 文件/符号:`bos.js` → `store.js`、`queueBosWrite` 别名;package exports 过渡期双路径。
 4. 明确 **不做** Azure、MinIO、B2、Spaces。
 
@@ -220,7 +221,7 @@ P0 可独立发版:BOS 用户无感,只修「配了别的云却写到百度」�
 - 为了通用性改掉 BOS 默认、强迫现有用户换 profile 名。
 - 会话权威改走 celld SQLite(与 v0.2 评估结论冲突:节点可丢,会话不能丢)。
 - 用 SDK 替换 aws CLI 作为 BOS/S3 主路径(boto3 已在 BOS 上 SignatureDoesNotMatch)。
-- 推广 worker 内手写 SigV4 作为多云 PUT。
+- 推广或参数化 worker 内未调用的手写 SigV4。
 - 在未做 CAS 探测前把 MinIO 本地当成 HA 部署。
 - 本评估 PR 改 `src/` `bin/` `scripts/` 行为(避免评估与实现缠在一起)。
 
@@ -246,7 +247,7 @@ P1:
 | `src/bos.js` | 默认 EP、白名单、profile=`bos`、CAS PUT/GET |
 | `src/bos-tools.js` | list/get/put 经 resolveEndpoint |
 | `bin/celagent-tui.mjs` | ensureCelld region、config 白名单、doctor 凭证、list/export/rm |
-| `worker/src/index.js` | BOS virtual-hosted SigV4(可选) |
+| `worker/src/index.js` | `bosPut`/`bosGet` 死代码(无调用);产物走 webhook |
 | `setup.sh` `install.sh` | 凭证、建桶、deploy、写 settings |
 | `scripts/node_mgr.sh` `cluster_mgr.sh` | 启动 celld、列 nodes/ |
 | `scripts/celld-bos-test.sh` | 17 项 BOS CAS/lease 探针(P1 应参数化) |
