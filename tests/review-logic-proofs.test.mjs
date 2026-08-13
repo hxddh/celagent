@@ -288,9 +288,11 @@ test("源码锚定: HANDOFF 不再把认证当唯一阻塞", () => {
   const handoff = readFileSync(join(root, "HANDOFF.md"), "utf8");
   assert.doesNotMatch(handoff, /卡 GitHub 认证/);
   assert.doesNotMatch(handoff, /阻塞\(唯一\)/);
+  assert.doesNotMatch(handoff, /资产缺口/);
   assert.match(handoff, /SHA256SUMS/);
   assert.match(handoff, /celld-linux-x64/);
   assert.match(handoff, /release\.yml/);
+  assert.match(handoff, /v0\.3\.1/);
 });
 
 test("源码锚定: Release 流水线拉 denoland celld 并匿名编译", () => {
@@ -316,6 +318,13 @@ test("源码锚定: install 支持 arm64/windows 且缺 SHA256SUMS 会警告", (
 
 test("源码锚定: doctor Celld 离线不报全部正常", () => {
   assert.match(tui, /核心正常 \(Celld 离线/);
+});
+
+test("源码锚定: 版本 0.3.1 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.3\.1"/);
+  const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
+  assert.match(smoke, /sha256sum --ignore-missing/);
+  assert.match(smoke, /celagent-linux-x64/);
 });
 
 test("源码锚定: saveConfig 合并 persistence/worker", () => {
