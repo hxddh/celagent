@@ -13,9 +13,17 @@ const require = createRequire(import.meta.url);
 // 动态 import(file://路径) 无法被 Bun 打包, 单二进制运行时找不到 chalk 等嵌套依赖。
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
+import { awsEnv } from "../src/bos.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
+
+const warned = { queue: false, persist: false, celld: false, worker: false };
+function warnOnce(ch, msg) {
+  if (warned[ch]) return;
+  warned[ch] = true;
+  console.warn(msg);
+}
 
 // ---- Celld 自动启动 (检测无节点 → 从配置拉起 BOS 节点) ----
 let ensureRan = false;
@@ -23,50 +31,36 @@ let ensureTime = 0;
 const ENSURE_COOLDOWN_MS = 30000;  // 30s 冷却, 避免频繁尝试
 let ensureLock = null;  // Bug 53: 进程内互斥 — 并发调用 ensureCelld 只执行一次自动启动
 async function ensureCelld() {
-  // 冷却期内不重复检查 (Bug B: 但允许周期性重试, 而非只跑一次)
   const now = Date.now();
   if (ensureRan && now - ensureTime < ENSURE_COOLDOWN_MS) return;
-  // 并发调用串行化: 第一个调用拿锁, 后续等待
   if (ensureLock) return ensureLock;
   ensureRan = true;
   ensureTime = now;
   const run = async () => {
+    try {
     for (const base of CELD_NODES) {
       try {
         const r = await fetch(`${base}/__celld/health`, { signal: AbortSignal.timeout(2000) });
         if (r.ok) return;
       } catch (e) { /* down */ }
     }
-  // 自动拉起 BOS 模式节点
   const cfgFile = join(homedir(), ".config", "celagent", "settings.json");
   if (existsSync(cfgFile)) {
     try {
       const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
       const bucket = cfg.persistence?.bucket;
-      // 凭证: 优先完整环境变量; 否则 AWS_PROFILE=bos (不把 SK 读进 Node 堆)
-      // Bug 77: 与 bos.js awsEnv 同策略 — 要么全用 env, 要么全用 profile,
-      // 绝不混用 (env 只有部分凭证时, 用 profile 的会签名失败且难排查)
       const hasFullEnv = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
       let hasBosProfile = false;
-      if (!hasFullEnv && existsSync(join(homedir(), ".aws", "credentials"))) {
+      if (!hasFullEnv) {
         try {
-          const creds = readFileSync(join(homedir(), ".aws", "credentials"), "utf8");
-          const section = creds.split(/\[bos\]/)[1]?.split(/\[/)[0] || "";
-          hasBosProfile = !!(section.match(/aws_access_key_id\s*=\s*\S+/) && section.match(/aws_secret_access_key\s*=\s*\S+/));
-        } catch (e) { /* 读取失败 */ }
+          const { execFileSync } = await import("node:child_process");
+          const ak = execFileSync("aws", ["configure", "get", "aws_access_key_id", "--profile", "bos"], {
+            encoding: "utf8", timeout: 8000, stdio: ["ignore", "pipe", "ignore"],
+          });
+          hasBosProfile = !!(ak && String(ak).trim());
+        } catch (e) { hasBosProfile = false; }
       }
-      const bosChildEnv = () => {
-        const env = { ...process.env, AWS_REGION: cfg.persistence?.region || "bj", AWS_EC2_METADATA_DISABLED: "true" };
-        if (hasFullEnv) {
-          delete env.AWS_PROFILE;
-        } else {
-          delete env.AWS_ACCESS_KEY_ID;
-          delete env.AWS_SECRET_ACCESS_KEY;
-          delete env.AWS_SESSION_TOKEN;
-          env.AWS_PROFILE = "bos";
-        }
-        return env;
-      };
+      const bosChildEnv = () => awsEnv({ AWS_REGION: cfg.persistence?.region || "bj" });
       if (bucket && (hasFullEnv || hasBosProfile)) {
         console.log("  (自动启动 Celld 节点, bucket=" + bucket + ")...");
         const { spawn } = await import("node:child_process");
@@ -126,14 +120,13 @@ async function ensureCelld() {
               detached: true,
             });
             child.on("error", (err) => {
-              if (!bosWarned) { console.warn(`  (警告: Celld 节点 ${port} 启动失败: ${err.message})`); bosWarned = true; }
+              warnOnce("celld", `  (警告: Celld 节点 ${port} 启动失败: ${err.message})`);
             });
             // Bug 62: celld 自身端口冲突/启动即崩时, spawn 不报 error (进程已起来),
             // 但子进程会很快非零退出 — 监听 exit 事件给出明确诊断
             child.on("exit", (code, sig) => {
-              if (code !== 0 && code !== null && !bosWarned) {
-                console.warn(`  (警告: Celld 节点 ${port} 启动后异常退出 code=${code} sig=${sig ?? ""}, 请检查端口占用或 node log)`);
-                bosWarned = true;
+              if (code !== 0 && code !== null) {
+                warnOnce("celld", `  (警告: Celld 节点 ${port} 启动后异常退出 code=${code} sig=${sig ?? ""}, 请检查端口占用或 node log)`);
               }
             });
             child.unref();
@@ -155,103 +148,115 @@ async function ensureCelld() {
         }
       }
       } catch (e) { /* 配置解析失败, 跳过自动启动 */ }
-      finally {
-        ensureLock = null;  // 释放锁, 允许下次冷却后重试
-      }
+    }
+    } finally {
+      ensureLock = null;  // 健康早退 / 无配置 / 拉起完成 都必须释放
     }
   };
   ensureLock = run();
   return ensureLock;
 }
 
-// ---- BOS 直写队列 (串行, 不阻塞对话; 每次对话后异步落盘) ----
+// ---- BOS 直写队列 (串行; 超限丢最旧, 保留最新) ----
 let bosQueue = Promise.resolve();
-let bosQueueLen = 0;
-let bosWarned = false;  // 只警告一次, 避免刷屏
-const BOS_QUEUE_MAX = 50;  // Bug E: 队列限长, 防内存泄漏
-function queueBosWrite(sessionId, seq, role, msg, opts = {}) {
-  // 完整记忆 (方案 A): fullContent 完整内容块 + fullToolResults 完整工具结果
-  const { fullContent = null, fullToolResults = null } = opts || {};
-  // 队列过长时丢弃最旧任务 (防堆积)
-  if (bosQueueLen >= BOS_QUEUE_MAX) {
-    if (!bosWarned) { console.warn("  (警告: BOS 写队列过长, 丢弃旧任务)"); bosWarned = true; }
+const BOS_QUEUE_MAX = 50;
+const bosPending = [];
+let bosPumping = false;
+function makeTurnEntry(sessionId, seq, role, msg, fullContent, fullToolResults) {
+  const entry = { turn: seq, role, msg, ts: Date.now() };
+  if (fullContent && fullContent.length > 0) entry.content = fullContent;
+  if (fullToolResults && fullToolResults.length > 0) entry.toolResults = fullToolResults;
+  return entry;
+}
+function mergeTurn(session, seq, role, msg, fullContent, fullToolResults) {
+  let finalSeq = seq;
+  if (session.turns.length > 0) {
+    const exists = session.turns.some(t => t.turn === seq);
+    if (!exists) {
+      const nums = session.turns.map(t => Number(t.turn)).filter(n => Number.isFinite(n));
+      const maxTurn = nums.length ? Math.max(...nums) : 0;
+      finalSeq = maxTurn + 1;
+    }
+  }
+  const entry = makeTurnEntry(session.id, finalSeq, role, msg, fullContent, fullToolResults);
+  const idx = session.turns.findIndex(t => t.turn === finalSeq);
+  if (idx >= 0) {
+    const prev = session.turns[idx];
+    if (prev?.content && !(fullContent && fullContent.length)) entry.content = prev.content;
+    if (prev?.toolResults && !(fullToolResults && fullToolResults.length)) entry.toolResults = prev.toolResults;
+    session.turns[idx] = entry;
+  } else {
+    session.turns.push(entry);
+  }
+  session.updatedAt = Date.now();
+}
+async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullToolResults) {
+  const { bosPut, bosGet } = await import("../src/bos.js");
+  const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
+  const bucket = cfg.persistence?.bucket;
+  const endpoint = cfg.persistence?.endpoint;
+  if (!bucket) {
+    warnOnce("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
     return;
   }
-  bosQueueLen++;
-  bosQueue = bosQueue.then(async () => {
-    try {
-      const { bosPut, bosGet } = await import("../src/bos.js");
-      const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
-      const bucket = cfg.persistence?.bucket;
-      const endpoint = cfg.persistence?.endpoint; // Bug 70: 透传自定义 endpoint
-      if (!bucket) {
-        if (!bosWarned) { console.warn("  (警告: 未配置 persistence.bucket, 会话不会持久化)"); bosWarned = true; }
+  const key = `sessions/${sessionId}.json`;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let session = { id: sessionId, turns: [] };
+    let etag = undefined;
+    const existing = await bosGet(key, { bucket, endpoint });
+    if (existing.ok) {
+      try {
+        session = JSON.parse(existing.body);
+        if (!Array.isArray(session.turns)) session.turns = [];
+      } catch (e) {
+        warnOnce("persist", `  (警告: BOS 会话 JSON 损坏, 跳过本轮以免覆盖历史: ${sessionId})`);
         return;
       }
-      const key = `sessions/${sessionId}.json`;
-      // 乐观锁 CAS: 读 ETag → If-Match 写 → 冲突重试 (防并发覆盖)
-      // Bug 75: 冲突重试必须重新读 ETag — 旧实现 3 次都用循环外读的同一个
-      // etag, 并发写入时必 412 重试耗尽 → 该轮数据丢失
-      for (let attempt = 0; attempt < 3; attempt++) {
-        let session = { id: sessionId, turns: [] };
-        let etag = undefined;
-        // 每次尝试都重新读 (冲突后对方已写, 必须拿到新 ETag 才能继续)
-        const existing = await bosGet(key, { bucket, endpoint });
-        if (existing.ok) {
-          try { session = JSON.parse(existing.body); } catch (e) { /* 覆盖 */ }
-          etag = existing.etag;
-        } else if (existing.error === "not-found") {
-          // Bug 76: 首写也条件化 (If-None-Match) — 并发冷启动同 ID 时,
-          // 双方都读 not-found 会互相无条件覆盖丢首轮; 条件写保证只有一个成功
-          // Bug 97: 首写必须包含当前轮次 — 旧实现建空对象后 return, 首轮数据丢失
-          const entry = { turn: seq, role, msg, ts: Date.now() };
-          if (fullContent && fullContent.length > 0) entry.content = fullContent;
-          if (fullToolResults && fullToolResults.length > 0) entry.toolResults = fullToolResults;
-          session.turns.push(entry);
-          session.updatedAt = Date.now();
-          const put = await bosPut(key, session, { bucket, endpoint, ifNoneMatch: true });
-          if (put.ok) return;
-          if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; } // 对方已建, 重读合并
-          if (!bosWarned) { console.warn(`  (警告: BOS 首写失败: ${put.error || "未知错误"})`); bosWarned = true; }
-          return;
-        } else {
-          // Bug 49: 读失败(网络/限流)时状态未知 — 绝不写, 防止覆盖已有历史
-          if (!bosWarned) { console.warn(`  (警告: BOS 读取失败, 跳过本轮持久化: ${existing.error})`); bosWarned = true; }
-          return;
-        }
-        // Bug 修复: turn 序号基于 BOS 实际历史, 防读失败时覆盖旧数据
-        // - 新会话(无历史): 用传入 seq (从 1 开始)
-        // - 有历史: 若 seq 已存在则替换, 否则追加为历史长度+1 (续写不覆盖)
-        let finalSeq = seq;
-        if (session.turns.length > 0) {
-          const exists = session.turns.some(t => t.turn === seq);
-          if (!exists) {
-            // 续写: 追加到历史末尾 (序号 = 最大 turn + 1), 绝不覆盖旧数据
-            const maxTurn = Math.max(...session.turns.map(t => t.turn));
-            finalSeq = maxTurn + 1;
-          }
-        }
-        const idx = session.turns.findIndex(t => t.turn === finalSeq);
-        // 完整记忆: 同轮替换时也保留完整字段; 新轮直接存
-        const entry = { turn: finalSeq, role, msg, ts: Date.now() };
-        if (fullContent && fullContent.length > 0) entry.content = fullContent;
-        if (fullToolResults && fullToolResults.length > 0) entry.toolResults = fullToolResults;
-        if (idx >= 0) session.turns[idx] = entry;
-        else session.turns.push(entry);
-        session.updatedAt = Date.now();
-        const put = await bosPut(key, session, { bucket, ifMatch: etag, endpoint });
-        if (put.ok) return;
-        if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; } // 冲突重试
-        // 其他错误: 警告一次
-        if (!bosWarned) { console.warn(`  (警告: BOS 持久化失败: ${put.error || "未知错误"})`); bosWarned = true; }
-        return;
-      }
-    } catch (e) {
-      if (!bosWarned) { console.warn(`  (警告: BOS 持久化异常: ${e.message})`); bosWarned = true; }
-    } finally {
-      bosQueueLen--;  // 任务完成, 释放队列槽
+      etag = existing.etag;
+    } else if (existing.error === "not-found") {
+      session.turns.push(makeTurnEntry(sessionId, seq, role, msg, fullContent, fullToolResults));
+      session.updatedAt = Date.now();
+      const put = await bosPut(key, session, { bucket, endpoint, ifNoneMatch: true });
+      if (put.ok) return;
+      if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; }
+      warnOnce("persist", `  (警告: BOS 首写失败: ${put.error || "未知错误"})`);
+      return;
+    } else {
+      warnOnce("persist", `  (警告: BOS 读取失败, 跳过本轮持久化: ${existing.error})`);
+      return;
     }
-  }).catch(() => { /* 队列错误不阻塞 */ });
+    mergeTurn(session, seq, role, msg, fullContent, fullToolResults);
+    const put = await bosPut(key, session, { bucket, ifMatch: etag, endpoint });
+    if (put.ok) return;
+    if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; }
+    warnOnce("persist", `  (警告: BOS 持久化失败: ${put.error || "未知错误"})`);
+    return;
+  }
+}
+function pumpBosQueue() {
+  if (bosPumping) return;
+  bosPumping = true;
+  bosQueue = (async () => {
+    try {
+      while (bosPending.length) {
+        const job = bosPending.shift();
+        try { await persistTurnToBos(job.sessionId, job.seq, job.role, job.msg, job.fullContent, job.fullToolResults); }
+        catch (e) { warnOnce("persist", `  (警告: BOS 持久化异常: ${e.message})`); }
+      }
+    } finally {
+      bosPumping = false;
+      if (bosPending.length) pumpBosQueue();
+    }
+  })();
+}
+function queueBosWrite(sessionId, seq, role, msg, opts = {}) {
+  const { fullContent = null, fullToolResults = null } = opts || {};
+  if (bosPending.length >= BOS_QUEUE_MAX) {
+    bosPending.shift();
+    warnOnce("queue", "  (警告: BOS 写队列过长, 丢弃最旧任务)");
+  }
+  bosPending.push({ sessionId, seq, role, msg, fullContent, fullToolResults });
+  pumpBosQueue();
   return bosQueue;
 }
 
@@ -277,10 +282,7 @@ async function celldCheckpoint(sessionId, seq, role, content, opts = {}) {
       } catch (e) { /* try next */ }
     }
     // Bug C: worker 全失败时提示一次 (BOS 兜底仍会写)
-    if (!workerOk && !bosWarned) {
-      console.warn("  (警告: Celld worker 写入失败, 仅 BOS 持久化)");
-      bosWarned = true;
-    }
+    if (!workerOk) warnOnce("worker", "  (警告: Celld worker 写入失败, 仅 BOS 持久化)");
   })();
 
   // 2. BOS 直写 (异步队列, 完整 msg + 完整记忆 — 方案 A)
@@ -299,39 +301,40 @@ function extractText(content) {
 
 // ---- 从 BOS 读历史 (权威源, 重启后恢复) ----
 async function loadHistoryFromBos(sessionId) {
-  // P0: 恢复读路径 — 优先 worker 缓存 (快, ~100ms), miss 回 BOS (权威, ~1.3s)
-  // 让 Celld worker 从"只写不读"变为真正的快路径
+  // BOS-first: worker 缓存会截断 msg 到 200 字符, 命中后覆盖完整 BOS 轮会丢记忆。
+  // 仅在 BOS miss / 无配置时才回退 worker。
   try {
-    // 1. 先试 worker 缓存 (任一节点)
+    const { bosGet } = await import("../src/bos.js");
+    const cfgFile = join(homedir(), ".config", "celagent", "settings.json");
+    if (existsSync(cfgFile)) {
+      try {
+        const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
+        const bucket = cfg.persistence?.bucket;
+        const endpoint = cfg.persistence?.endpoint;
+        if (bucket) {
+          const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint });
+          if (existing.ok) {
+            try {
+              const session = JSON.parse(existing.body);
+              return session.turns || [];
+            } catch (e) {
+              console.warn(`  (警告: 会话 ${sessionId} 的 BOS 历史数据损坏, 跳过恢复)`);
+              return null;
+            }
+          }
+        }
+      } catch (e) { /* 配置损坏则回退 worker */ }
+    }
     for (const base of CELD_NODES) {
       try {
         const url = `${base}/agent/celagent?action=resume&session=${encodeURIComponent(sessionId)}`;
         const resp = await fetch(url, { signal: AbortSignal.timeout(1500) });
         const data = await resp.json();
         if (data.ok && data.session && data.session.turns && data.session.turns.length > 0) {
-          return data.session.turns;  // 快路径: worker 缓存命中
+          return data.session.turns;
         }
-        break;  // 节点活着但无此会话 → 直接回 BOS
+        break;
       } catch (e) { /* try next node */ }
-    }
-    // 2. worker 全 miss → BOS 权威源
-    const { bosGet } = await import("../src/bos.js");
-    const cfgFile = join(homedir(), ".config", "celagent", "settings.json");
-    if (!existsSync(cfgFile)) return null;
-    const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
-    const bucket = cfg.persistence?.bucket;
-    const endpoint = cfg.persistence?.endpoint;
-    if (!bucket) return null;
-    const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint });
-    if (existing.ok) {
-      try {
-        const session = JSON.parse(existing.body);
-        return session.turns || [];
-      } catch (e) {
-        // 损坏的 JSON: 提示但不崩溃 (Bug 38)
-        console.warn(`  (警告: 会话 ${sessionId} 的 BOS 历史数据损坏, 跳过恢复)`);
-        return null;
-      }
     }
   } catch (e) { /* 忽略 */ }
   return null;
@@ -359,7 +362,7 @@ async function listSessions() {
       } catch (e) { /* 损坏则走降级 */ }
     }
     const runAws = (args) => new Promise((resolve) => {
-      execFile("aws", args, { env: { ...process.env, AWS_PROFILE: "bos" }, timeout: 20000, encoding: "utf8" }, (err, stdout) => {
+      execFile("aws", args, { env: awsEnv(), timeout: 20000, encoding: "utf8" }, (err, stdout) => {
         try { resolve(JSON.parse(stdout || "[]")); }
         catch (e) { resolve([]); }
       });
@@ -443,9 +446,10 @@ function loadConfig() {
   try { return JSON.parse(readFileSync(f, "utf8")); } catch (e) { return {}; }
 }
 function saveConfig(cfg) {
-  const { mkdirSync, writeFileSync } = require("node:fs");
+  const { mkdirSync, writeFileSync, chmodSync } = require("node:fs");
   mkdirSync(join(homedir(), ".config", "celagent"), { recursive: true });
-  writeFileSync(configFile(), JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  writeFileSync(configFile(), JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  try { chmodSync(configFile(), 0o600); } catch (e) { /* ignore */ }
 }
 async function configCommand(args) {
   const [op, key, value] = args;
@@ -497,18 +501,24 @@ async function configCommand(args) {
 async function doctorCommand() {
   console.log("celagent doctor — 自检\n");
   let ok = true;
-  // 0. pi-runtime 前置依赖 (Bug 89: models.json/auth.json/settings.json 是 TUI 启动前提,
-  //    缺失/损坏时 TUI 直接崩, 但旧 doctor 不检查 → 误报"全部正常")
+  // 0. pi-runtime 前置依赖 (pi 0.84 用 models-store.json, 旧版 models.json)
   const piDir = join(homedir(), ".config", "celagent", "pi-runtime");
-  const piFiles = ["settings.json", "models.json", "auth.json"];
-  const piStates = piFiles.map(f => {
+  const checkJson = (f) => {
     const p = join(piDir, f);
-    if (!existsSync(p)) return { f, state: "缺缺失" };
+    if (!existsSync(p)) return { f, state: "缺失" };
     try { JSON.parse(readFileSync(p, "utf8")); return { f, state: "✓" }; }
     catch (e) { return { f, state: "损坏" }; }
-  });
+  };
+  const piStates = ["settings.json", "auth.json"].map(checkJson);
+  const modelsStore = checkJson("models-store.json");
+  const modelsLegacy = checkJson("models.json");
+  const modelsState = modelsStore.state === "✓" ? modelsStore
+    : modelsLegacy.state === "✓" ? modelsLegacy
+    : modelsStore.state !== "缺失" ? modelsStore
+    : modelsLegacy;
+  piStates.push(modelsState);
   const piOk = piStates.every(s => s.state === "✓");
-  console.log(`[0/5] pi-runtime: ${piStates.map(s => `${s.f}${s.state === "✓" ? "" : " " + s.state}`).join(", ")} ${piOk ? "" : "✗ (TUI 无法启动!)"}`);
+  console.log(`[0/5] pi-runtime: ${piStates.map(s => `${s.f}${s.state === "✓" ? "" : " " + s.state}`).join(", ")} ${piOk ? "" : "✗ (TUI 可能无法启动)"}`);
   if (!piOk) ok = false;
   // 1. 配置
   const cfg = loadConfig();
@@ -531,11 +541,11 @@ async function doctorCommand() {
       if (r.ok) nodes.push(base);
     } catch (e) { /* down */ }
   }
-  console.log(`[3/5] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "✗ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
+  console.log(`[3/5] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "⚠ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
   // 4. BOS 连通
   if (bucket) {
     const probe = await new Promise((resolve) => {
-      execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com", "--query", "Contents[].Key", "--output", "json"], { env: { ...process.env, AWS_PROFILE: "bos" }, timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
+      execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com", "--query", "Contents[].Key", "--output", "json"], { env: awsEnv(), timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
     });
     console.log(`[4/5] BOS 连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
     if (!probe) ok = false;
@@ -625,8 +635,16 @@ async function taskCommand(args) {
   process.exit(1);
 }
 
+function assertSafeSessionId(id) {
+  if (!id || typeof id !== "string" || id.includes("..") || !/^[A-Za-z0-9._-]{1,128}$/.test(id)) {
+    console.error("✗ 无效会话 ID (仅允许字母数字、点、下划线、连字符, 最长 128)");
+    process.exit(1);
+  }
+}
+
 async function exportCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent export <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
+  assertSafeSessionId(id);
   const { bucket, endpoint } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { bosGet } = await import("../src/bos.js");
@@ -637,6 +655,7 @@ async function exportCommand(id) {
 }
 async function rmCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent rm <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
+  assertSafeSessionId(id);
   const { bucket, endpoint } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { execFile } = await import("node:child_process");
@@ -646,7 +665,7 @@ async function rmCommand(id) {
   });
   if (!confirm) { console.log("已取消"); return; }
   await new Promise((resolve) => {
-    execFile("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", `sessions/${id}.json`, "--endpoint-url", endpoint], { env: { ...process.env, AWS_PROFILE: "bos" }, timeout: 15000 }, (err) => resolve());
+    execFile("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", `sessions/${id}.json`, "--endpoint-url", endpoint], { env: awsEnv(), timeout: 15000 }, (err) => resolve());
   });
   console.log(`✓ 已删除会话 ${id}`);
 }
@@ -671,6 +690,7 @@ async function main() {
   // Bug 46: 无参数时不再共用 "default" — 生成唯一会话名 (时间戳+随机),
   // 避免多实例/多用户写入同一 key 造成串扰覆盖
   // 显式传 sessionId 时保留原名 (用户明确想续写该会话)
+  if (process.argv[2]) assertSafeSessionId(process.argv[2]);
   const sessionId = process.argv[2] || `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   console.log(`celagent — Pi TUI, 会话 ${sessionId}, Celld RPO=0 持久化\n`);
 
@@ -766,13 +786,17 @@ async function main() {
           const MAX_INJECT_TURNS = 50;
           const recent = savedHistory.slice(-MAX_INJECT_TURNS);
           const omitted = savedHistory.length - recent.length;
-          // 合并为一条清晰的历史上下文, 明确标注是之前的 assistant 回复
-          // (避免逐条 steer 成 user 消息误导 LLM — Bug 24)
+          const turnInjectText = (t) => {
+            const fromContent = Array.isArray(t.content)
+              ? t.content.filter(b => b.type === "text" && b.text).map(b => b.text).join(" ").trim()
+              : "";
+            return fromContent || t.msg || "";
+          };
           const historySummary = recent
-            .map(t => `[第${t.turn}轮(assistant)] ${t.msg}`)
+            .map(t => `[第${t.turn}轮(${t.role || "assistant"})] ${turnInjectText(t)}`)
             .join("\n");
           result.session.steer(
-            `以下是本会话之前的对话历史(均为 assistant 的回复内容, 请以此作为继续对话的上下文, 不要重复回答这些内容):\n${historySummary}` +
+            `以下是本会话之前的对话历史(请以此作为继续对话的上下文, 不要重复回答这些内容):\n${historySummary}` +
             (omitted > 0 ? `\n\n(注: 较早的 ${omitted} 轮历史已省略, 完整历史在 BOS 中)` : "")
           );
         } catch (e) { /* 注入失败不阻塞 */ }
@@ -781,12 +805,10 @@ async function main() {
       // 持久化 id: startup 用 argv sessionId (续写原会话); /new 生成独立 key (Bug 47 修复)
       let persistId = sessionId;
       let persistHistory = savedHistory;
-      if (startReason === "new") {
-        // /new: 新会话独立存储, 不混入旧历史
+      if (startReason === "new" || startReason === "fork") {
         persistId = `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         persistHistory = [];
-        // 提示用户新会话的持久化 ID (下次可 `celagent <id>` 续写)
-        console.log(`  ↳ 新会话持久化 ID: ${persistId} (下次: celagent ${persistId})`);
+        console.log(`  ↳ ${startReason === "fork" ? "fork" : "新"}会话持久化 ID: ${persistId} (下次: celagent ${persistId})`);
       } else if (startReason === "resume" && effSessionManager?.getSessionFile) {
         // Bug 64: /resume 切到别的本地会话后, persistId 必须跟着切换 —
         // 否则被恢复会话的续写会串写到 argv sessionId 的 key 下 (数据串写污染)
@@ -801,8 +823,12 @@ async function main() {
           console.log(`  ↳ 已恢复本地会话, 持久化 ID: ${persistId} (续写 ${persistHistory.length} 轮)`);
         }
       }
-      // seq 从当前会话历史长度继续 (resume 续写; new 从 0)
-      let seq = (persistHistory && persistHistory.length) || 0;
+      const maxTurn = (turns) => {
+        if (!turns?.length) return 0;
+        const nums = turns.map(t => Number(t.turn)).filter(n => Number.isFinite(n));
+        return nums.length ? Math.max(...nums) : 0;
+      };
+      let seq = maxTurn(persistHistory);
       // P1: 维护当前会话 turns 快照缓存 (供 session_snapshot 工具保存用)
       let snapshotTurns = (persistHistory || []).map(t => ({ turn: t.turn, role: t.role || "assistant", msg: t.msg, ts: t.ts }));
       globalThis.__celagentSnapshotTurns = () => snapshotTurns;

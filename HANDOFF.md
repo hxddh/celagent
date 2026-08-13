@@ -36,7 +36,8 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `scripts/node_mgr.sh` | 本机双节点管理(start/stop/status/restart,18090/18091) |
 | `scripts/cluster_mgr.sh` | 多机集群管理(add-node/status 等) |
 | `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
-| `tests/core.test.mjs` | 核心回归(9 用例:需节点在跑;mock 模式 6 pass) |
+| `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
+| `tests/review-logic-proofs.test.mjs` | P0 正确性源码锚定(BOS-first/队列丢最旧/fork/parse/steer/seq) |
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
 | `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、33 轮真实对话实录回放, 2026-08-11) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |
@@ -57,15 +58,15 @@ aws configure --profile bos          # 配 AK/SK/region=bj
 # 4. (仅首次) 一键部署: 建 bucket + 部署 worker + 写 settings.json + 启动双节点
 #    ⚠️ CELAGENT_SRC 必须指向你的仓库路径 (setup.sh 默认找 ~/celagent)
 CELAGENT_SRC=<仓库路径> ./setup.sh
-# 5. 跑测试 (需节点在跑; 无节点时 mock 模式 6 pass)
-node tests/core.test.mjs              # 9 用例全绿
+# 5. 跑测试 (需节点在跑; 无节点时 Celld/BOS 用例 skip, CLI + proof 仍跑)
+npm test
 ```
 
 ### 常用命令
 
 ```bash
 # 测试 (需节点: 先 scripts/node_mgr.sh start)
-node tests/core.test.mjs          # 9 用例: 需节点; 无节点时 mock 模式 6 pass
+npm test                          # core + P0 proof; 无节点时 Celld/BOS skip
 
 # 节点管理
 ./scripts/node_mgr.sh start|stop|status|restart
@@ -99,7 +100,7 @@ node bin/celagent-tui.mjs task ledger
 
 ### 已完成
 - ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content)
-- ✅ 测试:core 9 用例(节点在跑时全绿)、e2e 真实 LLM 验证
+- ✅ 测试:core CLI + 可选 Celld/BOS + P0 proof 源码锚定、e2e 真实 LLM 验证
 - ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo` 清除本机用户名/真实 session 指纹/AK 前缀打印;CI 含 Secret/PII 门禁;全部提交作者统一 `hxddh <hxddh@users.noreply.github.com>`;零密钥硬编码
   - `main` / `cursor/security-sanitize-2d82` / tag `v0.3.0` 均已指向净化后提交
   - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容(平台保留孤儿对象);彻底从 github.com 抹掉需向 GitHub Support 申请 purge(仓库内 refs 已无锚点)
@@ -164,8 +165,9 @@ node bin/celagent-tui.mjs task ledger
 
 - `install.sh` 正式模式已走 Release 二进制下载;开发模式用 `CELAGENT_SRC`
 - `install.sh` 中 celld: Release 随包优先, 回退 `https://celld.dev/install.sh`
-- worker 缓存读路径有 200 字符截断(URL 限制所致),完整数据在 BOS 权威源
+- worker 缓存读路径有 200 字符截断(URL 限制所致),完整数据在 BOS 权威源;恢复路径 **BOS-first**(仅 miss 才回退 worker)
+- P0 正确性(2026-08):队列超限丢最旧、ensureLock finally 释放、`/fork` 独立 persistId、JSON 损坏不覆盖、steer 用 content、seq=`max(turn)`、会话 ID 白名单、CI 扫描排除 `node_modules`
 - HTML 演示页数字已按 2026-08-11 实时 BOS 对齐;回放为 33 轮真实会话实录(脱敏后),
   后续更新数据时保持与 BOS 一致 + 敏感扫描(见红线)
-- ci.yml 的单元测试步骤带 `continue-on-error: true`(无节点时 mock 模式)——CI 全绿要求下应确认该步骤是否应改为必须通过
+- CI 单元测试已去掉 `continue-on-error`; Secret/PII 扫描排除 `node_modules`
 - CI 不构建发布二进制(当前跨平台构建为手动 `bun build`,见 PACKAGING)——后续可加 CI release job 自动化构建+上传

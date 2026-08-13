@@ -32,7 +32,10 @@ echo "[2/4] 创建 bucket: $BUCKET"
 if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
   echo "  ✓ bucket 已存在"
 else
-  AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" 2>&1 | head -2
+  if ! AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com"; then
+    echo "  ✗ bucket 创建失败: $BUCKET"
+    exit 1
+  fi
   echo "  ✓ bucket 创建成功"
 fi
 
@@ -58,7 +61,10 @@ if [ -d "$SRC_WORKER/worker/src" ]; then
   export AWS_PROFILE=bos AWS_REGION=bj
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
   export CELLD_ESBUILD="${CELLD_ESBUILD:-$SRC_WORKER/node_modules/.bin/esbuild}"
-  (cd "$SRC_WORKER/worker" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj 2>&1 | tail -2)
+  if ! (cd "$SRC_WORKER/worker" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj); then
+    echo "  ✗ worker 部署失败"
+    exit 1
+  fi
   echo "  ✓ worker 已部署"
 fi
 

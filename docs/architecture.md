@@ -57,10 +57,11 @@
 
 ```
 celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
+   → BOS miss 时才回退 worker resume (缓存可能截断 200 字符)
    → 取最近 50 轮 (MAX_INJECT_TURNS, Bug 78: 防超长会话撑爆模型上下文)
-   → result.session.steer("以下是本会话之前的对话历史...")  (Bug 24: 标注 assistant 轮)
-   → seq 续写起点 = BOS 历史长度 (防二次 resume 覆盖旧轮)
-优先级: BOS 权威源 > worker 缓存 (恢复读 BOS, 不依赖节点)
+   → result.session.steer(...) 注入 content 文本块 (缺省回退 t.msg) + 真实 t.role
+   → seq 续写起点 = max(turn) (非 turns.length, 防 gap 覆盖)
+优先级: BOS 权威源 > worker 缓存 (恢复先读 BOS, 不依赖节点)
 ```
 
 ## 2. 核心机制原理
@@ -84,7 +85,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 ### 2.3 双写一致性(worker 缓存 vs BOS)
 
 - **写**:两路并行,worker 失败不影响 BOS(缓存丢了可重建)。
-- **读**:恢复只读 BOS 权威;worker 缓存是快路径(148ms),截断 200 字符(URL 限制),
+- **读**:恢复先读 BOS 权威;仅 BOS miss 时才回退 worker 缓存(截断 200 字符,URL 限制),
   完整数据永远在 BOS。
 - **一致性模型**:BOS 为准,缓存可过期/缺失,无强一致要求。
 

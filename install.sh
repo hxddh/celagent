@@ -104,7 +104,10 @@ BUCKET="${CELAGENT_BUCKET:-${EXISTING_BUCKET:-celagent-$(_rand)-$(date +%s)}}"
 if AWS_PROFILE=bos aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" 2>/dev/null; then
   echo "  ✓ bucket 已存在: $BUCKET"
 else
-  AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com" >/dev/null 2>&1
+  if ! AWS_PROFILE=bos aws s3api create-bucket --bucket "$BUCKET" --region bj --endpoint-url "https://s3.bj.bcebos.com"; then
+    echo "  ✗ bucket 创建失败: $BUCKET"
+    exit 1
+  fi
   echo "  ✓ bucket 创建: $BUCKET"
 fi
 
@@ -132,8 +135,12 @@ if [ -n "$WORKER_SRC" ] && [ -d "$WORKER_SRC/src" ]; then
   elif [ -z "$CELLD_ESBUILD" ]; then
     export CELLD_ESBUILD="$(command -v npx >/dev/null 2>&1 && echo 'npx --yes esbuild' || echo '')"
   fi
-  (cd "$WORKER_SRC" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj >/dev/null 2>&1)
-  echo "  ✓ worker 已部署 (${WORKER_SRC})"
+  if (cd "$WORKER_SRC" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj); then
+    echo "  ✓ worker 已部署 (${WORKER_SRC})"
+  else
+    echo "  ✗ worker 部署失败"
+    exit 1
+  fi
 else
   echo "  ⚠️ worker 源码不可用, 跳过部署 (节点可能以基础模式运行)"
 fi

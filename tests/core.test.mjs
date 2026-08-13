@@ -43,11 +43,14 @@ async function celld(action, params = {}) {
 // ---- 真实 BOS 链路 (来自 src/bos.js) ----
 let bucket, endpoint;
 before(async () => {
-  // 读配置 (settings.json 单源)
-  const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
-  bucket = cfg.persistence?.bucket;
-  endpoint = cfg.persistence?.endpoint;
-  // 无配置则跳过 BOS 用例 (CI 无凭证时)
+  try {
+    const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
+    bucket = cfg.persistence?.bucket;
+    endpoint = cfg.persistence?.endpoint;
+  } catch (e) {
+    bucket = undefined;
+    endpoint = undefined;
+  }
   if (!bucket) console.log("(无 bucket 配置, BOS 用例将跳过)");
 });
 
@@ -147,16 +150,32 @@ test("8. CLI: 未知 - 参数拒绝 (Bug 80 回归)", async () => {
 });
 
 // ---- 配置单源化 (Bug 87 回归) ----
-test("9. config set model 同步 pi-runtime (Bug 87 回归)", async () => {
+test("9. config set model 同步 pi-runtime (Bug 87 回归)", async (t) => {
   const { execFileSync: ex } = await import("node:child_process");
   const piFile = join(homedir(), ".config", "celagent", "pi-runtime", "settings.json");
-  const orig = JSON.parse(readFileSync(piFile, "utf8"));
+  let orig;
+  try {
+    orig = JSON.parse(readFileSync(piFile, "utf8"));
+  } catch (e) {
+    return t.skip("无 pi-runtime/settings.json");
+  }
+  if (!orig.defaultModel) return t.skip("pi-runtime settings 无 defaultModel");
   try {
     ex("node", ["bin/celagent-tui.mjs", "config", "set", "model", orig.defaultModel], { encoding: "utf8" });
     const after = JSON.parse(readFileSync(piFile, "utf8"));
     assert.equal(after.defaultModel, orig.defaultModel, "pi-runtime defaultModel 同步");
   } finally {
-    // 还原
     writeFileSync(piFile, JSON.stringify(orig, null, 2) + "\n", "utf8");
   }
+});
+
+test("10. CLI: 非法 sessionId 拒绝", async () => {
+  const { execFileSync: ex } = await import("node:child_process");
+  let threw = false;
+  try { ex("node", ["bin/celagent-tui.mjs", "../etc"], { encoding: "utf8", timeout: 5000 }); }
+  catch (e) {
+    threw = true;
+    assert.match(String(e.stderr || e.stdout || ""), /无效会话 ID/);
+  }
+  assert.ok(threw, "含 .. 的会话 ID 应拒绝");
 });
