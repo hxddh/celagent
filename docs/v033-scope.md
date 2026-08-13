@@ -108,3 +108,5 @@ resolveEndpoint("https://evil.example")  ≠  BOS URL
 ## 发版
 
 实现合进 `main` 后打 tag **`v0.3.3`**(不移动 v0.3.0/v0.3.1/v0.3.2)。Release 资产形态不变,随包 celld 仍为 v0.2.0。
+
+✅ 2026-08-13:tag `v0.3.3` → `1514b1b`;Latest 已切;冒烟 `./scripts/release-smoke.sh v0.3.3` 通过。

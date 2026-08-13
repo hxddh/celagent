@@ -155,7 +155,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **celld v0.2 双监听**:Worker `127.0.0.1:18090/18091`;内部 `18092/18093`(port+2)。TUI 只打 Worker/health。详见 `docs/celld-v02-evaluation.md`
 - **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失);拉起节点另有 `ensure.lock`
 - **CI Release job**:`.github/workflows/release.yml` 在 tag / workflow_dispatch 时匿名路径构建并上传
-- **Release 资产**:v0.3.2 含 celagent 五平台、celld linux/darwin-arm64、SHA256SUMS;上游 celld 无 darwin-x64/Windows
+- **Release 资产**:v0.3.3 含 celagent 五平台、celld linux/darwin-arm64、SHA256SUMS;上游 celld 无 darwin-x64/Windows
 - **存储后端**:运维脚本从 settings 读 endpoint/region/profile;`resolveEndpoint` 对非白名单 URL **fail-closed**。CAS 实测与「已支持 R2」见 v0.3.4 / `docs/s3-compat-evaluation.md`
 
 ## 6. 与分布式部署的关系

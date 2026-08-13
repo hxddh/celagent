@@ -40,7 +40,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估 + 新特性利用评审(P0 双监听已落地) |
 | `docs/s3-compat-evaluation.md` | 多后端对象存储评估:合格/不合格分界、耦合清单、分阶段计划(未改代码) |
 | `docs/post-v032-evaluation.md` | v0.3.2 之后排期:候选方向取舍、死代码/fail-open/CI 边界 |
-| `docs/v033-scope.md` | v0.3.3 实现合同(本版落地: fail-closed + 配置单一来源) |
+| `docs/v033-scope.md` | v0.3.3 实现合同(已发布: fail-closed + 配置单一来源) |
 | `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取 |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
@@ -104,12 +104,13 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:不在仓库内;发布随包 **v0.2.0**(linux-x64/arm64、darwin-arm64)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。评估见 `docs/celld-v02-evaluation.md`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(v0.3.2 已发布)
+## 3. 发布状态(v0.3.3 已发布)
 
-仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.2](https://github.com/hxddh/celagent/releases/tag/v0.3.2)。
+仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.3](https://github.com/hxddh/celagent/releases/tag/v0.3.3)。
 
-- **tag `v0.3.2`** 指向 `e5ae737`(PR #7 合并提交);Release 资产由此 SHA 构建
-- **v0.3.1**(`6790e99`)仍可用,但 spawn 参数按 celld v0.1,配随包 0.2.0 二进制会拒启
+- **tag `v0.3.3`** 指向 `1514b1b`(PR #8 + #9 快进进 main);Release 资产由此 SHA 构建
+- **v0.3.2**(`e5ae737`)仍可用,无 persistence.endpoint 时行为与本版相同
+- **v0.3.1**(`6790e99`) spawn 参数按 celld v0.1,配随包 0.2.0 二进制会拒启
 - 旧 tag **`v0.3.0`** 仍指向 `31d12a4`;不要用 `git checkout v0.3.0` 当当前代码
 
 ### 已完成
@@ -118,8 +119,8 @@ node bin/celagent-tui.mjs task ledger
 - ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo`;CI 含 Secret/PII 门禁;零密钥硬编码
   - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容;彻底抹掉需向 GitHub Support 申请 purge
 - ✅ 构建:`.github/workflows/release.yml` 匿名路径 bun 交叉编译 + 拉取 `denoland/celld` + `SHA256SUMS`
-- ✅ **v0.3.2 资产清单**(形态同 v0.3.1):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是节点按 v0.2 双监听启动**
-- ✅ 安装校验:`scripts/release-smoke.sh` 下载 linux 包、核对 SHA256、跑 `version`/`help`(不需要 BOS/celld)
+- ✅ **v0.3.3 资产清单**(形态同 v0.3.2):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是非法 endpoint fail-closed,脚本读 settings**
+- ✅ 安装校验:`scripts/release-smoke.sh v0.3.3` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.3.3`;不需要 BOS/celld)
 
 ### 已知边界(不是本仓库能补的)
 - 上游 `denoland/celld` **没有** Intel Mac (`celld-darwin-x64`) 与 Windows 包;`install.sh` 回退 `celld.dev` / Windows 跳过 celld
@@ -132,10 +133,10 @@ node bin/celagent-tui.mjs task ledger
 0. ✅ docs/archive 已删除
 1. ✅ 仓库已推送
 2. ✅ CI 绿 (node 22/24)
-3. ✅ tag `v0.3.2` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
+3. ✅ tag `v0.3.3` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
 4. ✅ 跨平台 celagent 由 Release workflow 在 `/tmp/anon-build` 编译
 5. ✅ install.sh 正式模式从 GitHub Release 下载,有 `SHA256SUMS` 则校验
-6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.3.2` 或 `latest`(SHA256 + version/help)
+6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.3.3` 或 `latest`(SHA256 + version/help)
 
 ## 4. 版本与里程碑
 
@@ -146,8 +147,8 @@ node bin/celagent-tui.mjs task ledger
 | P1 记忆增强 | history_search + session_snapshot + 完整记忆(不截断) | ✅ 已并入 |
 | v0.3.0 | 首次公开 Release(tag 钉在 `31d12a4`; 资产后来被刷新) | ✅ 历史 |
 | v0.3.1 | P0–P5 正确性/安全/发版闭环:BOS-first、user 轮、token、endpoint 白名单、Release 全平台 + SHA256SUMS | ✅ 历史 |
-| v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | ✅ 已发布 |
-| v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | 本版 |
+| v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | ✅ 历史 |
+| v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | ✅ 已发布 |
 
 下一刀:**v0.3.4** CAS doctor + 至少一种非 BOS 实测(见 `docs/s3-compat-evaluation.md`)。不要插队做 provider 认证/快照 TUI/会话合并。
 
