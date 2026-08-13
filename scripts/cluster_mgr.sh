@@ -19,14 +19,29 @@ DEFAULT_PORTS="18090 18091"
 
 start_node() {
   local port=$1 advertise=$2
+  local adv_host="${advertise%:*}"
+  local internal_port=$((port + 2))
+  local internal_bind extra=()
+  case "$adv_host" in
+    127.*|localhost|::1) internal_bind="127.0.0.1:${internal_port}" ;;
+    *) internal_bind="${adv_host}:${internal_port}" ;;
+  esac
+  case "$adv_host" in
+    127.*|localhost|::1|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) ;;
+    *) extra=(--unsafe-public-advertise) ;;
+  esac
   # 凭证卫生: AWS_PROFILE=bos, 不把 SK 读进变量/显式注入
+  # celld v0.2: advertise 必须是内部监听地址, 且必须显式 --internal-listen
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
+    CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
     CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)}" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
-    --listen "127.0.0.1:${port}" --advertise "$advertise" \
+    --listen "127.0.0.1:${port}" \
+    --internal-listen "$internal_bind" \
+    --advertise "$internal_bind" \
+    "${extra[@]}" \
     > "$STATE_DIR/node$port.log" 2>&1 &
-  echo "  ✓ 节点 $port 启动 (pid $!, advertise=$advertise)"
+  echo "  ✓ 节点 $port 启动 (pid $!, worker=127.0.0.1:${port} internal=$internal_bind)"
 }
 
 wait_ready() {
@@ -55,7 +70,8 @@ case "${1:-status}" in
     ;;
   add-node)
     # 多机: 在另一台机器执行 cluster_mgr.sh add-node <port> <advertise>
-    # 例: cluster_mgr.sh add-node 19000 192.168.1.50:19000
+    echo "  例: cluster_mgr.sh add-node 19000 192.168.1.50:19000"
+    echo "      Worker 仍绑 127.0.0.1:19000; 内部监听/advertise 为 192.168.1.50:19002"
     PORT="${2:-19000}"
     ADVERTISE="${3:-127.0.0.1:$PORT}"
     start_node "$PORT" "$ADVERTISE"
@@ -80,8 +96,7 @@ case "${1:-status}" in
     echo "已停止"
     ;;
   *)
-    echo "用法: cluster_mgr.sh start|stop|status|add-node <port> <advertise>"
-    echo "多机部署: 每台机器装 celld + 相同 settings.json (同 bucket),"
-    echo "  然后 cluster_mgr.sh add-node <port> <本机IP:port> — 节点经 BOS 自动发现"
+    echo "用法: cluster_mgr.sh start|stop|status|add-node <port> <advertise-host:port>"
+    echo "  advertise 填本机可达地址; v0.2 实际广播内部口 (port+2), Worker 仍只听 127.0.0.1:<port>"
     ;;
 esac

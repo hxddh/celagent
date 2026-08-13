@@ -27,7 +27,9 @@ start_node() {
     CELLD_WATCH="$watch" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
     CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)}" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
-    --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" > "$log" 2>&1 &
+    --listen "127.0.0.1:${port}" \
+    --internal-listen "127.0.0.1:$((port + 2))" \
+    --advertise "127.0.0.1:$((port + 2))" > "$log" 2>&1 &
   echo "started node on $port (pid $!)"
 }
 

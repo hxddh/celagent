@@ -96,10 +96,12 @@ WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-${EXISTING_TOKEN:-$(_rand)$(_rand)}}"
 for port in 18090 18091; do
   # 凭证卫生: celld 走 AWS_PROFILE=bos, 清除可能残留的显式密钥 env
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
+    CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
     CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
-    --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" \
+    --listen "127.0.0.1:${port}" \
+    --internal-listen "127.0.0.1:$((port + 2))" \
+    --advertise "127.0.0.1:$((port + 2))" \
     > "$STATE_DIR/node$port.log" 2>&1 &
   echo "  ✓ 节点 $port 启动 (pid $!)"
 done
@@ -140,5 +142,5 @@ echo "  ✓ 配置已写入 $CONFIG_DIR/settings.json"
 echo ""
 echo "=== 部署完成 ==="
 echo "  bucket: $BUCKET"
-echo "  节点: 18090 + 18091 (BOS 持久化)"
+echo "  节点: 18090/18091 (Worker) + 18092/18093 (celld 内部监听)"
 echo "  使用: celagent"

@@ -284,6 +284,24 @@ test("源码锚定: cluster_mgr 传入 worker token", () => {
   assert.match(sh, /CELAGENT_WORKER_TOKEN=/);
 });
 
+test("源码锚定: celld v0.2 双监听 spawn", () => {
+  assert.match(tui, /--internal-listen/);
+  assert.match(tui, /internalPort = port \+ 2/);
+  assert.match(tui, /CELLD_IDLE_EVICT_S: "30"/);
+  assert.doesNotMatch(tui, /--advertise", `127\.0\.0\.1:\$\{port\}`/);
+  for (const rel of [
+    "scripts/node_mgr.sh",
+    "scripts/cluster_mgr.sh",
+    "setup.sh",
+    "install.sh",
+    "scripts/celld-bos-test.sh",
+  ]) {
+    const sh = readFileSync(join(root, rel), "utf8");
+    assert.match(sh, /--internal-listen/, `${rel} 必须 --internal-listen`);
+    assert.match(sh, /port \+ 2|18092/, `${rel} 内部口应为 public+2`);
+  }
+});
+
 test("源码锚定: HANDOFF 不再把认证当唯一阻塞", () => {
   const handoff = readFileSync(join(root, "HANDOFF.md"), "utf8");
   assert.doesNotMatch(handoff, /卡 GitHub 认证/);

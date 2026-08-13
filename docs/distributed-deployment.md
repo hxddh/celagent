@@ -46,8 +46,9 @@ cat ~/.config/celagent/settings.json
 ### 2. 加入集群
 
 ```bash
-# 每台机器 (端口可自定义, advertise 填本机可达地址)
+# 每台机器 (端口可自定义; 第二个参数填本机可达地址, v0.2 会广播 port+2 内部口)
 ./scripts/cluster_mgr.sh add-node 19000 192.168.1.50:19000
+# → Worker: 127.0.0.1:19000    内部/advertise: 192.168.1.50:19002
 # 机器 B: add-node 19001 192.168.1.51:19001
 # 机器 C: add-node 19002 192.168.1.52:19002
 ```
@@ -71,7 +72,7 @@ celagent my-session          # 在 B 上继续 (worker 缓存或 BOS 权威)
 # kill 任意节点 → agent 会话不丢:
 #  - 对话继续 (BOS 直写不依赖节点)
 #  - 恢复继续 (另一节点 cell 状态 / BOS 权威)
-pkill -f 'celld.*19000'      # 模拟机器 A 宕机
+pkill -f 'celld.*19000'      # 模拟崩溃(SIGTERM); v0.2 优雅退出应等 drain, 见 celld-v02-evaluation.md
 celagent my-session          # 在 B 上恢复 — 历史完整
 ```
 

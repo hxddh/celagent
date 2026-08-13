@@ -36,6 +36,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `scripts/node_mgr.sh` | 本机双节点管理(start/stop/status/restart,18090/18091) |
 | `scripts/cluster_mgr.sh` | 多机集群管理(add-node/status 等) |
 | `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
+| `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估(P0 双监听已落地;P1 drain/diagnose 未做) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
@@ -95,7 +96,7 @@ node bin/celagent-tui.mjs task ledger
 - **凭证优先级**:完整环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` 优先(必须成对);否则用 `AWS_PROFILE=bos`(不把 SK 读进脚本变量/Node 堆).两者不混用
 - **install.sh 可配置 env**:`CELAGENT_REPO`(仓库地址)、`CELAGENT_SRC`(开发模式)、`CELAGENT_ROOT`(安装根目录,默认 ~/.local)、`CELAGENT_BUCKET`(强制 bucket)、`CELLD_ESBUILD`(esbuild 路径)
 - **默认 bucket**:`celagent-<rand8>-<ts>`(随机后缀, 不含 whoami)
-- **Celld**:不在仓库内,安装方式 `curl -fsSL https://celld.dev/install.sh | sh`(装到 `~/.local/bin/celld`);发布后随 Release 包分发
+- **Celld**:不在仓库内;发布随包 **v0.2.0**(linux-x64/arm64、darwin-arm64)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。评估见 `docs/celld-v02-evaluation.md`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
 ## 3. 发布状态(v0.3.1 已发布)
@@ -117,6 +118,7 @@ node bin/celagent-tui.mjs task ledger
 
 ### 已知边界(不是本仓库能补的)
 - 上游 `denoland/celld` **没有** Intel Mac (`celld-darwin-x64`) 与 Windows 包;`install.sh` 回退 `celld.dev` / Windows 跳过 celld
+- celld v0.2 停机应 SIGTERM drain(默认 25s);当前脚本仍 `pkill`+短 sleep,own.json 全量清理是崩溃恢复而非优雅重启
 - 真实 BOS 联调 / 多机故障注入需要本机 `[bos]` 凭证与 celld,CI 不跑
 - 全新机器带凭证的 `curl | sh` + 建 bucket + TUI 对话,需有 BOS 的机器上验收
 

@@ -213,10 +213,12 @@ else
   sleep 2
   for port in 18090 18091; do
     nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-      CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
+      CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
       CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
       "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
-      --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" \
+      --listen "127.0.0.1:${port}" \
+      --internal-listen "127.0.0.1:$((port + 2))" \
+      --advertise "127.0.0.1:$((port + 2))" \
       > "$STATE_DIR/node$port.log" 2>&1 &
   done
   echo "  ✓ 节点 18090/18091 启动"

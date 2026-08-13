@@ -147,7 +147,8 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **worker 缓存上限**:checkpoint POST JSON, msg 8000 字符(旧 GET URL 兼容仍在);权威数据在 BOS,不受此限
 - **LTX 异步复制窗口**:写后立即 kill 节点可能 RestoreFailed(约 10s 窗口,见 bos-compat §四)
 - **own.json 残留**:强杀节点后阻塞接管,运维脚本需清理(见 setup.sh Bug 94);仅 `celagent-*` bucket 默认清理
-- **节点 lease 10s**:集群成员 TTL,网络分区时节点可能被误判离线
+- **节点 lease 10s**:集群成员 TTL;v0.2 对 peer 可 SIGTERM 直接 handoff,不必等 TTL。网络分区时节点仍可能被误判离线
+- **celld v0.2 双监听**:Worker `127.0.0.1:18090/18091`;内部 `18092/18093`(port+2)。TUI 只打 Worker/health。详见 `docs/celld-v02-evaluation.md`
 - **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失);拉起节点另有 `ensure.lock`
 - **CI Release job**:`.github/workflows/release.yml` 在 tag / workflow_dispatch 时匿名路径构建并上传
 - **Release 资产**:v0.3.1 含 celagent 五平台、celld linux/darwin-arm64、SHA256SUMS;上游 celld 无 darwin-x64/Windows

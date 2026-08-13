@@ -186,14 +186,17 @@ async function ensureCelld() {
             } catch (e) { /* 端口空闲, 启动 */ }
             // Bug 57: spawn 必须挂 error handler — 否则 celld 二进制缺失/损坏/
             // 无权限/端口冲突时, unhandled 'error' 事件直接炸掉整个 celagent 进程
+            // celld v0.2: --advertise 必须指向内部监听; 显式 advertise 必须带 --internal-listen
+            const internalPort = port + 2;
             const child = spawn(celldBin, [
               "--bucket", `s3://${bucket}`,
               "--endpoint", resolveEndpoint(cfg.persistence?.endpoint),
               "--region", cfg.persistence?.region || "bj",
               "--listen", `127.0.0.1:${port}`,
-              "--advertise", `127.0.0.1:${port}`,
+              "--internal-listen", `127.0.0.1:${internalPort}`,
+              "--advertise", `127.0.0.1:${internalPort}`,
             ], {
-              env: { ...bosChildEnv(), CELLD_WATCH: join(stateDir, `node${port}`), CELAGENT_WORKER_TOKEN: ensureWorkerToken() },
+              env: { ...bosChildEnv(), CELLD_WATCH: join(stateDir, `node${port}`), CELLD_IDLE_EVICT_S: "30", CELAGENT_WORKER_TOKEN: ensureWorkerToken() },
               stdio: "ignore",
               detached: true,
             });

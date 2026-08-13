@@ -143,7 +143,7 @@ if [ -n "$NODE1_PID" ]; then
     CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
     CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$TOKEN}" \
     "${CELLD:-$HOME/.local/bin/celld}" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
-    --listen 127.0.0.1:18090 --advertise 127.0.0.1:18090 > "${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log" 2>&1 &
+    --listen 127.0.0.1:18090 --internal-listen 127.0.0.1:18092 --advertise 127.0.0.1:18092 > "${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log" 2>&1 &
   sleep 6
 else
   check "节点1 存在" "fail"
