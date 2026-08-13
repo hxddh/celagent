@@ -65,3 +65,5 @@
 ## 发版
 
 实现合进 `main` 后打 tag **`v0.3.4`**(不移动旧 tag)。随包 celld 仍为 v0.2.0。
+
+✅ 2026-08-13:tag `v0.3.4` → `eec47c4`;Latest 已切;冒烟 `./scripts/release-smoke.sh v0.3.4` 通过。
