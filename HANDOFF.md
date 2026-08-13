@@ -98,9 +98,13 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:不在仓库内,安装方式 `curl -fsSL https://celld.dev/install.sh | sh`(装到 `~/.local/bin/celld`);发布后随 Release 包分发
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(v0.3.1)
+## 3. 发布状态(v0.3.1 已发布)
 
-仓库:`https://github.com/hxddh/celagent`。**代码版本 0.3.1**。在 `main` 打 tag `v0.3.1` 后,`.github/workflows/release.yml` 构建并上传资产,使 **tag / 资产 / 代码对齐**。旧 tag `v0.3.0` 仍指向早期提交 `31d12a4`;不要用 `git checkout v0.3.0` 当当前代码。
+仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.1](https://github.com/hxddh/celagent/releases/tag/v0.3.1)。
+
+- **tag `v0.3.1`** 指向 `6790e99`(PR #4 合并提交);Release 资产由此 SHA 构建
+- **`main`** 另含 PR #5:`.github/workflows/release.yml` 的 publish 设 `GH_REPO`(无 checkout 时 `gh` 才能上传)。不影响已发布二进制
+- 旧 tag **`v0.3.0`** 仍指向 `31d12a4`;不要用 `git checkout v0.3.0` 当当前代码
 
 ### 已完成
 - ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content);恢复 **BOS-first**
@@ -116,15 +120,15 @@ node bin/celagent-tui.mjs task ledger
 - 真实 BOS 联调 / 多机故障注入需要本机 `[bos]` 凭证与 celld,CI 不跑
 - 全新机器带凭证的 `curl | sh` + 建 bucket + TUI 对话,需有 BOS 的机器上验收
 
-### 发布流程
+### 发布流程(已完成)
 
 0. ✅ docs/archive 已删除
 1. ✅ 仓库已推送
 2. ✅ CI 绿 (node 22/24)
-3. 在 `main` 打 tag `v0.3.1` → Release workflow 上传资产(与代码同 SHA)。publish job 无 checkout,必须设 `GH_REPO`
+3. ✅ tag `v0.3.1` 已推送,资产已上传;`main` 已设 `GH_REPO` 供后续 tag
 4. ✅ 跨平台 celagent 由 Release workflow 在 `/tmp/anon-build` 编译
 5. ✅ install.sh 正式模式从 GitHub Release 下载,有 `SHA256SUMS` 则校验
-6. 上传后跑 `./scripts/release-smoke.sh v0.3.1`(无 BOS,校验 SHA256 + version/help)
+6. ✅ `./scripts/release-smoke.sh v0.3.1` 与 `latest` 通过(无 BOS,校验 SHA256 + version/help)
 
 ## 4. 版本与里程碑
 

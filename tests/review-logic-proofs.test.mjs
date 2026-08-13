@@ -293,6 +293,7 @@ test("源码锚定: HANDOFF 不再把认证当唯一阻塞", () => {
   assert.match(handoff, /celld-linux-x64/);
   assert.match(handoff, /release\.yml/);
   assert.match(handoff, /v0\.3\.1/);
+  assert.match(handoff, /已发布/);
 });
 
 test("源码锚定: Release 流水线拉 denoland celld 并匿名编译", () => {
