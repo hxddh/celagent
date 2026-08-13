@@ -13,9 +13,9 @@ jobs:
       matrix:
         node-version: [22, 24]  # undici 8.x 要求 node >= 22
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -23,18 +23,20 @@ jobs:
         run: npm ci
       - name: Syntax check all sources
         run: |
+          set -euo pipefail
           node --version
-          ls -la bin/ src/ tests/
-          for f in bin/*.mjs src/*.js tests/*.mjs; do node --check "$f" || echo "SYNTAX FAIL: $f"; done
+          fail=0
+          for f in bin/*.mjs src/*.js tests/*.mjs worker/src/*.js; do
+            [ -f "$f" ] || continue
+            node --check "$f" || { echo "SYNTAX FAIL: $f"; fail=1; }
+          done
+          exit "$fail"
       - name: CLI smoke test (help/version, no celld needed)
         run: |
           timeout 30 node bin/celagent-tui.mjs help >/dev/null || { echo "HELP FAILED exit=$?"; exit 1; }
           timeout 30 node bin/celagent-tui.mjs version | grep -q "celagent v" || { echo "VERSION FAILED"; exit 1; }
-      - name: "Unit tests (no celld, mock mode)"
+      - name: Unit tests (no celld required)
         run: npm test
-        env:
-          CELAGENT_MOCK: "1"
-        continue-on-error: true
       - name: Secret / PII scan
         run: |
           set -euo pipefail
@@ -46,11 +48,11 @@ jobs:
           PATTERN="${LEAKED_SESS}|${LEAKED_SESS2}|/Users/[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/(celagent|celld)|ALTAK[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|aws_secret_access_key[[:space:]]*=[[:space:]]*[^[:space:]<$]"
           hit=0
           if command -v rg >/dev/null 2>&1; then
-            if rg -n --glob '!package-lock.json' --glob '!.git/**' -e "$PATTERN" .; then
+            if rg -n --glob '!package-lock.json' --glob '!.git/**' --glob '!node_modules/**' -e "$PATTERN" .; then
               hit=1
             fi
           else
-            if grep -RIn --exclude=package-lock.json --exclude-dir=.git -E "$PATTERN" .; then
+            if grep -RIn --exclude=package-lock.json --exclude-dir=.git --exclude-dir=node_modules -E "$PATTERN" .; then
               hit=1
             fi
           fi
@@ -66,8 +68,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: 'npm'

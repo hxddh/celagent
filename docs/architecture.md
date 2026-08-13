@@ -57,10 +57,12 @@
 
 ```
 celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
+   → BOS miss 时才回退 worker resume (缓存 POST JSON, msg 上限 8000; 旧 GET 兼容)
    → 取最近 50 轮 (MAX_INJECT_TURNS, Bug 78: 防超长会话撑爆模型上下文)
-   → result.session.steer("以下是本会话之前的对话历史...")  (Bug 24: 标注 assistant 轮)
-   → seq 续写起点 = BOS 历史长度 (防二次 resume 覆盖旧轮)
-优先级: BOS 权威源 > worker 缓存 (恢复读 BOS, 不依赖节点)
+   → result.session.steer(...) 注入 content 文本块 (缺省回退 t.msg) + 真实 t.role
+   → seq 续写起点 = max(turn) (非 turns.length, 防 gap 覆盖)
+   → 运行中 message_end(user) + turn_end(assistant) 双角色落盘
+优先级: BOS 权威源 > worker 缓存 (恢复先读 BOS, 不依赖节点)
 ```
 
 ## 2. 核心机制原理
@@ -84,8 +86,8 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 ### 2.3 双写一致性(worker 缓存 vs BOS)
 
 - **写**:两路并行,worker 失败不影响 BOS(缓存丢了可重建)。
-- **读**:恢复只读 BOS 权威;worker 缓存是快路径(148ms),截断 200 字符(URL 限制),
-  完整数据永远在 BOS。
+- **读**:恢复先读 BOS 权威;仅 BOS miss 时才回退 worker 缓存(checkpoint POST JSON, msg 上限 8000;
+  旧 GET query 仍兼容),完整数据永远在 BOS。
 - **一致性模型**:BOS 为准,缓存可过期/缺失,无强一致要求。
 
 ## 3. 组件职责边界(为什么这样划分)
@@ -96,7 +98,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 |---|---|
 | `checkpoint` / `resume` | 会话轮次写入 / 读取(缓存层, 双写路径用) |
 | `sync` | 会话同步(节点间/与 BOS 对齐) |
-| `submit` / `status` / `ledger` | 任务状态机(断点续跑, exactly-once) |
+| `submit` / `status` / `ledger` | 任务状态机(断点续跑, 单 cell ledger 去重) |
 | `schedule` / `delegate` | 定时任务 / 跨 cell 委托 |
 | `hibernate` / `wake` / `hibernate-status` | 休眠唤醒(会话即 cell, 空闲回收) |
 | `kv-put/get/list/delete` | 通用 KV(缓存/协调) |
@@ -117,9 +119,9 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 
 **扩展点(改造/迭代入口)**:
 1. **换 LLM provider**:`config set provider/model` + pi 引擎支持(多模型已内建)
-2. **换存储后端**:`settings.json` 的 `persistence.endpoint` 指向任意 S3 兼容服务
-   (自定义 endpoint 透传设计, Bug 70;底层是 `src/bos.js` 的 aws CLI 封装,
-   BOS 为本项目唯一实测后端, 其他 S3 兼容服务需自行验证)
+2. **换存储后端**:`settings.json` 的 `persistence.endpoint` 默认仅允许 `s3.*.bcebos.com`
+   或本机回环;其他 S3 兼容地址需显式 `CELAGENT_ALLOW_ENDPOINT=1`(底层是 `src/bos.js`
+   的 aws CLI 封装, BOS 为本项目唯一实测后端)
 3. **新记忆工具**:在 `src/bos-tools.js` 加函数,注册进 customTools 数组
 4. **任务类型**:worker 的 `action=submit` switch 加分支(状态机已内建)
 5. **集群拓扑**:`cluster_mgr.sh` + nodes/ 注册表(节点自动发现,无需手动 peer)
@@ -142,17 +144,17 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 
 ## 5. 已知边界与技术债(架构视角)
 
-- **worker 200 字符截断**:URL 长度限制,缓存层妥协,权威数据不受影响
+- **worker 缓存上限**:checkpoint POST JSON, msg 8000 字符(旧 GET URL 兼容仍在);权威数据在 BOS,不受此限
 - **LTX 异步复制窗口**:写后立即 kill 节点可能 RestoreFailed(约 10s 窗口,见 bos-compat §四)
-- **own.json 残留**:强杀节点后阻塞接管,运维脚本需清理(见 setup.sh Bug 94)
+- **own.json 残留**:强杀节点后阻塞接管,运维脚本需清理(见 setup.sh Bug 94);仅 `celagent-*` bucket 默认清理
 - **节点 lease 10s**:集群成员 TTL,网络分区时节点可能被误判离线
-- **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失)
-- **CI 不构建发布二进制**:当前手动匿名路径构建(见 PACKAGING 注意 0)
-- **install.sh 正式模式未切 Release 下载**:发布流程步骤 5
+- **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失);拉起节点另有 `ensure.lock`
+- **CI Release job**:`.github/workflows/release.yml` 在 tag / workflow_dispatch 时匿名路径构建并上传
+- **Release 资产**:合并后跑 Release workflow 补 `celld-linux-*` 与 `SHA256SUMS`;上游 celld 无 darwin-x64/Windows
 
 ## 6. 与分布式部署的关系
 
 - 单机 = 双节点(18090/18091);多机 = cluster_mgr 加节点(见 distributed-deployment.md)
 - 多机共享同一 bucket → 会话跨机器可见(BOS 权威)
 - 节点经 BOS `nodes/` 注册表自动发现,无手动 peer 配置
-- 任务状态机 submit/status/ledger 跨节点断点续跑(exactly-once)
+- 任务状态机 submit/status/ledger 跨节点断点续跑(单 cell ledger 去重, 不是跨节点共识)

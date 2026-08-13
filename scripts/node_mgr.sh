@@ -25,6 +25,7 @@ start_node() {
   # 凭证卫生: AWS_PROFILE=bos, 不把 SK 读进变量/显式注入
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     CELLD_WATCH="$watch" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
+    CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)}" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
     --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" > "$log" 2>&1 &
   echo "started node on $port (pid $!)"
@@ -54,10 +55,14 @@ case "${1:-status}" in
     # (只有自动启动路径清理过, 手动重启路径遗漏 — 环境一致性缺陷)
     OWN_KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --endpoint-url "$EP" \
       --prefix "cells/" --query "Contents[?ends_with(Key, \`own.json\`)].Key" --output json 2>/dev/null || echo "[]")
-    for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
-      aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "$EP" >/dev/null 2>&1
-      echo "cleaned stale ownership: $k"
-    done
+    if [ "${CELAGENT_CLEAN_OWN:-}" = "1" ] || echo "$BUCKET" | grep -q '^celagent-'; then
+      for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
+        aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "$EP" >/dev/null 2>&1
+        echo "cleaned stale ownership: $k"
+      done
+    else
+      echo "skip own.json wipe (bucket=$BUCKET 非 celagent- 前缀; CELAGENT_CLEAN_OWN=1 强制)"
+    fi
     # BOS 预热(避免并发启动限流)
     aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$EP" >/dev/null 2>&1 || true
     sleep 2

@@ -27,13 +27,38 @@ before(async () => {
   if (!celldUp) console.log("(Celld 节点未运行, Celld 用例将 skip — node_mgr.sh start 可启动)");
 });
 
+function workerToken() {
+  if (process.env.CELAGENT_WORKER_TOKEN) return process.env.CELAGENT_WORKER_TOKEN;
+  try {
+    const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
+    const t = cfg.worker?.token;
+    return (typeof t === "string" && t.length >= 8) ? t : "";
+  } catch {
+    return "";
+  }
+}
+
 async function celld(action, params = {}) {
-  const q = new URLSearchParams(params).toString();
+  const tok = workerToken();
+  const headers = {};
+  if (tok) headers["X-Celagent-Token"] = tok;
+  const postBody = action === "checkpoint" || action === "sync";
   for (const base of NODES) {
     try {
-      const resp = await fetch(`${base}/agent/${AGENT}?action=${action}&${q}`, {
-        signal: AbortSignal.timeout(8000),
-      });
+      const u = new URL(`${base}/agent/${AGENT}`);
+      u.searchParams.set("action", action);
+      const init = { signal: AbortSignal.timeout(8000), headers: { ...headers } };
+      if (postBody) {
+        if (params.session) u.searchParams.set("session", String(params.session));
+        init.method = "POST";
+        init.headers["Content-Type"] = "application/json";
+        init.body = JSON.stringify(params);
+      } else {
+        for (const [k, v] of Object.entries(params)) {
+          if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
+        }
+      }
+      const resp = await fetch(u, init);
       return await resp.json();
     } catch (e) { /* try next */ }
   }
@@ -43,11 +68,14 @@ async function celld(action, params = {}) {
 // ---- 真实 BOS 链路 (来自 src/bos.js) ----
 let bucket, endpoint;
 before(async () => {
-  // 读配置 (settings.json 单源)
-  const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
-  bucket = cfg.persistence?.bucket;
-  endpoint = cfg.persistence?.endpoint;
-  // 无配置则跳过 BOS 用例 (CI 无凭证时)
+  try {
+    const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
+    bucket = cfg.persistence?.bucket;
+    endpoint = cfg.persistence?.endpoint;
+  } catch (e) {
+    bucket = undefined;
+    endpoint = undefined;
+  }
   if (!bucket) console.log("(无 bucket 配置, BOS 用例将跳过)");
 });
 
@@ -147,16 +175,32 @@ test("8. CLI: 未知 - 参数拒绝 (Bug 80 回归)", async () => {
 });
 
 // ---- 配置单源化 (Bug 87 回归) ----
-test("9. config set model 同步 pi-runtime (Bug 87 回归)", async () => {
+test("9. config set model 同步 pi-runtime (Bug 87 回归)", async (t) => {
   const { execFileSync: ex } = await import("node:child_process");
   const piFile = join(homedir(), ".config", "celagent", "pi-runtime", "settings.json");
-  const orig = JSON.parse(readFileSync(piFile, "utf8"));
+  let orig;
+  try {
+    orig = JSON.parse(readFileSync(piFile, "utf8"));
+  } catch (e) {
+    return t.skip("无 pi-runtime/settings.json");
+  }
+  if (!orig.defaultModel) return t.skip("pi-runtime settings 无 defaultModel");
   try {
     ex("node", ["bin/celagent-tui.mjs", "config", "set", "model", orig.defaultModel], { encoding: "utf8" });
     const after = JSON.parse(readFileSync(piFile, "utf8"));
     assert.equal(after.defaultModel, orig.defaultModel, "pi-runtime defaultModel 同步");
   } finally {
-    // 还原
     writeFileSync(piFile, JSON.stringify(orig, null, 2) + "\n", "utf8");
   }
+});
+
+test("10. CLI: 非法 sessionId 拒绝", async () => {
+  const { execFileSync: ex } = await import("node:child_process");
+  let threw = false;
+  try { ex("node", ["bin/celagent-tui.mjs", "../etc"], { encoding: "utf8", timeout: 5000 }); }
+  catch (e) {
+    threw = true;
+    assert.match(String(e.stderr || e.stdout || ""), /无效会话 ID/);
+  }
+  assert.ok(threw, "含 .. 的会话 ID 应拒绝");
 });

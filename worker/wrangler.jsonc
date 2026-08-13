@@ -1,3 +1,5 @@
+// Celld worker 绑定清单。部署走 `celld deploy`(见 setup.sh / install.sh),
+// 不是 Cloudflare wrangler; 本文件给 Celld 解析 Durable Object / SQLite 绑定。
 {
   "name": "agent-runtime",
   "main": "src/index.js",

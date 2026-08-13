@@ -1,26 +1,12 @@
 // bos-tools.js — P1 记忆增强: agent 可用的 BOS 记忆工具
 // history_search: 跨会话检索历史记忆 (只读)
 // session_snapshot: 显式记忆锚点 (写 snapshots/ 前缀, 不碰权威数据)
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, existsSync, writeFileSync, unlinkSync, chmodSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { execFile } from "node:child_process";
-
-const EP = "https://s3.bj.bcebos.com";
-
-function awsEnv() {
-  const env = { ...process.env, AWS_EC2_METADATA_DISABLED: "true" };
-  const hasFullEnv = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY;
-  if (hasFullEnv) {
-    delete env.AWS_PROFILE;
-  } else {
-    delete env.AWS_ACCESS_KEY_ID;
-    delete env.AWS_SECRET_ACCESS_KEY;
-    delete env.AWS_SESSION_TOKEN;
-    env.AWS_PROFILE = "bos";
-  }
-  return env;
-}
+import { writeFile, readFile, chmod, mkdtemp, rm } from "node:fs/promises";
+import { awsEnv, resolveEndpoint } from "./bos.js";
 
 function runAws(args) {
   return new Promise((resolve) => {
@@ -31,13 +17,27 @@ function runAws(args) {
   });
 }
 
-function loadBucket() {
+function loadPersistence() {
   const cfgFile = join(homedir(), ".config", "celagent", "settings.json");
   if (!existsSync(cfgFile)) return null;
   try {
     const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
-    return cfg.persistence?.bucket || null;
+    const bucket = cfg.persistence?.bucket || null;
+    if (!bucket) return null;
+    return { bucket, endpoint: resolveEndpoint(cfg.persistence?.endpoint) };
   } catch (e) { return null; }
+}
+
+async function privateTmp(name = "body.json") {
+  const dir = await mkdtemp(join(tmpdir(), "celagent-"));
+  try { await chmod(dir, 0o700); } catch (e) { /* ignore */ }
+  return {
+    dir,
+    path: join(dir, name),
+    async cleanup() {
+      try { await rm(dir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    },
+  };
 }
 
 function textOf(turn) {
@@ -56,53 +56,67 @@ function textOf(turn) {
 // ---- 工具 1: history_search — 跨会话检索记忆 ----
 export const history_search = {
   name: "history_search",
-  description: "在 BOS 云端历史会话中搜索记忆。返回匹配的会话轮次片段(session/turn/时间/内容摘要)。用于回忆之前会话中讨论过的问题、做过的修改、得出的结论。参数: query 必填(搜索关键词), limit 可选(返回条数, 默认 5, 最大 20), session 可选(限定某会话)。",
+  description: "在 BOS 云端历史中搜索记忆。默认只搜当前会话; 传 session=\"*\" 才跨会话。返回匹配轮次片段。",
   parameters: {
     type: "object",
     properties: {
       query: { type: "string", description: "搜索关键词(如: 并发、bug、架构)" },
       limit: { type: "number", description: "返回条数, 默认 5, 最大 20" },
-      session: { type: "string", description: "限定搜索某个会话 ID(可选)" },
+      session: { type: "string", description: "会话 ID; 默认当前会话; 传 * 搜索全部会话" },
     },
     required: ["query"],
   },
   execute: async (toolCallId, params) => {
     try {
-      const bucket = loadBucket();
-      if (!bucket) return { content: [{ type: "text", text: "未配置 BOS bucket, 无法搜索历史" }] };
+      const pers = loadPersistence();
+      if (!pers) return { content: [{ type: "text", text: "未配置 BOS bucket, 无法搜索历史" }] };
+      const { bucket, endpoint } = pers;
       const query = String(params.query || "").toLowerCase();
       const limit = Math.min(Number(params.limit) || 5, 20);
-      const sessionFilter = params.session ? String(params.session) : null;
+      const persistId = typeof globalThis.__celagentPersistId === "string" ? globalThis.__celagentPersistId : null;
+      const rawSession = params.session != null ? String(params.session) : persistId;
+      const cross = rawSession === "*" || rawSession === "all";
+      const sessionFilter = cross ? null : rawSession;
+      if (!sessionFilter && !cross) {
+        return { content: [{ type: "text", text: "未指定会话。默认只搜当前会话; 跨会话请传 session=\"*\"" }] };
+      }
+      if (sessionFilter && !/^[A-Za-z0-9._-]{1,128}$/.test(sessionFilter)) {
+        return { content: [{ type: "text", text: "非法会话 ID" }] };
+      }
 
-      // 列出 sessions/
-      let keys = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", EP, "--query", "Contents[].Key", "--output", "json"]);
-      if (!Array.isArray(keys)) keys = [];
+      let keys;
       if (sessionFilter) {
-        keys = keys.filter(k => k === `sessions/${sessionFilter}.json`);
+        keys = [`sessions/${sessionFilter}.json`];
+      } else {
+        keys = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--max-items", "40", "--query", "Contents[].Key", "--output", "json"]);
+        if (!Array.isArray(keys)) keys = [];
+        keys = keys.filter((k) => typeof k === "string").slice(0, 40);
       }
 
       const hits = [];
       for (const key of keys) {
-        // 读会话内容 (head-object 拿 ETag, get-object 拿 body)
-        const tmp = `/tmp/celagent-search-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
-        const dl = await new Promise((resolve) => {
-          execFile("aws", ["s3api", "get-object", "--bucket", bucket, "--key", key, "--endpoint-url", EP, tmp], { env: awsEnv(), timeout: 15000 }, (err) => resolve(!err));
-        });
-        if (!dl) continue;
-        try { chmodSync(tmp, 0o600); } catch (e) { /* ignore */ }
+        const tmp = await privateTmp("search.json");
         try {
-          const session = JSON.parse(readFileSync(tmp, "utf8"));
-          const sessionId = key.replace("sessions/", "").replace(".json", "");
-          for (const turn of (session.turns || [])) {
-            const haystack = textOf(turn).toLowerCase();
-            if (haystack.includes(query)) {
-              const snippet = (turn.msg || textOf(turn)).slice(0, 200);
-              hits.push({ session: sessionId, turn: turn.turn, role: turn.role || "?", ts: turn.ts, snippet });
-              if (hits.length >= limit) break;
+          const dl = await new Promise((resolve) => {
+            execFile("aws", ["s3api", "get-object", "--bucket", bucket, "--key", key, "--endpoint-url", endpoint, tmp.path], { env: awsEnv(), timeout: 15000 }, (err) => resolve(!err));
+          });
+          if (!dl) continue;
+          try { await chmod(tmp.path, 0o600); } catch (e) { /* ignore */ }
+          try {
+            const session = JSON.parse(await readFile(tmp.path, "utf8"));
+            const sessionId = key.replace("sessions/", "").replace(".json", "");
+            for (const turn of (session.turns || [])) {
+              const haystack = textOf(turn).toLowerCase();
+              if (haystack.includes(query)) {
+                const snippet = (turn.msg || textOf(turn)).slice(0, 200);
+                hits.push({ session: sessionId, turn: turn.turn, role: turn.role || "?", ts: turn.ts, snippet });
+                if (hits.length >= limit) break;
+              }
             }
-          }
-        } catch (e) { /* 跳过损坏会话 */ }
-        try { unlinkSync(tmp); } catch (e) { /* ignore */ }
+          } catch (e) { /* 跳过损坏会话 */ }
+        } finally {
+          await tmp.cleanup();
+        }
         if (hits.length >= limit) break;
       }
 
@@ -133,12 +147,12 @@ export const session_snapshot = {
   },
   execute: async (toolCallId, params) => {
     try {
-      const bucket = loadBucket();
-      if (!bucket) return { content: [{ type: "text", text: "未配置 BOS bucket, 无法保存快照" }] };
+      const pers = loadPersistence();
+      if (!pers) return { content: [{ type: "text", text: "未配置 BOS bucket, 无法保存快照" }] };
+      const { bucket, endpoint } = pers;
       const name = String(params.name || "").trim();
       if (!name) return { content: [{ type: "text", text: "缺少快照名称" }] };
       const note = params.note ? String(params.note) : "";
-      // 快照保存当前上下文中可见的会话状态 (由调用方注入 currentTurns)
       const currentTurns = (typeof globalThis.__celagentSnapshotTurns === "function")
         ? globalThis.__celagentSnapshotTurns()
         : [];
@@ -147,15 +161,17 @@ export const session_snapshot = {
         name, note, createdAt: Date.now(),
         turns: currentTurns,
       });
-      // 写临时文件再 put
-      const tmp = `/tmp/celagent-snap-${Date.now()}.json`;
-      writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600 });
-      const put = await new Promise((resolve) => {
-        execFile("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", tmp, "--endpoint-url", EP, "--output", "json"], { env: awsEnv(), timeout: 20000 }, (err, stdout) => resolve(!err));
-      });
-      unlinkSync(tmp);
-      if (!put) return { content: [{ type: "text", text: "快照保存失败" }] };
-      return { content: [{ type: "text", text: `已保存会话快照: ${key} (${currentTurns.length} 轮)` }] };
+      const tmp = await privateTmp("snap.json");
+      try {
+        await writeFile(tmp.path, body, { encoding: "utf8", mode: 0o600 });
+        const put = await new Promise((resolve) => {
+          execFile("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", tmp.path, "--endpoint-url", endpoint, "--output", "json"], { env: awsEnv(), timeout: 20000 }, (err, stdout) => resolve(!err));
+        });
+        if (!put) return { content: [{ type: "text", text: "快照保存失败" }] };
+        return { content: [{ type: "text", text: `已保存会话快照: ${key} (${currentTurns.length} 轮)` }] };
+      } finally {
+        await tmp.cleanup();
+      }
     } catch (e) {
       return { content: [{ type: "text", text: `session_snapshot 失败: ${e.message}` }] };
     }
