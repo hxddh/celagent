@@ -2,7 +2,8 @@
 
 > 本文档是 celagent 的**架构权威说明**——回答"为什么这么设计"和"哪里可以改"。
 > 面向:改造架构、基于迭代、新 agent 深入接手。配套:`HANDOFF.md`(交接入口)、
-> `README.md`(用户视角)、`docs/distributed-deployment.md`(多机)、`docs/bos-compat.md`(BOS 边界)。
+> `README.md`(用户视角)、`docs/distributed-deployment.md`(多机)、`docs/bos-compat.md`(BOS 边界)、
+> `docs/s3-compat-evaluation.md`(多后端对象存储:合格门禁与迭代计划)。
 
 ## 1. 系统总览
 
@@ -25,7 +26,8 @@
 └─────────────────────────────┘  └──────────────────────────────┘
 ```
 
-**一句话**:BOS 保数据(权威源,RPO=0)、Celld 保执行(缓存/任务/集群)、agent 可用 BOS(记忆工具)。
+**一句话**:对象存储保数据(权威源,RPO=0;默认 BOS)、Celld 保执行(缓存/任务/集群)、agent 可用同一存储(记忆工具)。
+不是所有「S3 兼容」都能当权威源——必须有条件写 + 写后读一致;见 `docs/s3-compat-evaluation.md`。
 
 **记忆体系**:`sessions/<id>.json`(权威会话)+ `snapshots/<name>-<ts>.json`(显式记忆锚点,
 由 `session_snapshot` 工具写入,不碰权威数据,可跨会话检索 via `history_search`)。
@@ -119,9 +121,11 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 
 **扩展点(改造/迭代入口)**:
 1. **换 LLM provider**:`config set provider/model` + pi 引擎支持(多模型已内建)
-2. **换存储后端**:`settings.json` 的 `persistence.endpoint` 默认仅允许 `s3.*.bcebos.com`
-   或本机回环;其他 S3 兼容地址需显式 `CELAGENT_ALLOW_ENDPOINT=1`(底层是 `src/bos.js`
-   的 aws CLI 封装, BOS 为本项目唯一实测后端)
+2. **换存储后端**:当前默认仅允许 `s3.*.bcebos.com` 或本机回环;其他地址需
+   `CELAGENT_ALLOW_ENDPOINT=1`。**非法 endpoint 会静默退回 BOS**(已知缺陷,评估要求
+   改成 fail-closed)。底层是 `src/bos.js` 的 aws CLI 封装;BOS 为唯一实测后端。
+   合格/不合格后端与分阶段计划见 `docs/s3-compat-evaluation.md`——不要把 MinIO/B2
+   当 RPO=0 部署选项
 3. **新记忆工具**:在 `src/bos-tools.js` 加函数,注册进 customTools 数组
 4. **任务类型**:worker 的 `action=submit` switch 加分支(状态机已内建)
 5. **集群拓扑**:`cluster_mgr.sh` + nodes/ 注册表(节点自动发现,无需手动 peer)
@@ -152,6 +156,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失);拉起节点另有 `ensure.lock`
 - **CI Release job**:`.github/workflows/release.yml` 在 tag / workflow_dispatch 时匿名路径构建并上传
 - **Release 资产**:v0.3.2 含 celagent 五平台、celld linux/darwin-arm64、SHA256SUMS;上游 celld 无 darwin-x64/Windows
+- **存储后端耦合**:运维脚本硬编码 BOS endpoint/profile/region;`resolveEndpoint` 对非白名单 URL 静默回退 BOS。扩后端计划见 `docs/s3-compat-evaluation.md`
 
 ## 6. 与分布式部署的关系
 

@@ -103,3 +103,7 @@ AWS_PROFILE=bos aws s3api ...   # 正常
 1. **测试基线**: 每次改动后跑 `celld-bos-test.sh`,确认输出 0 失败(17 项检查)
 2. **生产配置**: 双节点 + BOS, 串行启动, 监控 RestoreFailed
 3. **容量**: BOS 小对象 PUT P99 决定写延迟, 高频场景需关注
+
+## 六、与其它 S3 兼容存储
+
+本文只记录 **BOS 实测边界**。把 celagent 接到 AWS S3 / R2 / Tigris 等,不是换 endpoint 那么简单:必须有条件写 + 写后读一致;MinIO 社区版等官方不合格。评估与分阶段计划见 `docs/s3-compat-evaluation.md`。

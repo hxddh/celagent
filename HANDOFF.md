@@ -2,13 +2,14 @@
 
 > 本文档是**唯一权威交接入口**。任何 agent 或开发者接手本项目,先从本文档开始。
 > 配套文档:`README.md`(用户视角)、**`docs/architecture.md`(架构权威: 数据流/机制/设计决策/扩展点)**、
-> `PACKAGING.md`(打包/发布)、`docs/distributed-deployment.md`(多机部署)。
+> `PACKAGING.md`(打包/发布)、`docs/distributed-deployment.md`(多机部署)、
+> `docs/s3-compat-evaluation.md`(多后端对象存储评估)。
 
 ## 0. 项目定位
 
-**celagent**:独立开源 agent 产品。基于 Pi TUI 引擎 + Celld 分布式运行时 + BOS 对象存储,核心卖点是**会话永不丢(RPO=0)**——每轮对话经 BOS 权威落盘,崩溃/换机器/节点故障历史一条不丢。
+**celagent**:独立开源 agent 产品。基于 Pi TUI 引擎 + Celld 分布式运行时 + 对象存储,核心卖点是**会话永不丢(RPO=0)**——每轮对话经对象存储权威落盘,崩溃/换机器/节点故障历史一条不丢。默认后端是百度 BOS(唯一实测);扩到其它 S3 兼容存储的条件与计划见 `docs/s3-compat-evaluation.md`。
 
-**核心心智模型**:BOS 保数据(权威源,RPO=0)+ Celld 保执行(缓存/任务/集群)+ agent 可用 BOS(记忆工具)。
+**核心心智模型**:对象存储保数据(权威源,RPO=0)+ Celld 保执行(缓存/任务/集群)+ agent 可用同一存储(记忆工具)。
 
 ```
 TUI 交互 (pi-coding-agent 引擎, 全量工具)
@@ -16,7 +17,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
    ├─▶ worker SQLite (快速缓存, 2s 超时, 丢了可重建)
    └─▶ BOS 直写队列 (权威源, CAS If-Match 乐观锁 + 幂等去重)
                                 │
-                    sessions/<id>.json  (完整 content, 不截断)
+                    sessions/<id>.json  (完整 content, 不截断; 默认 BOS)
 ```
 
 **架构细节(数据流时序/机制原理/组件边界/10 项设计决策/扩展点)见 `docs/architecture.md`**——
@@ -27,7 +28,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | 路径 | 职责 |
 |------|------|
 | `bin/celagent-tui.mjs` | CLI + TUI 主程序(~880 行:命令解析含 task 分布式任务、节点自动启动、turn_end 持久化钩子、会话恢复) |
-| `src/bos.js` | BOS 直写核心(aws CLI 异步封装、CAS If-Match/If-None-Match、指数退避重试) |
+| `src/bos.js` | 对象存储直写核心(aws CLI、CAS If-Match/If-None-Match;默认 BOS,见 s3-compat-evaluation) |
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
 | `worker/src/index.js` | Celld worker(缓存读路径、Sync API、AWS SigV4 手写签名) |
 | `worker/wrangler.jsonc` | Celld worker 绑定清单(部署走 `celld deploy`, 不是 Cloudflare wrangler) |
@@ -37,6 +38,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `scripts/cluster_mgr.sh` | 多机集群管理(add-node/status 等) |
 | `scripts/celld-bos-test.sh` | BOS 模式端到端测试 |
 | `docs/celld-v02-evaluation.md` | celld v0.2.0 对照评估 + 新特性利用评审(P0 双监听已落地) |
+| `docs/s3-compat-evaluation.md` | 多后端对象存储评估:合格/不合格分界、耦合清单、分阶段计划(未改代码) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
@@ -143,7 +145,7 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.1 | P0–P5 正确性/安全/发版闭环:BOS-first、user 轮、token、endpoint 白名单、Release 全平台 + SHA256SUMS | ✅ 历史 |
 | v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | 本版 |
 
-后续候选方向(未排期):多 provider 认证管理、快照浏览 UI、会话 diff/合并、Bucket 生命周期(降本)。
+后续候选方向(未排期):**对象存储多后端 P0**(fail-closed + 配置单一来源,见 `docs/s3-compat-evaluation.md`)、多 provider 认证管理、快照浏览 UI、会话 diff/合并、Bucket 生命周期(降本)。
 
 ## 5. 工程约定(接手者必须遵守)
 
@@ -174,3 +176,4 @@ node bin/celagent-tui.mjs task ledger
   后续更新数据时保持与 BOS 一致 + 敏感扫描(见红线)
 - CI 单元测试已去掉 `continue-on-error`; Secret/PII 扫描排除 `node_modules`
 - 发版由 `.github/workflows/release.yml` 在 tag `v*` 时构建并上传;本地可用 `./scripts/prepare-release-assets.sh` / `./scripts/release-smoke.sh`
+- **存储多后端**(评估未落地):脚本硬编码 BOS endpoint/`AWS_PROFILE=bos`/`region=bj`;`resolveEndpoint` 对非白名单 URL **静默退回 BOS**。计划见 `docs/s3-compat-evaluation.md`(P0: fail-closed + 配置单一来源)
