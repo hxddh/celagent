@@ -96,8 +96,11 @@ WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-${EXISTING_TOKEN:-$(_rand)$(_rand)}}"
 for port in 18090 18091; do
   # 凭证卫生: celld 走 AWS_PROFILE=bos, 清除可能残留的显式密钥 env
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
+    CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 \
+    CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_MAX_RESIDENT_CELLS=128 \
+    AWS_PROFILE=bos AWS_REGION=bj \
     CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
+    CELLD_VAR_CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
     --listen "127.0.0.1:${port}" \
     --internal-listen "127.0.0.1:$((port + 2))" \

@@ -14,7 +14,7 @@ EP="https://s3.bj.bcebos.com"
 STATE_DIR="$HOME/.local/celagent/state"
 mkdir -p "$STATE_DIR"
 
-# 默认双节点 (18090/18091) — 与 node_mgr 一致
+TOKEN="${CELAGENT_WORKER_TOKEN:-$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)}"
 DEFAULT_PORTS="18090 18091"
 
 start_node() {
@@ -33,8 +33,14 @@ start_node() {
   # 凭证卫生: AWS_PROFILE=bos, 不把 SK 读进变量/显式注入
   # celld v0.2: advertise 必须是内部监听地址, 且必须显式 --internal-listen
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
-    CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)}" \
+    CELLD_WATCH="$STATE_DIR/node$port" \
+    CELLD_IDLE_EVICT_S=30 \
+    CELLD_ALARM_RESIDENT_MS=60000 \
+    CELLD_ADMISSION_WAIT_MS=2000 \
+    CELLD_MAX_RESIDENT_CELLS=128 \
+    AWS_PROFILE=bos AWS_REGION=bj \
+    CELAGENT_WORKER_TOKEN="$TOKEN" \
+    CELLD_VAR_CELAGENT_WORKER_TOKEN="$TOKEN" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
     --listen "127.0.0.1:${port}" \
     --internal-listen "$internal_bind" \
@@ -57,10 +63,26 @@ wait_ready() {
   return 1
 }
 
+stop_local() {
+  for p in 18090 18091 19000; do
+    curl -s -m 2 -X POST "http://127.0.0.1:$((p + 2))/shutdown?handoff=preserve" >/dev/null 2>&1 || true
+  done
+  pkill -TERM -f 'celld.*1809' 2>/dev/null || true
+  pkill -TERM -f 'celld.*19000' 2>/dev/null || true
+  for i in $(seq 1 15); do
+    up=0
+    for p in 18090 18091 19000; do
+      curl -s -m 1 "http://127.0.0.1:${p}/__celld/health" 2>/dev/null | grep -q ok && up=1
+    done
+    [ "$up" = 0 ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
 case "${1:-status}" in
   start)
-    pkill -f 'celld.*1809' 2>/dev/null || true
-    sleep 2
+    stop_local || true
     echo "启动双节点 (本地集群)..."
     for p in $DEFAULT_PORTS; do
       start_node "$p" "127.0.0.1:$p"
@@ -89,10 +111,13 @@ case "${1:-status}" in
         echo "  ✓ $p 运行中"
       fi
     done
+    if [ -x "$CELLD" ] && [ -n "$BUCKET" ]; then
+      echo "celld diagnose:"
+      "$CELLD" diagnose --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj 2>&1 | sed 's/^/  /' || echo "  (diagnose 失败, 忽略)"
+    fi
     ;;
   stop)
-    pkill -f 'celld.*1809' 2>/dev/null || true
-    pkill -f 'celld.*19000' 2>/dev/null || true
+    stop_local || true
     echo "已停止"
     ;;
   *)

@@ -244,10 +244,34 @@ v0.2 让 cell 历史更难分叉、租约更抗存储抖动、接管更快。这
 
 ### 6.5 建议的利用顺序(P0 监听之后)
 
-1. **Token 真注入:**`CELLD_VAR_CELAGENT_WORKER_TOKEN` + wrangler `vars`;`checkToken` 改 `timingSafeEqual`(空 token 仍 fail-open 仅限本机开发)。
-2. **运维面:**`doctor` 读内部 `/state`;`node_mgr stop/restart` SIGTERM 或 `POST /shutdown`;`cluster_mgr status` 调 `celld diagnose`。
-3. **调参:**`CELLD_IDLE_EVICT_S=30`(已做)、`CELLD_ALARM_RESIDENT_MS`、`CELLD_ADMISSION_WAIT_MS`、`CELLD_MAX_RESIDENT_CELLS`。
-4. **可观测:**`CELAGENT_OTEL=1` → `CELLD_OTEL=1`;TUI `celldFetch` 传 `traceparent`。
-5. **新安装**才考虑桶 prefix;旧用户不迁。
-6. Loader/WS/Wasm/RPC 重写:没有明确产品需求就不动。
+v0.3.2 落地 §7 第 1–3 项。其余(OTEL、桶 prefix、Loader/WS/Wasm/RPC)不进本版。
+
+## 7. v0.3.2 具体内容(本版范围)
+
+**版本号 `0.3.2`。** 适配 celld v0.2.0,修 v0.3.1 随包 runtime 起不来,并把利用评审里值最高的几项做进产品。不混部 v0.1 节点。
+
+### 做(进本版)
+
+| 项 | 用户能感知什么 | 不做过界 |
+|----|----------------|----------|
+| 双监听 spawn | 节点能在 celld 0.2.0 上起来。Worker 仍 `18090/18091`,内部 `18092/18093` | 不把内部口暴露到非环回(多机 LAN 仅 internal) |
+| Worker token 真注入 | `CELLD_VAR_CELAGENT_WORKER_TOKEN` + wrangler `vars`;鉴权不再只靠进程 env | 空 token 仍 fail-open(本机无配置时) |
+| `timingSafeEqual` | token 比较抗时序 | 无 |
+| 优雅停机 | `node_mgr stop/restart`:`POST /shutdown?handoff=preserve` + SIGTERM,最多等 ~20s drain | 不改 TUI 自动拉起时的崩溃 own.json 清理 |
+| doctor `/state` | 节点健康之外打印 occupied/evicting/restoring | `/state` 失败不判 doctor 失败 |
+| `celld diagnose` | `cluster_mgr status` 附加官方探测 | diagnose 失败不挡 status |
+| 调参 | `CELLD_IDLE_EVICT_S=30`、`ALARM_RESIDENT_MS=60000`、`ADMISSION_WAIT_MS=2000`(对齐 TUI checkpoint 超时)、`MAX_RESIDENT_CELLS=128` | 不改默认双节点拓扑 |
+
+### 明确不进 v0.3.2
+
+- OTEL / `traceparent`(v0.3.3 候选,opt-in)
+- 桶 key prefix、GCS
+- JS RPC / Worker Loader / Wasm / WebSocket TUI
+- 把会话权威迁回 celld
+- Intel Mac / Windows celld 包
+
+### 发版
+
+合并后打 tag `v0.3.2`(不移动 `v0.3.0`/`v0.3.1`)。禁止与 v0.1 celld 混部。
+
 

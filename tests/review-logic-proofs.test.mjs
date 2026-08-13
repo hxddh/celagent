@@ -311,6 +311,7 @@ test("源码锚定: HANDOFF 不再把认证当唯一阻塞", () => {
   assert.match(handoff, /celld-linux-x64/);
   assert.match(handoff, /release\.yml/);
   assert.match(handoff, /v0\.3\.1/);
+  assert.match(handoff, /v0\.3\.2/);
   assert.match(handoff, /已发布/);
 });
 
@@ -340,11 +341,26 @@ test("源码锚定: doctor Celld 离线不报全部正常", () => {
   assert.match(tui, /核心正常 \(Celld 离线/);
 });
 
-test("源码锚定: 版本 0.3.1 与 release-smoke", () => {
-  assert.match(tui, /CELAGENT_VERSION = "0\.3\.1"/);
+test("源码锚定: 版本 0.3.2 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.3\.2"/);
   const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
   assert.match(smoke, /sha256sum --ignore-missing/);
   assert.match(smoke, /celagent-linux-x64/);
+});
+
+test("源码锚定: celld v0.2 token vars 与 timingSafeEqual", () => {
+  assert.match(tui, /CELLD_VAR_CELAGENT_WORKER_TOKEN/);
+  assert.match(tui, /CELLD_ALARM_RESIDENT_MS: "60000"/);
+  assert.match(tui, /port \+ 2\}\/state/);
+  const worker = readFileSync(join(root, "worker/src/index.js"), "utf8");
+  assert.match(worker, /timingSafeEqual/);
+  const wrangler = readFileSync(join(root, "worker/wrangler.jsonc"), "utf8");
+  assert.match(wrangler, /CELAGENT_WORKER_TOKEN/);
+  const nm = readFileSync(join(root, "scripts/node_mgr.sh"), "utf8");
+  assert.match(nm, /handoff=preserve/);
+  assert.match(nm, /CELLD_VAR_CELAGENT_WORKER_TOKEN=/);
+  const cm = readFileSync(join(root, "scripts/cluster_mgr.sh"), "utf8");
+  assert.match(cm, /celld diagnose/);
 });
 
 test("源码锚定: saveConfig 合并 persistence/worker", () => {
