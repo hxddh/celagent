@@ -140,10 +140,12 @@ if [ -n "$NODE1_PID" ]; then
   check "原会话 LTX 保留在 BOS (≥1)" "$([ "$LTX_AFTER" -gt 0 ] 2>/dev/null && echo ok || echo fail)"
   # 恢复节点1 (凭证卫生: AWS_PROFILE, 不物化 SK; 传入 worker token 与 node_mgr 一致)
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
+    CELLD_IDLE_EVICT_S=30 CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_MAX_RESIDENT_CELLS=128 \
+    AWS_PROFILE=bos AWS_REGION=bj \
     CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$TOKEN}" \
+    CELLD_VAR_CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$TOKEN}" \
     "${CELLD:-$HOME/.local/bin/celld}" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
-    --listen 127.0.0.1:18090 --advertise 127.0.0.1:18090 > "${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log" 2>&1 &
+    --listen 127.0.0.1:18090 --internal-listen 127.0.0.1:18092 --advertise 127.0.0.1:18092 > "${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log" 2>&1 &
   sleep 6
 else
   check "节点1 存在" "fail"

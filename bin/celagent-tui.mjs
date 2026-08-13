@@ -186,14 +186,27 @@ async function ensureCelld() {
             } catch (e) { /* 端口空闲, 启动 */ }
             // Bug 57: spawn 必须挂 error handler — 否则 celld 二进制缺失/损坏/
             // 无权限/端口冲突时, unhandled 'error' 事件直接炸掉整个 celagent 进程
+            // celld v0.2: --advertise 必须指向内部监听; 显式 advertise 必须带 --internal-listen
+            const internalPort = port + 2;
+            const workerToken = ensureWorkerToken();
             const child = spawn(celldBin, [
               "--bucket", `s3://${bucket}`,
               "--endpoint", resolveEndpoint(cfg.persistence?.endpoint),
               "--region", cfg.persistence?.region || "bj",
               "--listen", `127.0.0.1:${port}`,
-              "--advertise", `127.0.0.1:${port}`,
+              "--internal-listen", `127.0.0.1:${internalPort}`,
+              "--advertise", `127.0.0.1:${internalPort}`,
             ], {
-              env: { ...bosChildEnv(), CELLD_WATCH: join(stateDir, `node${port}`), CELAGENT_WORKER_TOKEN: ensureWorkerToken() },
+              env: {
+                ...bosChildEnv(),
+                CELLD_WATCH: join(stateDir, `node${port}`),
+                CELLD_IDLE_EVICT_S: "30",
+                CELLD_ALARM_RESIDENT_MS: "60000",
+                CELLD_ADMISSION_WAIT_MS: "2000",
+                CELLD_MAX_RESIDENT_CELLS: "128",
+                CELAGENT_WORKER_TOKEN: workerToken,
+                CELLD_VAR_CELAGENT_WORKER_TOKEN: workerToken,
+              },
               stdio: "ignore",
               detached: true,
             });
@@ -494,7 +507,7 @@ async function listSessions() {
 }
 
 // ---- 版本/帮助 ----
-const CELAGENT_VERSION = "0.3.1";
+const CELAGENT_VERSION = "0.3.2";
 function printVersion() {
   console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS RPO=0 持久化`);
 }
@@ -651,6 +664,14 @@ async function doctorCommand() {
   }
   console.log(`[3/5] Celld 节点: ${nodes.length > 0 ? "✓ " + nodes.join(", ") : "⚠ 全部离线 (celagent 会自动拉起, 或 node_mgr.sh start)"}`);
   const celldUp = nodes.length > 0;
+  for (const port of [18090, 18091]) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${port + 2}/state`, { signal: AbortSignal.timeout(1500) });
+      if (!r.ok) continue;
+      const j = await r.json();
+      console.log(`      :${port + 2}/state occupied=${j.occupied ?? "?"} evicting=${j.evicting ?? "?"} restoring=${j.restoring ?? "?"}`);
+    } catch (e) { /* 内部口离线不判失败 */ }
+  }
   // 4. BOS 连通
   if (bucket) {
     const probe = await new Promise((resolve) => {

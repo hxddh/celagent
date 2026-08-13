@@ -14,6 +14,7 @@ WATCH1="${NODE_DIR:-$HOME/.local/celagent/nodes}/node1-watch"
 WATCH2="${NODE_DIR:-$HOME/.local/celagent/nodes}/node2-watch"
 LOG1="${NODE_DIR:-$HOME/.local/celagent/nodes}/node1.log"
 LOG2="${NODE_DIR:-$HOME/.local/celagent/nodes}/node2.log"
+TOKEN="${CELAGENT_WORKER_TOKEN:-$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)}"
 
 start_node() {
   local port=$1 watch=$2 log=$3
@@ -23,11 +24,20 @@ start_node() {
     tail -c 1048576 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log"
   fi
   # 凭证卫生: AWS_PROFILE=bos, 不把 SK 读进变量/显式注入
+  # CELLD_VAR_* 才能进 worker env (celld v0.2)
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    CELLD_WATCH="$watch" CELLD_IDLE_EVICT_S=30 AWS_PROFILE=bos AWS_REGION=bj \
-    CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$(jq -r '.worker.token // empty' "$HOME/.config/celagent/settings.json" 2>/dev/null)}" \
+    CELLD_WATCH="$watch" \
+    CELLD_IDLE_EVICT_S=30 \
+    CELLD_ALARM_RESIDENT_MS=60000 \
+    CELLD_ADMISSION_WAIT_MS=2000 \
+    CELLD_MAX_RESIDENT_CELLS=128 \
+    AWS_PROFILE=bos AWS_REGION=bj \
+    CELAGENT_WORKER_TOKEN="$TOKEN" \
+    CELLD_VAR_CELAGENT_WORKER_TOKEN="$TOKEN" \
     "$CELLD" --bucket "s3://${BUCKET}" --endpoint "$EP" --region bj \
-    --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" > "$log" 2>&1 &
+    --listen "127.0.0.1:${port}" \
+    --internal-listen "127.0.0.1:$((port + 2))" \
+    --advertise "127.0.0.1:$((port + 2))" > "$log" 2>&1 &
   echo "started node on $port (pid $!)"
 }
 
@@ -46,39 +56,59 @@ wait_ready() {
   return 1
 }
 
+# v0.2: 内部口 preserve 同机重启, 再 SIGTERM; 最多等 20s drain
+stop_all() {
+  for p in 18090 18091; do
+    curl -s -m 2 -X POST "http://127.0.0.1:$((p + 2))/shutdown?handoff=preserve" >/dev/null 2>&1 || true
+  done
+  pkill -TERM -f 'celld.*1809' 2>/dev/null || true
+  for i in $(seq 1 20); do
+    up=0
+    for p in 18090 18091; do
+      if curl -s -m 1 "http://127.0.0.1:${p}/__celld/health" 2>/dev/null | grep -q ok; then
+        up=1
+      fi
+    done
+    [ "$up" = 0 ] && return 0
+    sleep 1
+  done
+  echo "warn: drain timeout (nodes still answering health)"
+  return 1
+}
+
 case "${1:-status}" in
   start)
-    pkill -f 'celld.*1809' 2>/dev/null || true
-    sleep 2
-    # Bug 63: 先清理残留 own.json (与 ensureCelld 自动启动路径一致 — Bug 50 修复)
-    # 旧节点被强杀后 own.json 指向死节点, 阻塞新节点接管 → RestoreFailed
-    # (只有自动启动路径清理过, 手动重启路径遗漏 — 环境一致性缺陷)
-    OWN_KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --endpoint-url "$EP" \
-      --prefix "cells/" --query "Contents[?ends_with(Key, \`own.json\`)].Key" --output json 2>/dev/null || echo "[]")
-    if [ "${CELAGENT_CLEAN_OWN:-}" = "1" ] || echo "$BUCKET" | grep -q '^celagent-'; then
+    stop_all || true
+    # 优雅停机后不扫 own.json; 仅崩溃残留(health 仍在)或 CELAGENT_CLEAN_OWN=1
+    STILL_UP=0
+    curl -s -m 1 "http://127.0.0.1:18090/__celld/health" 2>/dev/null | grep -q ok && STILL_UP=1
+    curl -s -m 1 "http://127.0.0.1:18091/__celld/health" 2>/dev/null | grep -q ok && STILL_UP=1
+    if [ "${CELAGENT_CLEAN_OWN:-}" = "1" ] || { [ "$STILL_UP" = "1" ] && echo "$BUCKET" | grep -q '^celagent-'; }; then
+      OWN_KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --endpoint-url "$EP" \
+        --prefix "cells/" --query "Contents[?ends_with(Key, \`own.json\`)].Key" --output json 2>/dev/null || echo "[]")
       for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
         aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "$EP" >/dev/null 2>&1
         echo "cleaned stale ownership: $k"
       done
     else
-      echo "skip own.json wipe (bucket=$BUCKET 非 celagent- 前缀; CELAGENT_CLEAN_OWN=1 强制)"
+      echo "skip own.json wipe (graceful drain 或非 celagent- 桶; CELAGENT_CLEAN_OWN=1 强制)"
     fi
-    # BOS 预热(避免并发启动限流)
     aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$EP" >/dev/null 2>&1 || true
-    sleep 2
     start_node 18090 "$WATCH1" "$LOG1"
     start_node 18091 "$WATCH2" "$LOG2"
     wait_ready 18090 "$LOG1" || true
     wait_ready 18091 "$LOG2" || true
     ;;
   stop)
-    pkill -f 'celld.*1809' 2>/dev/null || true
+    stop_all || true
     echo "stopped"
     ;;
   status)
     for p in 18090 18091; do
-      if pgrep -f "celld.*${p}" >/dev/null; then
+      if curl -s -m 1 "http://127.0.0.1:${p}/__celld/health" 2>/dev/null | grep -q ok; then
         echo "node $p: running"
+        ST=$(curl -s -m 1 "http://127.0.0.1:$((p + 2))/state" 2>/dev/null || true)
+        [ -n "$ST" ] && echo "  $ST"
       else
         echo "node $p: down"
       fi
@@ -86,7 +116,6 @@ case "${1:-status}" in
     ;;
   restart)
     "$0" stop
-    sleep 2
     "$0" start
     ;;
   *)

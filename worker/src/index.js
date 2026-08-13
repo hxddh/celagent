@@ -116,8 +116,8 @@ async function bosGet(env, key) {
 }
 
 // ===== v2: 对象存储交互(经 webhook 代理, worker 零凭证) =====
-// 源码确认 v0.1.0 的 worker vars 注入不可用(manifest vars=null),
-// 凭证由 webhook 端点持有(boto3 签名), worker 只发内容 — 安全且真实
+// 凭证由 webhook 端点持有; worker token 经 v0.2 CELLD_VAR_* / wrangler vars 注入
+// (v0.1 manifest vars=null, 进程 env 进不了 DO env → checkToken fail-open)
 function isLoopbackHost(hostname) {
   return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
 }
@@ -154,13 +154,24 @@ function mergeTurns(existingTurns, incomingTurns) {
   return [...byTurn.values()].sort((a, b) => Number(a.turn) - Number(b.turn));
 }
 
+function tokenEquals(a, b) {
+  const enc = new TextEncoder();
+  const ba = enc.encode(String(a));
+  const bb = enc.encode(String(b));
+  const te = globalThis.crypto?.subtle?.timingSafeEqual;
+  if (typeof te === 'function' && ba.byteLength === bb.byteLength) {
+    try { return te.call(globalThis.crypto.subtle, ba, bb); } catch (e) { /* fall through */ }
+  }
+  return a === b;
+}
+
 function checkToken(req, env) {
   const expected = env && env.CELAGENT_WORKER_TOKEN;
   if (!expected) return true;
   const header = req.headers.get('X-Celagent-Token') || '';
   const auth = req.headers.get('Authorization') || '';
   const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
-  return header === expected || bearer === expected;
+  return tokenEquals(header, expected) || tokenEquals(bearer, expected);
 }
 
 async function bosPutProxy(env, key, content) {

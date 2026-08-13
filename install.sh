@@ -1,12 +1,12 @@
 #!/bin/bash
-# celagent v0.3.1 一键安装: CLI 二进制 + Celld 运行时 + BOS 对象存储持久化
+# celagent v0.3.2 一键安装: CLI 二进制 + Celld 运行时 + BOS 对象存储持久化
 # 正式模式: 从 GitHub Release 下载对应平台二进制 (含 celld 随包 + worker 源码包)
 # 开发模式: CELAGENT_SRC=<源码目录> ./install.sh (软链直指源码, 改即生效)
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
-VERSION="0.3.1"
+VERSION="0.3.2"
 REPO="https://github.com/hxddh/celagent"
 RELEASE_URL="${CELAGENT_RELEASE_URL:-$REPO/releases/latest/download}"
 
@@ -213,10 +213,15 @@ else
   sleep 2
   for port in 18090 18091; do
     nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-      CELLD_WATCH="$STATE_DIR/node$port" AWS_PROFILE=bos AWS_REGION=bj \
+      CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 \
+      CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_MAX_RESIDENT_CELLS=128 \
+      AWS_PROFILE=bos AWS_REGION=bj \
       CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
+      CELLD_VAR_CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
       "$CELLD" --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj \
-      --listen "127.0.0.1:${port}" --advertise "127.0.0.1:${port}" \
+      --listen "127.0.0.1:${port}" \
+      --internal-listen "127.0.0.1:$((port + 2))" \
+      --advertise "127.0.0.1:$((port + 2))" \
       > "$STATE_DIR/node$port.log" 2>&1 &
   done
   echo "  ✓ 节点 18090/18091 启动"
