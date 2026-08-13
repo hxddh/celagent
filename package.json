@@ -7,16 +7,19 @@
     "celagent": "./bin/celagent-tui.mjs"
   },
   "exports": {
-    "./bos": "./src/bos.js"
+    "./bos": "./src/bos.js",
+    "./bos-tools": "./src/bos-tools.js"
   },
   "files": [
     "bin/",
     "src/",
     "scripts/",
     "worker/",
+    "docs/",
     "install.sh",
     "setup.sh",
     "README.md",
+    "HANDOFF.md",
     "LICENSE"
   ],
   "scripts": {

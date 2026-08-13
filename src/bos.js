@@ -8,8 +8,33 @@ import { tmpdir } from "node:os";
 const EP = "https://s3.bj.bcebos.com";
 const AWS_TIMEOUT_MS = 20000;
 
-function resolveEndpoint(override) {
-  return override || EP;
+function normalizeEndpoint(raw) {
+  return String(raw || "").trim().replace(/\/$/, "");
+}
+
+/** BOS s3.<region>.bcebos.com, 或本机; 其他需 CELAGENT_ALLOW_ENDPOINT=1 */
+export function isAllowedEndpoint(raw) {
+  const ep = normalizeEndpoint(raw);
+  if (!ep) return false;
+  if (process.env.CELAGENT_ALLOW_ENDPOINT === "1" || process.env.CELAGENT_ALLOW_ENDPOINT === "true") {
+    try { return Boolean(new URL(ep)); } catch (e) { return false; }
+  }
+  try {
+    const u = new URL(ep);
+    if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1") {
+      return u.protocol === "http:" || u.protocol === "https:";
+    }
+    if (u.protocol !== "https:") return false;
+    return /^s3(\.[a-z0-9-]+)?\.bcebos\.com$/i.test(u.hostname);
+  } catch (e) {
+    return false;
+  }
+}
+
+export function resolveEndpoint(override) {
+  const ep = normalizeEndpoint(override);
+  if (!ep) return EP;
+  return isAllowedEndpoint(ep) ? ep : EP;
 }
 
 /** 凭证要么全用 env, 要么全用 profile — 绝不混用 */

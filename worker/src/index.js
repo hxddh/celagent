@@ -232,7 +232,7 @@ export class AgentRuntime {
         // 写入任务并立即触发首步执行(alarm 驱动)
         await this.state.storage.put(`task:${taskId}`, task);
         await this.state.storage.put(`agent:${agent}:active_tasks`, (await this.state.storage.get(`agent:${agent}:active_tasks`) || 0) + 1);
-        await this.state.storage.setAlarm(Date.now() + 100);
+        await this.scheduleNextAlarm();
         return new Response(JSON.stringify({ taskId, status: task.status, steps, agent }));
       }
 
@@ -263,7 +263,7 @@ export class AgentRuntime {
           nextRunAt: Date.now() + intervalMs
         };
         await this.state.storage.put(`cron:${name}`, cron);
-        await this.state.storage.setAlarm(cron.nextRunAt);
+        await this.scheduleNextAlarm();
         return new Response(JSON.stringify({ scheduled: name, intervalMs }));
       }
 
@@ -447,12 +447,22 @@ export class AgentRuntime {
         // P1: epoch fencing — 会话级单写者锁 (原子获取: noOverwrite)
         // 修复竞态: 原实现'检查-写入-删除'三步非原子, 并发双方都能通过检查
         const writeKey = `writer:${session}`;
+        const LOCK_TTL_MS = 15000;
+        const meta = { clientId, seq, ts: Date.now() };
         try {
-          await this.state.storage.put(writeKey, { clientId, seq, ts: Date.now() }, { noOverwrite: true });
+          await this.state.storage.put(writeKey, meta, { noOverwrite: true });
         } catch (e) {
-          // 锁已被其他 client 持有 (noOverwrite 原子失败) → 拒绝
           const current = await this.state.storage.get(writeKey);
-          return new Response(JSON.stringify({ conflict: true, reason: 'writer-busy', current }));
+          if (current?.ts && (Date.now() - current.ts) > LOCK_TTL_MS) {
+            await this.state.storage.delete(writeKey);
+            try {
+              await this.state.storage.put(writeKey, meta, { noOverwrite: true });
+            } catch (e2) {
+              return new Response(JSON.stringify({ conflict: true, reason: 'writer-busy', current: await this.state.storage.get(writeKey) }));
+            }
+          } else {
+            return new Response(JSON.stringify({ conflict: true, reason: 'writer-busy', current }));
+          }
         }
         try {
           // 乐观锁: 若指定了期望版本, 校验当前值版本
@@ -483,10 +493,25 @@ export class AgentRuntime {
     }
   }
 
+  async scheduleNextAlarm() {
+    const now = Date.now();
+    let next = Infinity;
+    const crons = await this.state.storage.list({ prefix: 'cron:', limit: 50 });
+    for (const [, cron] of crons) {
+      if (cron?.nextRunAt) next = Math.min(next, cron.nextRunAt);
+    }
+    const tasks = await this.state.storage.list({ prefix: 'task:', limit: 100 });
+    for (const [, task] of tasks) {
+      if (task?.status === 'pending' && task.step < task.steps) next = Math.min(next, now + 50);
+    }
+    if (Number.isFinite(next) && next < Infinity) {
+      await this.state.storage.setAlarm(Math.max(next, now + 10));
+    }
+  }
+
   async alarm() {
     // alarm 触发: 检查任务续跑、定时任务、deadline
     const now = Date.now();
-    const agent = 'default';
 
     // 1. 定时任务: 检查所有 cron
     const crons = await this.state.storage.list({ prefix: 'cron:', limit: 50 });
@@ -496,9 +521,7 @@ export class AgentRuntime {
         cron.lastRunAt = now;
         cron.nextRunAt = now + cron.intervalMs;
         await this.state.storage.put(key, cron);
-        // 记录一次定时执行(模拟真实业务)
         await this.recordToolCall(`cron:${cron.name}`, { run: cron.runCount, at: now });
-        await this.state.storage.setAlarm(cron.nextRunAt);
       }
     }
 
@@ -506,13 +529,11 @@ export class AgentRuntime {
     const tasks = await this.state.storage.list({ prefix: 'task:', limit: 100 });
     for (const [key, task] of tasks) {
       if (task.status === 'pending' && task.step < task.steps) {
-        // 执行当前步骤
         await this.executeStep(task);
-        // 继续调度下一次
         await this.state.storage.put(key, task);
-        await this.state.storage.setAlarm(Date.now() + 50);
       }
     }
+    await this.scheduleNextAlarm();
   }
 
   // 模拟真实 agent 的工具调用: 外部副作用 + 幂等 ledger

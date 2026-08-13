@@ -55,10 +55,14 @@ case "${1:-status}" in
     # (只有自动启动路径清理过, 手动重启路径遗漏 — 环境一致性缺陷)
     OWN_KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --endpoint-url "$EP" \
       --prefix "cells/" --query "Contents[?ends_with(Key, \`own.json\`)].Key" --output json 2>/dev/null || echo "[]")
-    for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
-      aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "$EP" >/dev/null 2>&1
-      echo "cleaned stale ownership: $k"
-    done
+    if [ "${CELAGENT_CLEAN_OWN:-}" = "1" ] || echo "$BUCKET" | grep -q '^celagent-'; then
+      for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
+        aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "$EP" >/dev/null 2>&1
+        echo "cleaned stale ownership: $k"
+      done
+    else
+      echo "skip own.json wipe (bucket=$BUCKET 非 celagent- 前缀; CELAGENT_CLEAN_OWN=1 强制)"
+    fi
     # BOS 预热(避免并发启动限流)
     aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$EP" >/dev/null 2>&1 || true
     sleep 2

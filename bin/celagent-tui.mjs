@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url);
 // 动态 import(file://路径) 无法被 Bun 打包, 单二进制运行时找不到 chalk 等嵌套依赖。
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
-import { awsEnv } from "../src/bos.js";
+import { awsEnv, resolveEndpoint, isAllowedEndpoint } from "../src/bos.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
@@ -115,13 +115,16 @@ async function ensureCelld() {
           // Bug 50: 先清理残留 own.json (旧节点被强杀后, own.json 指向已死节点,
           // 会阻塞新节点接管导致 RestoreFailed) — 必须在启动节点之前清理
           // (之前顺序是"启动→等待→清理", 已失败的节点不会自动重试接管)
+          // 仅清理本产品专用 bucket (celagent-*) 的残留 own.json, 避免误删共享 bucket 上其他节点
+          const allowOwnClean = process.env.CELAGENT_CLEAN_OWN === "1" || String(bucket).startsWith("celagent-");
+          if (allowOwnClean) {
           try {
             const { execFileSync } = await import("node:child_process");
             const keys = execFileSync("aws", [
               "s3api", "list-objects-v2",
               "--bucket", bucket,
               "--prefix", "cells/",
-              "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com",
+              "--endpoint-url", resolveEndpoint(cfg.persistence?.endpoint),
               "--query", "Contents[?ends_with(Key, `own.json`)].Key",
               "--output", "json",
             ], { env: bosChildEnv(), encoding: "utf8" });
@@ -132,12 +135,15 @@ async function ensureCelld() {
                   "s3api", "delete-object",
                   "--bucket", bucket,
                   "--key", k,
-                  "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com",
+                  "--endpoint-url", resolveEndpoint(cfg.persistence?.endpoint),
                 ], { env: bosChildEnv(), stdio: "ignore" });
               }
               console.log(`  (已清理 ${ownKeys.length} 个残留 ownership)`);
             }
           } catch (e) { /* 清理失败不阻塞 */ }
+          } else {
+            console.warn("  (跳过 own.json 全量清理: bucket 非 celagent- 前缀, 设 CELAGENT_CLEAN_OWN=1 强制)");
+          }
 
           for (const port of [18090, 18091]) {
             // Bug 53: 端口预检 — 另一进程可能已启动节点 (跨进程双启动竞态),
@@ -150,7 +156,7 @@ async function ensureCelld() {
             // 无权限/端口冲突时, unhandled 'error' 事件直接炸掉整个 celagent 进程
             const child = spawn(celldBin, [
               "--bucket", `s3://${bucket}`,
-              "--endpoint", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com",
+              "--endpoint", resolveEndpoint(cfg.persistence?.endpoint),
               "--region", cfg.persistence?.region || "bj",
               "--listen", `127.0.0.1:${port}`,
               "--advertise", `127.0.0.1:${port}`,
@@ -234,7 +240,7 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
   const { bosPut, bosGet } = await import("../src/bos.js");
   const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
   const bucket = cfg.persistence?.bucket;
-  const endpoint = cfg.persistence?.endpoint;
+  const endpoint = resolveEndpoint(cfg.persistence?.endpoint);
   if (!bucket) {
     warnOnce("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
     return;
@@ -349,7 +355,7 @@ async function loadHistoryFromBos(sessionId) {
       try {
         const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
         const bucket = cfg.persistence?.bucket;
-        const endpoint = cfg.persistence?.endpoint;
+        const endpoint = resolveEndpoint(cfg.persistence?.endpoint);
         if (bucket) {
           const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint });
           if (existing.ok) {
@@ -397,7 +403,7 @@ async function listSessions() {
       try {
         const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
         bucket = cfg.persistence?.bucket || null;
-        endpoint = cfg.persistence?.endpoint || endpoint;
+        endpoint = resolveEndpoint(cfg.persistence?.endpoint);
       } catch (e) { /* 损坏则走降级 */ }
     }
     const runAws = (args) => new Promise((resolve) => {
@@ -406,10 +412,13 @@ async function listSessions() {
         catch (e) { resolve([]); }
       });
     });
-    // 3) 降级: 扫描账号下所有 bucket, 找含 sessions/ 会话的 (Bug 65)
-    // 并发扫描 (Bug 83): bucket 多时串行扫描慢 (每个 ~200ms), 并发限 6
+    // 3) 无 bucket: 需显式 --scan 才枚举账号 (避免默认列出全部 bucket)
     if (!bucket) {
-      console.log("(未找到 settings.json 配置, 自动扫描账号下所有 bucket...)");
+      if (!process.argv.includes("--scan")) {
+        console.error("✗ 未找到 persistence.bucket (用 --bucket 指定, 或 celagent list --scan 扫描账号)");
+        return;
+      }
+      console.log("(未找到 settings.json 配置, --scan 扫描账号下含会话的 bucket...)");
       const buckets = await runAws(["s3api", "list-buckets", "--query", "Buckets[].Name", "--output", "json"]);
       const all = Array.isArray(buckets) ? buckets : [];
       const candidates = [];
@@ -430,7 +439,11 @@ async function listSessions() {
     }
     const list = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--query", "Contents[].{k:Key,s:Size,l:LastModified}", "--output", "json"]);
     const sessions = (Array.isArray(list) ? list : [])
-      .filter(i => i.k?.endsWith(".json") && !/\/verify\/|bugtest-|stress-|takeover-|async-/.test(i.k) && !/-(test|verify|check|fix|tmp|temp)$/i.test(i.k.replace("sessions/", "").replace(/\.json$/, "")) && !/^(bug\d|cred-|iso-|race|dup-|ifmatch|queue-|nooverwrite|conc-|degrade|direct|corrupt|long-msg|bos-|aws-|default|debug|seq-|switch-|final-|full-|restore-e2e)/.test(i.k.replace("sessions/", "").replace(/\.json$/, "")))
+      .filter(i => i.k?.endsWith(".json") && !i.k.includes("/verify/"))
+      .filter(i => {
+        const id = i.k.replace("sessions/", "").replace(/\.json$/, "");
+        return !/^(bugtest-|stress-|takeover-)/.test(id);
+      })
       .map(i => ({ id: i.k.replace("sessions/", "").replace(/\.json$/, ""), size: i.s || 0, modified: (i.l || "").slice(0, 16) }))
       .sort((a, b) => b.modified.localeCompare(a.modified));
     if (sessions.length === 0) { console.log("(BOS 暂无会话)"); return; }
@@ -458,7 +471,7 @@ function printHelp() {
 用法:
   celagent                     启动 TUI (自动生成唯一会话 ID)
   celagent <id>                续写指定会话 (从 BOS 恢复历史)
-  celagent list [--bucket B]   列出 BOS 里所有可恢复会话 (settings 丢失时自动扫描 bucket)
+  celagent list [--bucket B] [--scan]  列出 BOS 会话 (--scan 才枚举账号下全部 bucket)
   celagent export <id> [--bucket B]  导出会话到 JSON (stdout)
   celagent rm <id> [--bucket B] [--yes]  删除 BOS 里的会话 (非 TTY 必须 --yes)
   celagent config get <key>   读取配置 (如 persistence.bucket)
@@ -499,7 +512,22 @@ async function configCommand(args) {
     console.log(v === undefined ? "(未设置)" : typeof v === "object" ? JSON.stringify(v) : String(v));
   } else if (op === "set") {
     if (!key || value === undefined) { console.error("用法: celagent config set <key> <value>"); process.exit(1); }
+    if (!/^[A-Za-z0-9._-]+$/.test(key) || key.includes("..")) {
+      console.error("✗ 非法配置键");
+      process.exit(1);
+    }
     const parts = key.split(".");
+    const protectedObjs = new Set(["persistence", "worker"]);
+    if (parts.length === 1 && protectedObjs.has(parts[0]) && cfg[parts[0]] && typeof cfg[parts[0]] === "object") {
+      console.error(`✗ ${parts[0]} 是对象, 请用 ${parts[0]}.<field> 设置 (避免把嵌套配置写成标量)`);
+      process.exit(1);
+    }
+    if (key === "persistence.endpoint") {
+      if (!isAllowedEndpoint(value)) {
+        console.error("✗ persistence.endpoint 仅允许 https://s3.<region>.bcebos.com 或本机; 或设 CELAGENT_ALLOW_ENDPOINT=1");
+        process.exit(1);
+      }
+    }
     let o = cfg;
     for (let i = 0; i < parts.length - 1; i++) { o[parts[i]] ??= {}; o = o[parts[i]]; }
     if (value === "" || value === "null") {
@@ -584,7 +612,7 @@ async function doctorCommand() {
   // 4. BOS 连通
   if (bucket) {
     const probe = await new Promise((resolve) => {
-      execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", cfg.persistence?.endpoint || "https://s3.bj.bcebos.com", "--query", "Contents[].Key", "--output", "json"], { env: awsEnv(), timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
+      execFile("aws", ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", resolveEndpoint(cfg.persistence?.endpoint), "--query", "Contents[].Key", "--output", "json"], { env: awsEnv(), timeout: 15000, encoding: "utf8" }, (err, stdout) => resolve(!err));
     });
     console.log(`[4/5] BOS 连通: ${probe ? "✓ 可读写 bucket=" + bucket : "✗ 访问失败 (检查凭证/endpoint/网络)"}`);
     if (!probe) ok = false;
@@ -599,11 +627,11 @@ async function getBucketArg() {
   const argvIdx = process.argv.indexOf("--bucket");
   if (argvIdx > 0 && process.argv[argvIdx + 1]) {
     const cfg = loadConfig();
-    return { bucket: process.argv[argvIdx + 1], endpoint: cfg.persistence?.endpoint || "https://s3.bj.bcebos.com" };
+    return { bucket: process.argv[argvIdx + 1], endpoint: resolveEndpoint(cfg.persistence?.endpoint) };
   }
   const cfg = loadConfig();
-  if (cfg.persistence?.bucket) return { bucket: cfg.persistence.bucket, endpoint: cfg.persistence.endpoint || "https://s3.bj.bcebos.com" };
-  return { bucket: null, endpoint: "https://s3.bj.bcebos.com" };
+  if (cfg.persistence?.bucket) return { bucket: cfg.persistence.bucket, endpoint: resolveEndpoint(cfg.persistence.endpoint) };
+  return { bucket: null, endpoint: resolveEndpoint() };
 }
 // ---- P1: agent 任务化 — 任务状态机 (celld submit/status/ledger) ----
 async function taskCommand(args) {
@@ -788,7 +816,7 @@ async function main() {
   // 1. 组装 services (独立 agentDir)
   let services;
   try {
-    const settingsManager = pi.SettingsManager.create(cwd, AGENT_DIR, { projectTrusted: true });
+    const settingsManager = pi.SettingsManager.create(cwd, AGENT_DIR, { projectTrusted: false });
     services = await pi.createAgentSessionServices({
       cwd,
       agentDir: AGENT_DIR,
@@ -869,6 +897,7 @@ async function main() {
           console.log(`  ↳ 已恢复本地会话, 持久化 ID: ${persistId} (续写 ${persistHistory.length} 轮)`);
         }
       }
+      globalThis.__celagentPersistId = persistId;
       const maxTurn = (turns) => {
         if (!turns?.length) return 0;
         const nums = turns.map(t => Number(t.turn)).filter(n => Number.isFinite(n));

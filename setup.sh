@@ -77,10 +77,14 @@ sleep 2
 # own.json 指向死节点, 阻塞新节点接管 → RestoreFailed)
 OWN_KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --endpoint-url "https://s3.bj.bcebos.com" \
   --prefix "cells/" --query "Contents[?ends_with(Key, \`own.json\`)].Key" --output json 2>/dev/null || echo "[]")
-for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
-  aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "https://s3.bj.bcebos.com" >/dev/null 2>&1
-  echo "cleaned stale ownership: $k"
-done
+if [ "${CELAGENT_CLEAN_OWN:-}" = "1" ] || echo "$BUCKET" | grep -q '^celagent-'; then
+  for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
+    aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "https://s3.bj.bcebos.com" >/dev/null 2>&1
+    echo "cleaned stale ownership: $k"
+  done
+else
+  echo "skip own.json wipe (bucket=$BUCKET 非 celagent- 前缀; CELAGENT_CLEAN_OWN=1 强制)"
+fi
 
 # Bug 71: 移除本地 worker.js 打包/检查死代码 — BOS 模式节点从 bucket 的
 # deploy/current.json 加载 worker (上面 celld deploy 已部署), 本地 worker.js

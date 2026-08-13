@@ -206,3 +206,46 @@ test("源码锚定: rm 非 TTY 需要 --yes", () => {
 test("源码锚定: snapshot 返回 slice 拷贝", () => {
   assert.match(tui, /__celagentSnapshotTurns = \(\) => snapshotTurns\.slice\(\)/);
 });
+
+test("resolveEndpoint 拒绝非 BOS https", async () => {
+  const { resolveEndpoint, isAllowedEndpoint } = await import("../src/bos.js");
+  assert.equal(isAllowedEndpoint("https://s3.bj.bcebos.com"), true);
+  assert.equal(isAllowedEndpoint("https://s3.gz.bcebos.com"), true);
+  assert.equal(isAllowedEndpoint("http://127.0.0.1:9000"), true);
+  assert.equal(isAllowedEndpoint("https://evil.example/"), false);
+  assert.equal(isAllowedEndpoint("http://evil.example"), false);
+  assert.equal(resolveEndpoint("https://evil.example"), "https://s3.bj.bcebos.com");
+  assert.equal(resolveEndpoint("https://s3.gz.bcebos.com"), "https://s3.gz.bcebos.com");
+});
+
+test("源码锚定: list 不再隐藏 default/debug/bos-*", () => {
+  assert.doesNotMatch(tui, /bos-\|aws-\|default\|debug/);
+  assert.match(tui, /\[--scan\]/);
+});
+
+test("源码锚定: config set 拒绝把 persistence 写成标量", () => {
+  assert.match(tui, /protectedObjs/);
+  assert.match(tui, /是对象, 请用/);
+  assert.match(tui, /isAllowedEndpoint\(value\)/);
+});
+
+test("源码锚定: own.json 清理受 bucket 前缀约束", () => {
+  assert.match(tui, /CELAGENT_CLEAN_OWN/);
+  assert.match(tui, /startsWith\("celagent-"\)/);
+});
+
+test("源码锚定: history_search 默认当前会话", () => {
+  const tools = readFileSync(join(root, "src/bos-tools.js"), "utf8");
+  assert.match(tools, /__celagentPersistId/);
+  assert.match(tools, /rawSession === "\*"/);
+});
+
+test("源码锚定: worker cwrite 锁 TTL + scheduleNextAlarm", () => {
+  assert.match(worker, /LOCK_TTL_MS/);
+  assert.match(worker, /async scheduleNextAlarm/);
+  assert.match(worker, /await this\.scheduleNextAlarm\(\)/);
+});
+
+test("源码锚定: projectTrusted 默认 false", () => {
+  assert.match(tui, /projectTrusted: false/);
+});

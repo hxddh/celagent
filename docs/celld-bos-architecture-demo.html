@@ -339,7 +339,7 @@
     <text x="540" y="385" font-size="14" font-weight="700" fill="var(--svg-dim)" text-anchor="middle">恢复路径:启动 / 换机器 / 节点故障 ↓</text>
     <rect x="60" y="405" width="990" height="90" rx="14" fill="var(--svg-panel)" stroke="#3fb950"/>
     <text x="90" y="438" font-size="16" font-weight="700" fill="#3fb950">④ 从 BOS 恢复 — 历史完整(RPO=0)</text>
-    <text x="90" y="465" font-size="12.5" fill="var(--svg-dim)">读取优先级:worker 缓存快路径 → miss 回 BOS 权威源;agent 可跨会话检索历史(history_search)。实测:节点全挂后轮次完整恢复 (RPO=0)</text>
+    <text x="90" y="465" font-size="12.5" fill="var(--svg-dim)">读取优先级:BOS 权威源 → 仅 miss 才回退 worker 缓存;agent 默认可检索当前会话(history_search session=* 跨会话)。节点全挂后从 BOS 恢复</text>
     <path d="M 800 355 L 800 405" stroke="#3fb950" stroke-width="2.5" fill="none" marker-end="url(#arrG)"/>
     <text x="812" y="382" font-size="12.5" fill="#3fb950" font-family="monospace">读历史</text>
   </svg>
@@ -459,13 +459,13 @@
     <div class="dataflow-note" style="margin-top:14px">
       <b>不存什么:</b> 不存你的项目文件、不存工具产生的文件内容本身 — 只存<b>对话记录</b>(谁说了什么、调了哪些工具、结果摘要)。
       写入的 msg 形如:<code style="color:var(--blue)">"分析一下… [工具调用: bash(&#34;ls&#34;)] [工具结果: bash: src bin docs…"</code><br>
-      <span style="color:var(--dim)">注:真实产品钩子(turn_end)只存 assistant 轮;user 轮仅出现在本页演示脚本中。
+      <span style="color:var(--dim)">注:产品钩子同时持久化 user 轮(message_end)与 assistant 轮(turn_end)。
       摘要长度上限:工具调用 ≤100 字符、工具结果 ≤300 字符(汇总拼接后写入)。</span>
     </div>
     <div class="dataflow-note" style="margin-top:12px">
-      <b>为什么 worker 缓存截断 200 字符?</b> 缓存写入走 HTTP GET,msg 作为 URL 参数传递 —
-      URL 长度受限,且中文经 URL 编码后膨胀约 3 倍(200 中文字符 → 约 1080 字符 URL)。
-      截断是安全的:worker 只是缓存(丢了可从 BOS 重建),<b>BOS 权威源永远存完整内容</b>。
+      <b>为什么 worker 缓存曾截断 200 字符?</b> 旧实现把 msg 放进 URL query。
+      现已改为 POST JSON(最长 8000)。完整 content/toolResults 仍只在 BOS。
+      恢复路径 <b>BOS-first</b>,worker 仅作 miss 回退。
     </div>
     </div>
   </div>
@@ -492,7 +492,7 @@
           <tr><td>thinking 推理过程</td><td style="color:var(--green)">✅ 完整</td><td>✅ 完整</td></tr>
           <tr><td>工具调用(名称+完整参数)</td><td style="color:var(--green)">✅ 完整</td><td>✅ 完整</td></tr>
           <tr><td>工具结果</td><td style="color:var(--green)">✅ 完整</td><td style="color:var(--red)">❌ 不存</td></tr>
-          <tr><td>user 输入</td><td style="color:var(--yellow)">⚠ 真实产品不写(turn_end 钩子只存 assistant 轮);本页示例数据含 user 轮(演示脚本直接写入)</td><td>✅ 完整</td></tr>
+          <tr><td>user 输入</td><td style="color:var(--green)">✅ 完整(message_end)</td><td>✅ 完整</td></tr>
           <tr><td>摘要 msg(供恢复注入)</td><td style="color:var(--green)">✅ 保留</td><td>—</td></tr>
         </tbody>
       </table>

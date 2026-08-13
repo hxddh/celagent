@@ -129,9 +129,16 @@ if [ -n "$CELAGENT_SRC" ] && [ -d "${CELAGENT_SRC}/worker/src" ]; then
 else
   echo "  下载 worker 源码包..."
   mkdir -p "${CELAGENT_ROOT}/celagent"
-  if curl -fsSL "${RELEASE_URL}/worker.tar.gz" -o /tmp/celagent-worker.tar.gz 2>/dev/null; then
-    tar -xzf /tmp/celagent-worker.tar.gz -C "${CELAGENT_ROOT}/celagent/"
-    WORKER_SRC="${CELAGENT_ROOT}/celagent/worker"
+  WORKER_TGZ=$(mktemp "${TMPDIR:-/tmp}/celagent-worker.XXXXXX.tar.gz")
+  if curl -fsSL "${RELEASE_URL}/worker.tar.gz" -o "$WORKER_TGZ" 2>/dev/null; then
+    if tar -tzf "$WORKER_TGZ" | grep -E '(^/)|(^\.\./)|(/\.\./)'; then
+      echo "  ✗ worker.tar.gz 含非法路径, 拒绝解包"
+      rm -f "$WORKER_TGZ"
+    else
+      tar -xzf "$WORKER_TGZ" -C "${CELAGENT_ROOT}/celagent/"
+      WORKER_SRC="${CELAGENT_ROOT}/celagent/worker"
+    fi
+    rm -f "$WORKER_TGZ"
   fi
 fi
 if [ -n "$WORKER_SRC" ] && [ -d "$WORKER_SRC/src" ]; then
@@ -141,8 +148,13 @@ if [ -n "$WORKER_SRC" ] && [ -d "$WORKER_SRC/src" ]; then
   # esbuild: 优先本地 node_modules, 下载模式回退 npx (自动拉取)
   if [ -x "${CELAGENT_ROOT}/celagent/node_modules/.bin/esbuild" ]; then
     export CELLD_ESBUILD="${CELAGENT_ROOT}/celagent/node_modules/.bin/esbuild"
-  elif [ -z "$CELLD_ESBUILD" ]; then
-    export CELLD_ESBUILD="$(command -v npx >/dev/null 2>&1 && echo 'npx --yes esbuild' || echo '')"
+  elif [ -n "$CELLD_ESBUILD" ]; then
+    :
+  elif command -v esbuild >/dev/null 2>&1; then
+    export CELLD_ESBUILD="$(command -v esbuild)"
+  else
+    echo "  ⚠️ 未找到 esbuild (设 CELLD_ESBUILD 或安装到 PATH), 跳过 npx 自动拉取"
+    export CELLD_ESBUILD=""
   fi
   if (cd "$WORKER_SRC" && "$CELLD" deploy . --bucket "s3://${BUCKET}" --endpoint "https://s3.bj.bcebos.com" --region bj); then
     echo "  ✓ worker 已部署 (${WORKER_SRC})"

@@ -168,6 +168,7 @@ node bin/celagent-tui.mjs task ledger
 - worker 缓存读路径有 200 字符截断(URL 限制所致),完整数据在 BOS 权威源;恢复路径 **BOS-first**(仅 miss 才回退 worker)
 - P0 正确性(2026-08):队列超限丢最旧、ensureLock finally 释放、`/fork` 独立 persistId、JSON 损坏不覆盖、steer 用 content、seq=`max(turn)`、会话 ID 白名单、CI 扫描排除 `node_modules`
 - P1(2026-08):user 轮一并落盘; worker `sync` 按 turn 合并; checkpoint 改 POST body; 本机 worker token(无 token 时 fail-open); ledger 先 pending 再 webhook; `rm --yes`
+- P2(2026-08):endpoint 白名单; own.json 仅 `celagent-*` bucket 清理; list `--scan`; config 嵌套保护; history_search 默认当前会话; cwrite 锁 TTL; alarm 取最近唤醒点
 - HTML 演示页数字已按 2026-08-11 实时 BOS 对齐;回放为 33 轮真实会话实录(脱敏后),
   后续更新数据时保持与 BOS 一致 + 敏感扫描(见红线)
 - CI 单元测试已去掉 `continue-on-error`; Secret/PII 扫描排除 `node_modules`

@@ -6,9 +6,7 @@ import { join } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { writeFile, readFile, chmod, mkdtemp, rm } from "node:fs/promises";
-import { awsEnv } from "./bos.js";
-
-const EP = "https://s3.bj.bcebos.com";
+import { awsEnv, resolveEndpoint } from "./bos.js";
 
 function runAws(args) {
   return new Promise((resolve) => {
@@ -26,7 +24,7 @@ function loadPersistence() {
     const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
     const bucket = cfg.persistence?.bucket || null;
     if (!bucket) return null;
-    return { bucket, endpoint: cfg.persistence?.endpoint || EP };
+    return { bucket, endpoint: resolveEndpoint(cfg.persistence?.endpoint) };
   } catch (e) { return null; }
 }
 
@@ -58,13 +56,13 @@ function textOf(turn) {
 // ---- 工具 1: history_search — 跨会话检索记忆 ----
 export const history_search = {
   name: "history_search",
-  description: "在 BOS 云端历史会话中搜索记忆。返回匹配的会话轮次片段(session/turn/时间/内容摘要)。用于回忆之前会话中讨论过的问题、做过的修改、得出的结论。参数: query 必填(搜索关键词), limit 可选(返回条数, 默认 5, 最大 20), session 可选(限定某会话)。",
+  description: "在 BOS 云端历史中搜索记忆。默认只搜当前会话; 传 session=\"*\" 才跨会话。返回匹配轮次片段。",
   parameters: {
     type: "object",
     properties: {
       query: { type: "string", description: "搜索关键词(如: 并发、bug、架构)" },
       limit: { type: "number", description: "返回条数, 默认 5, 最大 20" },
-      session: { type: "string", description: "限定搜索某个会话 ID(可选)" },
+      session: { type: "string", description: "会话 ID; 默认当前会话; 传 * 搜索全部会话" },
     },
     required: ["query"],
   },
@@ -75,7 +73,13 @@ export const history_search = {
       const { bucket, endpoint } = pers;
       const query = String(params.query || "").toLowerCase();
       const limit = Math.min(Number(params.limit) || 5, 20);
-      const sessionFilter = params.session ? String(params.session) : null;
+      const persistId = typeof globalThis.__celagentPersistId === "string" ? globalThis.__celagentPersistId : null;
+      const rawSession = params.session != null ? String(params.session) : persistId;
+      const cross = rawSession === "*" || rawSession === "all";
+      const sessionFilter = cross ? null : rawSession;
+      if (!sessionFilter && !cross) {
+        return { content: [{ type: "text", text: "未指定会话。默认只搜当前会话; 跨会话请传 session=\"*\"" }] };
+      }
 
       let keys = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--query", "Contents[].Key", "--output", "json"]);
       if (!Array.isArray(keys)) keys = [];
