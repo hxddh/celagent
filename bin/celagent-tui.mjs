@@ -494,7 +494,7 @@ async function listSessions() {
 }
 
 // ---- 版本/帮助 ----
-const CELAGENT_VERSION = "0.3.0";
+const CELAGENT_VERSION = "0.3.1";
 function printVersion() {
   console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS RPO=0 持久化`);
 }

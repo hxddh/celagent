@@ -41,11 +41,13 @@ GitHub Release:
   celagent-darwin-arm64    (单文件)
   celagent-darwin-x64
   celagent-linux-x64
+  celagent-linux-arm64
   celagent-windows-x64.exe
-  install.sh               (curl|sh, 下载对应平台)
-  celld-<平台>             (随包; 当前 v0.3.0 仅有 darwin-arm64)
+  install.sh
+  install.ps1
+  celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64
   worker.tar.gz
-  SHA256SUMS               (可选; install.sh 存在则校验, 缺失则跳过)
+  SHA256SUMS
 
 用户:
   curl -fsSL install.sh | sh
