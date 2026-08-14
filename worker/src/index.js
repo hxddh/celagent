@@ -178,12 +178,17 @@ export class AgentRuntime {
         // 跨 cell 委托: agent A 委托给 agent B 的任务
         const target = url.searchParams.get('target') || 'delegatee';
         const steps = parseInt(url.searchParams.get('steps') || '3');
-        // 直接调用目标 agent 的 submit
+        const headers = {};
+        const tok = req.headers.get('X-Celagent-Token') || this.env.CELAGENT_WORKER_TOKEN || '';
+        if (tok) headers['X-Celagent-Token'] = tok;
+        const auth = req.headers.get('Authorization');
+        if (auth) headers['Authorization'] = auth;
         const targetId = this.env.AGENT_RUNTIME.idFromName(target);
         const targetStub = this.env.AGENT_RUNTIME.get(targetId);
-        const resp = await targetStub.fetch(
-          `http://internal/delegate?action=submit&type=short&steps=${steps}`
-        );
+        const resp = await targetStub.fetch(new Request(
+          `http://internal/delegate?action=submit&type=short&steps=${steps}`,
+          { headers }
+        ));
         const body = await resp.json();
         // 记录委托关系
         await this.state.storage.put(`delegation:${body.taskId}`, {

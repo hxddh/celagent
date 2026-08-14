@@ -99,9 +99,11 @@ async function privateTmp(name = "body.json") {
   };
 }
 
-function runAws(args, { timeout = AWS_TIMEOUT_MS, profile } = {}) {
+function runAws(args, { timeout = AWS_TIMEOUT_MS, profile, region } = {}) {
   const extra = {};
   if (profile) extra.AWS_PROFILE = profile;
+  const rg = String(region ?? "").trim();
+  if (rg) extra.AWS_REGION = rg;
   return new Promise((resolve) => {
     execFile("aws", args, { env: awsEnv(extra), timeout, encoding: "utf8" }, (err, stdout, stderr) => {
       if (err) {
@@ -112,6 +114,22 @@ function runAws(args, { timeout = AWS_TIMEOUT_MS, profile } = {}) {
       resolve({ ok: true, stdout });
     });
   });
+}
+
+/** aws CLI JSON 输出; 失败不伪装成空数组 */
+export async function awsJson(args, opts = {}) {
+  const r = await runAws(args, opts);
+  if (!r.ok) return { ok: false, error: r.error };
+  try {
+    return { ok: true, data: JSON.parse(r.stdout || "[]") };
+  } catch (e) {
+    return { ok: false, error: "invalid-json" };
+  }
+}
+
+/** 进程内 CAS 门禁: 通过或 cas-ignored 才粘滞; 网络/凭证失败下次重试 */
+export function casGateSticky(result) {
+  return Boolean(result && (result.ok || result.error === "cas-ignored"));
 }
 
 function etagFromGetStdout(stdout) {
@@ -133,7 +151,7 @@ function resolvePutGetEndpoint(endpoint) {
   }
 }
 
-export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRetries = 3, endpoint, profile } = {}) {
+export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRetries = 3, endpoint, profile, region } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
   const resolved = resolvePutGetEndpoint(endpoint);
   if (!resolved.ok) return { ok: false, error: resolved.error };
@@ -153,7 +171,7 @@ export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRe
     if (ifMatch) args.push("--if-match", ifMatch);
     if (ifNoneMatch) args.push("--if-none-match", "*");
     for (let attempt = 0; ; attempt++) {
-      const r = await runAws(args, { profile });
+      const r = await runAws(args, { profile, region });
       if (r.ok) {
         try { return { ok: true, result: JSON.parse(r.stdout) }; }
         catch (e) { return { ok: true, result: {} }; }
@@ -173,7 +191,7 @@ export async function bosPut(key, content, { bucket, ifMatch, ifNoneMatch, maxRe
   }
 }
 
-export async function bosGet(key, { bucket, endpoint, profile } = {}) {
+export async function bosGet(key, { bucket, endpoint, profile, region } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
   const resolved = resolvePutGetEndpoint(endpoint);
   if (!resolved.ok) return { ok: false, error: resolved.error };
@@ -186,7 +204,7 @@ export async function bosGet(key, { bucket, endpoint, profile } = {}) {
       "--key", key,
       "--endpoint-url", ep,
       tmp.path,
-    ], { profile });
+    ], { profile, region });
     if (!dl.ok) {
       const msg = dl.error || "";
       return { ok: false, error: (msg.includes("404") || msg.includes("NoSuchKey")) ? "not-found" : msg };
@@ -202,7 +220,7 @@ export async function bosGet(key, { bucket, endpoint, profile } = {}) {
         "--endpoint-url", ep,
         "--query", "ETag",
         "--output", "text",
-      ], { profile });
+      ], { profile, region });
       if (head.ok) etag = head.stdout.trim() || undefined;
     }
     const body = await readFile(tmp.path, "utf8");
@@ -215,7 +233,7 @@ export async function bosGet(key, { bucket, endpoint, profile } = {}) {
   }
 }
 
-export async function bosDelete(key, { bucket, endpoint, profile } = {}) {
+export async function bosDelete(key, { bucket, endpoint, profile, region } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
   const resolved = resolvePutGetEndpoint(endpoint);
   if (!resolved.ok) return { ok: false, error: resolved.error };
@@ -224,7 +242,7 @@ export async function bosDelete(key, { bucket, endpoint, profile } = {}) {
     "--bucket", bucket,
     "--key", key,
     "--endpoint-url", resolved.ep,
-  ], { profile });
+  ], { profile, region });
   if (!r.ok) return { ok: false, error: r.error };
   return { ok: true };
 }
@@ -289,7 +307,7 @@ export function evaluateCasChecks({
 }
 
 /** 对当前 bucket 做会话路径 CAS 门禁。ops 可注入,供无 aws CLI 的测试 */
-export async function probeStoreCas({ bucket, endpoint, profile, ops } = {}) {
+export async function probeStoreCas({ bucket, endpoint, profile, region, ops } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket", message: "未配置 bucket", checks: [] };
   const put = ops?.put || ((key, content, extra) => bosPut(key, content, extra));
   const get = ops?.get || ((key, extra) => bosGet(key, extra));
@@ -298,7 +316,7 @@ export async function probeStoreCas({ bucket, endpoint, profile, ops } = {}) {
   const key = `celagent-cas-probe/${id}.json`;
   const expectedBody1 = JSON.stringify({ probe: 1, id });
   const expectedBody2 = JSON.stringify({ probe: 2, id });
-  const common = { bucket, endpoint, profile };
+  const common = { bucket, endpoint, profile, region };
   try {
     const create = await put(key, expectedBody1, common);
     const got = create.ok ? await get(key, common) : {};

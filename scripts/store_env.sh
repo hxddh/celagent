@@ -10,6 +10,36 @@ celagent_is_bcebos() {
   case "$1" in *bcebos.com*) return 0 ;; *) return 1 ;; esac
 }
 
+# 与 src/bos.js isAllowedEndpoint 对齐: 非法 URL 拒绝,不改写成 BOS
+celagent_is_allowed_endpoint() {
+  local raw="${1%/}"
+  [ -z "$raw" ] && return 1
+  if [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "1" ] || [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "true" ]; then
+    case "$raw" in http://*|https://*) return 0 ;; *) return 1 ;; esac
+  fi
+  local rest host scheme
+  case "$raw" in
+    http://*) scheme=http; rest="${raw#http://}" ;;
+    https://*) scheme=https; rest="${raw#https://}" ;;
+    *) return 1 ;;
+  esac
+  host="${rest%%/*}"
+  host="${host%%:*}"
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+  case "$host" in
+    127.0.0.1|localhost|::1|\[::1\]) return 0 ;;
+  esac
+  [ "$scheme" = https ] || return 1
+  case "$host" in
+    s3.bcebos.com|s3.*.bcebos.com) return 0 ;;
+    s3.amazonaws.com|s3.*.amazonaws.com) return 0 ;;
+    *.r2.cloudflarestorage.com) return 0 ;;
+    fly.storage.tigris.dev|*.tigris.dev) return 0 ;;
+    t3.storage.dev|*.t3.storage.dev) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 celagent_load_store() {
   local settings="${CELAGENT_SETTINGS:-$HOME/.config/celagent/settings.json}"
   STORE_BUCKET=""
@@ -25,6 +55,10 @@ celagent_load_store() {
     [ -n "$ep" ] && [ "$ep" != "null" ] && STORE_EP="$ep"
     [ -n "$pr" ] && [ "$pr" != "null" ] && STORE_PROFILE="$pr"
     [ -n "$rg" ] && [ "$rg" != "null" ] && STORE_REGION="$rg"
+  fi
+  if ! celagent_is_allowed_endpoint "$STORE_EP"; then
+    echo "✗ persistence.endpoint 不允许: $STORE_EP (仅 https 合格 host 或本机; 或设 CELAGENT_ALLOW_ENDPOINT=1)" >&2
+    return 1
   fi
   if [ -z "$STORE_REGION" ]; then
     if celagent_is_bcebos "$STORE_EP"; then

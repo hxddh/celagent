@@ -148,6 +148,38 @@ if [ -f "$SETTINGS_FILE" ]; then
   [ -n "$_pr" ] && STORE_PROFILE="$_pr"
   [ -n "$_rg" ] && STORE_REGION="$_rg"
 fi
+celagent_install_ep_ok() {
+  local raw="${1%/}"
+  [ -z "$raw" ] && return 1
+  if [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "1" ] || [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "true" ]; then
+    case "$raw" in http://*|https://*) return 0 ;; *) return 1 ;; esac
+  fi
+  local rest host scheme
+  case "$raw" in
+    http://*) scheme=http; rest="${raw#http://}" ;;
+    https://*) scheme=https; rest="${raw#https://}" ;;
+    *) return 1 ;;
+  esac
+  host="${rest%%/*}"
+  host="${host%%:*}"
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+  case "$host" in
+    127.0.0.1|localhost|::1|\[::1\]) return 0 ;;
+  esac
+  [ "$scheme" = https ] || return 1
+  case "$host" in
+    s3.bcebos.com|s3.*.bcebos.com) return 0 ;;
+    s3.amazonaws.com|s3.*.amazonaws.com) return 0 ;;
+    *.r2.cloudflarestorage.com) return 0 ;;
+    fly.storage.tigris.dev|*.tigris.dev) return 0 ;;
+    t3.storage.dev|*.t3.storage.dev) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+if ! celagent_install_ep_ok "$STORE_EP"; then
+  echo "  ✗ persistence.endpoint 不允许: $STORE_EP (仅 https 合格 host 或本机; 或设 CELAGENT_ALLOW_ENDPOINT=1)"
+  exit 1
+fi
 if [ -z "$STORE_REGION" ]; then
   case "$STORE_EP" in
     *bcebos.com*) STORE_REGION=bj ;;
@@ -303,6 +335,22 @@ EOF
 fi
 chmod 600 "$SETTINGS"
 echo "  ✓ 配置已写入"
+
+# CAS 探针 — 与 setup.sh 对齐: 条件写必须真正执行
+echo "[CAS] 探针 (If-Match / If-None-Match / 写后读)..."
+if [ -x "${CELAGENT_ROOT}/bin/celagent" ]; then
+  if ! "${CELAGENT_ROOT}/bin/celagent" cas-probe --bucket "$BUCKET"; then
+    echo "  ✗ 此存储不能保证 RPO=0 (条件写未生效)。换合格后端或检查权限后再安装。"
+    exit 1
+  fi
+elif command -v celagent >/dev/null 2>&1; then
+  if ! celagent cas-probe --bucket "$BUCKET"; then
+    echo "  ✗ 此存储不能保证 RPO=0 (条件写未生效)。换合格后端或检查权限后再安装。"
+    exit 1
+  fi
+else
+  echo "  ⚠ 未找到 celagent,跳过 CAS 探针 (随后请运行: celagent doctor)"
+fi
 
 echo ""
 echo "=== 安装完成 ==="

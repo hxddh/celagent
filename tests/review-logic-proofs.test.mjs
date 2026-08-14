@@ -197,15 +197,19 @@ test("源码锚定: worker token 鉴权 + webhook 默认 loopback", () => {
   assert.match(worker, /function webhookBase/);
   assert.match(tui, /X-Celagent-Token/);
   assert.match(tui, /function ensureWorkerToken/);
+  assert.match(worker, /targetStub\.fetch\(new Request/);
+  assert.match(worker, /headers\['X-Celagent-Token'\]/);
 });
 
-test("源码锚定: rm 非 TTY 需要 --yes", () => {
+test("源码锚定: rm 非 TTY 需要 --yes 且检查删除失败", () => {
   assert.match(tui, /非交互删除需要 --yes/);
   assert.match(tui, /process\.argv\.includes\("--yes"\)/);
+  assert.match(tui, /删除失败/);
 });
 
-test("源码锚定: snapshot 返回 slice 拷贝", () => {
+test("源码锚定: snapshot 返回 slice 拷贝且含 content", () => {
   assert.match(tui, /__celagentSnapshotTurns = \(\) => snapshotTurns\.slice\(\)/);
+  assert.match(tui, /snapshotTurns\.push\(makeTurnEntry/);
 });
 
 test("resolveEndpoint fail-closed 且白名单扩合格 host", async () => {
@@ -249,12 +253,15 @@ test("源码锚定: own.json 清理受 bucket 前缀约束", () => {
   assert.match(tui, /startsWith\("celagent-"\)/);
 });
 
-test("源码锚定: history_search 默认当前会话", () => {
+test("源码锚定: history_search 默认当前会话且读 snapshots/", () => {
   const tools = readFileSync(join(root, "src/bos-tools.js"), "utf8");
   assert.match(tools, /__celagentPersistId/);
   assert.match(tools, /rawSession === "\*"/);
   assert.match(tools, /sessions\/\$\{sessionFilter\}\.json/);
   assert.match(tools, /--max-items/);
+  assert.match(tools, /snapshots\//);
+  assert.match(tools, /persistenceFromCfg/);
+  assert.match(tools, /endpoint-not-allowed/);
 });
 
 test("源码锚定: worker cwrite 锁 TTL + scheduleNextAlarm", () => {
@@ -349,6 +356,8 @@ test("源码锚定: install 支持 arm64/windows 且缺 SHA256SUMS 会警告", (
   assert.match(sh, /windows-x64/);
   assert.match(sh, /CELAGENT_REQUIRE_CHECKSUM/);
   assert.match(sh, /verify_checksums\(\) \{/);
+  assert.match(sh, /cas-probe/);
+  assert.match(sh, /celagent_install_ep_ok/);
 });
 
 test("源码锚定: doctor Celld 离线不报全部正常", () => {
@@ -361,6 +370,11 @@ test("源码锚定: doctor 含 CAS 门禁且 persist 拒绝无 CAS 写入", () =
   assert.match(tui, /probeStoreCas/);
   assert.match(tui, /此存储不能保证 RPO=0,拒绝权威写入/);
   assert.match(tui, /async function ensureStoreCas/);
+  assert.match(tui, /casGateSticky/);
+  assert.doesNotMatch(tui, /\[1\/5\]/);
+  assert.match(tui, /bosDelete/);
+  assert.match(tui, /列举会话失败/);
+  assert.match(tui, /region: store\.region/);
 });
 
 test("源码锚定: worker 已删除未调用的 SigV4 bosPut", () => {
@@ -385,6 +399,9 @@ test("源码锚定: 运维脚本读 store_env 而非写死 BOS endpoint", () => 
   const cm = readFileSync(join(root, "scripts/cluster_mgr.sh"), "utf8");
   assert.match(cm, /store_env\.sh/);
   assert.doesNotMatch(cm, /EP="https:\/\/s3\.bj\.bcebos\.com"/);
+  const env = readFileSync(join(root, "scripts/store_env.sh"), "utf8");
+  assert.match(env, /celagent_is_allowed_endpoint/);
+  assert.match(env, /persistence\.endpoint 不允许/);
 });
 
 test("源码锚定: celld v0.2 token vars 与 timingSafeEqual", () => {

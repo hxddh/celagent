@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url);
 // 动态 import(file://路径) 无法被 Bun 打包, 单二进制运行时找不到 chalk 等嵌套依赖。
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
-import { awsEnv, resolveEndpoint, isAllowedEndpoint, resolveRegion } from "../src/bos.js";
+import { awsEnv, resolveEndpoint, isAllowedEndpoint, resolveRegion, awsJson, casGateSticky } from "../src/bos.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
@@ -291,15 +291,28 @@ function mergeTurn(session, seq, role, msg, fullContent, fullToolResults) {
   }
   session.updatedAt = Date.now();
 }
-let casGatePromise = null;
+let casGateStickyResult = null;
+let casGateInflight = null;
 async function ensureStoreCas(store) {
-  if (!casGatePromise) {
-    casGatePromise = (async () => {
-      const { probeStoreCas } = await import("../src/bos.js");
-      return probeStoreCas({ bucket: store.bucket, endpoint: store.endpoint, profile: store.profile });
+  if (casGateStickyResult) return casGateStickyResult;
+  if (!casGateInflight) {
+    casGateInflight = (async () => {
+      try {
+        const { probeStoreCas } = await import("../src/bos.js");
+        const r = await probeStoreCas({
+          bucket: store.bucket,
+          endpoint: store.endpoint,
+          profile: store.profile,
+          region: store.region,
+        });
+        if (casGateSticky(r)) casGateStickyResult = r;
+        return r;
+      } finally {
+        casGateInflight = null;
+      }
     })();
   }
-  return casGatePromise;
+  return casGateInflight;
 }
 async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullToolResults) {
   const { bosPut, bosGet } = await import("../src/bos.js");
@@ -312,20 +325,25 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
   const bucket = store.bucket;
   const endpoint = store.endpoint;
   const profile = store.profile;
+  const region = store.region;
   if (!bucket) {
     warnOnce("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
     return;
   }
   const cas = await ensureStoreCas(store);
   if (!cas.ok) {
-    warnOnce("cas", `  (警告: 此存储不能保证 RPO=0,拒绝权威写入: ${cas.message || cas.error})`);
+    if (cas.error === "cas-ignored") {
+      warnOnce("cas", `  (警告: 此存储不能保证 RPO=0,拒绝权威写入: ${cas.message || cas.error})`);
+    } else {
+      warnOnce("cas-temp", `  (警告: CAS 探针失败,跳过本轮写入: ${cas.message || cas.error})`);
+    }
     return;
   }
   const key = `sessions/${sessionId}.json`;
   for (let attempt = 0; attempt < 3; attempt++) {
     let session = { id: sessionId, turns: [] };
     let etag = undefined;
-    const existing = await bosGet(key, { bucket, endpoint, profile });
+    const existing = await bosGet(key, { bucket, endpoint, profile, region });
     if (existing.ok) {
       try {
         session = JSON.parse(existing.body);
@@ -338,7 +356,7 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
     } else if (existing.error === "not-found") {
       session.turns.push(makeTurnEntry(sessionId, seq, role, msg, fullContent, fullToolResults));
       session.updatedAt = Date.now();
-      const put = await bosPut(key, session, { bucket, endpoint, profile, ifNoneMatch: true });
+      const put = await bosPut(key, session, { bucket, endpoint, profile, region, ifNoneMatch: true });
       if (put.ok) return;
       if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; }
       warnOnce("persist", `  (警告: BOS 首写失败: ${put.error || "未知错误"})`);
@@ -348,7 +366,7 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
       return;
     }
     mergeTurn(session, seq, role, msg, fullContent, fullToolResults);
-    const put = await bosPut(key, session, { bucket, ifMatch: etag, endpoint, profile });
+    const put = await bosPut(key, session, { bucket, ifMatch: etag, endpoint, profile, region });
     if (put.ok) return;
     if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; }
     warnOnce("persist", `  (警告: BOS 持久化失败: ${put.error || "未知错误"})`);
@@ -434,7 +452,7 @@ async function loadHistoryFromBos(sessionId) {
         const bucket = store.bucket;
         const endpoint = store.endpoint;
         if (bucket) {
-          const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint, profile: store.profile });
+          const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint, profile: store.profile, region: store.region });
           if (existing.ok) {
             try {
               const session = JSON.parse(existing.body);
@@ -467,7 +485,6 @@ async function listSessions() {
   // 降级链 (Bug 65): settings.json 丢失时自动发现账号下所有含会话的 bucket,
   // 保证“本地数据全丢, 只要凭证还在”仍能找回会话
   try {
-    const { execFile } = await import("node:child_process");
     const cfg = loadConfig();
     let store;
     try { store = storeFromCfg(cfg); } catch (e) {
@@ -483,12 +500,7 @@ async function listSessions() {
     } else {
       bucket = store.bucket;
     }
-    const runAws = (args) => new Promise((resolve) => {
-      execFile("aws", args, { env: awsEnv(store.awsExtra), timeout: 20000, encoding: "utf8" }, (err, stdout) => {
-        try { resolve(JSON.parse(stdout || "[]")); }
-        catch (e) { resolve([]); }
-      });
-    });
+    const awsOpts = { profile: store.profile, region: store.region };
     // 3) 无 bucket: 需显式 --scan 才枚举账号 (避免默认列出全部 bucket)
     if (!bucket) {
       if (!process.argv.includes("--scan")) {
@@ -496,12 +508,16 @@ async function listSessions() {
         return;
       }
       console.log("(未找到 settings.json 配置, --scan 扫描账号下含会话的 bucket...)");
-      const buckets = await runAws(["s3api", "list-buckets", "--query", "Buckets[].Name", "--output", "json"]);
-      const all = Array.isArray(buckets) ? buckets : [];
+      const bucketsR = await awsJson(["s3api", "list-buckets", "--endpoint-url", endpoint, "--query", "Buckets[].Name", "--output", "json"], awsOpts);
+      if (!bucketsR.ok) {
+        console.error(`✗ 列举 bucket 失败: ${bucketsR.error}`);
+        return;
+      }
+      const all = Array.isArray(bucketsR.data) ? bucketsR.data : [];
       const candidates = [];
       const worker = async (b) => {
-        const hit = await runAws(["s3api", "list-objects-v2", "--bucket", b, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", endpoint, "--query", "Contents[].Key", "--output", "json"]);
-        if (Array.isArray(hit) && hit.length > 0) candidates.push(b);
+        const hit = await awsJson(["s3api", "list-objects-v2", "--bucket", b, "--prefix", "sessions/", "--max-items", "1", "--endpoint-url", endpoint, "--query", "Contents[].Key", "--output", "json"], awsOpts);
+        if (hit.ok && Array.isArray(hit.data) && hit.data.length > 0) candidates.push(b);
       };
       for (let i = 0; i < all.length; i += 6) {
         await Promise.all(all.slice(i, i + 6).map(worker));
@@ -514,7 +530,12 @@ async function listSessions() {
         return;
       }
     }
-    const list = await runAws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--query", "Contents[].{k:Key,s:Size,l:LastModified}", "--output", "json"]);
+    const listed = await awsJson(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", "sessions/", "--endpoint-url", endpoint, "--query", "Contents[].{k:Key,s:Size,l:LastModified}", "--output", "json"], awsOpts);
+    if (!listed.ok) {
+      console.error(`✗ 列举会话失败: ${listed.error}`);
+      return;
+    }
+    const list = listed.data;
     const sessions = (Array.isArray(list) ? list : [])
       .filter(i => i.k?.endsWith(".json") && !i.k.includes("/verify/"))
       .filter(i => {
@@ -689,7 +710,7 @@ async function doctorCommand() {
   const cfg = loadConfig();
   let store;
   try { store = storeFromCfg(cfg); } catch (e) {
-    console.log(`[1/5] 配置: ✗ ${e.message}`);
+    console.log(`[1/6] 配置: ✗ ${e.message}`);
     process.exit(1);
   }
   const bucket = store.bucket;
@@ -737,7 +758,7 @@ async function doctorCommand() {
   // 5. CAS — 条件写必须真正执行,不能只看 PUT 200
   if (bucket && (cred || hasEnv) && storeReachable) {
     const { probeStoreCas } = await import("../src/bos.js");
-    const cas = await probeStoreCas({ bucket, endpoint: store.endpoint, profile: store.profile });
+    const cas = await probeStoreCas({ bucket, endpoint: store.endpoint, profile: store.profile, region: store.region });
     console.log(`[5/6] CAS: ${cas.ok ? "✓ If-Match / If-None-Match / 写后读" : "✗ " + (cas.message || cas.error)}`);
     if (!cas.ok) ok = false;
   } else {
@@ -751,25 +772,26 @@ async function doctorCommand() {
 
 // ---- 导出/删除会话 ----
 async function getBucketArg() {
-  // 返回 { bucket, endpoint, profile } — 显式 --bucket > settings.json
+  // 返回 { bucket, endpoint, profile, region } — 显式 --bucket > settings.json
   const cfg = loadConfig();
   let store;
   try { store = storeFromCfg(cfg); } catch (e) {
     console.error(`✗ ${e.message}`);
     process.exit(1);
   }
+  const base = { endpoint: store.endpoint, profile: store.profile, region: store.region };
   const argvIdx = process.argv.indexOf("--bucket");
   if (argvIdx > 0 && process.argv[argvIdx + 1]) {
-    return { bucket: process.argv[argvIdx + 1], endpoint: store.endpoint, profile: store.profile };
+    return { bucket: process.argv[argvIdx + 1], ...base };
   }
-  if (store.bucket) return { bucket: store.bucket, endpoint: store.endpoint, profile: store.profile };
-  return { bucket: null, endpoint: store.endpoint, profile: store.profile };
+  if (store.bucket) return { bucket: store.bucket, ...base };
+  return { bucket: null, ...base };
 }
 async function casProbeCommand() {
-  const { bucket, endpoint, profile } = await getBucketArg();
+  const { bucket, endpoint, profile, region } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定或先 setup.sh)"); process.exit(1); }
   const { probeStoreCas } = await import("../src/bos.js");
-  const cas = await probeStoreCas({ bucket, endpoint, profile });
+  const cas = await probeStoreCas({ bucket, endpoint, profile, region });
   if (!cas.ok) {
     console.error(`✗ ${cas.message || cas.error}`);
     process.exit(1);
@@ -854,10 +876,10 @@ function assertSafeSessionId(id) {
 async function exportCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent export <会话ID> [--bucket B] (ID 可用 celagent list 查看)"); process.exit(1); }
   assertSafeSessionId(id);
-  const { bucket, endpoint, profile } = await getBucketArg();
+  const { bucket, endpoint, profile, region } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { bosGet } = await import("../src/bos.js");
-  const r = await bosGet(`sessions/${id}.json`, { bucket, endpoint, profile });
+  const r = await bosGet(`sessions/${id}.json`, { bucket, endpoint, profile, region });
   if (!r.ok) { console.error(`✗ 会话不存在或读取失败: ${r.error}`); process.exit(1); }
   const session = JSON.parse(r.body);
   console.log(JSON.stringify({ id, exportedAt: new Date().toISOString(), turns: session.turns || [] }, null, 2));
@@ -865,9 +887,8 @@ async function exportCommand(id) {
 async function rmCommand(id) {
   if (!id || id.startsWith("-")) { console.error("用法: celagent rm <会话ID> [--bucket B] [--yes] (ID 可用 celagent list 查看)"); process.exit(1); }
   assertSafeSessionId(id);
-  const { bucket, endpoint, profile } = await getBucketArg();
+  const { bucket, endpoint, profile, region } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
-  const { execFile } = await import("node:child_process");
   const force = process.argv.includes("--yes") || process.argv.includes("-y");
   let confirm = force;
   if (!confirm) {
@@ -881,9 +902,12 @@ async function rmCommand(id) {
     });
   }
   if (!confirm) { console.log("已取消"); return; }
-  await new Promise((resolve) => {
-    execFile("aws", ["s3api", "delete-object", "--bucket", bucket, "--key", `sessions/${id}.json`, "--endpoint-url", endpoint], { env: awsEnv({ AWS_PROFILE: profile }), timeout: 15000 }, (err) => resolve());
-  });
+  const { bosDelete } = await import("../src/bos.js");
+  const r = await bosDelete(`sessions/${id}.json`, { bucket, endpoint, profile, region });
+  if (!r.ok) {
+    console.error(`✗ 删除失败: ${r.error}`);
+    process.exit(1);
+  }
   console.log(`✓ 已删除会话 ${id}`);
 }
 
@@ -1049,7 +1073,12 @@ async function main() {
       };
       let seq = maxTurn(persistHistory);
       // P1: 维护当前会话 turns 快照缓存 (供 session_snapshot 工具保存用)
-      let snapshotTurns = (persistHistory || []).map(t => ({ turn: t.turn, role: t.role || "assistant", msg: t.msg, ts: t.ts }));
+      let snapshotTurns = (persistHistory || []).map(t => {
+        const e = { turn: t.turn, role: t.role || "assistant", msg: t.msg, ts: t.ts };
+        if (t.content && t.content.length) e.content = t.content;
+        if (t.toolResults && t.toolResults.length) e.toolResults = t.toolResults;
+        return e;
+      });
       globalThis.__celagentSnapshotTurns = () => snapshotTurns.slice();
       result.session.subscribe(async (event) => {
         if (event?.type === "message_end" && event.message?.role === "user") {
@@ -1057,7 +1086,7 @@ async function main() {
           const text = extractText(event.message?.content);
           const fullContent = Array.isArray(event.message?.content) ? event.message.content : [];
           void celldCheckpoint(persistId, seq, "user", text || "(无文本)", { fullContent });
-          snapshotTurns.push({ turn: seq, role: "user", msg: text || "(无文本)", ts: Date.now() });
+          snapshotTurns.push(makeTurnEntry(persistId, seq, "user", text || "(无文本)", fullContent, null));
           return;
         }
         if (event?.type === "turn_end") {
@@ -1084,7 +1113,7 @@ async function main() {
           // Bug 52: 不 await — checkpoint 全异步 (worker fire-and-forget + BOS 队列), 绝不阻塞对话
           void celldCheckpoint(persistId, seq, "assistant", msg, { fullContent, fullToolResults });
           // P1: 同步快照缓存
-          snapshotTurns.push({ turn: seq, role: "assistant", msg, ts: Date.now() });
+          snapshotTurns.push(makeTurnEntry(persistId, seq, "assistant", msg, fullContent, fullToolResults));
         }
       });
       return { ...result, services, diagnostics: [] };  // 完整契约 (Bug: /new 需 services+diagnostics)
