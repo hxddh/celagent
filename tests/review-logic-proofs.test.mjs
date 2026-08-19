@@ -49,29 +49,13 @@ test("源码锚定: seq = maxTurn(persistHistory)", () => {
   assert.doesNotMatch(tui, /let seq = \(persistHistory && persistHistory\.length\) \|\| 0/);
 });
 
-// ---- 同 turn replace 保留已有 content ----
-test("同 turn replace: 缺 content 的新写入不抹掉已有 content", () => {
-  const session = {
-    turns: [
-      { turn: 1, msg: "A".repeat(500), content: [{ type: "text", text: "A".repeat(500) }] },
-      { turn: 2, msg: "B".repeat(500), content: [{ type: "text", text: "B".repeat(500) }] },
-    ],
-  };
-  const seq = 2;
-  const fullContent = null;
-  const entry = { turn: 2, msg: "x".repeat(200) };
-  const idx = session.turns.findIndex((t) => t.turn === seq);
-  const prev = session.turns[idx];
-  if (prev?.content && !(fullContent && fullContent.length)) entry.content = prev.content;
-  session.turns[idx] = entry;
-  assert.equal(session.turns[1].msg.length, 200);
-  assert.ok(Array.isArray(session.turns[1].content));
-  assert.equal(session.turns[1].content[0].text.length, 500);
-});
-
-test("源码锚定: mergeTurn 保留已有 content/toolResults", () => {
+// ---- 同 turn 合并: 幂等重试保留字段; 并发不同内容追加不覆盖 ----
+test("源码锚定: mergeTurn 保留已有 content/toolResults, 并发同号追加", () => {
   assert.match(persist, /if \(prev\?\.content && !\(fullContent && fullContent\.length\)\) entry\.content = prev\.content/);
   assert.match(persist, /if \(prev\?\.toolResults && !\(fullToolResults && fullToolResults\.length\)\) entry\.toolResults = prev\.toolResults/);
+  // 评审 P1: 同号但内容不同 = 并发写入者, 追加新号而非覆盖对方的轮
+  assert.match(persist, /sameOrigin/);
+  assert.match(persist, /绝不覆盖对方的轮/);
 });
 
 // ---- ensureLock finally 释放 ----
