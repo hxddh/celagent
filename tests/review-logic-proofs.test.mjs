@@ -207,9 +207,15 @@ test("源码锚定: rm 非 TTY 需要 --yes 且检查删除失败", () => {
   assert.match(tui, /删除失败/);
 });
 
-test("源码锚定: snapshot 返回 slice 拷贝且含 content", () => {
-  assert.match(tui, /__celagentSnapshotTurns = \(\) => snapshotTurns\.slice\(\)/);
-  assert.match(tui, /snapshotTurns\.push\(makeTurnEntry/);
+test("源码锚定: snapshot 全量从 BOS 重建, 进程内只留摘要", () => {
+  assert.match(tui, /__celagentSnapshotTurns = async \(\) =>/);
+  const start = tui.indexOf("__celagentSnapshotTurns = async");
+  const block = tui.slice(start, start + 500);
+  assert.match(block, /loadHistoryFromBos\(persistId\)/);
+  // 内存缓存只 push 摘要对象, 不再驻留完整 content/toolResults
+  assert.doesNotMatch(tui, /snapshotTurns\.push\(makeTurnEntry/);
+  assert.match(tui, /snapshotTurns\.push\(\{ turn: seq, role: "user"/);
+  assert.match(tui, /snapshotTurns\.push\(\{ turn: seq, role: "assistant"/);
 });
 
 test("resolveEndpoint fail-closed 且白名单扩合格 host", async () => {
@@ -223,6 +229,10 @@ test("resolveEndpoint fail-closed 且白名单扩合格 host", async () => {
   assert.equal(isAllowedEndpoint("https://fly.storage.tigris.dev"), true);
   assert.equal(isAllowedEndpoint("https://t3.storage.dev"), true);
   assert.equal(isAllowedEndpoint("http://127.0.0.1:9000"), true);
+  assert.equal(isAllowedEndpoint("http://[::1]:9000"), true);
+  assert.equal(isAllowedEndpoint("http://[::1]"), true);
+  assert.equal(isAllowedEndpoint("https://s3.a.b.bcebos.com"), false);
+  assert.equal(isAllowedEndpoint("https://s3.a.b.amazonaws.com"), false);
   assert.equal(isAllowedEndpoint("https://evil.example/"), false);
   assert.equal(isAllowedEndpoint("http://evil.example"), false);
   assert.equal(resolveEndpoint(), DEFAULT_ENDPOINT);

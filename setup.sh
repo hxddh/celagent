@@ -51,14 +51,21 @@ else
 fi
 
 # 2b. CAS 探针 — 条件写必须真正执行,否则拒绝把会话当权威源
+# 退出码 2 = 探针未完成 (网络/凭证临时问题, 无法判定), 不能误报成存储不合格
 echo "[2b] CAS 探针 (If-Match / If-None-Match / 写后读)..."
+CAS_CMD=()
 if command -v celagent >/dev/null 2>&1; then
-  if ! celagent cas-probe --bucket "$BUCKET"; then
-    echo "  ✗ 此存储不能保证 RPO=0 (条件写未生效)。换合格后端或检查权限后再 setup。"
-    exit 1
-  fi
+  CAS_CMD=(celagent)
 elif [ -f "$ROOT/bin/celagent-tui.mjs" ]; then
-  if ! node "$ROOT/bin/celagent-tui.mjs" cas-probe --bucket "$BUCKET"; then
+  CAS_CMD=(node "$ROOT/bin/celagent-tui.mjs")
+fi
+if [ "${#CAS_CMD[@]}" -gt 0 ]; then
+  CAS_RC=0
+  "${CAS_CMD[@]}" cas-probe --bucket "$BUCKET" || CAS_RC=$?
+  if [ "$CAS_RC" -eq 2 ]; then
+    echo "  ✗ CAS 探针未完成 (临时网络/凭证问题, 无法判定存储能力)。请稍后重试 setup, 或运行: celagent doctor"
+    exit 1
+  elif [ "$CAS_RC" -ne 0 ]; then
     echo "  ✗ 此存储不能保证 RPO=0 (条件写未生效)。换合格后端或检查权限后再 setup。"
     exit 1
   fi

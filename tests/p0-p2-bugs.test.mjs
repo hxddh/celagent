@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { awsEnv, casGateSticky, probeStoreCas } from "../src/bos.js";
-import { persistenceFromCfg } from "../src/bos-tools.js";
+import { persistenceFromCfg, collectHitsFromTurns } from "../src/bos-tools.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -15,11 +15,17 @@ test("awsEnv: extra.AWS_REGION 进入子进程环境", () => {
   assert.equal(env.AWS_EC2_METADATA_DISABLED, "true");
 });
 
-test("casGateSticky: 仅 ok 与 cas-ignored 粘滞", () => {
+test("casGateSticky: 结论性结果粘滞, transient 不粘滞", () => {
   assert.equal(casGateSticky({ ok: true }), true);
+  // 结论性能力失败也必须粘滞 — 否则每一轮都重跑探针再丢轮 (P0)
   assert.equal(casGateSticky({ ok: false, error: "cas-ignored" }), true);
-  assert.equal(casGateSticky({ ok: false, error: "create-failed" }), false);
-  assert.equal(casGateSticky({ ok: false, error: "no-bucket" }), false);
+  assert.equal(casGateSticky({ ok: false, error: "no-etag" }), true);
+  assert.equal(casGateSticky({ ok: false, error: "if-none-match" }), true);
+  assert.equal(casGateSticky({ ok: false, error: "read-after-write" }), true);
+  // transient (网络等) 不粘滞, 下次重试
+  assert.equal(casGateSticky({ ok: false, transient: true, error: "create-failed" }), false);
+  assert.equal(casGateSticky({ ok: false, transient: true, error: "probe-put-failed" }), false);
+  assert.equal(casGateSticky({ ok: false, transient: true, error: "no-bucket" }), false);
   assert.equal(casGateSticky(null), false);
 });
 
@@ -81,6 +87,21 @@ test("probeStoreCas: region 传入 ops", async () => {
   assert.ok(seen.every((x) => x === "auto"), `region 应贯穿: ${JSON.stringify(seen)}`);
 });
 
+test("collectHitsFromTurns: 命中在 toolResults 深处时片段必须含命中文本", () => {
+  const turns = [{
+    turn: 3, role: "assistant", ts: 1,
+    msg: "本轮摘要与查询完全无关的一段开头文字",
+    toolResults: [{
+      toolName: "bash",
+      content: [{ type: "text", text: "x".repeat(500) + " 独特命中标记词 " + "y".repeat(100) }],
+    }],
+  }];
+  const hits = [];
+  collectHitsFromTurns(turns, { query: "独特命中标记词", sessionId: "s", source: "session", hits, limit: 5 });
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].snippet, /独特命中标记词/);
+});
+
 test("store_env: 合格 host 放行, 非法 endpoint fail-closed", () => {
   const script = `
     set -e
@@ -89,6 +110,11 @@ test("store_env: 合格 host 放行, 非法 endpoint fail-closed", () => {
     celagent_is_allowed_endpoint "https://abc.r2.cloudflarestorage.com" || exit 12
     celagent_is_allowed_endpoint "http://127.0.0.1:9000" || exit 13
     celagent_is_allowed_endpoint "https://evil.example" && exit 14
+    celagent_is_allowed_endpoint "http://[::1]:9000" || exit 17
+    celagent_is_allowed_endpoint "http://[::1]" || exit 18
+    celagent_is_allowed_endpoint "https://s3.a.b.bcebos.com" && exit 19
+    celagent_is_allowed_endpoint "https://s3.a.b.amazonaws.com" && exit 20
+    celagent_is_allowed_endpoint "https://s3.us-east-1.amazonaws.com" || exit 21
     CELAGENT_ALLOW_ENDPOINT=1
     celagent_is_allowed_endpoint "https://evil.example" || exit 15
     unset CELAGENT_ALLOW_ENDPOINT
