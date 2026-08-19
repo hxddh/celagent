@@ -1,13 +1,13 @@
 # celagent
 
-独立开源 agent — **Pi 完整 TUI + Celld/BOS 对象存储持久化 (RPO=0)**。
-会话权威落盘在对象存储:CAS 成功后可跨机恢复。恢复读 BOS;worker 仅作 miss 回退。
+独立开源 agent — **Pi 完整 TUI + Celld/BOS 对象存储持久化**。
+会话权威落盘在对象存储:**CAS 成功后**可跨机读回。恢复读 BOS;仅 BOS miss 才回退 worker 缓存。网络抖动时写入留队重试,读失败不把截断缓存当成完整历史。
 
 ## 特性
 
 - **完整 Pi TUI**:复用 pi-coding-agent 引擎(不 fork),bash/read/write/grep/find/edit/ls 全量工具,多模型切换
-- **会话权威在 BOS (RPO≈0)**:每轮对话双写 — worker 缓存 + **BOS 直写**(CAS 乐观锁 + 幂等去重 + 异步队列);恢复先读 BOS
-- **跨机恢复**:`celagent <id>` 从 BOS 恢复完整历史,换机器/本地数据丢失都能找回
+- **会话权威在 BOS**:每轮对话双写 — worker 缓存 + **BOS 直写**(CAS 乐观锁 + 幂等去重 + 异步队列);GET/PUT 瞬时失败留队重试,不静默丢轮
+- **跨机恢复**:`celagent <id>` 从 BOS 读回已成功写入的历史(热恢复注入最近 50 轮文本,完整对象可用 `export` / `history_search`)
 - **分布式任务**:`celagent task submit/status/ledger` — celld 状态机,断点续跑 + 单 cell ledger 去重(exactly-once 限于同一 cell; 多机见 docs/distributed-deployment.md)
 - **本地会话恢复**:TUI 内 `/resume` 切换本机会话,`/new` 开新会话(自动独立持久化 ID)
 - **一键部署**:setup.sh 检测凭证 → 建 bucket → 部署 worker → 启动双节点 → 写配置
@@ -60,7 +60,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
                     轮次: {turn, role, msg, ts, content, toolResults}  (完整记忆, 不截断)
 ```
 
-恢复优先级:**BOS 是权威源** — 启动 `celagent <id>` 先从 BOS 读完整历史,仅 BOS miss 时才回退 worker 缓存。BOS 同时持久化 **user 与 assistant** 轮;`/resume` 从本地 JSONL 恢复;`/new` 与 `/fork` 均分配独立持久化 ID。
+恢复优先级:**BOS 是权威源** — `celagent <id>` 先从 BOS 读;仅对象不存在(miss)时才回退 worker 缓存。BOS 超时/5xx/权限失败**不回退**(避免把 8000 字截断缓存当成完整历史)。BOS 同时持久化 **user 与 assistant** 轮;热恢复把最近 50 轮文本注入 steer(不是 Pi 消息重放);`/resume` 从本地 JSONL 恢复;`/new` 与 `/fork` 均分配独立持久化 ID。
 
 ## agent 内置 BOS 记忆工具 (P1)
 

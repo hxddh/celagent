@@ -13,7 +13,8 @@ const require = createRequire(import.meta.url);
 // 动态 import(file://路径) 无法被 Bun 打包, 单二进制运行时找不到 chalk 等嵌套依赖。
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
-import { awsEnv, resolveEndpoint, isAllowedEndpoint, resolveRegion, awsJson, casGateSticky } from "../src/bos.js";
+import { awsEnv, resolveEndpoint, isAllowedEndpoint, awsJson } from "../src/bos.js";
+import { storeFromCfg, queueBosWrite, flushBosQueue, loadSessionHistory } from "../src/persist.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
@@ -258,166 +259,7 @@ async function ensureCelld() {
   return ensureLock;
 }
 
-// ---- BOS 直写队列 (串行; 超限丢最旧, 保留最新) ----
-let bosQueue = Promise.resolve();
-const BOS_QUEUE_MAX = 50;
-const bosPending = [];
-let bosPumping = false;
-function makeTurnEntry(sessionId, seq, role, msg, fullContent, fullToolResults) {
-  const entry = { turn: seq, role, msg, ts: Date.now() };
-  if (fullContent && fullContent.length > 0) entry.content = fullContent;
-  if (fullToolResults && fullToolResults.length > 0) entry.toolResults = fullToolResults;
-  return entry;
-}
-function mergeTurn(session, seq, role, msg, fullContent, fullToolResults) {
-  let finalSeq = seq;
-  if (session.turns.length > 0) {
-    const exists = session.turns.some(t => t.turn === seq);
-    if (!exists) {
-      const nums = session.turns.map(t => Number(t.turn)).filter(n => Number.isFinite(n));
-      const maxTurn = nums.length ? Math.max(...nums) : 0;
-      finalSeq = maxTurn + 1;
-    }
-  }
-  const entry = makeTurnEntry(session.id, finalSeq, role, msg, fullContent, fullToolResults);
-  const idx = session.turns.findIndex(t => t.turn === finalSeq);
-  if (idx >= 0) {
-    const prev = session.turns[idx];
-    if (prev?.content && !(fullContent && fullContent.length)) entry.content = prev.content;
-    if (prev?.toolResults && !(fullToolResults && fullToolResults.length)) entry.toolResults = prev.toolResults;
-    session.turns[idx] = entry;
-  } else {
-    session.turns.push(entry);
-  }
-  session.updatedAt = Date.now();
-}
-// CAS 门禁缓存按 store 身份键控 — persistTurnToBos 每轮重读 settings.json,
-// 中途换 bucket/endpoint 后旧 verdict 不得沿用 (防丢更新 / 误拒写)
-let casGateCache = { key: null, result: null };
-let casGateInflight = { key: null, promise: null };
-function storeCasKey(store) {
-  return [store.endpoint, store.bucket, store.profile, store.region || ""].join("|");
-}
-async function ensureStoreCas(store) {
-  const key = storeCasKey(store);
-  if (casGateCache.key === key && casGateCache.result) return casGateCache.result;
-  if (casGateInflight.key === key && casGateInflight.promise) return casGateInflight.promise;
-  const promise = (async () => {
-    try {
-      const { probeStoreCas } = await import("../src/bos.js");
-      const r = await probeStoreCas({
-        bucket: store.bucket,
-        endpoint: store.endpoint,
-        profile: store.profile,
-        region: store.region,
-      });
-      if (casGateSticky(r)) casGateCache = { key, result: r };
-      return r;
-    } finally {
-      if (casGateInflight.promise === promise) casGateInflight = { key: null, promise: null };
-    }
-  })();
-  casGateInflight = { key, promise };
-  return promise;
-}
-async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullToolResults) {
-  const { bosPut, bosGet } = await import("../src/bos.js");
-  const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
-  let store;
-  try { store = storeFromCfg(cfg); } catch (e) {
-    warnOnce("persist", `  (警告: ${e.message})`);
-    return;
-  }
-  const bucket = store.bucket;
-  const endpoint = store.endpoint;
-  const profile = store.profile;
-  const region = store.region;
-  if (!bucket) {
-    warnOnce("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
-    return;
-  }
-  const cas = await ensureStoreCas(store);
-  if (!cas.ok) {
-    if (cas.transient) {
-      // 瞬时失败 (网络等) 无法判定 — 任务留在队列, 恢复后补写, 不丢轮 (RPO=0)
-      warnOnce("cas-temp", `  (警告: CAS 探针暂未通过, 本轮写入将重试: ${cas.message || cas.error})`);
-      return "retry";
-    }
-    warnOnce("cas", `  (警告: 此存储不能保证 RPO=0,拒绝权威写入: ${cas.message || cas.error})`);
-    return;
-  }
-  const key = `sessions/${sessionId}.json`;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    let session = { id: sessionId, turns: [] };
-    let etag = undefined;
-    const existing = await bosGet(key, { bucket, endpoint, profile, region });
-    if (existing.ok) {
-      try {
-        session = JSON.parse(existing.body);
-        if (!Array.isArray(session.turns)) session.turns = [];
-      } catch (e) {
-        warnOnce("persist", `  (警告: BOS 会话 JSON 损坏, 跳过本轮以免覆盖历史: ${sessionId})`);
-        return;
-      }
-      etag = existing.etag;
-    } else if (existing.error === "not-found") {
-      session.turns.push(makeTurnEntry(sessionId, seq, role, msg, fullContent, fullToolResults));
-      session.updatedAt = Date.now();
-      const put = await bosPut(key, session, { bucket, endpoint, profile, region, ifNoneMatch: true });
-      if (put.ok) return;
-      if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; }
-      warnOnce("persist", `  (警告: BOS 首写失败: ${put.error || "未知错误"})`);
-      return;
-    } else {
-      warnOnce("persist", `  (警告: BOS 读取失败, 跳过本轮持久化: ${existing.error})`);
-      return;
-    }
-    mergeTurn(session, seq, role, msg, fullContent, fullToolResults);
-    const put = await bosPut(key, session, { bucket, ifMatch: etag, endpoint, profile, region });
-    if (put.ok) return;
-    if (put.conflict) { await new Promise(r => setTimeout(r, 100)); continue; }
-    warnOnce("persist", `  (警告: BOS 持久化失败: ${put.error || "未知错误"})`);
-    return;
-  }
-}
-function pumpBosQueue() {
-  if (bosPumping) return;
-  bosPumping = true;
-  bosQueue = (async () => {
-    let retries = 0;  // 连续 transient 重试次数, 任一任务落定即清零
-    try {
-      while (bosPending.length) {
-        const job = bosPending[0];
-        let outcome;
-        try { outcome = await persistTurnToBos(job.sessionId, job.seq, job.role, job.msg, job.fullContent, job.fullToolResults); }
-        catch (e) { warnOnce("persist", `  (警告: BOS 持久化异常: ${e.message})`); }
-        if (outcome === "retry") {
-          // 任务留在队首, 指数退避后重试; 超限时 queueBosWrite 仍会丢最旧兜底。
-          // 退避定时器 unref: 退出路径不被空转的 sleep 挂住 (flush 有 10s 上限)
-          retries += 1;
-          const delay = Math.min(60000, 1000 * 2 ** Math.min(retries, 6));
-          await new Promise(r => { const t = setTimeout(r, delay); if (t.unref) t.unref(); });
-          continue;
-        }
-        retries = 0;
-        if (bosPending[0] === job) bosPending.shift();
-      }
-    } finally {
-      bosPumping = false;
-      if (bosPending.length) pumpBosQueue();
-    }
-  })();
-}
-function queueBosWrite(sessionId, seq, role, msg, opts = {}) {
-  const { fullContent = null, fullToolResults = null } = opts || {};
-  if (bosPending.length >= BOS_QUEUE_MAX) {
-    bosPending.shift();
-    warnOnce("queue", "  (警告: BOS 写队列过长, 丢弃最旧任务)");
-  }
-  bosPending.push({ sessionId, seq, role, msg, fullContent, fullToolResults });
-  pumpBosQueue();
-  return bosQueue;
-}
+// 会话权威写/队列: src/persist.js (CAS 门禁 + I/O transient 重试 + BOS-first)
 
 // ---- Celld 镜像 (worker 同步 + BOS 异步, 不阻塞对话) ----
 async function celldCheckpoint(sessionId, seq, role, content, opts = {}) {
@@ -458,45 +300,34 @@ function extractText(content) {
 }
 
 // ---- 从 BOS 读历史 (权威源, 重启后恢复) ----
-async function loadHistoryFromBos(sessionId) {
-  // BOS-first: worker 缓存只存 msg 摘要(POST 上限 8000), 不含完整 content/toolResults。
-  // 仅在 BOS miss / 无配置时才回退 worker, 避免用缓存覆盖权威轮次。
-  try {
-    const { bosGet } = await import("../src/bos.js");
-    const cfgFile = join(homedir(), ".config", "celagent", "settings.json");
-    if (existsSync(cfgFile)) {
-      try {
-        const cfg = JSON.parse(readFileSync(cfgFile, "utf8"));
-        const store = storeFromCfg(cfg);
-        const bucket = store.bucket;
-        const endpoint = store.endpoint;
-        if (bucket) {
-          const existing = await bosGet(`sessions/${sessionId}.json`, { bucket, endpoint, profile: store.profile, region: store.region });
-          if (existing.ok) {
-            try {
-              const session = JSON.parse(existing.body);
-              return session.turns || [];
-            } catch (e) {
-              console.warn(`  (警告: 会话 ${sessionId} 的 BOS 历史数据损坏, 跳过恢复)`);
-              return null;
-            }
-          }
-        }
-      } catch (e) { /* 配置损坏则回退 worker */ }
-    }
-    for (const base of CELD_NODES) {
-      try {
-        const url = `${base}/agent/celagent?action=resume&session=${encodeURIComponent(sessionId)}`;
-        const resp = await fetch(url, { headers: workerHeaders(), signal: AbortSignal.timeout(1500) });
-        const data = await resp.json();
-        if (data.ok && data.session && data.session.turns && data.session.turns.length > 0) {
-          return data.session.turns;
-        }
-        break;
-      } catch (e) { /* try next node */ }
-    }
-  } catch (e) { /* 忽略 */ }
+async function workerResumeTurns(sessionId) {
+  for (const base of CELD_NODES) {
+    try {
+      const url = `${base}/agent/celagent?action=resume&session=${encodeURIComponent(sessionId)}`;
+      const resp = await fetch(url, { headers: workerHeaders(), signal: AbortSignal.timeout(1500) });
+      const data = await resp.json();
+      if (data.ok && data.session?.turns?.length > 0) return data.session.turns;
+      break;
+    } catch (e) { /* try next node */ }
+  }
   return null;
+}
+
+async function loadHistoryFromBos(sessionId) {
+  // BOS-first: 仅 miss 才回退 worker; 瞬时/权限失败不回退, 避免 8000 字截断当完整历史
+  const hist = await loadSessionHistory(sessionId, {
+    loadStore: () => storeFromCfg(loadConfig()),
+    fallbackResume: workerResumeTurns,
+  });
+  if (hist.corrupt) {
+    console.warn(`  (警告: 会话 ${sessionId} 的 BOS 历史数据损坏, 跳过恢复)`);
+    return null;
+  }
+  if (hist.transient || hist.fatal) {
+    console.warn(`  (警告: BOS 读取失败, 未回退 worker 缓存: ${hist.error})`);
+    return null;
+  }
+  return hist.turns;
 }
 
 async function listSessions() {
@@ -578,9 +409,9 @@ async function listSessions() {
 }
 
 // ---- 版本/帮助 ----
-const CELAGENT_VERSION = "0.3.6";
+const CELAGENT_VERSION = "0.3.7";
 function printVersion() {
-  console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS RPO=0 持久化`);
+  console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS 对象存储持久化`);
 }
 function printHelp() {
   printVersion();
@@ -628,18 +459,6 @@ function saveConfig(cfg) {
   mkdirSync(join(homedir(), ".config", "celagent"), { recursive: true });
   writeFileSync(configFile(), JSON.stringify(out, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
   try { chmodSync(configFile(), 0o600); } catch (e) { /* ignore */ }
-}
-function storeFromCfg(cfg = loadConfig()) {
-  const endpoint = resolveEndpoint(cfg.persistence?.endpoint);
-  const region = resolveRegion(endpoint, cfg.persistence?.region);
-  const profile = String(cfg.persistence?.profile || "").trim() || "bos";
-  return {
-    bucket: cfg.persistence?.bucket || null,
-    endpoint,
-    region,
-    profile,
-    awsExtra: { AWS_PROFILE: profile, ...(region ? { AWS_REGION: region } : {}) },
-  };
 }
 async function configCommand(args) {
   const [op, key, value] = args;
@@ -980,9 +799,19 @@ async function main() {
   await ensureCelld();
 
   // 0.5 从 BOS 恢复历史 (权威源, 重启不丢) — 只读一次, 传给会话注入用
-  const savedHistory = await loadHistoryFromBos(sessionId);
+  const hist = await loadSessionHistory(sessionId, {
+    loadStore: () => storeFromCfg(loadConfig()),
+    fallbackResume: workerResumeTurns,
+  });
+  if (hist.corrupt) {
+    console.warn(`  (警告: 会话 ${sessionId} 的 BOS 历史数据损坏, 跳过恢复)`);
+  } else if (hist.transient || hist.fatal) {
+    console.warn(`  (警告: BOS 读取失败, 未回退 worker 缓存: ${hist.error})`);
+  }
+  const savedHistory = hist.turns;
   if (savedHistory && savedHistory.length > 0) {
-    console.log(`  (已从 BOS 恢复 ${savedHistory.length} 轮历史)`);
+    const src = hist.source === "worker" ? "worker 缓存(BOS miss)" : "BOS";
+    console.log(`  (已从 ${src} 恢复 ${savedHistory.length} 轮历史)`);
   }
 
   // P0: 冷启动对齐 — 把 BOS 权威状态同步到 worker 缓存 (sync),
@@ -1183,7 +1012,7 @@ async function flushOnExit() {
   if (flushedOnExit) return;
   flushedOnExit = true;
   // 超时保护: 队列最多等 10s (BOS 写失败不阻塞退出)
-  await Promise.race([bosQueue, new Promise(r => setTimeout(r, 10000))]).catch(() => {});
+  await flushBosQueue(10000);
 }
 function scheduleSignalExit(code) {
   // unref: 若 pi 的 process.exit 先执行, 此定时器不会阻止进程退出

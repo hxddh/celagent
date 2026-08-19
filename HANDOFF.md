@@ -7,7 +7,7 @@
 
 ## 0. 项目定位
 
-**celagent**:独立开源 agent 产品。基于 Pi TUI 引擎 + Celld 分布式运行时 + 对象存储,核心卖点是**会话永不丢(RPO=0)**——每轮对话经对象存储权威落盘,崩溃/换机器/节点故障历史一条不丢。默认后端是百度 BOS(唯一实测);扩到其它 S3 兼容存储的条件与计划见 `docs/s3-compat-evaluation.md`。
+**celagent**:独立开源 agent 产品。基于 Pi TUI 引擎 + Celld 分布式运行时 + 对象存储,核心卖点是**会话权威在对象存储**——CAS 成功的轮次可跨机读回;热恢复注入最近 50 轮文本(完整对象用 `export` / `history_search`)。默认后端是百度 BOS(唯一实测);扩到其它 S3 兼容存储的条件与计划见 `docs/s3-compat-evaluation.md`。
 
 **核心心智模型**:对象存储保数据(权威源,RPO=0)+ Celld 保执行(缓存/任务/集群)+ agent 可用同一存储(记忆工具)。
 
@@ -27,8 +27,9 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 
 | 路径 | 职责 |
 |------|------|
-| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~880 行:命令解析含 task 分布式任务、节点自动启动、turn_end 持久化钩子、会话恢复) |
+| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~1020 行:命令解析含 task、节点自动启动、turn_end 钩子;权威写/恢复已抽到 persist.js) |
 | `src/bos.js` | 对象存储直写核心(aws CLI、CAS If-Match/If-None-Match;默认 BOS,见 s3-compat-evaluation) |
+| `src/persist.js` | 会话权威写/恢复(队列、CAS 门禁、I/O transient 重试、BOS-first;可注入 get/put 单测) |
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
 | `worker/src/index.js` | Celld worker(缓存读路径、Sync API、产物走 webhook) |
 | `worker/wrangler.jsonc` | Celld worker 绑定清单(部署走 `celld deploy`, 不是 Cloudflare wrangler) |
@@ -44,12 +45,15 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/v034-scope.md` | v0.3.4 实现合同(已发布: CAS doctor + 删 SigV4 死代码) |
 | `docs/v035-scope.md` | v0.3.5 实现合同(已发布: region 贯穿、CAS 粘滞、rm/list 错误、记忆工具) |
 | `docs/v036-scope.md` | v0.3.6 实现合同(已发布: 深度审查 9 项修复 — CAS transient/粘滞/键控、队列重试不丢轮、白名单对齐、记忆工具) |
+| `docs/v037-scope.md` | v0.3.7 实现合同(本刀: persist I/O retry、恢复非 miss 不回退 worker、保证句) |
+| `docs/v038-scope.md` | v0.3.8 实现合同(下一刀: 非 BOS 真桶实测,需凭证,无凭证不开 PR) |
 | `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取(endpoint fail-closed) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
 | `tests/review-logic-proofs.test.mjs` | P0 正确性源码锚定(BOS-first/队列丢最旧/fork/parse/steer/seq) |
 | `tests/p0-p2-bugs.test.mjs` | v0.3.5/v0.3.6 回归(region/CAS 粘滞/非法 endpoint/store_env/片段命中) |
+| `tests/persist.test.mjs` | v0.3.7 可执行回归(GET/PUT retry、恢复优先级、JSON 损坏;内存 store) |
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
 | `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、33 轮真实对话实录回放, 2026-08-11) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |
@@ -108,7 +112,7 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:不在仓库内;发布随包 **v0.2.0**(linux-x64/arm64、darwin-arm64)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。评估见 `docs/celld-v02-evaluation.md`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(v0.3.6 已发布)
+## 3. 发布状态(Latest v0.3.6; v0.3.7 本树未打 tag)
 
 仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.6](https://github.com/hxddh/celagent/releases/tag/v0.3.6)。
 
@@ -159,8 +163,9 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.4 | CAS doctor、setup/persist 拒绝无条件写存储、删 worker SigV4 死代码 | ✅ 历史 |
 | v0.3.5 | 会话路径带 region、CAS 只粘滞 cas-ignored、rm/list 报错、snapshot 全量 | ✅ 历史 |
 | v0.3.6 | 深度审查 9 项修复:CAS transient 不丢轮/结论性粘滞/按 store 键控、cas-probe exit 2、白名单 IPv6+单标签对齐、history_search 片段命中、snapshot 内存摘要化 | ✅ 已发布 |
+| v0.3.7 | persist 主路径与探针对齐:GET/PUT 瞬时失败留队重试;恢复非 miss 不回退 worker;抽出 `src/persist.js` + 内存 store 测试;保证句可辩护化 | 本树,未打 tag |
 
-下一刀:**v0.3.7** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要把 region 贯穿当成「已支持 R2」。不要插队做 provider 认证/快照 TUI/会话合并。
+下一刀:**v0.3.8** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要把 region 贯穿当成「已支持 R2」。不要插队做 provider 认证/快照 TUI/会话合并。
 
 ## 5. 工程约定(接手者必须遵守)
 
@@ -194,4 +199,5 @@ node bin/celagent-tui.mjs task ledger
 - **存储多后端 P0(v0.3.3)**:非法 endpoint fail-closed;脚本读 settings。
 - **CAS 门禁(v0.3.4)**:doctor/setup/persist 拒绝忽略 If-Match 的存储。
 - **正确性(v0.3.5)**:会话读写带 `persistence.region`;`rm`/`list` 不再把失败当成功。
-- **正确性(v0.3.6)**:CAS 探针 transient(网络)与结论性(能力)分开——transient 本轮任务留队首退避重试不丢轮,结论性判决一次粘滞且按 `endpoint|bucket|profile|region` 键控;`cas-probe` transient exit 2,install/setup 不再把网络抖动误报成存储不合格;endpoint 白名单 bash/JS 对 IPv6 与多标签 host 行为一致;`history_search` 片段必含命中文本、会话读失败不吞快照命中;进程内快照缓存只留摘要。真 R2/S3 联调与「已支持」仍未做。
+- **正确性(v0.3.6)**:CAS 探针 transient(网络)与结论性(能力)分开——transient 本轮任务留队首退避重试不丢轮,结论性判决一次粘滞且按 `endpoint|bucket|profile|region` 键控;`cas-probe` transient exit 2,install/setup 不再把网络抖动误报成存储不合格;endpoint 白名单 bash/JS 对 IPv6 与多标签 host 行为一致;`history_search` 片段必含命中文本、会话读失败不吞快照命中;进程内快照缓存只留摘要。
+- **正确性(v0.3.7)**:persist 主路径 GET/PUT 瞬时失败同样 `"retry"`(403/401 不重试);`loadSessionHistory` 仅 not-found 才回退 worker;抽出 `src/persist.js`,内存 store 可执行测试覆盖写/恢复。可辩护保证:CAS 成功的 `sessions/<id>.json` 可跨机读回;热恢复注入最近 50 轮文本。真 R2/S3 联调与「已支持」仍未做(→ v0.3.8)。
