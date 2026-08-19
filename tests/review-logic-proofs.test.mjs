@@ -401,8 +401,8 @@ test("源码锚定: worker 已删除未调用的 SigV4 bosPut", () => {
   assert.match(w, /async function bosPutProxy/);
 });
 
-test("源码锚定: 版本 0.4.0 与 release-smoke", () => {
-  assert.match(tui, /CELAGENT_VERSION = "0\.4\.0"/);
+test("源码锚定: 版本 0.4.1 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.4\.1"/);
   const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
   assert.match(smoke, /sha256sum --ignore-missing/);
   assert.match(smoke, /celagent-linux-x64/);
