@@ -46,5 +46,5 @@
 
 ## 发版
 
-实现合进 `main` 后打 tag **`v0.4.0`**(不移动旧 tag)。随包 celld 仍为 v0.2.0。
+实现合进 `main`(PR #19,`f9e6e0a`)后打 tag **`v0.4.0`**(不移动旧 tag)。随包 celld 仍为 v0.2.0。
 冒烟:`./scripts/release-smoke.sh v0.4.0` → `celagent v0.4.0` + SHA256 通过。

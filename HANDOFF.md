@@ -118,7 +118,7 @@ node bin/celagent-tui.mjs task ledger
 
 仓库:`https://github.com/hxddh/celagent`。Latest:[v0.4.0](https://github.com/hxddh/celagent/releases/tag/v0.4.0)。
 
-- **tag `v0.4.0`** 指向本刀合并进 main 的提交;Release 资产由此 SHA 构建
+- **tag `v0.4.0`** 指向 PR #19 合并进 main 的提交(`f9e6e0a`);Release 资产由此 SHA 构建
 - **v0.3.7**(`fa872c9`,PR #17) persist 主路径 GET/PUT 瞬时失败留队;恢复非 miss 不回退 worker;权威对象仍是 turns JSON + steer 50 轮
 - **v0.3.6**(`23cacbb`,PR #16)CAS 探针 retry 不丢轮,但 persist 主路径 GET/PUT 瞬时失败仍会静默丢轮;恢复超时会回退 8000 字 worker 缓存
 - **v0.3.5**(`0c674cf`,PR #14)CAS 只粘滞 cas-ignored:瞬时探针失败会消费队列任务丢轮,永久性失败每轮重探,判决不按 store 键控
