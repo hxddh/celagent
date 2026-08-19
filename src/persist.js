@@ -62,25 +62,30 @@ export function classifyStoreError(error) {
   return "transient";
 }
 
-/** JSONL 条目 id 序列 (跳过无 id 行) — 覆盖保护的谱系判据 */
-export function jsonlEntryIds(body) {
+/** JSONL 条目 id 序列 (跳过无 id 行) — 覆盖保护的谱系判据。
+ *  strict: 任何非空不可解析行 → 返回 null (谱系不可判) */
+export function jsonlEntryIds(body, { strict = false } = {}) {
   const ids = [];
-  if (typeof body !== "string") return ids;
+  if (typeof body !== "string") return strict ? null : ids;
   for (const line of body.split(/\r?\n/)) {
     if (!line.trim()) continue;
     try {
       const o = JSON.parse(line);
       if (o && typeof o.id === "string" && o.id) ids.push(o.id);
-    } catch (e) { /* skip */ }
+    } catch (e) {
+      if (strict) return null;
+    }
   }
   return ids;
 }
 
 /** Pi 会话文件是追加式日志 (compaction 也是追加条目, 不重写):
  *  远端 (旧快照) 的条目序列必须是本地 (新状态) 的前缀, 本地才可整体覆盖远端。
- *  否则本地是另一条谱系 (新建/分叉/别处已写入更多), 覆盖会永久丢远端数据 */
+ *  否则本地是另一条谱系 (新建/分叉/别处已写入更多), 覆盖会永久丢远端数据。
+ *  远端含坏行时谱系不可判 (isJsonlBody 只验首行, 坏行可能是可恢复数据) → 拒绝 */
 export function jsonlSupersedes(localBody, remoteBody) {
-  const remote = jsonlEntryIds(remoteBody);
+  const remote = jsonlEntryIds(remoteBody, { strict: true });
+  if (remote === null) return false;
   const local = jsonlEntryIds(localBody);
   if (remote.length > local.length) return false;
   for (let i = 0; i < remote.length; i++) {
@@ -154,24 +159,31 @@ export function makeTurnEntry(sessionId, seq, role, msg, fullContent, fullToolRe
 }
 
 export function mergeTurn(session, seq, role, msg, fullContent, fullToolResults) {
+  const maxTurnOf = () => {
+    const nums = session.turns.map((t) => Number(t.turn)).filter((n) => Number.isFinite(n));
+    return nums.length ? Math.max(...nums) : 0;
+  };
   let finalSeq = seq;
-  if (session.turns.length > 0) {
-    const exists = session.turns.some((t) => t.turn === seq);
-    if (!exists) {
-      const nums = session.turns.map((t) => Number(t.turn)).filter((n) => Number.isFinite(n));
-      const maxTurn = nums.length ? Math.max(...nums) : 0;
-      finalSeq = maxTurn + 1;
-    }
+  if (session.turns.length > 0 && !session.turns.some((t) => t.turn === seq)) {
+    finalSeq = maxTurnOf() + 1;
   }
-  const entry = makeTurnEntry(session.id, finalSeq, role, msg, fullContent, fullToolResults);
   const idx = session.turns.findIndex((t) => t.turn === finalSeq);
   if (idx >= 0) {
     const prev = session.turns[idx];
+    // 同号且同源 (role+msg 相同) = 本端幂等重试 → 原位更新, 保留已有更全字段;
+    // 同号但内容不同 = 并发写入者已占该号 (双端同起点续写) → 追加新号, 绝不覆盖对方的轮
+    const sameOrigin = prev?.role === role && String(prev?.msg ?? "") === String(msg ?? "");
+    if (!sameOrigin) {
+      session.turns.push(makeTurnEntry(session.id, maxTurnOf() + 1, role, msg, fullContent, fullToolResults));
+      session.updatedAt = Date.now();
+      return;
+    }
+    const entry = makeTurnEntry(session.id, finalSeq, role, msg, fullContent, fullToolResults);
     if (prev?.content && !(fullContent && fullContent.length)) entry.content = prev.content;
     if (prev?.toolResults && !(fullToolResults && fullToolResults.length)) entry.toolResults = prev.toolResults;
     session.turns[idx] = entry;
   } else {
-    session.turns.push(entry);
+    session.turns.push(makeTurnEntry(session.id, finalSeq, role, msg, fullContent, fullToolResults));
   }
   session.updatedAt = Date.now();
 }

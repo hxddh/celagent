@@ -94,17 +94,34 @@ test("classifyStoreError: not-found / conflict / fatal / transient", () => {
   assert.equal(classifyStoreError("Service Unavailable 503"), "transient");
 });
 
-test("mergeTurn: 缺 content 的新写入不抹掉已有 content", () => {
+test("mergeTurn: 同源幂等重试缺 content 不抹掉已有 content", () => {
   const session = {
     id: "s",
     turns: [
-      { turn: 1, msg: "A".repeat(50), content: [{ type: "text", text: "A".repeat(50) }] },
-      { turn: 2, msg: "B".repeat(50), content: [{ type: "text", text: "B".repeat(50) }] },
+      { turn: 1, role: "user", msg: "A".repeat(50), content: [{ type: "text", text: "A".repeat(50) }] },
+      { turn: 2, role: "assistant", msg: "B".repeat(50), content: [{ type: "text", text: "B".repeat(50) }] },
     ],
   };
-  mergeTurn(session, 2, "assistant", "x".repeat(10), null, null);
-  assert.equal(session.turns[1].msg.length, 10);
+  mergeTurn(session, 2, "assistant", "B".repeat(50), null, null);
+  assert.equal(session.turns.length, 2, "幂等重试不追加新轮");
   assert.equal(session.turns[1].content[0].text.length, 50);
+});
+
+test("mergeTurn: 同号但内容不同 = 并发写入者, 追加不覆盖 (评审 P1)", () => {
+  const session = {
+    id: "s",
+    turns: [
+      { turn: 10, role: "assistant", msg: "base" },
+      { turn: 11, role: "assistant", msg: "client-A 的轮次", content: [{ type: "text", text: "A-full" }] },
+    ],
+  };
+  // client B 与 A 从同一 maxTurn=10 起号, CAS 冲突重试后读到 A 的 turn 11
+  mergeTurn(session, 11, "assistant", "client-B 的轮次", [{ type: "text", text: "B-full" }], null);
+  assert.equal(session.turns.length, 3, "B 的轮次应追加为新号");
+  assert.equal(session.turns[1].msg, "client-A 的轮次", "A 的轮次必须原样保留");
+  assert.equal(session.turns[1].content[0].text, "A-full");
+  assert.equal(session.turns[2].turn, 12);
+  assert.equal(session.turns[2].msg, "client-B 的轮次");
 });
 
 test("persistTurnToBos: GET 超时返回 retry, 不写空会话", async () => {
@@ -439,6 +456,25 @@ test("jsonlSupersedes: 追加扩展可覆盖, 分叉/落后不可覆盖", () => 
   ].join("\n") + "\n";
   assert.equal(jsonlSupersedes(other, base), false, "不同谱系 (新建会话撞 id) 不可覆盖");
   assert.ok(jsonlEntryIds(base).length >= 2);
+});
+
+test("jsonlSupersedes: 远端含坏行谱系不可判, 拒绝覆盖 (评审 P2)", () => {
+  const base = sampleJsonl();
+  const remoteTorn = base + '{"type":"message","id":"torn-li' + "\n";
+  const localExtended = base + jsonlLine("c3d4e5f6", "b2c3d4e5", "user", "more") + "\n";
+  assert.equal(jsonlSupersedes(localExtended, remoteTorn), false, "远端坏行可能是可恢复数据");
+  assert.equal(jsonlEntryIds(remoteTorn, { strict: true }), null);
+});
+
+test("persistJsonlToBos: 远端含坏行拒绝覆盖", async () => {
+  const mem = memoryStore();
+  const base = sampleJsonl();
+  const remoteTorn = base + '{"type":"message","id":"torn-li' + "\n";
+  await mem.put("sessions/sid.jsonl", remoteTorn);
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", base + jsonlLine("c3d4e5f6", "b2c3d4e5", "user", "next") + "\n");
+  assert.equal(r, undefined);
+  assert.equal(mem.objects.get("sessions/sid.jsonl").body, remoteTorn, "含坏行的远端必须原样保留");
 });
 
 test("persistJsonlToBos: 新会话撞已有 id 拒绝整体覆盖 (RPO=0)", async () => {
