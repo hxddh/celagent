@@ -115,6 +115,12 @@ test("store_env: 合格 host 放行, 非法 endpoint fail-closed", () => {
     celagent_is_allowed_endpoint "https://s3.a.b.bcebos.com" && exit 19
     celagent_is_allowed_endpoint "https://s3.a.b.amazonaws.com" && exit 20
     celagent_is_allowed_endpoint "https://s3.us-east-1.amazonaws.com" || exit 21
+    celagent_is_allowed_endpoint "http://[::1]@evil.example" && exit 22
+    celagent_is_allowed_endpoint "http://[::1].evil.example" && exit 23
+    celagent_is_allowed_endpoint "http://[::1]:9000@evil.example" && exit 24
+    celagent_is_allowed_endpoint "https://s3.bj.bcebos.com@evil.example" && exit 25
+    celagent_is_allowed_endpoint "https://evil.example?x=.r2.cloudflarestorage.com" && exit 26
+    celagent_is_allowed_endpoint "http://[::1]:abc" && exit 27
     CELAGENT_ALLOW_ENDPOINT=1
     celagent_is_allowed_endpoint "https://evil.example" || exit 15
     unset CELAGENT_ALLOW_ENDPOINT
