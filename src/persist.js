@@ -62,6 +62,33 @@ export function classifyStoreError(error) {
   return "transient";
 }
 
+/** JSONL 条目 id 序列 (跳过无 id 行) — 覆盖保护的谱系判据 */
+export function jsonlEntryIds(body) {
+  const ids = [];
+  if (typeof body !== "string") return ids;
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const o = JSON.parse(line);
+      if (o && typeof o.id === "string" && o.id) ids.push(o.id);
+    } catch (e) { /* skip */ }
+  }
+  return ids;
+}
+
+/** Pi 会话文件是追加式日志 (compaction 也是追加条目, 不重写):
+ *  远端 (旧快照) 的条目序列必须是本地 (新状态) 的前缀, 本地才可整体覆盖远端。
+ *  否则本地是另一条谱系 (新建/分叉/别处已写入更多), 覆盖会永久丢远端数据 */
+export function jsonlSupersedes(localBody, remoteBody) {
+  const remote = jsonlEntryIds(remoteBody);
+  const local = jsonlEntryIds(localBody);
+  if (remote.length > local.length) return false;
+  for (let i = 0; i < remote.length; i++) {
+    if (remote[i] !== local[i]) return false;
+  }
+  return true;
+}
+
 export function isJsonlBody(body) {
   if (typeof body !== "string") return false;
   const first = body.split(/\r?\n/).find((l) => l.trim());
@@ -153,8 +180,14 @@ export function storeCasKey(store) {
   return [store.endpoint, store.bucket, store.profile, store.region || ""].join("|");
 }
 
-function defaultWarn(ch, msg) {
-  console.warn(msg);
+/** 默认 warn 按 channel 去重 — 队列退避重试下同类警告只打一次, 不刷屏 TUI */
+function makeChannelWarn() {
+  const warned = new Set();
+  return (ch, msg) => {
+    if (warned.has(ch)) return;
+    warned.add(ch);
+    console.warn(msg);
+  };
 }
 
 function defaultSleep(ms) {
@@ -165,7 +198,7 @@ function defaultSleep(ms) {
 }
 
 export function createPersister(deps = {}) {
-  const warn = deps.warn || defaultWarn;
+  const warn = deps.warn || makeChannelWarn();
   const sleep = deps.sleep || defaultSleep;
   const get = deps.get || ((key, opts) => bosGet(key, opts));
   const put = deps.put || ((key, content, opts) => bosPut(key, content, opts));
@@ -188,6 +221,11 @@ export function createPersister(deps = {}) {
       }
       if (e.code === "no-config") {
         warn("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
+        return { skip: true };
+      }
+      if (e instanceof SyntaxError) {
+        // settings.json 损坏是本地配置错误, 重试不会好转 — 与读路径 (当作 no-config) 一致, 不无限退避
+        warn("persist", `  (警告: settings.json 损坏, 会话不会持久化: ${e.message})`);
         return { skip: true };
       }
       warn("persist", `  (警告: ${e.message})`);
@@ -252,6 +290,12 @@ export function createPersister(deps = {}) {
       if (existing.ok) {
         if (!isJsonlBody(existing.body)) {
           warn("persist", `  (警告: BOS JSONL 损坏, 跳过本轮以免覆盖历史: ${sessionId})`);
+          return;
+        }
+        // RPO=0 覆盖保护: 远端必须是本地的谱系前缀。新建会话撞已有 id、
+        // 另一实例已写入更多轮、本地落后于远端 — 都拒绝整体覆盖 (远端数据优先)
+        if (!jsonlSupersedes(jsonlBody, existing.body)) {
+          warn("persist", `  (警告: BOS 会话 ${sessionId} 与本地不同源或更完整, 拒绝整体覆盖以免丢历史 — 另起会话请换 ID)`);
           return;
         }
         const written = await put(key, jsonlBody, { ...common, ifMatch: existing.etag });

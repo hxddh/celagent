@@ -30,7 +30,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 |------|------|
 | `bin/celagent-tui.mjs` | CLI + TUI 主程序(~1100 行:命令解析含 task、节点自动启动、JSONL 打开/steer 兼容;权威写/恢复在 persist.js) |
 | `src/bos.js` | 对象存储直写核心(aws CLI、CAS If-Match/If-None-Match;默认 BOS,见 s3-compat-evaluation) |
-| `src/persist.js` | 会话权威写/恢复(JSONL 队列、CAS 门禁、I/O transient 重试、BOS-first;旧 turns JSON 只读兼容;可注入 get/put 单测) |
+| `src/persist.js` | 会话权威写/恢复(JSONL 队列 + 谱系覆盖保护、CAS 门禁、I/O transient 重试、BOS-first;旧 turns JSON 会话继续按轮合并写,不隐式迁移;可注入 get/put 单测) |
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
 | `worker/src/index.js` | Celld worker(缓存读路径、Sync API、产物走 webhook) |
 | `worker/wrangler.jsonc` | Celld worker 绑定清单(部署走 `celld deploy`, 不是 Cloudflare wrangler) |
@@ -206,4 +206,5 @@ node bin/celagent-tui.mjs task ledger
 - **正确性(v0.3.5)**:会话读写带 `persistence.region`;`rm`/`list` 不再把失败当成功。
 - **正确性(v0.3.6)**:CAS 探针 transient(网络)与结论性(能力)分开——transient 本轮任务留队首退避重试不丢轮,结论性判决一次粘滞且按 `endpoint|bucket|profile|region` 键控;`cas-probe` transient exit 2,install/setup 不再把网络抖动误报成存储不合格;endpoint 白名单 bash/JS 对 IPv6 与多标签 host 行为一致;`history_search` 片段必含命中文本、会话读失败不吞快照命中;进程内快照缓存只留摘要。
 - **正确性(v0.3.7)**:persist 主路径 GET/PUT 瞬时失败同样 `"retry"`(403/401 不重试);`loadSessionHistory` 仅 not-found 才回退 worker;抽出 `src/persist.js`,内存 store 可执行测试覆盖写/恢复。
-- **质变(v0.4.0)**:权威对象 `sessions/<id>.jsonl`;`celagent <id>` 用 `SessionManager.open` 打开真 Pi 会话;JSONL 路径禁止 steer;旧 `.json` 只读兼容;同会话 JSONL 队列合并为最新。可辩护保证:CAS 成功的 JSONL 可跨机被 Pi 打开。真 R2/S3 联调与「已支持」仍未做(→ v0.3.8)。
+- **质变(v0.4.0)**:权威对象 `sessions/<id>.jsonl`;`celagent <id>` 用 `SessionManager.open` 打开真 Pi 会话;JSONL 路径禁止 steer;同会话 JSONL 队列合并为最新。可辩护保证:CAS 成功的 JSONL 可跨机被 Pi 打开。真 R2/S3 联调与「已支持」仍未做(→ v0.3.8)。
+- **v0.4.0 后深度审查修复(RPO=0 收紧)**:JSONL 整体写加**谱系覆盖保护**(Pi 会话文件是追加式日志,远端条目 id 序列必须是本地前缀才允许覆盖 — 新会话撞 id、别处已写更多、本地落后一律拒绝);显式 `celagent <id>` 启动遇 BOS 读失败**拒绝启动**(防全新会话绑同 id 后覆盖);**旧 `.json` 会话不隐式迁移 JSONL**(50 轮 steer 摘要会遮蔽全量历史)——继续按轮 CAS 合并写,`/resume` 按远端类型路由,远端状态未知则本次拒绝权威写;`rm` 旧对象删失败必须报错(残留 `.json` 会复活会话);`history_search` `.jsonl` 读失败不跳过 `.json` 回退、跨会话也报部分失败;settings.json 损坏不再无限重试;persister 默认 warn 按 channel 去重。

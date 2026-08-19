@@ -408,7 +408,7 @@ test("源码锚定: 版本 0.4.0 与 release-smoke", () => {
   assert.match(smoke, /celagent-linux-x64/);
 });
 
-test("源码锚定: JSONL 为权威, SessionManager.open, 禁止作文注入", () => {
+test("源码锚定: JSONL 为权威, 旧格式按轮合并, 覆盖有谱系保护", () => {
   assert.match(tui, /SessionManager\.open\(/);
   assert.match(tui, /queueJsonlWrite/);
   assert.match(tui, /queueSessionJsonl/);
@@ -417,7 +417,20 @@ test("源码锚定: JSONL 为权威, SessionManager.open, 禁止作文注入", (
   assert.match(persist, /persistJsonlToBos/);
   assert.match(persist, /queueJsonlWrite/);
   assert.match(persist, /kind === "jsonl"/);
-  assert.doesNotMatch(tui, /queueBosWrite\(/);
+  // P0: 旧格式会话不隐式迁移 JSONL (50 轮 steer 摘要会遮蔽全量 .json 历史) —
+  // 继续按轮 CAS 合并写; JSONL 整体写有谱系前缀覆盖保护
+  assert.match(tui, /persistMode === "legacy"/);
+  assert.match(tui, /queueBosWrite\(persistId/);
+  assert.match(tui, /persistMode === "jsonl"\) queueSessionJsonl/);
+  assert.match(persist, /jsonlSupersedes/);
+  // P0: 显式会话 ID + BOS 读失败 → 拒绝启动, 防止全新会话绑定同 id 后覆盖历史
+  assert.match(tui, /拒绝继续。请稍后重试/);
+  // rm: 旧格式对象删除失败必须报错 (残留 .json 会复活已删除会话)
+  assert.match(tui, /仍残留, 会话可能被恢复/);
+  // history_search: .jsonl 读失败不算 "已有 jsonl", 不跳过 .json 回退
+  const tools = readFileSync(join(root, "src/bos-tools.js"), "utf8");
+  assert.doesNotMatch(tools, /if \(jsonlKey && !miss\) haveJsonl\.add/);
+  assert.match(tools, /结果可能不完整/);
 });
 
 test("源码锚定: 运维脚本读 store_env 而非写死 BOS endpoint", () => {

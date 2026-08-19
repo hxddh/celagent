@@ -10,6 +10,8 @@ import {
   BOS_QUEUE_MAX,
   isJsonlBody,
   turnsFromJsonl,
+  jsonlEntryIds,
+  jsonlSupersedes,
   persistIdFromJsonlPath,
   sessionJsonlKey,
   sessionTurnsKey,
@@ -415,6 +417,103 @@ test("loadSessionHistory: JSONL 损坏不回退旧 JSON 或 worker", async () =>
   assert.equal(r.kind, "jsonl");
   assert.equal(r.turns, null);
   assert.equal(fallback, 0);
+});
+
+// ---- P0: JSONL 整体写的谱系覆盖保护 ----
+function jsonlLine(id, parentId, role, text) {
+  return JSON.stringify({
+    type: "message", id, parentId, timestamp: "2026-08-19T00:00:03.000Z",
+    message: { role, content: [{ type: "text", text }], timestamp: 1720000002000 },
+  });
+}
+
+test("jsonlSupersedes: 追加扩展可覆盖, 分叉/落后不可覆盖", () => {
+  const base = sampleJsonl();
+  const extended = base + jsonlLine("c3d4e5f6", "b2c3d4e5", "user", "more") + "\n";
+  assert.equal(jsonlSupersedes(extended, base), true, "追加扩展是合法覆盖");
+  assert.equal(jsonlSupersedes(base, base), true, "等同也合法");
+  assert.equal(jsonlSupersedes(base, extended), false, "本地落后于远端不可覆盖");
+  const other = [
+    JSON.stringify({ type: "session", version: 3, id: "uuid-other", timestamp: "2026-08-19T01:00:00.000Z", cwd: "/tmp" }),
+    jsonlLine("zzzz1111", null, "user", "fresh"),
+  ].join("\n") + "\n";
+  assert.equal(jsonlSupersedes(other, base), false, "不同谱系 (新建会话撞 id) 不可覆盖");
+  assert.ok(jsonlEntryIds(base).length >= 2);
+});
+
+test("persistJsonlToBos: 新会话撞已有 id 拒绝整体覆盖 (RPO=0)", async () => {
+  const mem = memoryStore();
+  const full = sampleJsonl("old-history-1", "old-history-2");
+  await mem.put("sessions/sid.jsonl", full);
+  const fresh = [
+    JSON.stringify({ type: "session", version: 3, id: "uuid-fresh", timestamp: "2026-08-19T02:00:00.000Z", cwd: "/tmp" }),
+    jsonlLine("ffff0001", null, "user", "brand new"),
+  ].join("\n") + "\n";
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", fresh);
+  assert.equal(r, undefined, "拒绝是终态, 不重试");
+  assert.equal(mem.objects.get("sessions/sid.jsonl").body, full, "远端历史必须原样保留");
+});
+
+test("persistJsonlToBos: 本地落后于远端 (别处已写更多) 拒绝覆盖", async () => {
+  const mem = memoryStore();
+  const base = sampleJsonl();
+  const remoteAhead = base + jsonlLine("c3d4e5f6", "b2c3d4e5", "assistant", "written elsewhere") + "\n";
+  await mem.put("sessions/sid.jsonl", remoteAhead);
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", base);
+  assert.equal(r, undefined);
+  assert.equal(mem.objects.get("sessions/sid.jsonl").body, remoteAhead);
+});
+
+test("persistJsonlToBos: 同谱系追加扩展正常覆盖", async () => {
+  const mem = memoryStore();
+  const base = sampleJsonl();
+  await mem.put("sessions/sid.jsonl", base);
+  const extended = base + jsonlLine("c3d4e5f6", "b2c3d4e5", "user", "next turn") + "\n";
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", extended);
+  assert.equal(r, undefined);
+  assert.equal(mem.objects.get("sessions/sid.jsonl").body, extended);
+});
+
+test("resolveStore: settings.json 损坏 (SyntaxError) 不无限重试", async () => {
+  const mem = memoryStore();
+  const p = createPersister({
+    get: (key) => mem.get(key),
+    put: (key, content, extra) => mem.put(key, content, extra),
+    probe: probeOk,
+    warn: silent,
+    sleep: async () => {},
+    loadStore: () => JSON.parse("{corrupt"),
+  });
+  const r = await p.persistJsonlToBos("sid", sampleJsonl());
+  assert.equal(r, undefined, "配置损坏是终态, 不能返回 retry");
+  assert.equal(mem.puts.length, 0);
+});
+
+test("默认 warn 按 channel 去重, 重试不刷屏", async () => {
+  const seen = [];
+  const orig = console.warn;
+  console.warn = (m) => seen.push(m);
+  try {
+    const mem = memoryStore();
+    const p = createPersister({
+      store,
+      get: (key) => mem.get(key),
+      put: (key, content, extra) => mem.put(key, content, extra),
+      probe: async () => ({ ok: false, transient: true, error: "create-failed", message: "网络抖动" }),
+      sleep: async () => {},
+      loadStore: () => store,
+    });
+    const r1 = await p.persistJsonlToBos("sid", sampleJsonl());
+    const r2 = await p.persistJsonlToBos("sid", sampleJsonl());
+    assert.equal(r1, "retry");
+    assert.equal(r2, "retry");
+    assert.equal(seen.length, 1, `同 channel 警告只打一次, 实际 ${seen.length} 次`);
+  } finally {
+    console.warn = orig;
+  }
 });
 
 test("队列: 同会话 JSONL 合并为最新快照", async () => {
