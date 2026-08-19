@@ -68,11 +68,14 @@ function textOf(turn) {
   return parts.join("\n");
 }
 
-function collectHitsFromTurns(turns, { query, sessionId, source, hits, limit }) {
+export function collectHitsFromTurns(turns, { query, sessionId, source, hits, limit }) {
   for (const turn of turns || []) {
-    const haystack = textOf(turn).toLowerCase();
-    if (!haystack.includes(query)) continue;
-    const snippet = (turn.msg || textOf(turn)).slice(0, 200);
+    const full = textOf(turn);
+    const idx = full.toLowerCase().indexOf(query);
+    if (idx < 0) continue;
+    // 片段取匹配位置附近 — 命中可能在 toolResults/thinking 深处, turn.msg 开头未必含匹配文本
+    const start = Math.max(0, idx - 60);
+    const snippet = (start > 0 ? "…" : "") + full.slice(start, start + 200);
     hits.push({ session: sessionId, turn: turn.turn, role: turn.role || "?", ts: turn.ts, snippet, source });
     if (hits.length >= limit) return true;
   }
@@ -153,10 +156,7 @@ export const history_search = {
           if (collectHitsFromTurns(session.turns, { query, sessionId, source: "session", hits, limit })) break;
         } catch (e) { /* 跳过损坏会话 */ }
       }
-      if (sessionFilter && hits.length === 0 && sessionReadError) {
-        return { content: [{ type: "text", text: `读取会话失败: ${sessionReadError}` }] };
-      }
-
+      // 会话对象读失败不在此早退 — 快照可能仍有该会话的命中, 先扫完再决定
       if (hits.length < limit) {
         for (const key of snapKeys) {
           const got = await bosGet(key, storeOpts);
@@ -173,14 +173,19 @@ export const history_search = {
       }
 
       const scanned = sessionKeys.length + snapKeys.length;
+      const readWarn = (sessionFilter && sessionReadError)
+        ? `\n\n(警告: 读取会话对象失败: ${sessionReadError}; 结果可能缺少 sessions/ 命中)` : "";
       if (hits.length === 0) {
+        if (sessionFilter && sessionReadError) {
+          return { content: [{ type: "text", text: `读取会话失败: ${sessionReadError}; 已扫描 ${snapKeys.length} 个快照, 未找到与"${params.query}"相关的内容` }] };
+        }
         return { content: [{ type: "text", text: `在 ${scanned} 个历史对象(会话+快照)中未找到与"${params.query}"相关的内容` }] };
       }
       const lines = hits.map(h => {
         const kind = h.source === "snapshot" ? "快照" : "会话";
         return `[${kind} ${h.session} · 第${h.turn}轮 · ${h.role}${h.ts ? " · " + new Date(h.ts).toLocaleString() : ""}]\n  ${h.snippet.replace(/\n/g, " ")}`;
       });
-      return { content: [{ type: "text", text: `找到 ${hits.length} 条相关记忆:\n\n` + lines.join("\n\n") }] };
+      return { content: [{ type: "text", text: `找到 ${hits.length} 条相关记忆:\n\n` + lines.join("\n\n") + readWarn }] };
     } catch (e) {
       return { content: [{ type: "text", text: `history_search 失败: ${e.message}` }] };
     }
@@ -207,8 +212,9 @@ export const session_snapshot = {
       const name = String(params.name || "").trim();
       if (!name) return { content: [{ type: "text", text: "缺少快照名称" }] };
       const note = params.note ? String(params.note) : "";
+      // getter 可能是异步的 (TUI 从 BOS 权威源重建全量轮次), await 兼容同步/异步实现
       const currentTurns = (typeof globalThis.__celagentSnapshotTurns === "function")
-        ? globalThis.__celagentSnapshotTurns()
+        ? (await globalThis.__celagentSnapshotTurns()) || []
         : [];
       const persistId = typeof globalThis.__celagentPersistId === "string" ? globalThis.__celagentPersistId : null;
       const key = `snapshots/${name.replace(/[^\w\u4e00-\u9fa5-]/g, "_")}-${Date.now()}.json`;

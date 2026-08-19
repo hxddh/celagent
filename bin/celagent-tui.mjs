@@ -291,28 +291,34 @@ function mergeTurn(session, seq, role, msg, fullContent, fullToolResults) {
   }
   session.updatedAt = Date.now();
 }
-let casGateStickyResult = null;
-let casGateInflight = null;
+// CAS 门禁缓存按 store 身份键控 — persistTurnToBos 每轮重读 settings.json,
+// 中途换 bucket/endpoint 后旧 verdict 不得沿用 (防丢更新 / 误拒写)
+let casGateCache = { key: null, result: null };
+let casGateInflight = { key: null, promise: null };
+function storeCasKey(store) {
+  return [store.endpoint, store.bucket, store.profile, store.region || ""].join("|");
+}
 async function ensureStoreCas(store) {
-  if (casGateStickyResult) return casGateStickyResult;
-  if (!casGateInflight) {
-    casGateInflight = (async () => {
-      try {
-        const { probeStoreCas } = await import("../src/bos.js");
-        const r = await probeStoreCas({
-          bucket: store.bucket,
-          endpoint: store.endpoint,
-          profile: store.profile,
-          region: store.region,
-        });
-        if (casGateSticky(r)) casGateStickyResult = r;
-        return r;
-      } finally {
-        casGateInflight = null;
-      }
-    })();
-  }
-  return casGateInflight;
+  const key = storeCasKey(store);
+  if (casGateCache.key === key && casGateCache.result) return casGateCache.result;
+  if (casGateInflight.key === key && casGateInflight.promise) return casGateInflight.promise;
+  const promise = (async () => {
+    try {
+      const { probeStoreCas } = await import("../src/bos.js");
+      const r = await probeStoreCas({
+        bucket: store.bucket,
+        endpoint: store.endpoint,
+        profile: store.profile,
+        region: store.region,
+      });
+      if (casGateSticky(r)) casGateCache = { key, result: r };
+      return r;
+    } finally {
+      if (casGateInflight.promise === promise) casGateInflight = { key: null, promise: null };
+    }
+  })();
+  casGateInflight = { key, promise };
+  return promise;
 }
 async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullToolResults) {
   const { bosPut, bosGet } = await import("../src/bos.js");
@@ -332,11 +338,12 @@ async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullTool
   }
   const cas = await ensureStoreCas(store);
   if (!cas.ok) {
-    if (cas.error === "cas-ignored") {
-      warnOnce("cas", `  (警告: 此存储不能保证 RPO=0,拒绝权威写入: ${cas.message || cas.error})`);
-    } else {
-      warnOnce("cas-temp", `  (警告: CAS 探针失败,跳过本轮写入: ${cas.message || cas.error})`);
+    if (cas.transient) {
+      // 瞬时失败 (网络等) 无法判定 — 任务留在队列, 恢复后补写, 不丢轮 (RPO=0)
+      warnOnce("cas-temp", `  (警告: CAS 探针暂未通过, 本轮写入将重试: ${cas.message || cas.error})`);
+      return "retry";
     }
+    warnOnce("cas", `  (警告: 此存储不能保证 RPO=0,拒绝权威写入: ${cas.message || cas.error})`);
     return;
   }
   const key = `sessions/${sessionId}.json`;
@@ -377,11 +384,23 @@ function pumpBosQueue() {
   if (bosPumping) return;
   bosPumping = true;
   bosQueue = (async () => {
+    let retries = 0;  // 连续 transient 重试次数, 任一任务落定即清零
     try {
       while (bosPending.length) {
-        const job = bosPending.shift();
-        try { await persistTurnToBos(job.sessionId, job.seq, job.role, job.msg, job.fullContent, job.fullToolResults); }
+        const job = bosPending[0];
+        let outcome;
+        try { outcome = await persistTurnToBos(job.sessionId, job.seq, job.role, job.msg, job.fullContent, job.fullToolResults); }
         catch (e) { warnOnce("persist", `  (警告: BOS 持久化异常: ${e.message})`); }
+        if (outcome === "retry") {
+          // 任务留在队首, 指数退避后重试; 超限时 queueBosWrite 仍会丢最旧兜底。
+          // 退避定时器 unref: 退出路径不被空转的 sleep 挂住 (flush 有 10s 上限)
+          retries += 1;
+          const delay = Math.min(60000, 1000 * 2 ** Math.min(retries, 6));
+          await new Promise(r => { const t = setTimeout(r, delay); if (t.unref) t.unref(); });
+          continue;
+        }
+        retries = 0;
+        if (bosPending[0] === job) bosPending.shift();
       }
     } finally {
       bosPumping = false;
@@ -794,7 +813,9 @@ async function casProbeCommand() {
   const cas = await probeStoreCas({ bucket, endpoint, profile, region });
   if (!cas.ok) {
     console.error(`✗ ${cas.message || cas.error}`);
-    process.exit(1);
+    // exit 2 = 探针未完成 (transient, 无法判定), 区别于 exit 1 = 存储不合格;
+    // install.sh/setup.sh 按此区分提示, 不把网络抖动误报成 "换后端"
+    process.exit(cas.transient ? 2 : 1);
   }
   console.log(`✓ ${cas.message}`);
 }
@@ -1072,21 +1093,25 @@ async function main() {
         return nums.length ? Math.max(...nums) : 0;
       };
       let seq = maxTurn(persistHistory);
-      // P1: 维护当前会话 turns 快照缓存 (供 session_snapshot 工具保存用)
-      let snapshotTurns = (persistHistory || []).map(t => {
-        const e = { turn: t.turn, role: t.role || "assistant", msg: t.msg, ts: t.ts };
-        if (t.content && t.content.length) e.content = t.content;
-        if (t.toolResults && t.toolResults.length) e.toolResults = t.toolResults;
-        return e;
-      });
-      globalThis.__celagentSnapshotTurns = () => snapshotTurns.slice();
+      // P1: 进程内只留每轮摘要 (turn/role/msg/ts) — 完整 content/toolResults 已在
+      // BOS 权威会话里, 全量驻留内存会让长会话无界增长。session_snapshot 取全量时
+      // 从 BOS 重建, 队列尚未刷到的最新轮用内存摘要补齐
+      let snapshotTurns = (persistHistory || []).map(t => ({ turn: t.turn, role: t.role || "assistant", msg: t.msg, ts: t.ts }));
+      globalThis.__celagentSnapshotTurns = async () => {
+        let full = [];
+        try { full = (await loadHistoryFromBos(persistId)) || []; } catch (e) { full = []; }
+        const have = new Set(full.map(t => Number(t.turn)).filter(Number.isFinite));
+        return full
+          .concat(snapshotTurns.filter(t => !have.has(Number(t.turn))))
+          .sort((a, b) => Number(a.turn) - Number(b.turn));
+      };
       result.session.subscribe(async (event) => {
         if (event?.type === "message_end" && event.message?.role === "user") {
           seq++;
           const text = extractText(event.message?.content);
           const fullContent = Array.isArray(event.message?.content) ? event.message.content : [];
           void celldCheckpoint(persistId, seq, "user", text || "(无文本)", { fullContent });
-          snapshotTurns.push(makeTurnEntry(persistId, seq, "user", text || "(无文本)", fullContent, null));
+          snapshotTurns.push({ turn: seq, role: "user", msg: text || "(无文本)", ts: Date.now() });
           return;
         }
         if (event?.type === "turn_end") {
@@ -1112,8 +1137,8 @@ async function main() {
           if (toolResults.length > 0) msg += ` [工具结果: ${toolResults.join(" | ").slice(0, 300)}]`;
           // Bug 52: 不 await — checkpoint 全异步 (worker fire-and-forget + BOS 队列), 绝不阻塞对话
           void celldCheckpoint(persistId, seq, "assistant", msg, { fullContent, fullToolResults });
-          // P1: 同步快照缓存
-          snapshotTurns.push(makeTurnEntry(persistId, seq, "assistant", msg, fullContent, fullToolResults));
+          // P1: 同步快照缓存 (仅摘要, 全量在 BOS)
+          snapshotTurns.push({ turn: seq, role: "assistant", msg, ts: Date.now() });
         }
       });
       return { ...result, services, diagnostics: [] };  // 完整契约 (Bug: /new 需 services+diagnostics)
@@ -1140,9 +1165,9 @@ async function main() {
   await interactive.run();
 
   // 4. 退出前 flush BOS 队列 (Bug 17 修复: 避免丢最后几轮)
-  try {
-    await bosQueue;
-  } catch (e) { /* 忽略 */ }
+  // 走 flushOnExit 的 10s 上限 — 队列引入 transient 重试后, 裸 await bosQueue
+  // 会在网络长时间不可用时挂死正常退出路径
+  await flushOnExit();
 }
 
 // 退出时 flush 队列 — Bug 48/59: 信号处理策略

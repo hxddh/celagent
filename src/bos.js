@@ -14,7 +14,8 @@ function normalizeEndpoint(raw) {
 }
 
 function isAllowedHost(hostname) {
-  const h = String(hostname || "").toLowerCase();
+  // URL.hostname 对 IPv6 字面量带方括号 ("[::1]"), 先剥掉再比较
+  const h = String(hostname || "").toLowerCase().replace(/^\[(.*)\]$/, "$1");
   if (h === "127.0.0.1" || h === "localhost" || h === "::1") return true;
   if (/^s3(\.[a-z0-9-]+)?\.bcebos\.com$/i.test(h)) return true;
   if (h === "s3.amazonaws.com" || /^s3(\.[a-z0-9-]+)?\.amazonaws\.com$/i.test(h)) return true;
@@ -33,7 +34,8 @@ export function isAllowedEndpoint(raw) {
   }
   try {
     const u = new URL(ep);
-    if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1") {
+    const host = u.hostname.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+    if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
       return u.protocol === "http:" || u.protocol === "https:";
     }
     if (u.protocol !== "https:") return false;
@@ -127,9 +129,11 @@ export async function awsJson(args, opts = {}) {
   }
 }
 
-/** 进程内 CAS 门禁: 通过或 cas-ignored 才粘滞; 网络/凭证失败下次重试 */
+/** 进程内 CAS 门禁: 结论性结果 (通过 / 存储能力不足) 粘滞; transient (网络等, 无法判定) 下次重试 */
 export function casGateSticky(result) {
-  return Boolean(result && (result.ok || result.error === "cas-ignored"));
+  if (!result) return false;
+  if (result.ok) return true;
+  return Boolean(result.error) && !result.transient;
 }
 
 function etagFromGetStdout(stdout) {
@@ -247,7 +251,9 @@ export async function bosDelete(key, { bucket, endpoint, profile, region } = {})
   return { ok: true };
 }
 
-/** 根据探针各步结果判定存储是否真的执行条件写。忽略 If-Match → cas-ignored */
+/** 根据探针各步结果判定存储是否真的执行条件写。忽略 If-Match → cas-ignored。
+ *  结论性失败 (存储能力不足) 与 transient 失败必须分开: 一次网络抖动不能给出
+ *  "此存储不能保证 RPO=0" 的错误判决 — transient:true 表示探针未完成、无法判定 */
 export function evaluateCasChecks({
   create,
   got,
@@ -260,12 +266,19 @@ export function evaluateCasChecks({
 } = {}) {
   const checks = [];
   const fail = (error, message) => ({ ok: false, error, message, checks });
+  const failTransient = (error, message) => ({ ok: false, transient: true, error, message, checks });
+  // 条件写请求返回 NotImplemented/501 = 存储明确不支持, 是结论而非抖动
+  const notImplemented = (r) => /NotImplemented|not.?implemented|\b501\b/i.test(String(r?.error || ""));
   if (!create?.ok) {
     checks.push({ name: "create", ok: false });
-    return fail("create-failed", create?.error || "CAS 探针无法写入");
+    return failTransient("create-failed", `CAS 探针无法写入 (网络/凭证/权限问题, 无法判定): ${create?.error || "未知错误"}`);
   }
   checks.push({ name: "create", ok: true });
-  if (!got?.ok || String(got.body) !== String(expectedBody1)) {
+  if (!got?.ok) {
+    checks.push({ name: "read-after-write", ok: false });
+    return failTransient("probe-read-failed", `CAS 探针写入后读取失败 (无法判定): ${got?.error || "未知错误"}`);
+  }
+  if (String(got.body) !== String(expectedBody1)) {
     checks.push({ name: "read-after-write", ok: false });
     return fail("read-after-write", "PUT 成功后 GET 看不到新内容,此存储不能保证 RPO=0");
   }
@@ -281,7 +294,10 @@ export function evaluateCasChecks({
   }
   if (!ifNoneMatchExisting?.conflict) {
     checks.push({ name: "if-none-match-existing", ok: false });
-    return fail("if-none-match", "已存在对象上 If-None-Match:* 未返回冲突,此存储不能保证 RPO=0");
+    if (notImplemented(ifNoneMatchExisting)) {
+      return fail("if-none-match", "存储不支持 If-None-Match (NotImplemented),此存储不能保证 RPO=0");
+    }
+    return failTransient("probe-put-failed", `If-None-Match 探针步骤失败 (非冲突非成功, 无法判定): ${ifNoneMatchExisting?.error || "未知错误"}`);
   }
   checks.push({ name: "if-none-match-existing", ok: true });
   if (ifMatchWrong?.ok) {
@@ -290,15 +306,26 @@ export function evaluateCasChecks({
   }
   if (!ifMatchWrong?.conflict) {
     checks.push({ name: "if-match-wrong", ok: false });
-    return fail("if-match-wrong", "错误 ETag 的 If-Match 未返回冲突,此存储不能保证 RPO=0");
+    if (notImplemented(ifMatchWrong)) {
+      return fail("if-match-wrong", "存储不支持 If-Match (NotImplemented),此存储不能保证 RPO=0");
+    }
+    return failTransient("probe-put-failed", `错误 ETag 的 If-Match 探针步骤失败 (非冲突非成功, 无法判定): ${ifMatchWrong?.error || "未知错误"}`);
   }
   checks.push({ name: "if-match-wrong", ok: true });
   if (!ifMatchRight?.ok) {
     checks.push({ name: "if-match-right", ok: false });
-    return fail("if-match-right", ifMatchRight?.error || "正确 ETag 的 If-Match 失败");
+    if (ifMatchRight?.conflict) {
+      // 探针 key 是本进程独占的 UUID, 正确 ETag 被拒即 ETag 比较语义异常
+      return fail("if-match-right", "正确 ETag 的 If-Match 被拒绝,ETag 语义异常,此存储不能保证 RPO=0");
+    }
+    return failTransient("probe-put-failed", `正确 ETag 的 If-Match 探针步骤失败 (无法判定): ${ifMatchRight?.error || "未知错误"}`);
   }
   checks.push({ name: "if-match-right", ok: true });
-  if (!gotAfter?.ok || String(gotAfter.body) !== String(expectedBody2)) {
+  if (!gotAfter?.ok) {
+    checks.push({ name: "read-after-cas", ok: false });
+    return failTransient("probe-read-failed", `条件覆盖后读取失败 (无法判定): ${gotAfter?.error || "未知错误"}`);
+  }
+  if (String(gotAfter.body) !== String(expectedBody2)) {
     checks.push({ name: "read-after-cas", ok: false });
     return fail("read-after-write", "条件覆盖后 GET 看不到新内容,此存储不能保证 RPO=0");
   }
@@ -308,7 +335,7 @@ export function evaluateCasChecks({
 
 /** 对当前 bucket 做会话路径 CAS 门禁。ops 可注入,供无 aws CLI 的测试 */
 export async function probeStoreCas({ bucket, endpoint, profile, region, ops } = {}) {
-  if (!bucket) return { ok: false, error: "no-bucket", message: "未配置 bucket", checks: [] };
+  if (!bucket) return { ok: false, transient: true, error: "no-bucket", message: "未配置 bucket", checks: [] };
   const put = ops?.put || ((key, content, extra) => bosPut(key, content, extra));
   const get = ops?.get || ((key, extra) => bosGet(key, extra));
   const del = ops?.del || ((key, extra) => bosDelete(key, extra));

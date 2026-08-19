@@ -148,34 +148,61 @@ if [ -f "$SETTINGS_FILE" ]; then
   [ -n "$_pr" ] && STORE_PROFILE="$_pr"
   [ -n "$_rg" ] && STORE_REGION="$_rg"
 fi
-celagent_install_ep_ok() {
-  local raw="${1%/}"
-  [ -z "$raw" ] && return 1
-  if [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "1" ] || [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "true" ]; then
-    case "$raw" in http://*|https://*) return 0 ;; *) return 1 ;; esac
-  fi
-  local rest host scheme
-  case "$raw" in
-    http://*) scheme=http; rest="${raw#http://}" ;;
-    https://*) scheme=https; rest="${raw#https://}" ;;
-    *) return 1 ;;
-  esac
-  host="${rest%%/*}"
-  host="${host%%:*}"
-  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
-  case "$host" in
-    127.0.0.1|localhost|::1|\[::1\]) return 0 ;;
-  esac
-  [ "$scheme" = https ] || return 1
-  case "$host" in
-    s3.bcebos.com|s3.*.bcebos.com) return 0 ;;
-    s3.amazonaws.com|s3.*.amazonaws.com) return 0 ;;
-    *.r2.cloudflarestorage.com) return 0 ;;
-    fly.storage.tigris.dev|*.tigris.dev) return 0 ;;
-    t3.storage.dev|*.t3.storage.dev) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# endpoint 门禁: 规范实现在 scripts/store_env.sh (与 src/bos.js isAllowedEndpoint 对齐)。
+# 开发模式 / 仓库内运行时直接 source; 仅 curl|bash 独立分发时用下面的内置回退
+# (回退拷贝必须与 store_env.sh 保持逐字同步)
+_EP_HELPER=""
+for _cand in "${CELAGENT_SRC:+$CELAGENT_SRC/scripts/store_env.sh}" \
+             "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/scripts/store_env.sh"; do
+  if [ -n "$_cand" ] && [ -f "$_cand" ]; then _EP_HELPER="$_cand"; break; fi
+done
+if [ -n "$_EP_HELPER" ]; then
+  # shellcheck source=scripts/store_env.sh
+  . "$_EP_HELPER"
+  celagent_install_ep_ok() { celagent_is_allowed_endpoint "$1"; }
+else
+  celagent_install_ep_mid_ok() {
+    case "$1" in ""|*.*|*[!a-z0-9-]*) return 1 ;; *) return 0 ;; esac
+  }
+  celagent_install_ep_ok() {
+    local raw="${1%/}"
+    [ -z "$raw" ] && return 1
+    if [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "1" ] || [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "true" ]; then
+      case "$raw" in http://*|https://*) return 0 ;; *) return 1 ;; esac
+    fi
+    local rest host scheme mid
+    case "$raw" in
+      http://*) scheme=http; rest="${raw#http://}" ;;
+      https://*) scheme=https; rest="${raw#https://}" ;;
+      *) return 1 ;;
+    esac
+    host="${rest%%/*}"
+    case "$host" in
+      \[*)
+        # IPv6 字面量带方括号 ([::1] 或 [::1]:9000) — %%:* 会从第一个冒号截断
+        host="${host%%]*}"; host="${host#\[}" ;;
+      *) host="${host%%:*}" ;;
+    esac
+    host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+    case "$host" in
+      127.0.0.1|localhost|::1) return 0 ;;
+    esac
+    [ "$scheme" = https ] || return 1
+    case "$host" in
+      s3.bcebos.com|s3.amazonaws.com) return 0 ;;
+      s3.*.bcebos.com)
+        mid="${host#s3.}"; mid="${mid%.bcebos.com}"
+        celagent_install_ep_mid_ok "$mid" && return 0 || return 1 ;;
+      s3.*.amazonaws.com)
+        mid="${host#s3.}"; mid="${mid%.amazonaws.com}"
+        celagent_install_ep_mid_ok "$mid" && return 0 || return 1 ;;
+      *.r2.cloudflarestorage.com) return 0 ;;
+      fly.storage.tigris.dev|*.tigris.dev) return 0 ;;
+      t3.storage.dev|*.t3.storage.dev) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+fi
 if ! celagent_install_ep_ok "$STORE_EP"; then
   echo "  ✗ persistence.endpoint 不允许: $STORE_EP (仅 https 合格 host 或本机; 或设 CELAGENT_ALLOW_ENDPOINT=1)"
   exit 1
@@ -337,14 +364,21 @@ chmod 600 "$SETTINGS"
 echo "  ✓ 配置已写入"
 
 # CAS 探针 — 与 setup.sh 对齐: 条件写必须真正执行
+# 退出码 2 = 探针未完成 (网络/凭证临时问题, 无法判定), 不能误报成存储不合格
 echo "[CAS] 探针 (If-Match / If-None-Match / 写后读)..."
+CAS_BIN=""
 if [ -x "${CELAGENT_ROOT}/bin/celagent" ]; then
-  if ! "${CELAGENT_ROOT}/bin/celagent" cas-probe --bucket "$BUCKET"; then
-    echo "  ✗ 此存储不能保证 RPO=0 (条件写未生效)。换合格后端或检查权限后再安装。"
-    exit 1
-  fi
+  CAS_BIN="${CELAGENT_ROOT}/bin/celagent"
 elif command -v celagent >/dev/null 2>&1; then
-  if ! celagent cas-probe --bucket "$BUCKET"; then
+  CAS_BIN="celagent"
+fi
+if [ -n "$CAS_BIN" ]; then
+  CAS_RC=0
+  "$CAS_BIN" cas-probe --bucket "$BUCKET" || CAS_RC=$?
+  if [ "$CAS_RC" -eq 2 ]; then
+    echo "  ✗ CAS 探针未完成 (临时网络/凭证问题, 无法判定存储能力)。请稍后重试安装, 或运行: celagent doctor"
+    exit 1
+  elif [ "$CAS_RC" -ne 0 ]; then
     echo "  ✗ 此存储不能保证 RPO=0 (条件写未生效)。换合格后端或检查权限后再安装。"
     exit 1
   fi

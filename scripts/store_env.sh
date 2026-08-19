@@ -11,28 +11,47 @@ celagent_is_bcebos() {
 }
 
 # 与 src/bos.js isAllowedEndpoint 对齐: 非法 URL 拒绝,不改写成 BOS
+# (install.sh 独立分发时内置一份同名回退拷贝 celagent_install_ep_ok — 改这里须同步)
+
+# s3.<X>.bcebos.com / s3.<X>.amazonaws.com 的中段与 JS 正则 [a-z0-9-]+ 对齐:
+# 只允许单标签 — glob 的 * 会吞点号, 否则 s3.a.b.bcebos.com 这类多标签 host
+# 在这里放行、在 JS 运行时被拒, 造成 install 通过 / cas-probe 失败的错位
+celagent_ep_mid_label_ok() {
+  case "$1" in ""|*.*|*[!a-z0-9-]*) return 1 ;; *) return 0 ;; esac
+}
+
 celagent_is_allowed_endpoint() {
   local raw="${1%/}"
   [ -z "$raw" ] && return 1
   if [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "1" ] || [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "true" ]; then
     case "$raw" in http://*|https://*) return 0 ;; *) return 1 ;; esac
   fi
-  local rest host scheme
+  local rest host scheme mid
   case "$raw" in
     http://*) scheme=http; rest="${raw#http://}" ;;
     https://*) scheme=https; rest="${raw#https://}" ;;
     *) return 1 ;;
   esac
   host="${rest%%/*}"
-  host="${host%%:*}"
+  case "$host" in
+    \[*)
+      # IPv6 字面量带方括号 ([::1] 或 [::1]:9000) — %%:* 会从第一个冒号截断, 必须先按 ] 剥
+      host="${host%%]*}"; host="${host#\[}" ;;
+    *) host="${host%%:*}" ;;
+  esac
   host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
   case "$host" in
-    127.0.0.1|localhost|::1|\[::1\]) return 0 ;;
+    127.0.0.1|localhost|::1) return 0 ;;
   esac
   [ "$scheme" = https ] || return 1
   case "$host" in
-    s3.bcebos.com|s3.*.bcebos.com) return 0 ;;
-    s3.amazonaws.com|s3.*.amazonaws.com) return 0 ;;
+    s3.bcebos.com|s3.amazonaws.com) return 0 ;;
+    s3.*.bcebos.com)
+      mid="${host#s3.}"; mid="${mid%.bcebos.com}"
+      celagent_ep_mid_label_ok "$mid" && return 0 || return 1 ;;
+    s3.*.amazonaws.com)
+      mid="${host#s3.}"; mid="${mid%.amazonaws.com}"
+      celagent_ep_mid_label_ok "$mid" && return 0 || return 1 ;;
     *.r2.cloudflarestorage.com) return 0 ;;
     fly.storage.tigris.dev|*.tigris.dev) return 0 ;;
     t3.storage.dev|*.t3.storage.dev) return 0 ;;
