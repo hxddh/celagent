@@ -1,12 +1,12 @@
 #!/bin/bash
-# celagent v0.3.6 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
+# celagent v0.3.7 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
 # 正式模式: 从 GitHub Release 下载对应平台二进制 (含 celld 随包 + worker 源码包)
 # 开发模式: CELAGENT_SRC=<源码目录> ./install.sh (软链直指源码, 改即生效)
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
-VERSION="0.3.6"
+VERSION="0.3.7"
 REPO="https://github.com/hxddh/celagent"
 RELEASE_URL="${CELAGENT_RELEASE_URL:-$REPO/releases/latest/download}"
 

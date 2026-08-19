@@ -52,20 +52,24 @@
        ② BOS 直写: 入异步队列 queueBosWrite (串行执行, 限长 50 —
           BOS_QUEUE_MAX, Bug E 防内存泄漏, 超出丢最旧任务)
           → bosGet 读当前对象 + ETag → 合并轮次 → If-Match CAS 写
-          → 冲突(412)重读重试 ×3 → 失败警告但不阻塞对话
-   → 退出前: await bosQueue (Bug 17: flush 队列, 不丢最后几轮)
+          → 冲突(412)重读重试 ×3 → GET/PUT 瞬时失败返回 retry,任务留队首指数退避
+          → 权限类失败(403/401)不重试;JSON 损坏拒绝覆盖
+   → 退出前: await flushBosQueue(10s) (Bug 17: flush 队列; 退避中的任务可能被 10s 上限截断)
 ```
 
 ### 1.4 恢复路径
 
 ```
-celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
-   → BOS miss 时才回退 worker resume (缓存 POST JSON, msg 上限 8000; 旧 GET 兼容)
+celagent <id> → loadSessionHistory(id) (src/persist.js)
+   → BOS 读成功: 用权威 turns
+   → BOS not-found / 无 bucket: 才回退 worker resume (缓存 POST JSON, msg 上限 8000; 旧 GET 兼容)
+   → BOS 超时/5xx/403: **不回退 worker**, 警告后空历史启动 (避免截断缓存当完整历史)
+   → JSON 损坏: 不回退、不覆盖
    → 取最近 50 轮 (MAX_INJECT_TURNS, Bug 78: 防超长会话撑爆模型上下文)
    → result.session.steer(...) 注入 content 文本块 (缺省回退 t.msg) + 真实 t.role
    → seq 续写起点 = max(turn) (非 turns.length, 防 gap 覆盖)
    → 运行中 message_end(user) + turn_end(assistant) 双角色落盘
-优先级: BOS 权威源 > worker 缓存 (恢复先读 BOS, 不依赖节点)
+优先级: BOS 权威源 > worker 缓存 (仅 miss 才回退; 读失败 ≠ miss)
 ```
 
 ## 2. 核心机制原理
@@ -115,7 +119,8 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 | 组件 | 职责 | 明确不做 | 改动入口 |
 |---|---|---|---|
 | `bin/celagent-tui.mjs` | CLI/交互/编排 | 不实现 LLM 协议、不实现存储细节 | 命令集、钩子、恢复策略 |
-| `src/bos.js` | BOS 直写原语 | 不感知会话语义 | CAS/重试/endpoint 策略 |
+| `src/bos.js` | 对象存储直写原语 | 不感知会话语义 | CAS/重试/endpoint 策略 |
+| `src/persist.js` | 会话权威写/恢复/队列 | 不实现 LLM、不打 celld | I/O 分类、门禁、BOS-first |
 | `src/bos-tools.js` | agent 记忆工具 | 不涉及交互 | 工具集扩展(新记忆工具) |
 | `worker/src/index.js` | celld worker(缓存/任务/签名) | 不做权威存储 | 缓存策略、任务类型 |
 | `scripts/*.sh` | 运维(节点/集群/部署) | 不进入产品代码 | 拓扑管理、部署流程 |
@@ -156,7 +161,7 @@ celagent <id> → loadHistoryFromBos(id) (bosGet sessions/<id>.json)
 - **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失);拉起节点另有 `ensure.lock`
 - **CI Release job**:`.github/workflows/release.yml` 在 tag / workflow_dispatch 时匿名路径构建并上传
 - **Release 资产**:v0.3.3 含 celagent 五平台、celld linux/darwin-arm64、SHA256SUMS;上游 celld 无 darwin-x64/Windows
-- **存储后端**:运维脚本从 settings 读 endpoint/region/profile;`resolveEndpoint` 对非白名单 URL **fail-closed**。`celagent doctor` / `cas-probe` 验证 If-Match 真的执行。会话路径带 `persistence.region`(v0.3.5);CAS 探针 transient 与结论性失败分开、判决按 store 键控、瞬时失败队列重试不丢轮(v0.3.6)。真桶实测与「已支持 R2」见 v0.3.7 / `docs/s3-compat-evaluation.md`
+- **存储后端**:运维脚本从 settings 读 endpoint/region/profile;`resolveEndpoint` 对非白名单 URL **fail-closed**。`celagent doctor` / `cas-probe` 验证 If-Match 真的执行。会话路径带 `persistence.region`(v0.3.5);CAS 探针 transient 与结论性失败分开、判决按 store 键控(v0.3.6);persist 主路径 GET/PUT 瞬时失败同样留队重试,恢复时非 miss 不回退 worker(v0.3.7)。真桶实测与「已支持 R2」见 v0.3.8 / `docs/s3-compat-evaluation.md`
 
 ## 6. 与分布式部署的关系
 

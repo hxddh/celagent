@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const tui = readFileSync(join(root, "bin/celagent-tui.mjs"), "utf8");
+const persist = readFileSync(join(root, "src/persist.js"), "utf8");
 
 // ---- 队列超限丢最旧、保留最新 ----
 test("队列超限丢最旧保留最新", () => {
@@ -24,9 +25,9 @@ test("队列超限丢最旧保留最新", () => {
 });
 
 test("源码锚定: 队列超限 shift 最旧而非 return", () => {
-  assert.match(tui, /if \(bosPending\.length >= BOS_QUEUE_MAX\)/);
-  const start = tui.indexOf("if (bosPending.length >= BOS_QUEUE_MAX)");
-  const block = tui.slice(start, start + 180);
+  assert.match(persist, /if \(bosPending\.length >= BOS_QUEUE_MAX\)/);
+  const start = persist.indexOf("if (bosPending.length >= BOS_QUEUE_MAX)");
+  const block = persist.slice(start, start + 180);
   assert.match(block, /bosPending\.shift\(\)/);
   assert.doesNotMatch(block, /return;/);
   assert.match(block, /丢弃最旧任务/);
@@ -69,8 +70,8 @@ test("同 turn replace: 缺 content 的新写入不抹掉已有 content", () => 
 });
 
 test("源码锚定: mergeTurn 保留已有 content/toolResults", () => {
-  assert.match(tui, /if \(prev\?\.content && !\(fullContent && fullContent\.length\)\) entry\.content = prev\.content/);
-  assert.match(tui, /if \(prev\?\.toolResults && !\(fullToolResults && fullToolResults\.length\)\) entry\.toolResults = prev\.toolResults/);
+  assert.match(persist, /if \(prev\?\.content && !\(fullContent && fullContent\.length\)\) entry\.content = prev\.content/);
+  assert.match(persist, /if \(prev\?\.toolResults && !\(fullToolResults && fullToolResults\.length\)\) entry\.toolResults = prev\.toolResults/);
 });
 
 // ---- ensureLock finally 释放 ----
@@ -94,7 +95,7 @@ test("ensureLock: finally 在健康早退后释放", async () => {
 });
 
 test("源码锚定: ensureCelld 外层 finally 清 ensureLock", () => {
-  const fn = tui.slice(tui.indexOf("async function ensureCelld"), tui.indexOf("// ---- BOS 直写队列"));
+  const fn = tui.slice(tui.indexOf("async function ensureCelld"), tui.indexOf("// ---- Celld 镜像"));
   assert.match(fn, /} finally \{\s*ensureLock = null/);
   assert.match(fn, /releaseEnsureFileLock/);
 });
@@ -106,8 +107,8 @@ test("源码锚定: persistId 处理 new 与 fork", () => {
 
 // ---- JSON parse 失败不覆盖 ----
 test("源码锚定: BOS JSON parse 失败 return 不覆盖", () => {
-  assert.match(tui, /JSON\.parse\(existing\.body\)[\s\S]{0,200}catch[\s\S]{0,250}return;/);
-  assert.doesNotMatch(tui, /JSON\.parse\(existing\.body\).*catch[\s\S]{0,40}覆盖/);
+  assert.match(persist, /JSON\.parse\(existing\.body\)[\s\S]{0,200}catch[\s\S]{0,250}return;/);
+  assert.doesNotMatch(persist, /JSON\.parse\(existing\.body\).*catch[\s\S]{0,40}覆盖/);
 });
 
 // ---- steer 用 content + role ----
@@ -118,11 +119,12 @@ test("源码锚定: steer 注入用 t.content 与 t.role", () => {
 });
 
 // ---- BOS-first 恢复 ----
-test("源码锚定: loadHistoryFromBos 先 bosGet 再 worker resume", () => {
-  const fn = tui.slice(tui.indexOf("async function loadHistoryFromBos"), tui.indexOf("async function listSessions"));
-  const bosIdx = fn.indexOf("bosGet");
-  const workerIdx = fn.indexOf("action=resume");
-  assert.ok(bosIdx >= 0 && workerIdx > bosIdx, "bosGet 出现在 resume 之前");
+test("源码锚定: loadSessionHistory 仅 miss 才 fallbackResume", () => {
+  const fn = persist.slice(persist.indexOf("export async function loadSessionHistory"));
+  assert.match(fn, /kind !== "not-found"/);
+  assert.match(fn, /transient: kind === "transient"/);
+  assert.match(tui, /未回退 worker 缓存/);
+  assert.match(tui, /fallbackResume: workerResumeTurns/);
 });
 
 test("源码锚定: 会话 ID 白名单", () => {
@@ -291,7 +293,7 @@ test("源码锚定: ensureCelld 跨进程 ensure.lock", () => {
   assert.match(tui, /ensure\.lock/);
   assert.match(tui, /openSync\(lockPath, "wx"\)/);
   assert.match(tui, /releaseEnsureFileLock/);
-  const fn = tui.slice(tui.indexOf("async function ensureCelld"), tui.indexOf("// ---- BOS 直写队列"));
+  const fn = tui.slice(tui.indexOf("async function ensureCelld"), tui.indexOf("// ---- Celld 镜像"));
   assert.match(fn, /releaseEnsureFileLock\(fileLockDir\)/);
 });
 
@@ -380,9 +382,11 @@ test("源码锚定: doctor 含 CAS 门禁且 persist 拒绝无 CAS 写入", () =
   assert.match(tui, /\[5\/6\] CAS:/);
   assert.match(tui, /cas-probe/);
   assert.match(tui, /probeStoreCas/);
-  assert.match(tui, /此存储不能保证 RPO=0,拒绝权威写入/);
-  assert.match(tui, /async function ensureStoreCas/);
-  assert.match(tui, /casGateSticky/);
+  assert.match(tui, /src\/persist\.js/);
+  assert.match(persist, /async function ensureStoreCas/);
+  assert.match(persist, /casGateSticky/);
+  assert.match(persist, /此存储不能保证 RPO=0,拒绝权威写入/);
+  assert.match(persist, /classifyStoreError/);
   assert.doesNotMatch(tui, /\[1\/5\]/);
   assert.match(tui, /bosDelete/);
   assert.match(tui, /列举会话失败/);
@@ -396,8 +400,8 @@ test("源码锚定: worker 已删除未调用的 SigV4 bosPut", () => {
   assert.match(w, /async function bosPutProxy/);
 });
 
-test("源码锚定: 版本 0.3.6 与 release-smoke", () => {
-  assert.match(tui, /CELAGENT_VERSION = "0\.3\.6"/);
+test("源码锚定: 版本 0.3.7 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.3\.7"/);
   const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
   assert.match(smoke, /sha256sum --ignore-missing/);
   assert.match(smoke, /celagent-linux-x64/);

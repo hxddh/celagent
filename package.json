@@ -1,14 +1,15 @@
 {
   "name": "celagent",
-  "version": "0.3.6",
-  "description": "独立开源 agent — Pi TUI + Celld/BOS RPO=0 持久化，崩溃/换机器/节点故障会话不丢",
+  "version": "0.3.7",
+  "description": "独立开源 agent — Pi TUI + Celld/BOS 对象存储持久化，CAS 成功的会话可跨机恢复",
   "type": "module",
   "bin": {
     "celagent": "./bin/celagent-tui.mjs"
   },
   "exports": {
     "./bos": "./src/bos.js",
-    "./bos-tools": "./src/bos-tools.js"
+    "./bos-tools": "./src/bos-tools.js",
+    "./persist": "./src/persist.js"
   },
   "files": [
     "bin/",
