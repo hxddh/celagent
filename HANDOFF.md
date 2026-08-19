@@ -43,12 +43,13 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/v033-scope.md` | v0.3.3 实现合同(已发布: fail-closed + 配置单一来源) |
 | `docs/v034-scope.md` | v0.3.4 实现合同(已发布: CAS doctor + 删 SigV4 死代码) |
 | `docs/v035-scope.md` | v0.3.5 实现合同(已发布: region 贯穿、CAS 粘滞、rm/list 错误、记忆工具) |
+| `docs/v036-scope.md` | v0.3.6 实现合同(已发布: 深度审查 9 项修复 — CAS transient/粘滞/键控、队列重试不丢轮、白名单对齐、记忆工具) |
 | `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取(endpoint fail-closed) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
 | `tests/review-logic-proofs.test.mjs` | P0 正确性源码锚定(BOS-first/队列丢最旧/fork/parse/steer/seq) |
-| `tests/p0-p2-bugs.test.mjs` | v0.3.5 回归(region/CAS 粘滞/非法 endpoint/store_env) |
+| `tests/p0-p2-bugs.test.mjs` | v0.3.5/v0.3.6 回归(region/CAS 粘滞/非法 endpoint/store_env/片段命中) |
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
 | `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、33 轮真实对话实录回放, 2026-08-11) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |
@@ -107,11 +108,12 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:不在仓库内;发布随包 **v0.2.0**(linux-x64/arm64、darwin-arm64)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。评估见 `docs/celld-v02-evaluation.md`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(v0.3.5 已发布)
+## 3. 发布状态(v0.3.6 已发布)
 
-仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.5](https://github.com/hxddh/celagent/releases/tag/v0.3.5)。
+仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.6](https://github.com/hxddh/celagent/releases/tag/v0.3.6)。
 
-- **tag `v0.3.5`** 指向 `0c674cf`(PR #14 快进进 main);Release 资产由此 SHA 构建
+- **tag `v0.3.6`** 指向 PR #16 合并进 main 的提交;Release 资产由此 SHA 构建
+- **v0.3.5**(`0c674cf`,PR #14)CAS 只粘滞 cas-ignored:瞬时探针失败会消费队列任务丢轮,永久性失败每轮重探,判决不按 store 键控
 - **v0.3.4**(`eec47c4`)有 CAS 门禁,但会话路径不带 `persistence.region`,rm 失败仍报成功
 - **v0.3.3**(`1514b1b`)无 CAS 门禁
 - **v0.3.2**(`e5ae737`)无 persistence.endpoint 时行为与 v0.3.3 相同
@@ -124,8 +126,8 @@ node bin/celagent-tui.mjs task ledger
 - ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo`;CI 含 Secret/PII 门禁;零密钥硬编码
   - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容;彻底抹掉需向 GitHub Support 申请 purge
 - ✅ 构建:`.github/workflows/release.yml` 匿名路径 bun 交叉编译 + 拉取 `denoland/celld` + `SHA256SUMS`
-- ✅ **v0.3.5 资产清单**(形态同 v0.3.4):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是会话路径带 region、CAS 只粘滞 cas-ignored、rm/list 报错、snapshot 全量**
-- ✅ 安装校验:`scripts/release-smoke.sh v0.3.5` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.3.5`;不需要 BOS/celld)
+- ✅ **v0.3.6 资产清单**(形态同 v0.3.5):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是 CAS transient 不丢轮/结论性粘滞/按 store 键控、cas-probe exit 2、白名单 IPv6+单标签、history_search 片段命中、snapshot 内存摘要化**
+- ✅ 安装校验:`scripts/release-smoke.sh v0.3.6` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.3.6`;不需要 BOS/celld)
 
 ### 已知边界(不是本仓库能补的)
 - 上游 `denoland/celld` **没有** Intel Mac (`celld-darwin-x64`) 与 Windows 包;`install.sh` 回退 `celld.dev` / Windows 跳过 celld
@@ -138,10 +140,10 @@ node bin/celagent-tui.mjs task ledger
 0. ✅ docs/archive 已删除
 1. ✅ 仓库已推送
 2. ✅ CI 绿 (node 22/24)
-3. ✅ tag `v0.3.5` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
+3. ✅ tag `v0.3.6` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
 4. ✅ 跨平台 celagent 由 Release workflow 在 `/tmp/anon-build` 编译
 5. ✅ install.sh 正式模式从 GitHub Release 下载,有 `SHA256SUMS` 则校验
-6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.3.5` 或 `latest`(SHA256 + version/help)
+6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.3.6` 或 `latest`(SHA256 + version/help)
 
 ## 4. 版本与里程碑
 
@@ -155,9 +157,10 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.2 | celld v0.2 适配:双监听、`CELLD_VAR_` token、timingSafeEqual、drain/diagnose、驻留/admission 调参 | ✅ 历史 |
 | v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | ✅ 历史 |
 | v0.3.4 | CAS doctor、setup/persist 拒绝无条件写存储、删 worker SigV4 死代码 | ✅ 历史 |
-| v0.3.5 | 会话路径带 region、CAS 只粘滞 cas-ignored、rm/list 报错、snapshot 全量 | ✅ 已发布 |
+| v0.3.5 | 会话路径带 region、CAS 只粘滞 cas-ignored、rm/list 报错、snapshot 全量 | ✅ 历史 |
+| v0.3.6 | 深度审查 9 项修复:CAS transient 不丢轮/结论性粘滞/按 store 键控、cas-probe exit 2、白名单 IPv6+单标签对齐、history_search 片段命中、snapshot 内存摘要化 | ✅ 已发布 |
 
-下一刀:**v0.3.6** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要把 v0.3.5 的 region 贯穿当成「已支持 R2」。不要插队做 provider 认证/快照 TUI/会话合并。
+下一刀:**v0.3.7** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要把 region 贯穿当成「已支持 R2」。不要插队做 provider 认证/快照 TUI/会话合并。
 
 ## 5. 工程约定(接手者必须遵守)
 
@@ -190,4 +193,5 @@ node bin/celagent-tui.mjs task ledger
 - 发版由 `.github/workflows/release.yml` 在 tag `v*` 时构建并上传;本地可用 `./scripts/prepare-release-assets.sh` / `./scripts/release-smoke.sh`
 - **存储多后端 P0(v0.3.3)**:非法 endpoint fail-closed;脚本读 settings。
 - **CAS 门禁(v0.3.4)**:doctor/setup/persist 拒绝忽略 If-Match 的存储。
-- **正确性(v0.3.5)**:会话读写带 `persistence.region`;CAS 瞬时失败可重试;`rm`/`list` 不再把失败当成功。真 R2/S3 联调与「已支持」仍未做。
+- **正确性(v0.3.5)**:会话读写带 `persistence.region`;`rm`/`list` 不再把失败当成功。
+- **正确性(v0.3.6)**:CAS 探针 transient(网络)与结论性(能力)分开——transient 本轮任务留队首退避重试不丢轮,结论性判决一次粘滞且按 `endpoint|bucket|profile|region` 键控;`cas-probe` transient exit 2,install/setup 不再把网络抖动误报成存储不合格;endpoint 白名单 bash/JS 对 IPv6 与多标签 host 行为一致;`history_search` 片段必含命中文本、会话读失败不吞快照命中;进程内快照缓存只留摘要。真 R2/S3 联调与「已支持」仍未做。

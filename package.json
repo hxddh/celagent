@@ -1,6 +1,6 @@
 {
   "name": "celagent",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "独立开源 agent — Pi TUI + Celld/BOS RPO=0 持久化，崩溃/换机器/节点故障会话不丢",
   "type": "module",
   "bin": {
