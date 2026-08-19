@@ -1,13 +1,13 @@
 # celagent
 
 独立开源 agent — **Pi 完整 TUI + Celld/BOS 对象存储持久化**。
-会话权威落盘在对象存储:**CAS 成功后**可跨机读回。恢复读 BOS;仅 BOS miss 才回退 worker 缓存。网络抖动时写入留队重试,读失败不把截断缓存当成完整历史。
+会话权威落盘在对象存储:**CAS 成功后**可跨机被 Pi 打开(原生 JSONL,不是 50 轮文本摘要)。恢复读 BOS;仅 BOS miss 才回退 worker 缓存。网络抖动时写入留队重试,读失败不把截断缓存当成完整历史。
 
 ## 特性
 
 - **完整 Pi TUI**:复用 pi-coding-agent 引擎(不 fork),bash/read/write/grep/find/edit/ls 全量工具,多模型切换
 - **会话权威在 BOS**:每轮对话双写 — worker 缓存 + **BOS 直写**(CAS 乐观锁 + 幂等去重 + 异步队列);GET/PUT 瞬时失败留队重试,不静默丢轮
-- **跨机恢复**:`celagent <id>` 从 BOS 读回已成功写入的历史(热恢复注入最近 50 轮文本,完整对象可用 `export` / `history_search`)
+- **跨机恢复**:`celagent <id>` 打开 BOS 上的 Pi JSONL(工具调用/thinking/分支都在)。旧 `sessions/<id>.json` 仍可读,走文本注入。完整对象可用 `export` / `history_search`
 - **分布式任务**:`celagent task submit/status/ledger` — celld 状态机,断点续跑 + 单 cell ledger 去重(exactly-once 限于同一 cell; 多机见 docs/distributed-deployment.md)
 - **本地会话恢复**:TUI 内 `/resume` 切换本机会话,`/new` 开新会话(自动独立持久化 ID)
 - **一键部署**:setup.sh 检测凭证 → 建 bucket → 部署 worker → 启动双节点 → 写配置
@@ -32,9 +32,9 @@ CELAGENT_SRC=~/celagent ./install.sh
 export DEEPSEEK_API_KEY=sk-xxx    # 真实 LLM (deepseek, OpenAI 兼容)
 
 celagent                   # 启动 TUI (自动生成唯一会话 ID)
-celagent <id>              # 续写指定会话 (从 BOS 恢复历史)
+celagent <id>              # 续写指定会话 (打开 BOS 上的 Pi JSONL)
 celagent list              # 列出 BOS 里所有可恢复会话
-celagent export <id>       # 导出会话 JSON
+celagent export <id>       # 导出会话 (优先 JSONL)
 celagent rm <id>           # 删除会话 (需确认)
 celagent doctor            # 自检: 配置/凭证/节点/BOS 连通
 celagent config get persistence.bucket
@@ -54,13 +54,13 @@ celagent help              # 全部命令
 TUI 交互 (pi-coding-agent 引擎, 全量工具)
    │  turn_end 钩子 (不阻塞对话)
    ├─▶ worker SQLite (快速缓存, 2s 超时, 丢了可重建)
-   └─▶ BOS 直写队列 (权威源, CAS If-Match 乐观锁 + 幂等去重)
+   └─▶ BOS 直写队列 (权威源, CAS If-Match 乐观锁 + 同会话 JSONL 合并)
                                 │
-                    sessions/<id>.json
-                    轮次: {turn, role, msg, ts, content, toolResults}  (完整记忆, 不截断)
+                    sessions/<id>.jsonl   Pi 原生会话 (权威)
+                    sessions/<id>.json    旧轮次 JSON (只读兼容)
 ```
 
-恢复优先级:**BOS 是权威源** — `celagent <id>` 先从 BOS 读;仅对象不存在(miss)时才回退 worker 缓存。BOS 超时/5xx/权限失败**不回退**(避免把 8000 字截断缓存当成完整历史)。BOS 同时持久化 **user 与 assistant** 轮;热恢复把最近 50 轮文本注入 steer(不是 Pi 消息重放);`/resume` 从本地 JSONL 恢复;`/new` 与 `/fork` 均分配独立持久化 ID。
+恢复优先级:**BOS 是权威源** — `celagent <id>` 先打开 `sessions/<id>.jsonl`;仅 JSONL miss 才读旧 `.json`(文本注入最近 50 轮);再 miss 才回退 worker 缓存。BOS 超时/5xx/权限失败**不回退**(避免把 8000 字截断缓存当成完整历史)。JSONL 路径用 `SessionManager.open`,不是 steer 作文。`/resume` 从本地 JSONL 恢复,persistId = 文件名 stem;`/new` 与 `/fork` 均分配独立持久化 ID。
 
 ## agent 内置 BOS 记忆工具 (P1)
 
@@ -78,9 +78,9 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | 命令 | 作用 |
 |------|------|
 | `celagent` | 启动 TUI,唯一会话 ID |
-| `celagent <id>` | 续写 BOS 会话 |
+| `celagent <id>` | 打开 BOS 上的 Pi JSONL |
 | `celagent list [--bucket B]` | 列会话(settings 丢失自动扫描 bucket) |
-| `celagent export <id>` | 导出 JSON |
+| `celagent export <id>` | 导出(优先 JSONL) |
 | `celagent rm <id>` | 删除会话(需确认) |
 | `celagent config get/set` | 配置读写 |
 | `celagent doctor` | 六维自检(含 CAS) |

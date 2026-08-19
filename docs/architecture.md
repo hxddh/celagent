@@ -14,13 +14,14 @@
 ┌─────────────────────────────────────────────────────────────┐
 │ 交互层: celagent TUI (pi-coding-agent 引擎, 不 fork)          │
 │   - 对话/工具/多模型 (bash/read/write/grep/find/edit/ls 全量) │
-│   - turn_end 钩子 → 双写 (worker 缓存 + BOS 直写)             │
-│   - 会话恢复 (BOS 权威 → steer 注入上下文)                    │
+│   - turn_end 钩子 → 双写 (worker 缓存 + BOS JSONL)           │
+│   - 会话恢复 (BOS JSONL → SessionManager.open)               │
 └──────────────┬──────────────────────────────┬────────────────┘
                │ HTTP checkpoint/resume       │ aws s3api 直连
 ┌──────────────▼──────────────┐  ┌────────────▼─────────────────┐
 │ 执行层: Celld 集群           │  │ 数据层: BOS 对象存储 (权威源) │
-│   - 节点 18090/18091/19000  │  │   sessions/<id>.json 会话    │
+│   - 节点 18090/18091/19000  │  │   sessions/<id>.jsonl Pi会话 │
+│   - worker SQLite 缓存      │  │   sessions/<id>.json 旧兼容  │
 │   - worker SQLite 缓存      │  │   cells/*/ltx 执行状态        │
 │   - 任务状态机 (task)       │  │   nodes/ 集群注册 (lease)     │
 │   - 休眠/唤醒/迁移          │  │   deploy/ worker 代码分发     │
@@ -30,7 +31,7 @@
 **一句话**:对象存储保数据(权威源,RPO=0;默认 BOS)、Celld 保执行(缓存/任务/集群)、agent 可用同一存储(记忆工具)。
 不是所有「S3 兼容」都能当权威源——必须有条件写 + 写后读一致;见 `docs/s3-compat-evaluation.md`。
 
-**记忆体系**:`sessions/<id>.json`(权威会话)+ `snapshots/<name>-<ts>.json`(显式记忆锚点,
+**记忆体系**:`sessions/<id>.jsonl`(Pi 原生权威会话)+ 旧 `sessions/<id>.json`(只读兼容)+ `snapshots/<name>-<ts>.json`(显式记忆锚点,
 由 `session_snapshot` 工具写入,不碰权威数据,可跨会话检索 via `history_search`)。
 
 ### 1.2 节点生命周期
@@ -46,14 +47,14 @@
 ```
 用户输入 → pi 引擎 (LLM 推理 + 工具调用循环) → assistant 回复
    → turn_end 事件 (不阻塞对话, Bug 52: 全异步)
-   → celldCheckpoint:
+   → celldCheckpoint + queueSessionJsonl:
        ① worker 缓存: HTTP checkpoint 到任一 celld 节点
           (fire-and-forget, 2s 超时, 失败仅警告 — 缓存可重建)
-       ② BOS 直写: 入异步队列 queueBosWrite (串行执行, 限长 50 —
-          BOS_QUEUE_MAX, Bug E 防内存泄漏, 超出丢最旧任务)
-          → bosGet 读当前对象 + ETag → 合并轮次 → If-Match CAS 写
+       ② BOS 权威: 读本地 Pi JSONL, 入异步队列 queueJsonlWrite (串行,
+          同会话未执行任务合并为最新快照; 限长 50, 超出丢最旧)
+          → bosGet 读当前 JSONL + ETag → 整份 PUT If-Match CAS
           → 冲突(412)重读重试 ×3 → GET/PUT 瞬时失败返回 retry,任务留队首指数退避
-          → 权限类失败(403/401)不重试;JSON 损坏拒绝覆盖
+          → 权限类失败(403/401)不重试;JSONL 损坏拒绝覆盖
    → 退出前: await flushBosQueue(10s) (Bug 17: flush 队列; 退避中的任务可能被 10s 上限截断)
 ```
 
@@ -61,15 +62,16 @@
 
 ```
 celagent <id> → loadSessionHistory(id) (src/persist.js)
-   → BOS 读成功: 用权威 turns
-   → BOS not-found / 无 bucket: 才回退 worker resume (缓存 POST JSON, msg 上限 8000; 旧 GET 兼容)
+   → BOS JSONL 读成功: 写入本地 <id>.jsonl, SessionManager.open (真 Pi 会话)
+   → JSONL miss: 读旧 sessions/<id>.json; 有 turns 则 steer 注入最近 50 轮(兼容)
+   → JSONL/JSON not-found / 无 bucket: 才回退 worker resume (缓存 POST JSON, msg 上限 8000)
    → BOS 超时/5xx/403: **不回退 worker**, 警告后空历史启动 (避免截断缓存当完整历史)
-   → JSON 损坏: 不回退、不覆盖
-   → 取最近 50 轮 (MAX_INJECT_TURNS, Bug 78: 防超长会话撑爆模型上下文)
-   → result.session.steer(...) 注入 content 文本块 (缺省回退 t.msg) + 真实 t.role
+   → JSONL/JSON 损坏: 不回退、不覆盖; JSONL 打开失败 fail-closed
+   → JSONL 路径禁止 steer (避免作文覆盖真消息树)
+   → persistId = JSONL 文件名 stem, 与 celagent <id> / BOS key 同一条会话
    → seq 续写起点 = max(turn) (非 turns.length, 防 gap 覆盖)
-   → 运行中 message_end(user) + turn_end(assistant) 双角色落盘
-优先级: BOS 权威源 > worker 缓存 (仅 miss 才回退; 读失败 ≠ miss)
+   → 运行中 message_end(user) + turn_end(assistant) 双角色镜像 worker, 并 queueJsonlWrite
+优先级: BOS JSONL > 旧 turns JSON > worker 缓存 (仅 miss 才回退; 读失败 ≠ miss)
 ```
 
 ## 2. 核心机制原理
@@ -87,7 +89,7 @@ celagent <id> → loadSessionHistory(id) (src/persist.js)
 |---|---|---|
 | If-Match 乐观锁 | 并发覆盖(多进程写同一会话) | bosGet 读 ETag → bosPut if-match → 412 冲突重读重试 |
 | If-None-Match 首写 | 并发冷启动同 ID 互相覆盖丢首轮 | 仅对象不存在时写(Bug 76) |
-| 单写者队列 | 进程内写序 | queueBosWrite 串行执行(BOS_QUEUE_MAX 防堆积) |
+| 单写者队列 | 进程内写序 | queueJsonlWrite 串行;同会话 JSONL 合并为最新快照 |
 | 轮次幂等 | 续写重复 | 读 BOS 历史定 seq;同轮存在则替换(Bug 97 修复后首轮也含内容) |
 
 ### 2.3 双写一致性(worker 缓存 vs BOS)
@@ -134,7 +136,7 @@ celagent <id> → loadSessionHistory(id) (src/persist.js)
 3. **新记忆工具**:在 `src/bos-tools.js` 加函数,注册进 customTools 数组
 4. **任务类型**:worker 的 `action=submit` switch 加分支(状态机已内建)
 5. **集群拓扑**:`cluster_mgr.sh` + nodes/ 注册表(节点自动发现,无需手动 peer)
-6. **恢复策略**:turn_end 钩子的注入逻辑(当前:最近 N 轮 + steer 摘要)
+6. **恢复策略**:JSONL → SessionManager.open;旧 turns JSON 才 steer 最近 N 轮
 
 ## 4. 关键设计决策(ADR)
 
@@ -150,6 +152,7 @@ celagent <id> → loadSessionHistory(id) (src/persist.js)
 | 8 | **异步队列写 BOS** | 不阻塞对话 | 退出需 flush | 同步写(卡 TUI) |
 | 9 | **凭证动态获取** | 仓库零凭证,安全红线 | 用户需预配凭证 | 配置文件存凭证(泄漏面) |
 | 10 | **CAS 条件写** | 并发安全 | 冲突重试开销 | 无条件覆盖(丢数据) |
+| 11 | **权威对象是 Pi JSONL** | 跨机打开真会话(工具/树/compaction),不是 50 轮作文 | 对象随 Pi 文件增长 | 轮次 JSON + steer(丢结构,v0.3.x) |
 
 ## 5. 已知边界与技术债(架构视角)
 
@@ -160,8 +163,8 @@ celagent <id> → loadSessionHistory(id) (src/persist.js)
 - **celld v0.2 双监听**:Worker `127.0.0.1:18090/18091`;内部 `18092/18093`(port+2)。TUI 只打 Worker/health。详见 `docs/celld-v02-evaluation.md`
 - **单写者进程内保证**:跨进程并发写靠 CAS(实测 412 拒绝,无重复无丢失);拉起节点另有 `ensure.lock`
 - **CI Release job**:`.github/workflows/release.yml` 在 tag / workflow_dispatch 时匿名路径构建并上传
-- **Release 资产**:v0.3.7 含 celagent 五平台、celld linux/darwin-arm64、SHA256SUMS;上游 celld 无 darwin-x64/Windows
-- **存储后端**:运维脚本从 settings 读 endpoint/region/profile;`resolveEndpoint` 对非白名单 URL **fail-closed**。`celagent doctor` / `cas-probe` 验证 If-Match 真的执行。会话路径带 `persistence.region`(v0.3.5);CAS 探针 transient 与结论性失败分开、判决按 store 键控(v0.3.6);persist 主路径 GET/PUT 瞬时失败同样留队重试,恢复时非 miss 不回退 worker(v0.3.7)。真桶实测与「已支持 R2」见 v0.3.8 / `docs/s3-compat-evaluation.md`
+- **Release 资产**:v0.4.0 含 celagent 五平台、celld linux/darwin-arm64、SHA256SUMS;上游 celld 无 darwin-x64/Windows
+- **存储后端**:运维脚本从 settings 读 endpoint/region/profile;`resolveEndpoint` 对非白名单 URL **fail-closed**。`celagent doctor` / `cas-probe` 验证 If-Match 真的执行。会话路径带 `persistence.region`(v0.3.5);CAS 探针 transient 与结论性失败分开、判决按 store 键控(v0.3.6);persist 主路径 GET/PUT 瞬时失败同样留队重试,恢复时非 miss 不回退 worker(v0.3.7);权威对象改为 Pi JSONL,`celagent <id>` 走 `SessionManager.open`(v0.4.0)。真桶实测与「已支持 R2」见 v0.3.8 / `docs/s3-compat-evaluation.md`
 
 ## 6. 与分布式部署的关系
 

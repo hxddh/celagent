@@ -4,7 +4,7 @@
 //       → createAgentSessionRuntime → InteractiveMode (完整 TUI)
 //       + turn_end 钩子 → Celld 镜像
 import { homedir } from "node:os";
-import { join, basename } from "node:path";
+import { join, dirname } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
 import { awsEnv, resolveEndpoint, isAllowedEndpoint, awsJson } from "../src/bos.js";
-import { storeFromCfg, queueBosWrite, flushBosQueue, loadSessionHistory } from "../src/persist.js";
+import { storeFromCfg, queueJsonlWrite, flushBosQueue, loadSessionHistory, STEER_LEGACY_HEADER, persistIdFromJsonlPath } from "../src/persist.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
@@ -285,9 +285,7 @@ async function celldCheckpoint(sessionId, seq, role, content, opts = {}) {
     if (!workerOk) warnOnce("worker", "  (警告: Celld worker 写入失败, 仅 BOS 持久化)");
   })();
 
-  // 2. BOS 直写 (异步队列, 完整 msg + 完整记忆 — 方案 A)
-  queueBosWrite(sessionId, seq, role, msg, { fullContent, fullToolResults });
-
+  // 2. BOS 权威写改走 JSONL 队列 (见 queueSessionJsonl); 本函数只镜像 worker 缓存
   return { worker: "async", bos: "queued" };
 }
 
@@ -330,8 +328,36 @@ async function loadHistoryFromBos(sessionId) {
   return hist.turns;
 }
 
+function bindSessionFile(sm, dest) {
+  if (!sm?.getSessionFile || !sm?.setSessionFile) return dest;
+  const { mkdirSync, renameSync, copyFileSync, existsSync, unlinkSync } = require("node:fs");
+  mkdirSync(dirname(dest), { recursive: true });
+  const cur = sm.getSessionFile();
+  if (!cur || cur === dest) return dest;
+  try {
+    if (existsSync(cur)) {
+      try { renameSync(cur, dest); }
+      catch (e) {
+        copyFileSync(cur, dest);
+        try { unlinkSync(cur); } catch (e2) { /* 源文件可留 */ }
+      }
+    }
+    sm.setSessionFile(dest);
+  } catch (e) { /* 绑定失败不阻塞; 仍用 Pi 原路径, persistId 仍指向 dest stem */ }
+  return dest;
+}
+
+function queueSessionJsonl(persistId, sm) {
+  try {
+    const f = sm?.getSessionFile?.();
+    if (!f || !existsSync(f)) return;
+    const body = readFileSync(f, "utf8");
+    queueJsonlWrite(persistId, body);
+  } catch (e) { /* 读本地 JSONL 失败不阻塞对话 */ }
+}
+
 async function listSessions() {
-  // 从 BOS 列出所有会话 (sessions/<id>.json), 显示 id/轮数/更新时间
+  // 从 BOS 列出会话 (sessions/<id>.jsonl 优先, 旧 .json 兼容)
   // 降级链 (Bug 65): settings.json 丢失时自动发现账号下所有含会话的 bucket,
   // 保证“本地数据全丢, 只要凭证还在”仍能找回会话
   try {
@@ -387,18 +413,27 @@ async function listSessions() {
     }
     const list = listed.data;
     const sessions = (Array.isArray(list) ? list : [])
-      .filter(i => i.k?.endsWith(".json") && !i.k.includes("/verify/"))
-      .filter(i => {
-        const id = i.k.replace("sessions/", "").replace(/\.json$/, "");
-        return !/^(bugtest-|stress-|takeover-)/.test(id);
+      .filter(i => (i.k?.endsWith(".jsonl") || i.k?.endsWith(".json")) && !i.k.includes("/verify/"))
+      .map(i => {
+        const name = i.k.replace("sessions/", "");
+        const jsonl = name.endsWith(".jsonl");
+        const id = name.replace(/\.jsonl$/, "").replace(/\.json$/, "");
+        return { id, size: i.s || 0, modified: (i.l || "").slice(0, 16), jsonl };
       })
-      .map(i => ({ id: i.k.replace("sessions/", "").replace(/\.json$/, ""), size: i.s || 0, modified: (i.l || "").slice(0, 16) }))
-      .sort((a, b) => b.modified.localeCompare(a.modified));
-    if (sessions.length === 0) { console.log("(BOS 暂无会话)"); return; }
-    console.log(`celagent — BOS 会话列表 (${sessions.length} 个, bucket=${bucket})\n`);
+      .filter(i => !/^(bugtest-|stress-|takeover-)/.test(i.id));
+    const byId = new Map();
+    for (const s of sessions) {
+      const prev = byId.get(s.id);
+      if (!prev || (s.jsonl && !prev.jsonl) || (s.jsonl === prev.jsonl && s.modified > prev.modified)) {
+        byId.set(s.id, s);
+      }
+    }
+    const unique = [...byId.values()].sort((a, b) => b.modified.localeCompare(a.modified));
+    if (unique.length === 0) { console.log("(BOS 暂无会话)"); return; }
+    console.log(`celagent — BOS 会话列表 (${unique.length} 个, bucket=${bucket})\n`);
     console.log("  ID (用于 celagent <id> 续写)                                           大小    更新");
     console.log("  " + "-".repeat(95));
-    for (const s of sessions) {
+    for (const s of unique) {
       const id = s.id.length > 52 ? s.id.slice(0, 49) + "..." : s.id;
       console.log(`  ${id.padEnd(52)} ${String(s.size).padStart(8)}B  ${s.modified}`);
     }
@@ -409,7 +444,7 @@ async function listSessions() {
 }
 
 // ---- 版本/帮助 ----
-const CELAGENT_VERSION = "0.3.7";
+const CELAGENT_VERSION = "0.4.0";
 function printVersion() {
   console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS 对象存储持久化`);
 }
@@ -418,9 +453,9 @@ function printHelp() {
   console.log(`
 用法:
   celagent                     启动 TUI (自动生成唯一会话 ID)
-  celagent <id>                续写指定会话 (从 BOS 恢复历史)
+  celagent <id>                续写指定会话 (打开 BOS 上的 Pi JSONL; 旧 .json 走文本注入)
   celagent list [--bucket B] [--scan]  列出 BOS 会话 (--scan 才枚举账号下全部 bucket)
-  celagent export <id> [--bucket B]  导出会话到 JSON (stdout)
+  celagent export <id> [--bucket B]  导出会话 (优先 JSONL, 旧对象为 JSON)
   celagent rm <id> [--bucket B] [--yes]  删除 BOS 里的会话 (非 TTY 必须 --yes)
   celagent config get <key>   读取配置 (如 persistence.bucket)
   celagent config set <key> <value>  写入配置 (如 model deepseek-v4-flash)
@@ -435,7 +470,7 @@ function printHelp() {
 示例:
   celagent list
   celagent sess-demo-xxxxxxxx
-  celagent export sess-demo-xxxxxxxx > backup.json
+  celagent export sess-demo-xxxxxxxx > backup.jsonl
 `);
 }
 
@@ -719,6 +754,15 @@ async function exportCommand(id) {
   const { bucket, endpoint, profile, region } = await getBucketArg();
   if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
   const { bosGet } = await import("../src/bos.js");
+  const jsonl = await bosGet(`sessions/${id}.jsonl`, { bucket, endpoint, profile, region });
+  if (jsonl.ok) {
+    process.stdout.write(jsonl.body.endsWith("\n") ? jsonl.body : jsonl.body + "\n");
+    return;
+  }
+  if (jsonl.error && jsonl.error !== "not-found") {
+    console.error(`✗ 会话读取失败: ${jsonl.error}`);
+    process.exit(1);
+  }
   const r = await bosGet(`sessions/${id}.json`, { bucket, endpoint, profile, region });
   if (!r.ok) { console.error(`✗ 会话不存在或读取失败: ${r.error}`); process.exit(1); }
   const session = JSON.parse(r.body);
@@ -743,9 +787,20 @@ async function rmCommand(id) {
   }
   if (!confirm) { console.log("已取消"); return; }
   const { bosDelete } = await import("../src/bos.js");
-  const r = await bosDelete(`sessions/${id}.json`, { bucket, endpoint, profile, region });
-  if (!r.ok) {
-    console.error(`✗ 删除失败: ${r.error}`);
+  const jsonl = await bosDelete(`sessions/${id}.jsonl`, { bucket, endpoint, profile, region });
+  const json = await bosDelete(`sessions/${id}.json`, { bucket, endpoint, profile, region });
+  const jsonlMiss = !jsonl.ok && (jsonl.error === "not-found" || /\bNoSuchKey\b|\b404\b/i.test(String(jsonl.error || "")));
+  const jsonMiss = !json.ok && (json.error === "not-found" || /\bNoSuchKey\b|\b404\b/i.test(String(json.error || "")));
+  if (!jsonl.ok && !jsonlMiss) {
+    console.error(`✗ 删除失败: ${jsonl.error}`);
+    process.exit(1);
+  }
+  if (!json.ok && !jsonMiss && jsonlMiss) {
+    console.error(`✗ 删除失败: ${json.error}`);
+    process.exit(1);
+  }
+  if (jsonlMiss && jsonMiss) {
+    console.error("✗ 会话不存在");
     process.exit(1);
   }
   console.log(`✓ 已删除会话 ${id}`);
@@ -798,7 +853,7 @@ async function main() {
   ensureWorkerToken();
   await ensureCelld();
 
-  // 0.5 从 BOS 恢复历史 (权威源, 重启不丢) — 只读一次, 传给会话注入用
+  // 0.5 从 BOS 恢复 (权威源) — JSONL 优先, 旧 turns 仅兼容
   const hist = await loadSessionHistory(sessionId, {
     loadStore: () => storeFromCfg(loadConfig()),
     fallbackResume: workerResumeTurns,
@@ -809,9 +864,12 @@ async function main() {
     console.warn(`  (警告: BOS 读取失败, 未回退 worker 缓存: ${hist.error})`);
   }
   const savedHistory = hist.turns;
-  if (savedHistory && savedHistory.length > 0) {
+  const openedFromJsonl = hist.kind === "jsonl" && typeof hist.jsonl === "string";
+  if (openedFromJsonl) {
+    console.log("  (已打开 BOS 会话)");
+  } else if (savedHistory && savedHistory.length > 0) {
     const src = hist.source === "worker" ? "worker 缓存(BOS miss)" : "BOS";
-    console.log(`  (已从 ${src} 恢复 ${savedHistory.length} 轮历史)`);
+    console.log(`  (旧格式, 文本注入; 已从 ${src} 恢复 ${savedHistory.length} 轮历史)`);
   }
 
   // P0: 冷启动对齐 — 把 BOS 权威状态同步到 worker 缓存 (sync),
@@ -852,7 +910,22 @@ async function main() {
   try {
     // Bug 修复: SessionManager 用独立会话目录, 绝不碰 ~/.pi/agent/sessions (本机 Pi 数据)
     const sessionDir = join(AGENT_DIR, "sessions", encodeURIComponent(cwd.replace(/\//g, "-")));
-    const sessionManager = pi.SessionManager.create(cwd, sessionDir);
+    const localJsonl = join(sessionDir, `${sessionId}.jsonl`);
+    const { mkdirSync, writeFileSync } = require("node:fs");
+    mkdirSync(sessionDir, { recursive: true });
+    let sessionManager;
+    if (openedFromJsonl) {
+      writeFileSync(localJsonl, hist.jsonl, { encoding: "utf8", mode: 0o600 });
+      try {
+        sessionManager = pi.SessionManager.open(localJsonl, sessionDir, cwd);
+      } catch (e) {
+        console.error(`会话 JSONL 无法被 Pi 打开: ${e.message}`);
+        process.exit(1);
+      }
+    } else {
+      sessionManager = pi.SessionManager.create(cwd, sessionDir);
+      bindSessionFile(sessionManager, localJsonl);
+    }
     const createRuntime = async (opts = {}) => {
       // Bug: 接受 pi 传入的 sessionManager/sessionStartEvent (newSession/resume 会传)
       // 并返回完整契约: {session, services, diagnostics, ...} 防止 /new 崩溃退出
@@ -867,11 +940,9 @@ async function main() {
         // P1: agent 可主动检索历史记忆 / 打显式快照
         customTools: [history_search, session_snapshot],
       });
-      // 恢复历史注入: 仅首次启动(startup)注入 argv 会话的历史
-      // 注: /resume /new /fork 不注入 — resume 可能是别的会话(无法匹配),
-      //     new/fork 是新上下文 (Bug 修复)
+      // 旧 turns JSON 才 steer; JSONL 已由 SessionManager.open 载入, 禁止作文注入
       const startReason = effStartEvent?.reason;
-      if (startReason === "startup" && savedHistory && savedHistory.length > 0) {
+      if (startReason === "startup" && !openedFromJsonl && savedHistory && savedHistory.length > 0) {
         try {
           // Bug 78: 注入历史有长度上限 — 超长会话 (几百轮) 全量拼进一条 steer
           // 会直接撑爆模型上下文窗口。只注入最近 MAX_INJECT_TURNS 轮 + 提示省略。
@@ -888,7 +959,7 @@ async function main() {
             .map(t => `[第${t.turn}轮(${t.role || "assistant"})] ${turnInjectText(t)}`)
             .join("\n");
           result.session.steer(
-            `以下是本会话之前的对话历史(请以此作为继续对话的上下文, 不要重复回答这些内容):\n${historySummary}` +
+            `${STEER_LEGACY_HEADER}(请以此作为继续对话的上下文, 不要重复回答这些内容):\n${historySummary}` +
             (omitted > 0 ? `\n\n(注: 较早的 ${omitted} 轮历史已省略, 完整历史在 BOS 中)` : "")
           );
         } catch (e) { /* 注入失败不阻塞 */ }
@@ -900,20 +971,23 @@ async function main() {
       if (startReason === "new" || startReason === "fork") {
         persistId = `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         persistHistory = [];
+        bindSessionFile(effSessionManager, join(sessionDir, `${persistId}.jsonl`));
         console.log(`  ↳ ${startReason === "fork" ? "fork" : "新"}会话持久化 ID: ${persistId} (下次: celagent ${persistId})`);
       } else if (startReason === "resume" && effSessionManager?.getSessionFile) {
-        // Bug 64: /resume 切到别的本地会话后, persistId 必须跟着切换 —
-        // 否则被恢复会话的续写会串写到 argv sessionId 的 key 下 (数据串写污染)
+        // persistId = JSONL 文件名 stem, 与 celagent <id> / BOS key 同一条会话
         const resumedFile = effSessionManager.getSessionFile();
         if (resumedFile) {
-          persistId = `sess-${basename(resumedFile).replace(/\.jsonl$/, "")}`;
-          // 从 BOS 读该会话的镜像历史 (若有) — 决定 seq 续写起点, 避免二次 resume 覆盖旧轮
+          persistId = persistIdFromJsonlPath(resumedFile);
+          const dest = join(sessionDir, `${persistId}.jsonl`);
+          bindSessionFile(effSessionManager, dest);
           try {
             const resumedHistory = await loadHistoryFromBos(persistId);
             persistHistory = (resumedHistory && resumedHistory.length) ? resumedHistory : [];
           } catch (e) { persistHistory = []; }
           console.log(`  ↳ 已恢复本地会话, 持久化 ID: ${persistId} (续写 ${persistHistory.length} 轮)`);
         }
+      } else if (startReason === "startup") {
+        bindSessionFile(effSessionManager, localJsonl);
       }
       globalThis.__celagentPersistId = persistId;
       const maxTurn = (turns) => {
@@ -940,20 +1014,18 @@ async function main() {
           const text = extractText(event.message?.content);
           const fullContent = Array.isArray(event.message?.content) ? event.message.content : [];
           void celldCheckpoint(persistId, seq, "user", text || "(无文本)", { fullContent });
+          queueSessionJsonl(persistId, effSessionManager);
           snapshotTurns.push({ turn: seq, role: "user", msg: text || "(无文本)", ts: Date.now() });
           return;
         }
         if (event?.type === "turn_end") {
           seq++;
           const text = extractText(event.message?.content);
-          // 完整记忆 (方案 A): 完整 message 内容块 (text/thinking/toolCall 全量)
-          // + 完整 toolResults (含文本结果), 存 BOS 权威源
           const fullContent = Array.isArray(event.message?.content) ? event.message.content : [];
           const fullToolResults = (event.toolResults || []).map(tr => ({
             toolName: tr.toolName,
             content: Array.isArray(tr.content) ? tr.content : null,
           }));
-          // 摘要 msg (兼容: worker 缓存 URL 截断 + 恢复注入用, 不占大体积)
           const toolCalls = fullContent.filter(b => b.type === "toolCall").map(b => `${b.name}(${JSON.stringify(b.arguments)})`);
           const toolResults = fullToolResults.map(tr => {
             const resultText = Array.isArray(tr.content)
@@ -964,12 +1036,12 @@ async function main() {
           let msg = text || "(无文本)";
           if (toolCalls.length > 0) msg += ` [工具调用: ${toolCalls.join(", ").slice(0, 100)}]`;
           if (toolResults.length > 0) msg += ` [工具结果: ${toolResults.join(" | ").slice(0, 300)}]`;
-          // Bug 52: 不 await — checkpoint 全异步 (worker fire-and-forget + BOS 队列), 绝不阻塞对话
           void celldCheckpoint(persistId, seq, "assistant", msg, { fullContent, fullToolResults });
-          // P1: 同步快照缓存 (仅摘要, 全量在 BOS)
+          queueSessionJsonl(persistId, effSessionManager);
           snapshotTurns.push({ turn: seq, role: "assistant", msg, ts: Date.now() });
         }
       });
+      queueSessionJsonl(persistId, effSessionManager);
       return { ...result, services, diagnostics: [] };  // 完整契约 (Bug: /new 需 services+diagnostics)
     };
     runtime = await pi.createAgentSessionRuntime(createRuntime, {
