@@ -172,8 +172,8 @@ export const history_search = {
         const got = await bosGet(key, storeOpts);
         if (!got.ok) {
           const miss = got.error === "not-found" || /\bNoSuchKey\b|\b404\b/i.test(String(got.error || ""));
-          if (sessionFilter && !miss) sessionReadError = got.error;
-          if (jsonlKey && !miss) haveJsonl.add(sid);
+          // 读失败 ≠ 已覆盖: 不标 haveJsonl (否则旧 .json 回退被跳过), 且跨会话搜索也要上报部分失败
+          if (!miss) sessionReadError = sessionReadError || got.error;
           continue;
         }
         const parsed = turnsFromSessionObject(key, got.body);
@@ -198,13 +198,13 @@ export const history_search = {
       }
 
       const scanned = sessionKeys.length + snapKeys.length;
-      const readWarn = (sessionFilter && sessionReadError)
-        ? `\n\n(警告: 读取会话对象失败: ${sessionReadError}; 结果可能缺少 sessions/ 命中)` : "";
+      const readWarn = sessionReadError
+        ? `\n\n(警告: 部分会话对象读取失败: ${sessionReadError}; 结果可能不完整)` : "";
       if (hits.length === 0) {
         if (sessionFilter && sessionReadError) {
           return { content: [{ type: "text", text: `读取会话失败: ${sessionReadError}; 已扫描 ${snapKeys.length} 个快照, 未找到与"${params.query}"相关的内容` }] };
         }
-        return { content: [{ type: "text", text: `在 ${scanned} 个历史对象(会话+快照)中未找到与"${params.query}"相关的内容` }] };
+        return { content: [{ type: "text", text: `在 ${scanned} 个历史对象(会话+快照)中未找到与"${params.query}"相关的内容${readWarn}` }] };
       }
       const lines = hits.map(h => {
         const kind = h.source === "snapshot" ? "快照" : "会话";

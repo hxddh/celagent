@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
 import { awsEnv, resolveEndpoint, isAllowedEndpoint, awsJson } from "../src/bos.js";
-import { storeFromCfg, queueJsonlWrite, flushBosQueue, loadSessionHistory, STEER_LEGACY_HEADER, persistIdFromJsonlPath } from "../src/persist.js";
+import { storeFromCfg, queueJsonlWrite, queueBosWrite, flushBosQueue, loadSessionHistory, STEER_LEGACY_HEADER, persistIdFromJsonlPath } from "../src/persist.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
@@ -311,12 +311,16 @@ async function workerResumeTurns(sessionId) {
   return null;
 }
 
-async function loadHistoryFromBos(sessionId) {
+async function loadHistoryInfoFromBos(sessionId) {
   // BOS-first: 仅 miss 才回退 worker; 瞬时/权限失败不回退, 避免 8000 字截断当完整历史
-  const hist = await loadSessionHistory(sessionId, {
+  return loadSessionHistory(sessionId, {
     loadStore: () => storeFromCfg(loadConfig()),
     fallbackResume: workerResumeTurns,
   });
+}
+
+async function loadHistoryFromBos(sessionId) {
+  const hist = await loadHistoryInfoFromBos(sessionId);
   if (hist.corrupt) {
     console.warn(`  (警告: 会话 ${sessionId} 的 BOS 历史数据损坏, 跳过恢复)`);
     return null;
@@ -795,8 +799,9 @@ async function rmCommand(id) {
     console.error(`✗ 删除失败: ${jsonl.error}`);
     process.exit(1);
   }
-  if (!json.ok && !jsonMiss && jsonlMiss) {
-    console.error(`✗ 删除失败: ${json.error}`);
+  // 旧格式对象删除失败也必须报错 — 残留的 .json 会在下次打开时把"已删除"的会话复活
+  if (!json.ok && !jsonMiss) {
+    console.error(`✗ 删除失败 (旧格式对象 sessions/${id}.json 仍残留, 会话可能被恢复): ${json.error}`);
     process.exit(1);
   }
   if (jsonlMiss && jsonMiss) {
@@ -861,15 +866,25 @@ async function main() {
   if (hist.corrupt) {
     console.warn(`  (警告: 会话 ${sessionId} 的 BOS 历史数据损坏, 跳过恢复)`);
   } else if (hist.transient || hist.fatal) {
+    // P0: 显式指定会话 ID 时, 远端状态未知就继续会以全新会话绑定同一 id,
+    // 后续整体写有覆盖已有历史的风险 — 拒绝启动, 不赌
+    if (process.argv[2]) {
+      console.error(`✗ BOS 读取失败 (${hist.error}), 无法确认会话 ${sessionId} 的远端状态。`);
+      console.error("  为避免覆盖已有历史, 拒绝继续。请稍后重试; 或不带会话 ID 启动全新会话。");
+      process.exit(1);
+    }
     console.warn(`  (警告: BOS 读取失败, 未回退 worker 缓存: ${hist.error})`);
   }
   const savedHistory = hist.turns;
   const openedFromJsonl = hist.kind === "jsonl" && typeof hist.jsonl === "string";
+  // 旧格式 (turns JSON / worker 缓存) 的会话继续走按轮 CAS 合并写 (.json),
+  // 不隐式迁移到 JSONL — 隐式迁移会用 50 轮 steer 摘要遮蔽全量历史 (P0)
+  const startupLegacy = !openedFromJsonl && Array.isArray(savedHistory) && savedHistory.length > 0;
   if (openedFromJsonl) {
     console.log("  (已打开 BOS 会话)");
-  } else if (savedHistory && savedHistory.length > 0) {
+  } else if (startupLegacy) {
     const src = hist.source === "worker" ? "worker 缓存(BOS miss)" : "BOS";
-    console.log(`  (旧格式, 文本注入; 已从 ${src} 恢复 ${savedHistory.length} 轮历史)`);
+    console.log(`  (旧格式, 文本注入; 已从 ${src} 恢复 ${savedHistory.length} 轮历史, 继续按轮持久化)`);
   }
 
   // P0: 冷启动对齐 — 把 BOS 权威状态同步到 worker 缓存 (sync),
@@ -966,11 +981,14 @@ async function main() {
       }
       // 挂 Celld 镜像钩子
       // 持久化 id: startup 用 argv sessionId (续写原会话); /new 生成独立 key (Bug 47 修复)
+      // persistMode: "jsonl" 整文件权威写 | "legacy" 旧格式按轮合并写 (.json) | "blocked" 远端状态未知, 拒绝权威写
       let persistId = sessionId;
       let persistHistory = savedHistory;
+      let persistMode = startupLegacy ? "legacy" : "jsonl";
       if (startReason === "new" || startReason === "fork") {
         persistId = `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         persistHistory = [];
+        persistMode = "jsonl";
         bindSessionFile(effSessionManager, join(sessionDir, `${persistId}.jsonl`));
         console.log(`  ↳ ${startReason === "fork" ? "fork" : "新"}会话持久化 ID: ${persistId} (下次: celagent ${persistId})`);
       } else if (startReason === "resume" && effSessionManager?.getSessionFile) {
@@ -980,10 +998,16 @@ async function main() {
           persistId = persistIdFromJsonlPath(resumedFile);
           const dest = join(sessionDir, `${persistId}.jsonl`);
           bindSessionFile(effSessionManager, dest);
-          try {
-            const resumedHistory = await loadHistoryFromBos(persistId);
-            persistHistory = (resumedHistory && resumedHistory.length) ? resumedHistory : [];
-          } catch (e) { persistHistory = []; }
+          let rh = null;
+          try { rh = await loadHistoryInfoFromBos(persistId); } catch (e) { rh = { turns: null, transient: true, error: e.message }; }
+          persistHistory = (rh?.turns && rh.turns.length) ? rh.turns : [];
+          if (rh?.transient || rh?.fatal) {
+            // 远端状态未知 — 权威写有覆盖风险, 本次会话只留本地/worker 镜像
+            persistMode = "blocked";
+            console.warn(`  (警告: BOS 读取失败, 无法确认会话 ${persistId} 远端状态, 本次不做权威写入: ${rh.error})`);
+          } else {
+            persistMode = (rh?.kind === "turns" && persistHistory.length > 0) ? "legacy" : "jsonl";
+          }
           console.log(`  ↳ 已恢复本地会话, 持久化 ID: ${persistId} (续写 ${persistHistory.length} 轮)`);
         }
       } else if (startReason === "startup") {
@@ -1008,13 +1032,24 @@ async function main() {
           .concat(snapshotTurns.filter(t => !have.has(Number(t.turn))))
           .sort((a, b) => Number(a.turn) - Number(b.turn));
       };
+      // 权威写路由: jsonl=整文件 (带谱系覆盖保护); legacy=按轮 CAS 合并进 .json;
+      // blocked=远端状态未知, 只镜像 worker, 警告一次
+      const queueAuthoritative = (seqNo, role, msg, fullContent, fullToolResults) => {
+        if (persistMode === "legacy") {
+          queueBosWrite(persistId, seqNo, role, msg, { fullContent, fullToolResults });
+        } else if (persistMode === "jsonl") {
+          queueSessionJsonl(persistId, effSessionManager);
+        } else {
+          warnOnce("persist", `  (警告: 会话 ${persistId} 远端状态未知, 本次不做权威写入 — 重启后重试)`);
+        }
+      };
       result.session.subscribe(async (event) => {
         if (event?.type === "message_end" && event.message?.role === "user") {
           seq++;
           const text = extractText(event.message?.content);
           const fullContent = Array.isArray(event.message?.content) ? event.message.content : [];
           void celldCheckpoint(persistId, seq, "user", text || "(无文本)", { fullContent });
-          queueSessionJsonl(persistId, effSessionManager);
+          queueAuthoritative(seq, "user", text || "(无文本)", fullContent, null);
           snapshotTurns.push({ turn: seq, role: "user", msg: text || "(无文本)", ts: Date.now() });
           return;
         }
@@ -1037,11 +1072,12 @@ async function main() {
           if (toolCalls.length > 0) msg += ` [工具调用: ${toolCalls.join(", ").slice(0, 100)}]`;
           if (toolResults.length > 0) msg += ` [工具结果: ${toolResults.join(" | ").slice(0, 300)}]`;
           void celldCheckpoint(persistId, seq, "assistant", msg, { fullContent, fullToolResults });
-          queueSessionJsonl(persistId, effSessionManager);
+          queueAuthoritative(seq, "assistant", msg, fullContent, fullToolResults);
           snapshotTurns.push({ turn: seq, role: "assistant", msg, ts: Date.now() });
         }
       });
-      queueSessionJsonl(persistId, effSessionManager);
+      // 初始对齐写仅 jsonl 模式 — legacy 会话绝不落 .jsonl (否则 50 轮摘要遮蔽全量 .json 历史)
+      if (persistMode === "jsonl") queueSessionJsonl(persistId, effSessionManager);
       return { ...result, services, diagnostics: [] };  // 完整契约 (Bug: /new 需 services+diagnostics)
     };
     runtime = await pi.createAgentSessionRuntime(createRuntime, {
