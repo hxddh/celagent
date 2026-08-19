@@ -3,7 +3,7 @@
 > 版本号 **`0.3.7`**。对 v0.3.6 深度审查后仍超前于实现的 RPO 主路径缺口。
 > **本文件是实现合同**。默认仍是 BOS。**不宣称**已支持 R2/S3。
 > 原定 v0.3.7 的非 BOS 真桶实测**顺延为 v0.3.8**。不移动 v0.3.0–v0.3.6。
-> 发版前 HANDOFF Latest 仍是 v0.3.6。
+> 已发布:[v0.3.7](https://github.com/hxddh/celagent/releases/tag/v0.3.7)。
 
 ## 用户能感知什么
 
@@ -45,4 +45,5 @@
 
 ## 发版
 
-实现合进 `main` 后打 tag **`v0.3.7`**(不移动旧 tag)。随包 celld 仍为 v0.2.0。
+实现合进 `main`(PR #17,`fa872c9`)后打 tag **`v0.3.7`**(不移动旧 tag)。随包 celld 仍为 v0.2.0。
+冒烟:`./scripts/release-smoke.sh v0.3.7` → `celagent v0.3.7` + SHA256 通过。

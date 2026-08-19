@@ -45,7 +45,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/v034-scope.md` | v0.3.4 实现合同(已发布: CAS doctor + 删 SigV4 死代码) |
 | `docs/v035-scope.md` | v0.3.5 实现合同(已发布: region 贯穿、CAS 粘滞、rm/list 错误、记忆工具) |
 | `docs/v036-scope.md` | v0.3.6 实现合同(已发布: 深度审查 9 项修复 — CAS transient/粘滞/键控、队列重试不丢轮、白名单对齐、记忆工具) |
-| `docs/v037-scope.md` | v0.3.7 实现合同(本刀: persist I/O retry、恢复非 miss 不回退 worker、保证句) |
+| `docs/v037-scope.md` | v0.3.7 实现合同(已发布: persist I/O retry、恢复非 miss 不回退 worker、保证句) |
 | `docs/v038-scope.md` | v0.3.8 实现合同(下一刀: 非 BOS 真桶实测,需凭证,无凭证不开 PR) |
 | `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取(endpoint fail-closed) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
@@ -112,11 +112,12 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:不在仓库内;发布随包 **v0.2.0**(linux-x64/arm64、darwin-arm64)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。评估见 `docs/celld-v02-evaluation.md`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(Latest v0.3.6; v0.3.7 本树未打 tag)
+## 3. 发布状态(Latest v0.3.7)
 
-仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.6](https://github.com/hxddh/celagent/releases/tag/v0.3.6)。
+仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.7](https://github.com/hxddh/celagent/releases/tag/v0.3.7)。
 
-- **tag `v0.3.6`** 指向 PR #16 合并进 main 的提交;Release 资产由此 SHA 构建
+- **tag `v0.3.7`** 指向 PR #17 合并进 main 的提交(`fa872c9`);Release 资产由此 SHA 构建
+- **v0.3.6**(`23cacbb`,PR #16)CAS 探针 retry 不丢轮,但 persist 主路径 GET/PUT 瞬时失败仍会静默丢轮;恢复超时会回退 8000 字 worker 缓存
 - **v0.3.5**(`0c674cf`,PR #14)CAS 只粘滞 cas-ignored:瞬时探针失败会消费队列任务丢轮,永久性失败每轮重探,判决不按 store 键控
 - **v0.3.4**(`eec47c4`)有 CAS 门禁,但会话路径不带 `persistence.region`,rm 失败仍报成功
 - **v0.3.3**(`1514b1b`)无 CAS 门禁
@@ -130,8 +131,8 @@ node bin/celagent-tui.mjs task ledger
 - ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo`;CI 含 Secret/PII 门禁;零密钥硬编码
   - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容;彻底抹掉需向 GitHub Support 申请 purge
 - ✅ 构建:`.github/workflows/release.yml` 匿名路径 bun 交叉编译 + 拉取 `denoland/celld` + `SHA256SUMS`
-- ✅ **v0.3.6 资产清单**(形态同 v0.3.5):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是 CAS transient 不丢轮/结论性粘滞/按 store 键控、cas-probe exit 2、白名单 IPv6+单标签、history_search 片段命中、snapshot 内存摘要化**
-- ✅ 安装校验:`scripts/release-smoke.sh v0.3.6` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.3.6`;不需要 BOS/celld)
+- ✅ **v0.3.7 资产清单**(形态同 v0.3.6):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是 persist 主路径 GET/PUT 瞬时失败留队重试、恢复非 miss 不回退 worker、保证句可辩护化**
+- ✅ 安装校验:`scripts/release-smoke.sh v0.3.7` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.3.7`;不需要 BOS/celld)
 
 ### 已知边界(不是本仓库能补的)
 - 上游 `denoland/celld` **没有** Intel Mac (`celld-darwin-x64`) 与 Windows 包;`install.sh` 回退 `celld.dev` / Windows 跳过 celld
@@ -144,10 +145,10 @@ node bin/celagent-tui.mjs task ledger
 0. ✅ docs/archive 已删除
 1. ✅ 仓库已推送
 2. ✅ CI 绿 (node 22/24)
-3. ✅ tag `v0.3.6` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
+3. ✅ tag `v0.3.7` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
 4. ✅ 跨平台 celagent 由 Release workflow 在 `/tmp/anon-build` 编译
 5. ✅ install.sh 正式模式从 GitHub Release 下载,有 `SHA256SUMS` 则校验
-6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.3.6` 或 `latest`(SHA256 + version/help)
+6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.3.7` 或 `latest`(SHA256 + version/help)
 
 ## 4. 版本与里程碑
 
@@ -162,8 +163,8 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.3 | 存储 P0:endpoint fail-closed、settings 单一来源、合格 host 白名单 | ✅ 历史 |
 | v0.3.4 | CAS doctor、setup/persist 拒绝无条件写存储、删 worker SigV4 死代码 | ✅ 历史 |
 | v0.3.5 | 会话路径带 region、CAS 只粘滞 cas-ignored、rm/list 报错、snapshot 全量 | ✅ 历史 |
-| v0.3.6 | 深度审查 9 项修复:CAS transient 不丢轮/结论性粘滞/按 store 键控、cas-probe exit 2、白名单 IPv6+单标签对齐、history_search 片段命中、snapshot 内存摘要化 | ✅ 已发布 |
-| v0.3.7 | persist 主路径与探针对齐:GET/PUT 瞬时失败留队重试;恢复非 miss 不回退 worker;抽出 `src/persist.js` + 内存 store 测试;保证句可辩护化 | 本树,未打 tag |
+| v0.3.6 | 深度审查 9 项修复:CAS transient 不丢轮/结论性粘滞/按 store 键控、cas-probe exit 2、白名单 IPv6+单标签对齐、history_search 片段命中、snapshot 内存摘要化 | ✅ 历史 |
+| v0.3.7 | persist 主路径与探针对齐:GET/PUT 瞬时失败留队重试;恢复非 miss 不回退 worker;抽出 `src/persist.js` + 内存 store 测试;保证句可辩护化 | ✅ 已发布 |
 
 下一刀:**v0.3.8** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要把 region 贯穿当成「已支持 R2」。不要插队做 provider 认证/快照 TUI/会话合并。
 
