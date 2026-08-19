@@ -8,6 +8,11 @@ import {
   createPersister,
   loadSessionHistory,
   BOS_QUEUE_MAX,
+  isJsonlBody,
+  turnsFromJsonl,
+  persistIdFromJsonlPath,
+  sessionJsonlKey,
+  sessionTurnsKey,
 } from "../src/persist.js";
 
 function memoryStore() {
@@ -265,4 +270,177 @@ test("makeTurnEntry 带 content/toolResults", () => {
   assert.equal(e.turn, 3);
   assert.equal(e.content[0].text, "t");
   assert.equal(e.toolResults[0].toolName, "bash");
+});
+
+function sampleJsonl(userText = "hello from jsonl", assistantText = "hi there") {
+  return [
+    JSON.stringify({ type: "session", version: 3, id: "uuid-test", timestamp: "2026-08-19T00:00:00.000Z", cwd: "/tmp" }),
+    JSON.stringify({
+      type: "message",
+      id: "a1b2c3d4",
+      parentId: null,
+      timestamp: "2026-08-19T00:00:01.000Z",
+      message: { role: "user", content: [{ type: "text", text: userText }], timestamp: 1720000000000 },
+    }),
+    JSON.stringify({
+      type: "message",
+      id: "b2c3d4e5",
+      parentId: "a1b2c3d4",
+      timestamp: "2026-08-19T00:00:02.000Z",
+      message: { role: "assistant", content: [{ type: "text", text: assistantText }], timestamp: 1720000001000 },
+    }),
+  ].join("\n") + "\n";
+}
+
+test("isJsonlBody: 仅首行 type=session 才算 Pi JSONL", () => {
+  assert.equal(isJsonlBody(sampleJsonl()), true);
+  assert.equal(isJsonlBody('{"id":"s","turns":[]}'), false);
+  assert.equal(isJsonlBody("{not json\n"), false);
+  assert.equal(isJsonlBody(""), false);
+});
+
+test("turnsFromJsonl: 抽出 user/assistant 文本, 跳过坏行", () => {
+  const body = sampleJsonl("ping", "pong") + "not-json\n";
+  const turns = turnsFromJsonl(body);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].role, "user");
+  assert.equal(turns[0].msg, "ping");
+  assert.equal(turns[1].role, "assistant");
+  assert.equal(turns[1].msg, "pong");
+});
+
+test("persistIdFromJsonlPath: stem 即 persistId", () => {
+  assert.equal(persistIdFromJsonlPath("/tmp/sess-abc.jsonl"), "sess-abc");
+  assert.equal(persistIdFromJsonlPath("foo.jsonl"), "foo");
+  assert.equal(sessionJsonlKey("sess-abc"), "sessions/sess-abc.jsonl");
+  assert.equal(sessionTurnsKey("sess-abc"), "sessions/sess-abc.json");
+});
+
+test("persistJsonlToBos: 首写成功", async () => {
+  const mem = memoryStore();
+  const p = persisterOf(mem);
+  const body = sampleJsonl();
+  const r = await p.persistJsonlToBos("sid", body);
+  assert.equal(r, undefined);
+  const got = await mem.get("sessions/sid.jsonl");
+  assert.equal(got.ok, true);
+  assert.equal(isJsonlBody(got.body), true);
+  assert.match(got.body, /hello from jsonl/);
+});
+
+test("persistJsonlToBos: 非法 body 不写", async () => {
+  const mem = memoryStore();
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", '{"turns":[]}');
+  assert.equal(r, undefined);
+  assert.equal(mem.objects.size, 0);
+});
+
+test("persistJsonlToBos: GET 超时返回 retry, 不写空对象", async () => {
+  const mem = memoryStore();
+  mem.failGet("TimeoutError waiting after 20000ms");
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", sampleJsonl());
+  assert.equal(r, "retry");
+  assert.equal(mem.objects.size, 0);
+});
+
+test("persistJsonlToBos: 损坏的已有 JSONL 不覆盖", async () => {
+  const mem = memoryStore();
+  mem.objects.set("sessions/sid.jsonl", { body: "{not a session", etag: `"e1"` });
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", sampleJsonl());
+  assert.equal(r, undefined);
+  assert.equal(mem.objects.get("sessions/sid.jsonl").body, "{not a session");
+});
+
+test("persistJsonlToBos: PUT 5xx 返回 retry", async () => {
+  const mem = memoryStore();
+  mem.failPut("Service Unavailable 503");
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", sampleJsonl());
+  assert.equal(r, "retry");
+  assert.equal(mem.objects.size, 0);
+});
+
+test("persistJsonlToBos: PUT AccessDenied 不重试", async () => {
+  const mem = memoryStore();
+  mem.failPut("AccessDenied");
+  const p = persisterOf(mem);
+  const r = await p.persistJsonlToBos("sid", sampleJsonl());
+  assert.equal(r, undefined);
+  assert.equal(mem.objects.size, 0);
+});
+
+test("loadSessionHistory: JSONL 优先于旧 turns JSON", async () => {
+  const mem = memoryStore();
+  await mem.put("sessions/sid.jsonl", sampleJsonl("from-jsonl"));
+  await mem.put("sessions/sid.json", { turns: [{ turn: 1, msg: "from-json" }] });
+  let fallback = 0;
+  const r = await loadSessionHistory("sid", {
+    store,
+    get: (key) => mem.get(key),
+    fallbackResume: async () => { fallback += 1; return [{ turn: 1, msg: "from-worker" }]; },
+  });
+  assert.equal(r.source, "bos");
+  assert.equal(r.kind, "jsonl");
+  assert.equal(r.turns[0].msg, "from-jsonl");
+  assert.equal(typeof r.jsonl, "string");
+  assert.equal(fallback, 0);
+});
+
+test("loadSessionHistory: JSONL miss 才读旧 JSON", async () => {
+  const mem = memoryStore();
+  await mem.put("sessions/sid.json", { turns: [{ turn: 1, msg: "legacy" }] });
+  const r = await loadSessionHistory("sid", {
+    store,
+    get: (key) => mem.get(key),
+  });
+  assert.equal(r.source, "bos");
+  assert.equal(r.kind, "turns");
+  assert.equal(r.turns[0].msg, "legacy");
+});
+
+test("loadSessionHistory: JSONL 损坏不回退旧 JSON 或 worker", async () => {
+  const mem = memoryStore();
+  mem.objects.set("sessions/sid.jsonl", { body: "nope", etag: `"e"` });
+  await mem.put("sessions/sid.json", { turns: [{ turn: 1, msg: "legacy" }] });
+  let fallback = 0;
+  const r = await loadSessionHistory("sid", {
+    store,
+    get: (key) => mem.get(key),
+    fallbackResume: async () => { fallback += 1; return [{ turn: 1, msg: "worker" }]; },
+  });
+  assert.equal(r.corrupt, true);
+  assert.equal(r.kind, "jsonl");
+  assert.equal(r.turns, null);
+  assert.equal(fallback, 0);
+});
+
+test("队列: 同会话 JSONL 合并为最新快照", async () => {
+  const mem = memoryStore();
+  let hold;
+  const gate = new Promise((r) => { hold = r; });
+  let firstGet = true;
+  const origGet = mem.get.bind(mem);
+  mem.get = async (key) => {
+    if (firstGet) {
+      firstGet = false;
+      await gate;
+    }
+    return origGet(key);
+  };
+  const p = persisterOf(mem);
+  p.queueJsonlWrite("sid", sampleJsonl("one"));
+  p.queueJsonlWrite("sid", sampleJsonl("two"));
+  p.queueJsonlWrite("sid", sampleJsonl("three"));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(p.pending.length <= 2, `pending=${p.pending.length}, 同会话 JSONL 应合并`);
+  hold();
+  await p.flush(500);
+  assert.equal(p.pending.length, 0);
+  const got = await mem.get("sessions/sid.jsonl");
+  assert.equal(got.ok, true);
+  assert.match(got.body, /three/);
+  assert.doesNotMatch(got.body, /"text":"one"/);
 });

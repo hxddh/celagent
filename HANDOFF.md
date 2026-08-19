@@ -7,7 +7,7 @@
 
 ## 0. 项目定位
 
-**celagent**:独立开源 agent 产品。基于 Pi TUI 引擎 + Celld 分布式运行时 + 对象存储,核心卖点是**会话权威在对象存储**——CAS 成功的轮次可跨机读回;热恢复注入最近 50 轮文本(完整对象用 `export` / `history_search`)。默认后端是百度 BOS(唯一实测);扩到其它 S3 兼容存储的条件与计划见 `docs/s3-compat-evaluation.md`。
+**celagent**:独立开源 agent 产品。基于 Pi TUI 引擎 + Celld 分布式运行时 + 对象存储,核心卖点是**会话权威在对象存储**——CAS 成功的 Pi JSONL 可跨机被 `SessionManager.open` 打开(工具调用/thinking/分支都在;旧 `.json` 仅文本注入兼容)。默认后端是百度 BOS(唯一实测);扩到其它 S3 兼容存储的条件与计划见 `docs/s3-compat-evaluation.md`。
 
 **核心心智模型**:对象存储保数据(权威源,RPO=0)+ Celld 保执行(缓存/任务/集群)+ agent 可用同一存储(记忆工具)。
 
@@ -17,7 +17,8 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
    ├─▶ worker SQLite (快速缓存, 2s 超时, 丢了可重建)
    └─▶ BOS 直写队列 (权威源, CAS If-Match 乐观锁 + 幂等去重)
                                 │
-                    sessions/<id>.json  (完整 content, 不截断; 默认 BOS)
+                    sessions/<id>.jsonl  Pi 原生会话 (权威)
+                    sessions/<id>.json   旧轮次 JSON (只读兼容)
 ```
 
 **架构细节(数据流时序/机制原理/组件边界/10 项设计决策/扩展点)见 `docs/architecture.md`**——
@@ -27,9 +28,9 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 
 | 路径 | 职责 |
 |------|------|
-| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~1020 行:命令解析含 task、节点自动启动、turn_end 钩子;权威写/恢复已抽到 persist.js) |
+| `bin/celagent-tui.mjs` | CLI + TUI 主程序(~1100 行:命令解析含 task、节点自动启动、JSONL 打开/steer 兼容;权威写/恢复在 persist.js) |
 | `src/bos.js` | 对象存储直写核心(aws CLI、CAS If-Match/If-None-Match;默认 BOS,见 s3-compat-evaluation) |
-| `src/persist.js` | 会话权威写/恢复(队列、CAS 门禁、I/O transient 重试、BOS-first;可注入 get/put 单测) |
+| `src/persist.js` | 会话权威写/恢复(JSONL 队列、CAS 门禁、I/O transient 重试、BOS-first;旧 turns JSON 只读兼容;可注入 get/put 单测) |
 | `src/bos-tools.js` | agent 内置记忆工具:`history_search`(跨会话检索)+ `session_snapshot`(显式快照),经 customTools 注入 pi 引擎 |
 | `worker/src/index.js` | Celld worker(缓存读路径、Sync API、产物走 webhook) |
 | `worker/wrangler.jsonc` | Celld worker 绑定清单(部署走 `celld deploy`, 不是 Cloudflare wrangler) |
@@ -46,14 +47,15 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/v035-scope.md` | v0.3.5 实现合同(已发布: region 贯穿、CAS 粘滞、rm/list 错误、记忆工具) |
 | `docs/v036-scope.md` | v0.3.6 实现合同(已发布: 深度审查 9 项修复 — CAS transient/粘滞/键控、队列重试不丢轮、白名单对齐、记忆工具) |
 | `docs/v037-scope.md` | v0.3.7 实现合同(已发布: persist I/O retry、恢复非 miss 不回退 worker、保证句) |
-| `docs/v038-scope.md` | v0.3.8 实现合同(下一刀: 非 BOS 真桶实测,需凭证,无凭证不开 PR) |
+| `docs/v038-scope.md` | v0.3.8 实现合同(再下一刀: 非 BOS 真桶实测,需凭证,无凭证不开 PR) |
+| `docs/v040-scope.md` | v0.4.0 实现合同(本刀: Pi JSONL 权威会话 + SessionManager.open) |
 | `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取(endpoint fail-closed) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
 | `tests/core.test.mjs` | 核心回归(CLI + 可选 Celld/BOS; 无节点时 skip) |
 | `tests/review-logic-proofs.test.mjs` | P0 正确性源码锚定(BOS-first/队列丢最旧/fork/parse/steer/seq) |
 | `tests/p0-p2-bugs.test.mjs` | v0.3.5/v0.3.6 回归(region/CAS 粘滞/非法 endpoint/store_env/片段命中) |
-| `tests/persist.test.mjs` | v0.3.7 可执行回归(GET/PUT retry、恢复优先级、JSON 损坏;内存 store) |
+| `tests/persist.test.mjs` | v0.3.7/v0.4.0 可执行回归(GET/PUT retry、JSONL 优先、损坏不覆盖、队列合并;内存 store) |
 | `tests/e2e-memory-tools.mjs` | 真实 LLM e2e(需 DEEPSEEK_API_KEY env) |
 | `docs/celld-bos-architecture-demo.html` | 架构演示页(单文件、零依赖、33 轮真实对话实录回放, 2026-08-11) |
 | `.github/workflows/ci.yml` | CI:syntax check + CLI smoke + 单元测试 + npm pack dry-run |
@@ -112,11 +114,12 @@ node bin/celagent-tui.mjs task ledger
 - **Celld**:不在仓库内;发布随包 **v0.2.0**(linux-x64/arm64、darwin-arm64)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。评估见 `docs/celld-v02-evaluation.md`
 - **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
 
-## 3. 发布状态(Latest v0.3.7)
+## 3. 发布状态(Latest v0.4.0)
 
-仓库:`https://github.com/hxddh/celagent`。Latest:[v0.3.7](https://github.com/hxddh/celagent/releases/tag/v0.3.7)。
+仓库:`https://github.com/hxddh/celagent`。Latest:[v0.4.0](https://github.com/hxddh/celagent/releases/tag/v0.4.0)。
 
-- **tag `v0.3.7`** 指向 PR #17 合并进 main 的提交(`fa872c9`);Release 资产由此 SHA 构建
+- **tag `v0.4.0`** 指向本刀合并进 main 的提交;Release 资产由此 SHA 构建
+- **v0.3.7**(`fa872c9`,PR #17) persist 主路径 GET/PUT 瞬时失败留队;恢复非 miss 不回退 worker;权威对象仍是 turns JSON + steer 50 轮
 - **v0.3.6**(`23cacbb`,PR #16)CAS 探针 retry 不丢轮,但 persist 主路径 GET/PUT 瞬时失败仍会静默丢轮;恢复超时会回退 8000 字 worker 缓存
 - **v0.3.5**(`0c674cf`,PR #14)CAS 只粘滞 cas-ignored:瞬时探针失败会消费队列任务丢轮,永久性失败每轮重探,判决不按 store 键控
 - **v0.3.4**(`eec47c4`)有 CAS 门禁,但会话路径不带 `persistence.region`,rm 失败仍报成功
@@ -126,13 +129,13 @@ node bin/celagent-tui.mjs task ledger
 - 旧 tag **`v0.3.0`** 仍指向 `31d12a4`;不要用 `git checkout v0.3.0` 当当前代码
 
 ### 已完成
-- ✅ 代码功能:核心持久化(BOS 直写 + CAS + 幂等)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot)、完整记忆(不截断 content);恢复 **BOS-first**
-- ✅ 测试:`npm test`(core + proof 源码锚定 + p0-p2-bugs);Celld/BOS 用例无节点时 skip;e2e 真实 LLM 需 `DEEPSEEK_API_KEY`
+- ✅ 代码功能:核心持久化(BOS JSONL + CAS + 同会话合并)、双节点、分布式部署、worker 缓存、记忆工具(history_search/session_snapshot);恢复 **BOS-first JSONL**
+- ✅ 测试:`npm test`(core + proof 源码锚定 + p0-p2-bugs + persist JSONL);Celld/BOS 用例无节点时 skip;e2e 真实 LLM 需 `DEEPSEEK_API_KEY`
 - ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo`;CI 含 Secret/PII 门禁;零密钥硬编码
   - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容;彻底抹掉需向 GitHub Support 申请 purge
 - ✅ 构建:`.github/workflows/release.yml` 匿名路径 bun 交叉编译 + 拉取 `denoland/celld` + `SHA256SUMS`
-- ✅ **v0.3.7 资产清单**(形态同 v0.3.6):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是 persist 主路径 GET/PUT 瞬时失败留队重试、恢复非 miss 不回退 worker、保证句可辩护化**
-- ✅ 安装校验:`scripts/release-smoke.sh v0.3.7` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.3.7`;不需要 BOS/celld)
+- ✅ **v0.4.0 资产清单**(形态同 v0.3.7):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是权威对象改为 Pi JSONL,`celagent <id>` 走 SessionManager.open**
+- ✅ 安装校验:`scripts/release-smoke.sh v0.4.0` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.4.0`;不需要 BOS/celld)
 
 ### 已知边界(不是本仓库能补的)
 - 上游 `denoland/celld` **没有** Intel Mac (`celld-darwin-x64`) 与 Windows 包;`install.sh` 回退 `celld.dev` / Windows 跳过 celld
@@ -145,10 +148,10 @@ node bin/celagent-tui.mjs task ledger
 0. ✅ docs/archive 已删除
 1. ✅ 仓库已推送
 2. ✅ CI 绿 (node 22/24)
-3. ✅ tag `v0.3.7` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
+3. ✅ tag `v0.4.0` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
 4. ✅ 跨平台 celagent 由 Release workflow 在 `/tmp/anon-build` 编译
 5. ✅ install.sh 正式模式从 GitHub Release 下载,有 `SHA256SUMS` 则校验
-6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.3.7` 或 `latest`(SHA256 + version/help)
+6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.4.0` 或 `latest`(SHA256 + version/help)
 
 ## 4. 版本与里程碑
 
@@ -165,6 +168,7 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.5 | 会话路径带 region、CAS 只粘滞 cas-ignored、rm/list 报错、snapshot 全量 | ✅ 历史 |
 | v0.3.6 | 深度审查 9 项修复:CAS transient 不丢轮/结论性粘滞/按 store 键控、cas-probe exit 2、白名单 IPv6+单标签对齐、history_search 片段命中、snapshot 内存摘要化 | ✅ 历史 |
 | v0.3.7 | persist 主路径与探针对齐:GET/PUT 瞬时失败留队重试;恢复非 miss 不回退 worker;抽出 `src/persist.js` + 内存 store 测试;保证句可辩护化 | ✅ 已发布 |
+| v0.4.0 | 质变:权威对象从轮次 JSON+steer 换成 Pi JSONL;`celagent <id>` 走 `SessionManager.open`;旧 `.json` 只读兼容 | ✅ 本刀 |
 
 下一刀:**v0.3.8** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要把 region 贯穿当成「已支持 R2」。不要插队做 provider 认证/快照 TUI/会话合并。
 
@@ -201,4 +205,5 @@ node bin/celagent-tui.mjs task ledger
 - **CAS 门禁(v0.3.4)**:doctor/setup/persist 拒绝忽略 If-Match 的存储。
 - **正确性(v0.3.5)**:会话读写带 `persistence.region`;`rm`/`list` 不再把失败当成功。
 - **正确性(v0.3.6)**:CAS 探针 transient(网络)与结论性(能力)分开——transient 本轮任务留队首退避重试不丢轮,结论性判决一次粘滞且按 `endpoint|bucket|profile|region` 键控;`cas-probe` transient exit 2,install/setup 不再把网络抖动误报成存储不合格;endpoint 白名单 bash/JS 对 IPv6 与多标签 host 行为一致;`history_search` 片段必含命中文本、会话读失败不吞快照命中;进程内快照缓存只留摘要。
-- **正确性(v0.3.7)**:persist 主路径 GET/PUT 瞬时失败同样 `"retry"`(403/401 不重试);`loadSessionHistory` 仅 not-found 才回退 worker;抽出 `src/persist.js`,内存 store 可执行测试覆盖写/恢复。可辩护保证:CAS 成功的 `sessions/<id>.json` 可跨机读回;热恢复注入最近 50 轮文本。真 R2/S3 联调与「已支持」仍未做(→ v0.3.8)。
+- **正确性(v0.3.7)**:persist 主路径 GET/PUT 瞬时失败同样 `"retry"`(403/401 不重试);`loadSessionHistory` 仅 not-found 才回退 worker;抽出 `src/persist.js`,内存 store 可执行测试覆盖写/恢复。
+- **质变(v0.4.0)**:权威对象 `sessions/<id>.jsonl`;`celagent <id>` 用 `SessionManager.open` 打开真 Pi 会话;JSONL 路径禁止 steer;旧 `.json` 只读兼容;同会话 JSONL 队列合并为最新。可辩护保证:CAS 成功的 JSONL 可跨机被 Pi 打开。真 R2/S3 联调与「已支持」仍未做(→ v0.3.8)。

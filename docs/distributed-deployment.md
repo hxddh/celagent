@@ -22,7 +22,8 @@
                │ 权威落盘
 ┌──────────────▼─────────────────────────────────────┐
 │ 数据层: BOS 对象存储 (唯一 bucket)                  │
-│   - sessions/<id>.json   会话权威 (CAS 保护)        │
+│   - sessions/<id>.jsonl  Pi 会话权威 (CAS 保护)     │
+│   - sessions/<id>.json   旧轮次 JSON (只读兼容)     │
 │   - cells/*/ltx          执行状态 (LTX 日志)        │
 │   - nodes/ fleet/ wake/  集群协调元数据              │
 │   - deploy/              worker 代码分发            │

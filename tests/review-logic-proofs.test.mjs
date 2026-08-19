@@ -271,7 +271,8 @@ test("源码锚定: history_search 默认当前会话且读 snapshots/", () => {
   const tools = readFileSync(join(root, "src/bos-tools.js"), "utf8");
   assert.match(tools, /__celagentPersistId/);
   assert.match(tools, /rawSession === "\*"/);
-  assert.match(tools, /sessions\/\$\{sessionFilter\}\.json/);
+  assert.match(tools, /sessions\/\$\{sessionFilter\}\.jsonl/);
+  assert.match(tools, /turnsFromJsonl/);
   assert.match(tools, /--max-items/);
   assert.match(tools, /snapshots\//);
   assert.match(tools, /persistenceFromCfg/);
@@ -400,11 +401,23 @@ test("源码锚定: worker 已删除未调用的 SigV4 bosPut", () => {
   assert.match(w, /async function bosPutProxy/);
 });
 
-test("源码锚定: 版本 0.3.7 与 release-smoke", () => {
-  assert.match(tui, /CELAGENT_VERSION = "0\.3\.7"/);
+test("源码锚定: 版本 0.4.0 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.4\.0"/);
   const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
   assert.match(smoke, /sha256sum --ignore-missing/);
   assert.match(smoke, /celagent-linux-x64/);
+});
+
+test("源码锚定: JSONL 为权威, SessionManager.open, 禁止作文注入", () => {
+  assert.match(tui, /SessionManager\.open\(/);
+  assert.match(tui, /queueJsonlWrite/);
+  assert.match(tui, /queueSessionJsonl/);
+  assert.match(tui, /!openedFromJsonl/);
+  assert.match(persist, /sessionJsonlKey/);
+  assert.match(persist, /persistJsonlToBos/);
+  assert.match(persist, /queueJsonlWrite/);
+  assert.match(persist, /kind === "jsonl"/);
+  assert.doesNotMatch(tui, /queueBosWrite\(/);
 });
 
 test("源码锚定: 运维脚本读 store_env 而非写死 BOS endpoint", () => {

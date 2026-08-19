@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import { awsJson, bosGet, bosPut, resolveEndpoint, resolveRegion } from "./bos.js";
+import { isJsonlBody, turnsFromJsonl } from "./persist.js";
 
 export function persistenceFromCfg(cfg) {
   const bucket = cfg?.persistence?.bucket || null;
@@ -82,6 +83,23 @@ export function collectHitsFromTurns(turns, { query, sessionId, source, hits, li
   return false;
 }
 
+function sessionIdFromKey(key) {
+  return String(key || "").replace(/^sessions\//, "").replace(/\.jsonl$/i, "").replace(/\.json$/i, "");
+}
+
+function turnsFromSessionObject(key, body) {
+  if (String(key).endsWith(".jsonl") || isJsonlBody(body)) {
+    if (!isJsonlBody(body)) return null;
+    return { id: sessionIdFromKey(key), turns: turnsFromJsonl(body) };
+  }
+  try {
+    const session = JSON.parse(body);
+    return { id: session.id || sessionIdFromKey(key), turns: session.turns || [] };
+  } catch (e) {
+    return null;
+  }
+}
+
 async function listKeys(pers, prefix) {
   const r = await awsJson([
     "s3api", "list-objects-v2",
@@ -130,11 +148,13 @@ export const history_search = {
 
       let sessionKeys;
       if (sessionFilter) {
-        sessionKeys = [`sessions/${sessionFilter}.json`];
+        sessionKeys = [`sessions/${sessionFilter}.jsonl`, `sessions/${sessionFilter}.json`];
       } else {
         const listed = await listKeys(pers, "sessions/");
         if (!listed.ok) return { content: [{ type: "text", text: `列举会话失败: ${listed.error}` }] };
-        sessionKeys = listed.keys;
+        sessionKeys = listed.keys
+          .filter((k) => k.endsWith(".jsonl") || k.endsWith(".json"))
+          .sort((a, b) => Number(b.endsWith(".jsonl")) - Number(a.endsWith(".jsonl")));
       }
 
       const snapListed = await listKeys(pers, "snapshots/");
@@ -144,17 +164,22 @@ export const history_search = {
       const hits = [];
       const storeOpts = { bucket: pers.bucket, endpoint: pers.endpoint, profile: pers.profile, region: pers.region };
       let sessionReadError = null;
+      const haveJsonl = new Set();
       for (const key of sessionKeys) {
+        const sid = sessionIdFromKey(key);
+        const jsonlKey = key.endsWith(".jsonl");
+        if (!jsonlKey && haveJsonl.has(sid)) continue;
         const got = await bosGet(key, storeOpts);
         if (!got.ok) {
-          if (sessionFilter && got.error !== "not-found") sessionReadError = got.error;
+          const miss = got.error === "not-found" || /\bNoSuchKey\b|\b404\b/i.test(String(got.error || ""));
+          if (sessionFilter && !miss) sessionReadError = got.error;
+          if (jsonlKey && !miss) haveJsonl.add(sid);
           continue;
         }
-        try {
-          const session = JSON.parse(got.body);
-          const sessionId = key.replace("sessions/", "").replace(".json", "");
-          if (collectHitsFromTurns(session.turns, { query, sessionId, source: "session", hits, limit })) break;
-        } catch (e) { /* 跳过损坏会话 */ }
+        const parsed = turnsFromSessionObject(key, got.body);
+        if (!parsed) continue;
+        if (jsonlKey) haveJsonl.add(parsed.id);
+        if (collectHitsFromTurns(parsed.turns, { query, sessionId: parsed.id, source: "session", hits, limit })) break;
       }
       // 会话对象读失败不在此早退 — 快照可能仍有该会话的命中, 先扫完再决定
       if (hits.length < limit) {

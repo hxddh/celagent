@@ -1,11 +1,28 @@
 // persist.js — 会话权威写/恢复 (BOS 队列 + CAS 门禁 + BOS-first)
 // TUI 只编排; 本模块可注入 get/put/probe, 单测不需要 aws CLI
+// v0.4: 权威对象是 Pi JSONL (sessions/<id>.jsonl); 旧 sessions/<id>.json 仅兼容读
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { bosGet, bosPut, casGateSticky, probeStoreCas, resolveEndpoint, resolveRegion } from "./bos.js";
 
 export const BOS_QUEUE_MAX = 50;
+export const STEER_LEGACY_HEADER = "以下是本会话之前的对话历史";
+
+export function sessionJsonlKey(sessionId) {
+  return `sessions/${sessionId}.jsonl`;
+}
+
+export function sessionTurnsKey(sessionId) {
+  return `sessions/${sessionId}.json`;
+}
+
+/** persistId = JSONL 文件名 stem, 与 celagent <id> / BOS key 同一条会话 */
+export function persistIdFromJsonlPath(p) {
+  const stem = basename(String(p || "")).replace(/\.jsonl$/i, "");
+  if (/^[A-Za-z0-9._-]{1,128}$/.test(stem)) return stem;
+  return `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 export function storeFromCfg(cfg) {
   const endpoint = resolveEndpoint(cfg?.persistence?.endpoint);
@@ -43,6 +60,63 @@ export function classifyStoreError(error) {
     return "fatal";
   }
   return "transient";
+}
+
+export function isJsonlBody(body) {
+  if (typeof body !== "string") return false;
+  const first = body.split(/\r?\n/).find((l) => l.trim());
+  if (!first) return false;
+  try {
+    const h = JSON.parse(first);
+    return h && h.type === "session";
+  } catch (e) {
+    return false;
+  }
+}
+
+function textFromMessageContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b) => b && b.type === "text" && b.text)
+    .map((b) => b.text)
+    .join(" ")
+    .trim();
+}
+
+/** 从 Pi JSONL 抽出轮次摘要, 给 snapshot / worker sync / 旧搜索路径用 */
+export function turnsFromJsonl(body) {
+  const turns = [];
+  if (typeof body !== "string") return turns;
+  let n = 0;
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch (e) {
+      continue;
+    }
+    if (obj.type !== "message" || !obj.message) continue;
+    const m = obj.message;
+    n += 1;
+    const role = m.role || "assistant";
+    const entry = {
+      turn: n,
+      role,
+      msg: textFromMessageContent(m.content) || m.toolName || "(无文本)",
+      ts: Number(m.timestamp) || Date.parse(obj.timestamp) || Date.now(),
+    };
+    if (Array.isArray(m.content) && m.content.length) entry.content = m.content;
+    else if (typeof m.content === "string" && m.content) {
+      entry.content = [{ type: "text", text: m.content }];
+    }
+    if (role === "toolResult") {
+      entry.toolResults = [{ toolName: m.toolName, content: Array.isArray(m.content) ? m.content : null }];
+    }
+    turns.push(entry);
+  }
+  return turns;
 }
 
 export function makeTurnEntry(sessionId, seq, role, msg, fullContent, fullToolResults) {
@@ -104,6 +178,23 @@ export function createPersister(deps = {}) {
   let casGateCache = { key: null, result: null };
   let casGateInflight = { key: null, promise: null };
 
+  async function resolveStore() {
+    try {
+      return { store: deps.store || loadStore() };
+    } catch (e) {
+      if (e.code === "endpoint-not-allowed") {
+        warn("persist", `  (警告: ${e.message})`);
+        return { skip: true };
+      }
+      if (e.code === "no-config") {
+        warn("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
+        return { skip: true };
+      }
+      warn("persist", `  (警告: ${e.message})`);
+      return { skip: true, retry: classifyStoreError(e.message) === "transient" };
+    }
+  }
+
   async function ensureStoreCas(store) {
     const key = storeCasKey(store);
     if (casGateCache.key === key && casGateCache.result) return casGateCache.result;
@@ -126,41 +217,80 @@ export function createPersister(deps = {}) {
     return promise;
   }
 
-  async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullToolResults) {
-    let store;
-    try {
-      store = deps.store || loadStore();
-    } catch (e) {
-      if (e.code === "endpoint-not-allowed") {
-        warn("persist", `  (警告: ${e.message})`);
-        return;
-      }
-      if (e.code === "no-config") {
-        warn("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
-        return;
-      }
-      warn("persist", `  (警告: ${e.message})`);
-      return classifyStoreError(e.message) === "transient" ? "retry" : undefined;
-    }
-    const bucket = store.bucket;
-    const endpoint = store.endpoint;
-    const profile = store.profile;
-    const region = store.region;
-    if (!bucket) {
+  async function gateStore() {
+    const resolved = await resolveStore();
+    if (resolved.skip) return { skip: true, retry: resolved.retry };
+    const store = resolved.store;
+    if (!store.bucket) {
       warn("persist", "  (警告: 未配置 persistence.bucket, 会话不会持久化)");
-      return;
+      return { skip: true };
     }
     const cas = await ensureStoreCas(store);
     if (!cas.ok) {
       if (cas.transient) {
         warn("cas-temp", `  (警告: CAS 探针暂未通过, 本轮写入将重试: ${cas.message || cas.error})`);
-        return "retry";
+        return { skip: true, retry: true };
       }
       warn("cas", `  (警告: 此存储不能保证 RPO=0,拒绝权威写入: ${cas.message || cas.error})`);
+      return { skip: true };
+    }
+    return { store };
+  }
+
+  async function persistJsonlToBos(sessionId, jsonlBody) {
+    if (typeof jsonlBody !== "string" || !isJsonlBody(jsonlBody)) {
+      warn("persist", `  (警告: 本地会话不是合法 Pi JSONL, 跳过权威写入: ${sessionId})`);
       return;
     }
-    const key = `sessions/${sessionId}.json`;
-    const common = { bucket, endpoint, profile, region };
+    const gated = await gateStore();
+    if (gated.skip) return gated.retry ? "retry" : undefined;
+    const store = gated.store;
+    const key = sessionJsonlKey(sessionId);
+    const common = { bucket: store.bucket, endpoint: store.endpoint, profile: store.profile, region: store.region };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const existing = await get(key, common);
+      if (existing.ok) {
+        if (!isJsonlBody(existing.body)) {
+          warn("persist", `  (警告: BOS JSONL 损坏, 跳过本轮以免覆盖历史: ${sessionId})`);
+          return;
+        }
+        const written = await put(key, jsonlBody, { ...common, ifMatch: existing.etag });
+        if (written.ok) return;
+        if (written.conflict) {
+          await sleep(100);
+          continue;
+        }
+        const kind = classifyStoreError(written.error);
+        if (kind === "transient") return "retry";
+        warn("persist", `  (警告: BOS JSONL 持久化失败: ${written.error || "未知错误"})`);
+        return;
+      }
+      const kind = classifyStoreError(existing.error);
+      if (kind === "not-found") {
+        const created = await put(key, jsonlBody, { ...common, ifNoneMatch: true });
+        if (created.ok) return;
+        if (created.conflict) {
+          await sleep(100);
+          continue;
+        }
+        const ck = classifyStoreError(created.error);
+        if (ck === "transient") return "retry";
+        warn("persist", `  (警告: BOS JSONL 首写失败: ${created.error || "未知错误"})`);
+        return;
+      }
+      if (kind === "transient") return "retry";
+      warn("persist", `  (警告: BOS JSONL 读取失败, 跳过本轮持久化: ${existing.error})`);
+      return;
+    }
+    return "retry";
+  }
+
+  async function persistTurnToBos(sessionId, seq, role, msg, fullContent, fullToolResults) {
+    const gated = await gateStore();
+    if (gated.skip) return gated.retry ? "retry" : undefined;
+    const store = gated.store;
+    const key = sessionTurnsKey(sessionId);
+    const common = { bucket: store.bucket, endpoint: store.endpoint, profile: store.profile, region: store.region };
     for (let attempt = 0; attempt < 3; attempt++) {
       let session = { id: sessionId, turns: [] };
       let etag = undefined;
@@ -219,7 +349,11 @@ export function createPersister(deps = {}) {
           const job = bosPending[0];
           let outcome;
           try {
-            outcome = await persistTurnToBos(job.sessionId, job.seq, job.role, job.msg, job.fullContent, job.fullToolResults);
+            if (job.kind === "jsonl") {
+              outcome = await persistJsonlToBos(job.sessionId, job.jsonlBody);
+            } else {
+              outcome = await persistTurnToBos(job.sessionId, job.seq, job.role, job.msg, job.fullContent, job.fullToolResults);
+            }
           } catch (e) {
             warn("persist", `  (警告: BOS 持久化异常: ${e.message})`);
             const kind = classifyStoreError(e.message);
@@ -241,15 +375,31 @@ export function createPersister(deps = {}) {
     })();
   }
 
-  function queueBosWrite(sessionId, seq, role, msg, opts = {}) {
-    const { fullContent = null, fullToolResults = null } = opts || {};
+  function enqueue(job) {
+    if (job.kind === "jsonl") {
+      const start = bosPumping && bosPending.length ? 1 : 0;
+      for (let i = bosPending.length - 1; i >= start; i--) {
+        if (bosPending[i].kind === "jsonl" && bosPending[i].sessionId === job.sessionId) {
+          bosPending.splice(i, 1);
+        }
+      }
+    }
     if (bosPending.length >= BOS_QUEUE_MAX) {
       bosPending.shift();
       warn("queue", "  (警告: BOS 写队列过长, 丢弃最旧任务)");
     }
-    bosPending.push({ sessionId, seq, role, msg, fullContent, fullToolResults });
+    bosPending.push(job);
     pumpBosQueue();
     return bosQueue;
+  }
+
+  function queueBosWrite(sessionId, seq, role, msg, opts = {}) {
+    const { fullContent = null, fullToolResults = null } = opts || {};
+    return enqueue({ kind: "turn", sessionId, seq, role, msg, fullContent, fullToolResults });
+  }
+
+  function queueJsonlWrite(sessionId, jsonlBody) {
+    return enqueue({ kind: "jsonl", sessionId, jsonlBody });
   }
 
   async function flush(timeoutMs = 10000) {
@@ -265,7 +415,9 @@ export function createPersister(deps = {}) {
 
   return {
     persistTurnToBos,
+    persistJsonlToBos,
     queueBosWrite,
+    queueJsonlWrite,
     flush,
     ensureStoreCas,
     get pending() {
@@ -279,67 +431,97 @@ export function createPersister(deps = {}) {
 
 const defaultPersister = createPersister();
 export const persistTurnToBos = (...args) => defaultPersister.persistTurnToBos(...args);
+export const persistJsonlToBos = (...args) => defaultPersister.persistJsonlToBos(...args);
 export const queueBosWrite = (...args) => defaultPersister.queueBosWrite(...args);
+export const queueJsonlWrite = (...args) => defaultPersister.queueJsonlWrite(...args);
 export const flushBosQueue = (...args) => defaultPersister.flush(...args);
 export const getBosQueue = () => defaultPersister.queue;
 
+async function getStoreOrFallback(opts, fallbackResume) {
+  try {
+    return { store: opts.store || (opts.loadStore || defaultLoadStore)() };
+  } catch (e) {
+    if (e.code === "endpoint-not-allowed") {
+      return { error: { turns: null, source: null, error: e.message, fatal: true } };
+    }
+    if (fallbackResume) {
+      try {
+        const turns = await fallbackResume(opts.sessionId);
+        if (turns?.length) return { error: { turns, source: "worker", miss: true, kind: "turns" } };
+      } catch (e2) { /* ignore */ }
+    }
+    return { error: { turns: null, source: null, error: e.message || "no-config" } };
+  }
+}
+
 /**
- * BOS-first 恢复。
- * - BOS 读成功 → { source:"bos", turns }
+ * BOS-first 恢复。优先 JSONL (真 Pi 会话); 仅 miss 才读旧 turns JSON; 再 miss 才 worker。
+ * - BOS 读成功 → { source:"bos", kind:"jsonl"|"turns", turns, jsonl? }
  * - BOS not-found / 无 bucket → 才调用 fallbackResume (worker 缓存)
  * - BOS 瞬时/权限失败 → 不回退 (避免 8000 字截断被当成完整历史)
- * - JSON 损坏 → 不回退、不覆盖
+ * - JSON/JSONL 损坏 → 不回退、不覆盖
  */
 export async function loadSessionHistory(sessionId, opts = {}) {
   const get = opts.get || ((key, o) => bosGet(key, o));
   const fallbackResume = opts.fallbackResume;
-  let store;
-  try {
-    store = opts.store || (opts.loadStore || defaultLoadStore)();
-  } catch (e) {
-    if (e.code === "endpoint-not-allowed") {
-      return { turns: null, source: null, error: e.message, fatal: true };
-    }
-    // 无配置: 允许 worker miss 回退
-    if (fallbackResume) {
-      try {
-        const turns = await fallbackResume(sessionId);
-        if (turns?.length) return { turns, source: "worker", miss: true };
-      } catch (e2) { /* ignore */ }
-    }
-    return { turns: null, source: null, error: e.message || "no-config" };
-  }
-  if (store.bucket) {
-    const existing = await get(`sessions/${sessionId}.json`, {
-      bucket: store.bucket,
-      endpoint: store.endpoint,
-      profile: store.profile,
-      region: store.region,
-    });
+  const resolved = await getStoreOrFallback({ ...opts, sessionId }, fallbackResume);
+  if (resolved.error) return resolved.error;
+  const store = resolved.store;
+  const common = store.bucket
+    ? { bucket: store.bucket, endpoint: store.endpoint, profile: store.profile, region: store.region }
+    : null;
+
+  async function readKey(key, asJsonl) {
+    const existing = await get(key, common);
     if (existing.ok) {
+      if (asJsonl) {
+        if (!isJsonlBody(existing.body)) {
+          return { done: true, value: { turns: null, source: "bos", error: "corrupt", corrupt: true, kind: "jsonl" } };
+        }
+        return {
+          done: true,
+          value: {
+            turns: turnsFromJsonl(existing.body),
+            source: "bos",
+            kind: "jsonl",
+            jsonl: existing.body,
+          },
+        };
+      }
       try {
         const session = JSON.parse(existing.body);
-        return { turns: session.turns || [], source: "bos" };
+        return { done: true, value: { turns: session.turns || [], source: "bos", kind: "turns" } };
       } catch (e) {
-        return { turns: null, source: "bos", error: "corrupt", corrupt: true };
+        return { done: true, value: { turns: null, source: "bos", error: "corrupt", corrupt: true, kind: "turns" } };
       }
     }
     const kind = classifyStoreError(existing.error);
     if (kind !== "not-found") {
       return {
-        turns: null,
-        source: "bos",
-        error: existing.error,
-        transient: kind === "transient",
-        fatal: kind === "fatal",
+        done: true,
+        value: {
+          turns: null,
+          source: "bos",
+          error: existing.error,
+          transient: kind === "transient",
+          fatal: kind === "fatal",
+        },
       };
     }
+    return { done: false };
+  }
+
+  if (store.bucket) {
+    const jsonl = await readKey(sessionJsonlKey(sessionId), true);
+    if (jsonl.done) return jsonl.value;
+    const turns = await readKey(sessionTurnsKey(sessionId), false);
+    if (turns.done) return turns.value;
   }
   if (fallbackResume) {
     try {
-      const turns = await fallbackResume(sessionId);
-      if (turns?.length) return { turns, source: "worker", miss: true };
+      const fb = await fallbackResume(sessionId);
+      if (fb?.length) return { turns: fb, source: "worker", miss: true, kind: "turns" };
     } catch (e) { /* ignore */ }
   }
-  return { turns: store.bucket ? [] : null, source: store.bucket ? "bos" : null, miss: true };
+  return { turns: store.bucket ? [] : null, source: store.bucket ? "bos" : null, miss: true, kind: store.bucket ? "turns" : null };
 }

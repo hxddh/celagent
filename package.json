@@ -1,7 +1,7 @@
 {
   "name": "celagent",
-  "version": "0.3.7",
-  "description": "独立开源 agent — Pi TUI + Celld/BOS 对象存储持久化，CAS 成功的会话可跨机恢复",
+  "version": "0.4.0",
+  "description": "独立开源 agent — Pi TUI + Celld/BOS 对象存储持久化，CAS 成功的 Pi JSONL 可跨机打开",
   "type": "module",
   "bin": {
     "celagent": "./bin/celagent-tui.mjs"
