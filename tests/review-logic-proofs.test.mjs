@@ -231,6 +231,8 @@ test("resolveEndpoint fail-closed 且白名单扩合格 host", async () => {
   assert.equal(isAllowedEndpoint("http://127.0.0.1:9000"), true);
   assert.equal(isAllowedEndpoint("http://[::1]:9000"), true);
   assert.equal(isAllowedEndpoint("http://[::1]"), true);
+  assert.equal(isAllowedEndpoint("http://[::1]@evil.example"), false);
+  assert.equal(isAllowedEndpoint("http://[::1].evil.example"), false);
   assert.equal(isAllowedEndpoint("https://s3.a.b.bcebos.com"), false);
   assert.equal(isAllowedEndpoint("https://s3.a.b.amazonaws.com"), false);
   assert.equal(isAllowedEndpoint("https://evil.example/"), false);

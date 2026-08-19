@@ -26,19 +26,27 @@ celagent_is_allowed_endpoint() {
   if [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "1" ] || [ "${CELAGENT_ALLOW_ENDPOINT:-}" = "true" ]; then
     case "$raw" in http://*|https://*) return 0 ;; *) return 1 ;; esac
   fi
-  local rest host scheme mid
+  local rest host scheme mid port=""
   case "$raw" in
     http://*) scheme=http; rest="${raw#http://}" ;;
     https://*) scheme=https; rest="${raw#https://}" ;;
     *) return 1 ;;
   esac
   host="${rest%%/*}"
+  # 门禁语义: endpoint 不允许 userinfo/query/fragment —
+  # http://[::1]@evil.example 的真实 host 是 evil.example, 截断解析会被绕过
+  case "$host" in *@*|*\?*|*\#*) return 1 ;; esac
   case "$host" in
-    \[*)
-      # IPv6 字面量带方括号 ([::1] 或 [::1]:9000) — %%:* 会从第一个冒号截断, 必须先按 ] 剥
-      host="${host%%]*}"; host="${host#\[}" ;;
-    *) host="${host%%:*}" ;;
+    \[*\]) host="${host#\[}"; host="${host%\]}" ;;
+    \[*\]:*)
+      # IPv6 字面量 ([::1]:9000) — ] 后只允许 :端口, 其它后缀 (如 [::1].evil.example) 拒绝
+      port="${host##*\]:}"; host="${host%%\]*}"; host="${host#\[}" ;;
+    \[*) return 1 ;;
+    *:*) port="${host##*:}"; host="${host%%:*}" ;;
   esac
+  if [ -n "$port" ]; then
+    case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  fi
   host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
   case "$host" in
     127.0.0.1|localhost|::1) return 0 ;;
