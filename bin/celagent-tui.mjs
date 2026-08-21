@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
 import { awsEnv, resolveEndpoint, isAllowedEndpoint, awsJson } from "../src/bos.js";
-import { storeFromCfg, queueJsonlWrite, queueBosWrite, flushBosQueue, loadSessionHistory, STEER_LEGACY_HEADER, persistIdFromJsonlPath, jsonlSupersedes, isJsonlBody } from "../src/persist.js";
+import { storeFromCfg, queueJsonlWrite, queueBosWrite, flushBosQueue, loadSessionHistory, STEER_LEGACY_HEADER, persistIdFromJsonlPath, jsonlSupersedes, isJsonlBody, sanitizeLocalJsonl } from "../src/persist.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
@@ -849,6 +849,7 @@ async function migrateCommand(id) {
       : `✗ 旧会话读取失败: ${legacy.error}`);
     process.exit(1);
   }
+  const legacyEtag = legacy.etag;
   let legacyTurns;
   try {
     const parsed = JSON.parse(legacy.body);
@@ -899,7 +900,21 @@ async function migrateCommand(id) {
   }
   if (!confirm) { console.log("已取消"); return; }
 
-  // 6. 首写保护写入
+  // 6. 源对象一致性复核: 另一个 TUI 若正以 legacy 模式写同一会话, 它在我们读取快照后
+  //    追加的轮次不会进 JSONL, 而之后所有加载/搜索都只认 JSONL —— 两份权威分叉且旧轮被藏。
+  //    ETag 变了说明有活跃写入者, 中止让用户先关掉它。
+  const recheck = await bosGet(sessionTurnsKey(id), opts);
+  if (!recheck.ok) {
+    console.error(`✗ 迁移前复核旧对象失败, 已中止 (未写入): ${recheck.error}`);
+    process.exit(1);
+  }
+  if (recheck.etag !== legacyEtag) {
+    console.error("✗ 旧会话在迁移过程中被改动 (可能另有 celagent 正开着同一会话)。");
+    console.error("  已中止, 未写入任何对象。请关闭该会话后重试 celagent migrate。");
+    process.exit(1);
+  }
+
+  // 7. 首写保护写入
   const put = await bosPut(jsonlKey, jsonl, { ...opts, ifNoneMatch: true });
   if (put.conflict) {
     console.error("✗ 目标对象刚被其它进程创建, 已放弃迁移 (未覆盖)");
@@ -1036,11 +1051,18 @@ async function main() {
       let keepLocal = false;
       try {
         if (existsSync(localJsonl)) {
-          const localBody = readFileSync(localJsonl, "utf8");
-          if (isJsonlBody(localBody) && localBody !== hist.jsonl && jsonlSupersedes(localBody, hist.jsonl)) {
+          // 崩溃常留下写了一半的尾行 — 必须整份严格校验后才可回写 BOS,
+          // 否则把坏行推上去, 之后的严格谱系检查会永久卡死该会话的持久化
+          const clean = sanitizeLocalJsonl(readFileSync(localJsonl, "utf8"));
+          if (clean && clean.body !== hist.jsonl && jsonlSupersedes(clean.body, hist.jsonl)) {
             keepLocal = true;
+            if (clean.repaired) {
+              // 半行不含任何完整记录, 丢掉它不损失曾经完整的数据
+              writeFileSync(localJsonl, clean.body, { encoding: "utf8", mode: 0o600 });
+              console.log("  (本地会话尾行残缺, 已丢弃该半行)");
+            }
             console.log("  (检测到本地会话领先于 BOS — 保留本地并补写回, 不覆盖)");
-            queueJsonlWrite(sessionId, localBody);
+            queueJsonlWrite(sessionId, clean.body);
           }
         }
       } catch (e) { keepLocal = false; }
@@ -1164,15 +1186,26 @@ async function main() {
         console.log(`  (BOS 已恢复可读, 会话 ${persistId} 继续权威写入: ${persistMode})`);
         return true;
       };
+      // blocked 期间的轮次必须**全部缓冲**: legacy 模式按轮写, 只补最后一轮会丢掉
+      // 期间所有轮次 (jsonl 模式因为传整份文件才碰巧无损)
+      const blockedBuffer = [];
+      const BLOCKED_BUFFER_MAX = 200;
+      const flushBlocked = () => {
+        const pending = blockedBuffer.splice(0, blockedBuffer.length);
+        if (persistMode === "jsonl") { queueSessionJsonl(persistId, effSessionManager); return; }
+        for (const j of pending) {
+          queueBosWrite(persistId, j.seqNo, j.role, j.msg, { fullContent: j.fullContent, fullToolResults: j.fullToolResults });
+        }
+      };
       const queueAuthoritative = (seqNo, role, msg, fullContent, fullToolResults) => {
         if (persistMode === "blocked") {
-          warnOnce("persist", `  (警告: 会话 ${persistId} 远端状态未知, 暂不做权威写入 — 将周期性重试)`);
-          void tryUnblock().then((ok) => {
-            // 解除封锁后立刻补写当前状态, 不等下一轮
-            if (!ok) return;
-            if (persistMode === "legacy") queueBosWrite(persistId, seqNo, role, msg, { fullContent, fullToolResults });
-            else queueSessionJsonl(persistId, effSessionManager);
-          });
+          warnOnce("persist", `  (警告: 会话 ${persistId} 远端状态未知, 暂缓权威写入 — 已缓冲, 恢复后补写)`);
+          if (blockedBuffer.length >= BLOCKED_BUFFER_MAX) {
+            blockedBuffer.shift();
+            warnOnce("queue", "  (警告: 封锁期缓冲已满, 丢弃最旧轮次)");
+          }
+          blockedBuffer.push({ seqNo, role, msg, fullContent, fullToolResults });
+          void tryUnblock().then((ok) => { if (ok) flushBlocked(); });
           return;
         }
         if (persistMode === "legacy") {

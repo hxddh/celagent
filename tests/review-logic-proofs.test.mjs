@@ -468,7 +468,7 @@ test("源码锚定: v0.4.2 迁移命令 / 崩溃恢复 / blocked 自愈", () => 
   assert.match(persist, /export function jsonlFromTurns/);
   assert.match(persist, /migratedFrom/);
   // 崩溃恢复: 本地领先则保留并补写回, 不被远端覆盖
-  assert.match(tui, /jsonlSupersedes\(localBody, hist\.jsonl\)/);
+  assert.match(tui, /jsonlSupersedes\(clean\.body, hist\.jsonl\)/);
   assert.match(tui, /保留本地并补写回/);
   // blocked 自愈: 周期性重探, 恢复后立刻补写
   assert.match(tui, /async function migrateCommand|const tryUnblock = async/);
@@ -477,4 +477,20 @@ test("源码锚定: v0.4.2 迁移命令 / 崩溃恢复 / blocked 自愈", () => 
   // 写放大: 只告警, 不靠延迟权威写换流量
   assert.match(persist, /JSONL_SIZE_WARN_BYTES/);
   assert.match(persist, /整文件重传/);
+});
+
+test("源码锚定: v0.4.2 评审三项 — 迁移并发守卫 / 封锁期缓冲 / 本地严格校验", () => {
+  // P1-1: 迁移前复核源 ETag; legacy 写入路径检测已迁移则停写
+  assert.match(tui, /recheck\.etag !== legacyEtag/);
+  assert.match(tui, /旧会话在迁移过程中被改动/);
+  assert.match(persist, /已迁移为 Pi JSONL, 旧格式写入已停止/);
+  assert.match(persist, /classifyStoreError\(migrated\.error\) === "transient"\) return "retry"/);
+  // P1-2: 封锁期全部缓冲并按序补写, 不只补最后一轮
+  assert.match(tui, /blockedBuffer/);
+  assert.match(tui, /const flushBlocked/);
+  assert.match(tui, /BLOCKED_BUFFER_MAX/);
+  // P1-3: 崩溃恢复前整份严格校验, 只允许丢残缺尾行
+  assert.match(persist, /export function sanitizeLocalJsonl/);
+  assert.match(tui, /sanitizeLocalJsonl\(readFileSync\(localJsonl/);
+  assert.doesNotMatch(tui, /isJsonlBody\(localBody\) && localBody !== hist\.jsonl/);
 });

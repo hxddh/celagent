@@ -13,6 +13,7 @@ import {
   jsonlEntryIds,
   jsonlSupersedes,
   jsonlFromTurns,
+  sanitizeLocalJsonl,
   MIGRATED_MODEL,
   JSONL_SIZE_WARN_BYTES,
   persistIdFromJsonlPath,
@@ -25,13 +26,20 @@ function memoryStore() {
   let n = 0;
   let getFail = null;
   let putFail = null;
+  const keyFail = new Map();
   const puts = [];
   return {
     objects,
     puts,
     failGet(err) { getFail = err; },
+    failGetKey(key, err) { keyFail.set(key, err); },
     failPut(err) { putFail = err; },
     async get(key) {
+      if (keyFail.has(key)) {
+        const e = keyFail.get(key);
+        keyFail.delete(key);
+        return { ok: false, error: e };
+      }
       if (getFail) {
         const e = getFail;
         getFail = null;
@@ -129,7 +137,7 @@ test("mergeTurn: 同号但内容不同 = 并发写入者, 追加不覆盖 (评�
 
 test("persistTurnToBos: GET 超时返回 retry, 不写空会话", async () => {
   const mem = memoryStore();
-  mem.failGet("TimeoutError waiting after 20000ms");
+  mem.failGetKey("sessions/sid.json", "TimeoutError waiting after 20000ms");
   const p = persisterOf(mem);
   const r = await p.persistTurnToBos("sid", 1, "user", "hi", null, null);
   assert.equal(r, "retry");
@@ -170,7 +178,7 @@ test("persistTurnToBos: JSON 损坏不覆盖、不重试", async () => {
 
 test("persistTurnToBos: GET AccessDenied 不重试", async () => {
   const mem = memoryStore();
-  mem.failGet("AccessDenied");
+  mem.failGetKey("sessions/sid.json", "AccessDenied");
   const p = persisterOf(mem);
   const r = await p.persistTurnToBos("sid", 1, "user", "hi", null, null);
   assert.equal(r, undefined);
@@ -683,4 +691,66 @@ test("迁移产物必须真能被 Pi SessionManager.open 打开 (无 pi 则跳�
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
   }
+});
+
+// ---- 评审 P1-3: 崩溃恢复前必须整份严格校验本地文件 ----
+test("sanitizeLocalJsonl: 完好放行 / 尾行残缺丢半行 / 中间损坏拒绝", () => {
+  const good = sampleJsonl();
+  assert.deepEqual(sanitizeLocalJsonl(good), { body: good, repaired: false });
+
+  const torn = good + '{"type":"message","id":"torn-hal';   // 崩溃写了一半的尾行
+  const fixed = sanitizeLocalJsonl(torn);
+  assert.equal(fixed.repaired, true);
+  assert.equal(jsonlEntryIds(fixed.body, { strict: true }) !== null, true);
+  assert.equal(fixed.body, good, "只丢半行, 其余原样");
+
+  const midBroken = good.split("\n").slice(0, 2).join("\n") + "\n{BROKEN\n" +
+    good.split("\n").slice(2).join("\n");
+  assert.equal(sanitizeLocalJsonl(midBroken), null, "中间行损坏不猜, 拒绝");
+  assert.equal(sanitizeLocalJsonl("not jsonl"), null);
+});
+
+test("崩溃恢复: 尾行残缺的本地文件修复后仍是远端的谱系超集", () => {
+  const remote = sampleJsonl();
+  const localFull = remote + jsonlLine("c3d4e5f6", "b2c3d4e5", "user", "崩溃前最后一轮") + "\n";
+  const torn = localFull + '{"type":"message","id":"half';
+  const clean = sanitizeLocalJsonl(torn);
+  assert.equal(clean.repaired, true);
+  assert.equal(jsonlSupersedes(clean.body, remote), true, "修复后仍可安全补写回");
+  // 未修复的原始 torn 直接推上去会污染远端 — 这正是要防的
+  assert.equal(jsonlEntryIds(torn, { strict: true }), null);
+});
+
+// ---- 评审 P1-1: 已迁移的会话不再接受旧格式写入 ----
+test("persistTurnToBos: 会话已迁移为 JSONL 时停写 .json 并告警", async () => {
+  const mem = memoryStore();
+  await mem.put("sessions/sid.jsonl", sampleJsonl());
+  const seen = [];
+  const p = createPersister({
+    store, get: (k) => mem.get(k), put: (k, c, e) => mem.put(k, c, e),
+    probe: probeOk, sleep: async () => {}, loadStore: () => store,
+    warn: (ch, msg) => seen.push([ch, msg]),
+  });
+  const before = mem.objects.has("sessions/sid.json");
+  const r = await p.persistTurnToBos("sid", 1, "user", "迁移后的轮次", null, null);
+  assert.equal(r, undefined, "停写是终态, 不重试");
+  assert.equal(mem.objects.has("sessions/sid.json"), before, "不得写入被遮蔽的旧对象");
+  assert.ok(seen.some(([ch]) => ch === "migrated"), "必须告知用户重启");
+});
+
+test("persistTurnToBos: 未迁移时旧格式照常写入", async () => {
+  const mem = memoryStore();
+  const p = persisterOf(mem);
+  const r = await p.persistTurnToBos("sid", 1, "user", "hi", null, null);
+  assert.equal(r, undefined);
+  assert.equal((await mem.get("sessions/sid.json")).ok, true);
+});
+
+test("persistTurnToBos: 迁移探针瞬时失败留队重试, 不盲写旧对象", async () => {
+  const mem = memoryStore();
+  mem.failGetKey("sessions/sid.jsonl", "connect ETIMEDOUT");
+  const p = persisterOf(mem);
+  const r = await p.persistTurnToBos("sid", 1, "user", "hi", null, null);
+  assert.equal(r, "retry", "无法确认是否已迁移时不猜, 留队");
+  assert.equal(mem.puts.length, 0);
 });

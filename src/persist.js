@@ -97,6 +97,25 @@ export function jsonlSupersedes(localBody, remoteBody) {
   return true;
 }
 
+/** 崩溃恢复前的本地文件校验:整份严格可解析才可用。
+ *  崩溃常见形态是**尾行写了一半** —— JSONL 行分隔, 半行不含任何完整记录,
+ *  丢掉它不损失任何曾经完整的数据, 故允许「只丢最后一个非空行」这一种修复;
+ *  中间行损坏则拒绝 (可能是真数据受损, 不猜)。返回 null = 不可用于恢复。 */
+export function sanitizeLocalJsonl(body) {
+  if (!isJsonlBody(body)) return null;
+  if (jsonlEntryIds(body, { strict: true }) !== null) return { body, repaired: false };
+  const lines = body.split(/\r?\n/);
+  let last = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim()) { last = i; break; }
+  }
+  if (last <= 0) return null;
+  const trimmed = lines.slice(0, last).join("\n") + "\n";
+  if (!isJsonlBody(trimmed)) return null;
+  if (jsonlEntryIds(trimmed, { strict: true }) === null) return null;  // 损坏不止尾行
+  return { body: trimmed, repaired: true };
+}
+
 export function isJsonlBody(body) {
   if (typeof body !== "string") return false;
   const first = body.split(/\r?\n/).find((l) => l.trim());
@@ -355,6 +374,16 @@ export function createPersister(deps = {}) {
     const store = gated.store;
     const key = sessionTurnsKey(sessionId);
     const common = { bucket: store.bucket, endpoint: store.endpoint, profile: store.profile, region: store.region };
+    // 该会话若已被 celagent migrate 转成 JSONL, 旧格式写入会写进一个没人再读的对象
+    // (加载与搜索都优先 .jsonl) —— 停写并告知, 避免两份权威悄悄分叉。
+    // 探针瞬时失败时**留队重试**而不是猜: 与全局语义一致 (transient 从不丢轮,
+    // 也不在"可能已迁移"的情况下盲写一个没人读的对象)
+    const migrated = await get(sessionJsonlKey(sessionId), common);
+    if (migrated.ok) {
+      warn("migrated", `  (警告: 会话 ${sessionId} 已迁移为 Pi JSONL, 旧格式写入已停止 — 请重启 celagent ${sessionId} 以继续持久化)`);
+      return;
+    }
+    if (classifyStoreError(migrated.error) === "transient") return "retry";
     for (let attempt = 0; attempt < 3; attempt++) {
       let session = { id: sessionId, turns: [] };
       let etag = undefined;
