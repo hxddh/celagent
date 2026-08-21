@@ -36,6 +36,7 @@ celagent <id>              # 续写指定会话 (打开 BOS 上的 Pi JSONL)
 celagent list              # 列出 BOS 里所有可恢复会话
 celagent export <id>       # 导出会话 (优先 JSONL)
 celagent rm <id>           # 删除会话 (需确认)
+celagent migrate <id>      # 旧 .json 会话转 Pi JSONL (保留原对象)
 celagent doctor            # 自检: 配置/凭证/节点/BOS 连通
 celagent config get persistence.bucket
 celagent config set model deepseek-v4-flash
@@ -82,6 +83,7 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `celagent list [--bucket B]` | 列会话(settings 丢失自动扫描 bucket) |
 | `celagent export <id>` | 导出(优先 JSONL) |
 | `celagent rm <id>` | 删除会话(需确认) |
+| `celagent migrate <id>` | 旧 `.json` 会话转 Pi JSONL(自检可打开才写,旧对象保留) |
 | `celagent config get/set` | 配置读写 |
 | `celagent doctor` | 六维自检(含 CAS) |
 | `celagent cas-probe` | 探测存储条件写(RPO=0 门禁) |

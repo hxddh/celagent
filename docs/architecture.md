@@ -31,7 +31,7 @@
 **一句话**:对象存储保数据(权威源,RPO=0;默认 BOS)、Celld 保执行(缓存/任务/集群)、agent 可用同一存储(记忆工具)。
 不是所有「S3 兼容」都能当权威源——必须有条件写 + 写后读一致;见 `docs/s3-compat-evaluation.md`。
 
-**记忆体系**:`sessions/<id>.jsonl`(Pi 原生权威会话)+ 旧 `sessions/<id>.json`(只读兼容)+ `snapshots/<name>-<ts>.json`(显式记忆锚点,
+**记忆体系**:`sessions/<id>.jsonl`(Pi 原生权威会话)+ 旧 `sessions/<id>.json`(只读兼容,可用 `celagent migrate <id>` 显式转成 JSONL — 自检 Pi 可打开才写,旧对象保留)+ `snapshots/<name>-<ts>.json`(显式记忆锚点,
 由 `session_snapshot` 工具写入,不碰权威数据,可跨会话检索 via `history_search`)。
 
 ### 1.2 节点生命周期
