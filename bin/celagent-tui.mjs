@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 // 开发模式 (源码目录有 node_modules) 时仍从本地解析; 编译时由 Bun 内联。
 import * as pi from "@earendil-works/pi-coding-agent";
 import { awsEnv, resolveEndpoint, isAllowedEndpoint, awsJson } from "../src/bos.js";
-import { storeFromCfg, queueJsonlWrite, queueBosWrite, flushBosQueue, loadSessionHistory, STEER_LEGACY_HEADER, persistIdFromJsonlPath } from "../src/persist.js";
+import { storeFromCfg, queueJsonlWrite, queueBosWrite, flushBosQueue, loadSessionHistory, STEER_LEGACY_HEADER, persistIdFromJsonlPath, jsonlSupersedes, isJsonlBody } from "../src/persist.js";
 
 const AGENT_DIR = join(homedir(), ".config", "celagent", "pi-runtime");
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091", "http://127.0.0.1:19000"];
@@ -448,7 +448,7 @@ async function listSessions() {
 }
 
 // ---- 版本/帮助 ----
-const CELAGENT_VERSION = "0.4.1";
+const CELAGENT_VERSION = "0.4.2";
 function printVersion() {
   console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS 对象存储持久化`);
 }
@@ -461,6 +461,7 @@ function printHelp() {
   celagent list [--bucket B] [--scan]  列出 BOS 会话 (--scan 才枚举账号下全部 bucket)
   celagent export <id> [--bucket B]  导出会话 (优先 JSONL, 旧对象为 JSON)
   celagent rm <id> [--bucket B] [--yes]  删除 BOS 里的会话 (非 TTY 必须 --yes)
+  celagent migrate <id> [--bucket B] [--yes]  旧 .json 会话转 Pi JSONL (保留原对象)
   celagent config get <key>   读取配置 (如 persistence.bucket)
   celagent config set <key> <value>  写入配置 (如 model deepseek-v4-flash)
   celagent doctor             自检: 配置/凭证/节点/存储连通/CAS
@@ -811,6 +812,104 @@ async function rmCommand(id) {
   console.log(`✓ 已删除会话 ${id}`);
 }
 
+// ---- v0.4.2: 旧 turns JSON → Pi JSONL 显式迁移 ----
+// v0.4.1 拒绝隐式迁移 (50 轮 steer 摘要会遮蔽全量历史), 这里给出路。
+// 安全性: 目标已存在则不动; 转换后**先用 SessionManager.open 本地验证**, 打不开就
+// 绝不写入; 写入用 ifNoneMatch (首写保护); 旧 .json 永不删除, 留作备份。
+async function migrateCommand(id) {
+  if (!id || id.startsWith("-")) {
+    console.error("用法: celagent migrate <会话ID> [--bucket B] [--yes] (把旧 .json 会话转成 Pi JSONL)");
+    process.exit(1);
+  }
+  assertSafeSessionId(id);
+  const { bucket, endpoint, profile, region } = await getBucketArg();
+  if (!bucket) { console.error("✗ 未找到 bucket (用 --bucket 指定)"); process.exit(1); }
+  const { bosGet, bosPut } = await import("../src/bos.js");
+  const { jsonlFromTurns, sessionJsonlKey, sessionTurnsKey, classifyStoreError } = await import("../src/persist.js");
+  const opts = { bucket, endpoint, profile, region };
+
+  // 1. 目标已存在 → 不动 (绝不覆盖已有权威 JSONL)
+  const jsonlKey = sessionJsonlKey(id);
+  const already = await bosGet(jsonlKey, opts);
+  if (already.ok) {
+    console.log(`✓ 会话 ${id} 已是 Pi JSONL, 无需迁移`);
+    return;
+  }
+  if (classifyStoreError(already.error) !== "not-found") {
+    console.error(`✗ 无法确认目标对象状态, 中止迁移 (避免误覆盖): ${already.error}`);
+    process.exit(1);
+  }
+
+  // 2. 读旧对象
+  const legacy = await bosGet(sessionTurnsKey(id), opts);
+  if (!legacy.ok) {
+    const kind = classifyStoreError(legacy.error);
+    console.error(kind === "not-found"
+      ? `✗ 会话不存在 (既无 ${jsonlKey} 也无 ${sessionTurnsKey(id)})`
+      : `✗ 旧会话读取失败: ${legacy.error}`);
+    process.exit(1);
+  }
+  let legacyTurns;
+  try {
+    const parsed = JSON.parse(legacy.body);
+    legacyTurns = Array.isArray(parsed.turns) ? parsed.turns : null;
+  } catch (e) { legacyTurns = null; }
+  if (!legacyTurns || legacyTurns.length === 0) {
+    console.error("✗ 旧会话为空或 JSON 损坏, 不迁移 (原对象未改动)");
+    process.exit(1);
+  }
+
+  // 3. 转换
+  const { jsonl, turns, messages } = jsonlFromTurns(id, legacyTurns, { cwd: process.cwd() });
+
+  // 4. 本地验证: Pi 打不开就绝不写入 — 合成条目的元数据是占位, 必须实测可加载
+  const { mkdtempSync, writeFileSync, rmSync } = require("node:fs");
+  const { tmpdir } = require("node:os");
+  const probeDir = mkdtempSync(join(tmpdir(), "celagent-migrate-"));
+  try {
+    const probeFile = join(probeDir, `${id}.jsonl`);
+    writeFileSync(probeFile, jsonl, { encoding: "utf8", mode: 0o600 });
+    const sm = pi.SessionManager.open(probeFile, probeDir, process.cwd());
+    const loaded = (typeof sm.getEntries === "function" ? sm.getEntries() : []) || [];
+    const got = loaded.filter((e) => e?.type === "message").length;
+    if (got !== messages) {
+      console.error(`✗ 迁移自检失败: 期望 ${messages} 条 message, Pi 实际载入 ${got} 条 — 未写入任何对象`);
+      process.exit(1);
+    }
+    console.log(`  ✓ 自检通过: Pi 可打开, 载入 ${got} 条 message`);
+  } catch (e) {
+    console.error(`✗ 迁移自检失败 (Pi 无法打开转换结果): ${e.message} — 未写入任何对象`);
+    process.exit(1);
+  } finally {
+    try { rmSync(probeDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // 5. 确认 (追加式操作, 但仍会写用户桶)
+  console.log(`\n迁移计划: ${sessionTurnsKey(id)} (${turns} 轮) → ${jsonlKey} (${messages} 条 message)`);
+  console.log(`  旧对象保留为备份, 不删除; assistant 的 api/provider/model/usage 与 toolResult 的 isError`);
+  console.log(`  为迁移占位 (旧格式未采集), 已记在 JSONL 头部 migratedFrom 里。`);
+  const force = process.argv.includes("--yes") || process.argv.includes("-y");
+  let confirm = force;
+  if (!confirm) {
+    if (!process.stdin.isTTY) { console.error("✗ 非交互迁移需要 --yes"); process.exit(1); }
+    confirm = await new Promise((resolve) => {
+      const readline = require("node:readline").createInterface({ input: process.stdin, output: process.stdout });
+      readline.question(`确定迁移会话 "${id}"? [y/N] `, (a) => { readline.close(); resolve(/^y/i.test(a.trim())); });
+    });
+  }
+  if (!confirm) { console.log("已取消"); return; }
+
+  // 6. 首写保护写入
+  const put = await bosPut(jsonlKey, jsonl, { ...opts, ifNoneMatch: true });
+  if (put.conflict) {
+    console.error("✗ 目标对象刚被其它进程创建, 已放弃迁移 (未覆盖)");
+    process.exit(1);
+  }
+  if (!put.ok) { console.error(`✗ 迁移写入失败: ${put.error || "未知错误"}`); process.exit(1); }
+  console.log(`✓ 已迁移: ${jsonlKey} (${messages} 条 message)`);
+  console.log(`  下次 celagent ${id} 将以真 Pi 会话打开; 旧对象 ${sessionTurnsKey(id)} 保留为备份`);
+}
+
 async function main() {
   const cwd = process.cwd();
   const cmd = process.argv[2];
@@ -823,6 +922,7 @@ async function main() {
   if (cmd === "cas-probe") { await casProbeCommand(); return; }
   if (cmd === "export") { await exportCommand(process.argv[3]); return; }
   if (cmd === "rm") { await rmCommand(process.argv[3]); return; }
+  if (cmd === "migrate") { await migrateCommand(process.argv[3]); return; }
   if (cmd === "task") { await taskCommand(process.argv.slice(3)); return; }
   // Bug 80: 未知的 - 开头参数 (拼错的 --xxx) 不应被静默当 sessionId 进 TUI
   if (cmd && cmd.startsWith("-")) {
@@ -930,7 +1030,21 @@ async function main() {
     mkdirSync(sessionDir, { recursive: true });
     let sessionManager;
     if (openedFromJsonl) {
-      writeFileSync(localJsonl, hist.jsonl, { encoding: "utf8", mode: 0o600 });
+      // 崩溃恢复: 本地文件若是远端的谱系超集 (上轮崩在"已追加本地、BOS 未落地"之间),
+      // 用远端覆盖会永久毁掉那几轮 — 此时保留本地, 并补写回 BOS。
+      // 谱系不同源 / 本地落后 / 本地损坏 → 仍以远端为准 (远端是权威源)。
+      let keepLocal = false;
+      try {
+        if (existsSync(localJsonl)) {
+          const localBody = readFileSync(localJsonl, "utf8");
+          if (isJsonlBody(localBody) && localBody !== hist.jsonl && jsonlSupersedes(localBody, hist.jsonl)) {
+            keepLocal = true;
+            console.log("  (检测到本地会话领先于 BOS — 保留本地并补写回, 不覆盖)");
+            queueJsonlWrite(sessionId, localBody);
+          }
+        }
+      } catch (e) { keepLocal = false; }
+      if (!keepLocal) writeFileSync(localJsonl, hist.jsonl, { encoding: "utf8", mode: 0o600 });
       try {
         sessionManager = pi.SessionManager.open(localJsonl, sessionDir, cwd);
       } catch (e) {
@@ -1034,13 +1148,37 @@ async function main() {
       };
       // 权威写路由: jsonl=整文件 (带谱系覆盖保护); legacy=按轮 CAS 合并进 .json;
       // blocked=远端状态未知, 只镜像 worker, 警告一次
+      // blocked 自愈: 远端状态未知时不写权威, 但按冷却周期重探;
+      // 一旦远端可读就升级回正常模式, 不必重启进程 (v0.4.2)
+      let blockedProbeAt = 0;
+      const BLOCKED_RETRY_MS = 30000;
+      const tryUnblock = async () => {
+        const now = Date.now();
+        if (now - blockedProbeAt < BLOCKED_RETRY_MS) return false;
+        blockedProbeAt = now;
+        let rh = null;
+        try { rh = await loadHistoryInfoFromBos(persistId); } catch (e) { return false; }
+        if (!rh || rh.transient || rh.fatal || rh.corrupt) return false;
+        const turns = Array.isArray(rh.turns) ? rh.turns : [];
+        persistMode = (rh.kind === "turns" && turns.length > 0) ? "legacy" : "jsonl";
+        console.log(`  (BOS 已恢复可读, 会话 ${persistId} 继续权威写入: ${persistMode})`);
+        return true;
+      };
       const queueAuthoritative = (seqNo, role, msg, fullContent, fullToolResults) => {
+        if (persistMode === "blocked") {
+          warnOnce("persist", `  (警告: 会话 ${persistId} 远端状态未知, 暂不做权威写入 — 将周期性重试)`);
+          void tryUnblock().then((ok) => {
+            // 解除封锁后立刻补写当前状态, 不等下一轮
+            if (!ok) return;
+            if (persistMode === "legacy") queueBosWrite(persistId, seqNo, role, msg, { fullContent, fullToolResults });
+            else queueSessionJsonl(persistId, effSessionManager);
+          });
+          return;
+        }
         if (persistMode === "legacy") {
           queueBosWrite(persistId, seqNo, role, msg, { fullContent, fullToolResults });
-        } else if (persistMode === "jsonl") {
-          queueSessionJsonl(persistId, effSessionManager);
         } else {
-          warnOnce("persist", `  (警告: 会话 ${persistId} 远端状态未知, 本次不做权威写入 — 重启后重试)`);
+          queueSessionJsonl(persistId, effSessionManager);
         }
       };
       result.session.subscribe(async (event) => {

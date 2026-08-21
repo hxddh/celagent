@@ -385,8 +385,8 @@ test("源码锚定: worker 已删除未调用的 SigV4 bosPut", () => {
   assert.match(w, /async function bosPutProxy/);
 });
 
-test("源码锚定: 版本 0.4.1 与 release-smoke", () => {
-  assert.match(tui, /CELAGENT_VERSION = "0\.4\.1"/);
+test("源码锚定: 版本 0.4.2 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.4\.2"/);
   const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
   assert.match(smoke, /sha256sum --ignore-missing/);
   assert.match(smoke, /celagent-linux-x64/);
@@ -454,4 +454,27 @@ test("源码锚定: Windows install.ps1 与 checkout v5", () => {
   assert.match(ps, /celagent-windows-x64\.exe/);
   const ci = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8");
   assert.match(ci, /actions\/checkout@v5/);
+});
+
+test("源码锚定: v0.4.2 迁移命令 / 崩溃恢复 / blocked 自愈", () => {
+  // 迁移: 目标已存在不动、Pi 自检不过不写、ifNoneMatch 首写、旧对象保留
+  assert.match(tui, /async function migrateCommand/);
+  assert.match(tui, /celagent migrate/);
+  assert.match(tui, /已是 Pi JSONL, 无需迁移/);
+  assert.match(tui, /迁移自检失败[\s\S]{0,80}未写入任何对象/);
+  assert.match(tui, /pi\.SessionManager\.open\(probeFile/);
+  assert.match(tui, /ifNoneMatch: true/);
+  assert.doesNotMatch(tui, /bosDelete\(sessionTurnsKey/, "迁移绝不删除旧对象");
+  assert.match(persist, /export function jsonlFromTurns/);
+  assert.match(persist, /migratedFrom/);
+  // 崩溃恢复: 本地领先则保留并补写回, 不被远端覆盖
+  assert.match(tui, /jsonlSupersedes\(localBody, hist\.jsonl\)/);
+  assert.match(tui, /保留本地并补写回/);
+  // blocked 自愈: 周期性重探, 恢复后立刻补写
+  assert.match(tui, /async function migrateCommand|const tryUnblock = async/);
+  assert.match(tui, /BLOCKED_RETRY_MS/);
+  assert.match(tui, /BOS 已恢复可读/);
+  // 写放大: 只告警, 不靠延迟权威写换流量
+  assert.match(persist, /JSONL_SIZE_WARN_BYTES/);
+  assert.match(persist, /整文件重传/);
 });

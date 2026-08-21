@@ -12,6 +12,9 @@ import {
   turnsFromJsonl,
   jsonlEntryIds,
   jsonlSupersedes,
+  jsonlFromTurns,
+  MIGRATED_MODEL,
+  JSONL_SIZE_WARN_BYTES,
   persistIdFromJsonlPath,
   sessionJsonlKey,
   sessionTurnsKey,
@@ -578,4 +581,106 @@ test("队列: 同会话 JSONL 合并为最新快照", async () => {
   assert.equal(got.ok, true);
   assert.match(got.body, /three/);
   assert.doesNotMatch(got.body, /"text":"one"/);
+});
+
+// ---- v0.4.2: 旧 turns → Pi JSONL 迁移 ----
+const legacyTurns = [
+  { turn: 1, role: "user", ts: 1720000000000, msg: "修并发 bug", content: [{ type: "text", text: "修并发 bug" }] },
+  { turn: 2, role: "assistant", ts: 1720000001000, msg: "看一下 [工具调用: read(...)]",
+    content: [
+      { type: "thinking", thinking: "先读文件" },
+      { type: "text", text: "看一下" },
+      { type: "toolCall", id: "call_abc123", name: "read", arguments: { path: "a.js" } },
+    ],
+    toolResults: [{ toolName: "read", content: [{ type: "text", text: "文件内容" }] }] },
+];
+
+test("jsonlFromTurns: 产出合法 Pi JSONL 首行 + 谱系链", () => {
+  const { jsonl, turns, messages } = jsonlFromTurns("sess-x", legacyTurns, { cwd: "/tmp" });
+  assert.equal(turns, 2);
+  assert.equal(messages, 3, "assistant 轮的 toolResult 展开成独立 message");
+  assert.equal(isJsonlBody(jsonl), true);
+  const lines = jsonl.trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(lines[0].type, "session");
+  assert.equal(lines[0].version, 3);
+  assert.equal(lines[0].id, "sess-x");
+  assert.ok(lines[0].migratedFrom, "必须标注迁移来源, 不冒充原始采样");
+  // parentId 串成单链
+  assert.equal(lines[1].parentId, null);
+  for (let i = 2; i < lines.length; i++) assert.equal(lines[i].parentId, lines[i - 1].id);
+});
+
+test("jsonlFromTurns: toolCallId 按顺序+名字重链回 toolCall", () => {
+  const { jsonl } = jsonlFromTurns("sess-x", legacyTurns);
+  const msgs = jsonl.trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "message");
+  const tr = msgs.find((e) => e.message.role === "toolResult");
+  assert.equal(tr.message.toolCallId, "call_abc123");
+  assert.equal(tr.message.toolName, "read");
+  assert.equal(tr.message.content[0].text, "文件内容");
+});
+
+test("jsonlFromTurns: 不可恢复的元数据标为迁移占位, 不伪造真实模型名", () => {
+  const { jsonl } = jsonlFromTurns("sess-x", legacyTurns);
+  const a = jsonl.trim().split("\n").map((l) => JSON.parse(l))
+    .find((e) => e.type === "message" && e.message.role === "assistant");
+  assert.equal(a.message.model, MIGRATED_MODEL);
+  assert.match(a.message.model, /migrated/, "占位必须自我标识, 不能像真实模型名");
+  assert.equal(a.message.usage.input, 0);
+  assert.equal(a.message.stopReason, "stop");
+  // thinking / text 块原样保留
+  assert.equal(a.message.content.find((b) => b.type === "thinking").thinking, "先读文件");
+});
+
+test("jsonlFromTurns: 乱序 turn 按序号排序, 空输入产出仅头部", () => {
+  const { jsonl } = jsonlFromTurns("s", [{ turn: 2, role: "assistant", msg: "第二" }, { turn: 1, role: "user", msg: "第一" }]);
+  const msgs = jsonl.trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "message");
+  assert.equal(msgs[0].message.role, "user");
+  const empty = jsonlFromTurns("s", []);
+  assert.equal(empty.messages, 0);
+  assert.equal(isJsonlBody(empty.jsonl), true);
+});
+
+test("jsonlFromTurns 产物可被 jsonlSupersedes 视为自身前缀 (可继续追加)", () => {
+  const { jsonl } = jsonlFromTurns("sess-x", legacyTurns);
+  assert.equal(jsonlSupersedes(jsonl, jsonl), true);
+  const truncated = jsonl.trim().split("\n").slice(0, 2).join("\n") + "\n";
+  assert.equal(jsonlSupersedes(jsonl, truncated), true, "迁移后继续写入不被谱系保护挡住");
+});
+
+test("写放大告警: 超阈值时提示整文件重传成本", async () => {
+  const mem = memoryStore();
+  const seen = [];
+  const p = createPersister({
+    store, get: (k) => mem.get(k), put: (k, c, e) => mem.put(k, c, e),
+    probe: probeOk, sleep: async () => {}, loadStore: () => store,
+    warn: (ch, msg) => seen.push([ch, msg]),
+  });
+  const pad = "x".repeat(JSONL_SIZE_WARN_BYTES);
+  const big = sampleJsonl(pad, "ok");
+  await p.persistJsonlToBos("sid", big);
+  assert.ok(seen.some(([ch]) => ch === "jsonl-size"), `应有 jsonl-size 提示: ${JSON.stringify(seen.map(x=>x[0]))}`);
+  assert.equal((await mem.get("sessions/sid.jsonl")).ok, true, "告警不阻止写入");
+});
+
+test("迁移产物必须真能被 Pi SessionManager.open 打开 (无 pi 则跳过)", async (t) => {
+  let pi;
+  try { pi = await import("@earendil-works/pi-coding-agent"); }
+  catch (e) { return t.skip("pi 引擎未安装"); }
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "celagent-mig-test-"));
+  try {
+    const { jsonl, messages } = jsonlFromTurns("sess-mig", legacyTurns, { cwd: dir });
+    const file = join(dir, "sess-mig.jsonl");
+    writeFileSync(file, jsonl, "utf8");
+    const sm = pi.SessionManager.open(file, dir, dir);
+    const entries = (typeof sm.getEntries === "function" ? sm.getEntries() : []) || [];
+    const msgs = entries.filter((e) => e?.type === "message");
+    assert.equal(msgs.length, messages, "Pi 载入的 message 数必须与转换数一致");
+    assert.deepEqual(msgs.map((e) => e.message.role), ["user", "assistant", "toolResult"]);
+    assert.equal(msgs[2].message.toolCallId, "call_abc123");
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
 });

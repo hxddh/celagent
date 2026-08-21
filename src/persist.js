@@ -4,9 +4,12 @@
 import { homedir } from "node:os";
 import { join, basename } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { bosGet, bosPut, casGateSticky, probeStoreCas, resolveEndpoint, resolveRegion } from "./bos.js";
 
 export const BOS_QUEUE_MAX = 50;
+/** 单会话 JSONL 超此大小提示写放大成本 (每轮整文件重传) */
+export const JSONL_SIZE_WARN_BYTES = 5 * 1024 * 1024;
 export const STEER_LEGACY_HEADER = "以下是本会话之前的对话历史";
 
 export function sessionJsonlKey(sessionId) {
@@ -291,6 +294,11 @@ export function createPersister(deps = {}) {
     if (typeof jsonlBody !== "string" || !isJsonlBody(jsonlBody)) {
       warn("persist", `  (警告: 本地会话不是合法 Pi JSONL, 跳过权威写入: ${sessionId})`);
       return;
+    }
+    // 写放大告警: S3 类存储无追加原语, 每轮都整文件重传 —— 单会话累计流量 O(n²)。
+    // 文本会话规模下可接受; 超阈值时明确告知成本 (分段存储是真解, 未做)
+    if (jsonlBody.length >= JSONL_SIZE_WARN_BYTES) {
+      warn("jsonl-size", `  (提示: 会话 ${sessionId} 已达 ${(jsonlBody.length / 1048576).toFixed(1)} MB, 每轮都会整文件重传 — 长会话建议开新会话以控制流量)`);
     }
     const gated = await gateStore();
     if (gated.skip) return gated.retry ? "retry" : undefined;
@@ -580,4 +588,98 @@ export async function loadSessionHistory(sessionId, opts = {}) {
     } catch (e) { /* ignore */ }
   }
   return { turns: store.bucket ? [] : null, source: store.bucket ? "bos" : null, miss: true, kind: store.bucket ? "turns" : null };
+}
+
+// ---- v0.4.2: 旧 turns JSON → Pi JSONL 显式迁移 ----
+// v0.4.1 关掉了隐式迁移 (50 轮 steer 摘要会遮蔽全量历史), 但没给出路:
+// 旧会话永远停在 legacy 按轮模式, 拿不到 v0.4.0 的真 Pi 会话。本节补上无损转换。
+//
+// 可恢复: user/assistant 的完整 content 块 (含带 id 的 toolCall)、toolResults 的
+//         toolName+content、时间戳。toolCallId 按「第 N 个 toolCall ↔ 第 N 个 toolResult」
+//         重链 (二者由同一 turn_end 事件按序捕获), 并用 toolName 交叉校验。
+// 不可恢复 (旧格式从未采集): assistant 的 api/provider/model/usage/stopReason、
+//         toolResult 的 isError。这些**不伪造成真实值** — 统一标注为迁移占位,
+//         provenance 存在 header.migratedFrom 里, 让读到的人知道它不是原始采样。
+export const MIGRATED_MODEL = "unknown-migrated-v03-turns";
+export const MIGRATED_PROVIDER = "unknown-migrated";
+
+function migratedUsage() {
+  // 旧格式未采集 token 计数; 全零表示「未知」而非「真的 0」, 由 header.migratedFrom 兜底说明
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
+
+function makeEntryId(used) {
+  for (let i = 0; i < 1000; i++) {
+    const id = randomUUID().replace(/-/g, "").slice(0, 8);
+    if (!used.has(id)) { used.add(id); return id; }
+  }
+  throw new Error("entry id 生成失败");
+}
+
+function contentBlocksOf(turn) {
+  if (Array.isArray(turn.content) && turn.content.length) return turn.content;
+  const text = String(turn.msg ?? "").trim();
+  return text ? [{ type: "text", text }] : [];
+}
+
+/** 把一条旧 turn 展开成 Pi message 列表 (assistant 轮可能带出若干 toolResult) */
+function messagesFromTurn(turn) {
+  const out = [];
+  const ts = Number(turn.ts) || Date.now();
+  const role = turn.role === "user" ? "user" : "assistant";
+  const content = contentBlocksOf(turn);
+  if (role === "user") {
+    // UserMessage 只接受 text/image 块; 旧 user 轮理论上只有 text, 其它块降级为文本
+    const safe = content.filter((b) => b && (b.type === "text" || b.type === "image"));
+    out.push({ role: "user", content: safe.length ? safe : [{ type: "text", text: String(turn.msg ?? "") }], timestamp: ts });
+    return out;
+  }
+  out.push({
+    role: "assistant",
+    content: content.filter((b) => b && (b.type === "text" || b.type === "thinking" || b.type === "toolCall")),
+    api: "unknown", provider: MIGRATED_PROVIDER, model: MIGRATED_MODEL,
+    usage: migratedUsage(), stopReason: "stop", timestamp: ts,
+  });
+  const calls = content.filter((b) => b && b.type === "toolCall");
+  const results = Array.isArray(turn.toolResults) ? turn.toolResults : [];
+  results.forEach((tr, i) => {
+    const byOrder = calls[i];
+    // 顺序配对 + toolName 交叉校验; 名字不符时退回按名字找第一个未用的 call
+    let call = byOrder && (!tr.toolName || !byOrder.name || byOrder.name === tr.toolName) ? byOrder : null;
+    if (!call) call = calls.find((c) => c.name === tr.toolName) || null;
+    out.push({
+      role: "toolResult",
+      toolCallId: call?.id || `migrated-${i}`,
+      toolName: tr.toolName || call?.name || "unknown",
+      content: Array.isArray(tr.content) ? tr.content.filter((b) => b && (b.type === "text" || b.type === "image")) : [],
+      isError: false,   // 旧格式未采集成败, 一律按非错误处理 (仅影响展示)
+      timestamp: ts,
+    });
+  });
+  return out;
+}
+
+/** 旧 turns 数组 → Pi JSONL 文本。cwd 用调用方当前工作目录 (旧格式未记录) */
+export function jsonlFromTurns(sessionId, turns, { cwd = process.cwd(), now = () => new Date().toISOString() } = {}) {
+  const iso = now();
+  const ordered = (Array.isArray(turns) ? turns.slice() : [])
+    .filter((t) => t && typeof t === "object")
+    .sort((a, b) => (Number(a.turn) || 0) - (Number(b.turn) || 0));
+  const lines = [JSON.stringify({
+    type: "session", version: 3, id: sessionId, timestamp: iso, cwd,
+    migratedFrom: { format: "celagent-v0.3-turns", turns: ordered.length, at: iso,
+      note: "assistant 的 api/provider/model/usage/stopReason 与 toolResult 的 isError 为迁移占位, 旧格式未采集" },
+  })];
+  const used = new Set();
+  let parentId = null;
+  let messages = 0;
+  for (const turn of ordered) {
+    for (const message of messagesFromTurn(turn)) {
+      const id = makeEntryId(used);
+      lines.push(JSON.stringify({ type: "message", id, parentId, timestamp: iso, message }));
+      parentId = id;
+      messages += 1;
+    }
+  }
+  return { jsonl: lines.join("\n") + "\n", turns: ordered.length, messages };
 }
