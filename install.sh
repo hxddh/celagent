@@ -7,6 +7,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
 VERSION="0.4.3"
+# 随包 celld 版本 — 必须与 scripts/prepare-release-assets.sh 的 CELLD_UPSTREAM_TAG 一致。
+# 就地升级时用它判断已装 celld 是否过时 (否则老用户永远停在旧运行时)
+CELLD_BUNDLED_VERSION="0.3.0"
 REPO="https://github.com/hxddh/celagent"
 RELEASE_URL="${CELAGENT_RELEASE_URL:-$REPO/releases/latest/download}"
 
@@ -107,6 +110,24 @@ CELLD=""
 for cand in "$HOME/.local/bin/celld" "${CELAGENT_ROOT}/bin/celld" "/usr/local/bin/celld"; do
   [ -x "$cand" ] && CELLD="$cand" && break
 done
+# 就地升级: 已装 celld 若低于随包版本, 清空 CELLD 让下面的下载分支替换它。
+# 不这么做的话, 老用户跑新 install.sh 只会拿到新 CLI 配旧运行时 (拿不到新能力)。
+# 版本读不出来时保守保留 (未知不等于过时); 升级失败会回滚到原二进制, 不让安装变砖。
+CELLD_PREV=""
+if [ -n "$CELLD" ]; then
+  CELLD_CUR=$("$CELLD" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [ -z "$CELLD_CUR" ]; then
+    echo "  ⚠️ 无法识别已装 celld 版本 ($CELLD), 保留原样"
+  elif [ "$CELLD_CUR" = "$CELLD_BUNDLED_VERSION" ]; then
+    echo "  ✓ 已装 celld $CELLD_CUR = 随包版本"
+  elif [ "$(printf '%s\n%s\n' "$CELLD_CUR" "$CELLD_BUNDLED_VERSION" | sort -V | head -1)" = "$CELLD_CUR" ]; then
+    echo "  ↑ 已装 celld $CELLD_CUR 低于随包 $CELLD_BUNDLED_VERSION, 升级中..."
+    CELLD_PREV="$CELLD"
+    CELLD=""
+  else
+    echo "  ✓ 已装 celld $CELLD_CUR 高于随包 $CELLD_BUNDLED_VERSION, 保留"
+  fi
+fi
 if [ -z "$CELLD" ] && [ "$PLATFORM" = "windows-x64" ]; then
   echo "  ⚠️ 上游 celld 暂无 Windows 包, 跳过 celld (仅安装 celagent.exe)"
 elif [ -z "$CELLD" ]; then
@@ -123,11 +144,16 @@ elif [ -z "$CELLD" ]; then
   else
     rm -f "${CELAGENT_ROOT}/bin/celld-${PLATFORM}"
     echo "  Release 暂无 celld-${PLATFORM} (Intel Mac 上游未发), 回退 celld.dev 官方安装..."
-    curl -fsSL https://celld.dev/install.sh | sh || {
+    if curl -fsSL https://celld.dev/install.sh | sh; then
+      CELLD="$HOME/.local/bin/celld"
+    elif [ -n "$CELLD_PREV" ]; then
+      # 升级失败但原来能跑 — 回滚, 不把可用安装变砖
+      echo "  ⚠️ celld 升级失败, 回滚到已装的 $CELLD_PREV (稍后可重跑 install.sh 重试)"
+      CELLD="$CELLD_PREV"
+    else
       echo "  ✗ celld 下载失败 (网络问题?), 请手动安装"
       exit 1
-    }
-    CELLD="$HOME/.local/bin/celld"
+    fi
   fi
 fi
 [ -n "$CELLD" ] && echo "  ✓ celld: $CELLD"

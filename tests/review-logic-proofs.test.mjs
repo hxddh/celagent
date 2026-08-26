@@ -518,3 +518,20 @@ test("源码锚定: 依赖跟随上游最新 — 无过时钉版, celld 新能�
   }
   assert.equal(pkg.dependencies.chalk, undefined, "chalk 不应是直接依赖");
 });
+
+test("源码锚定: install.sh 就地升级过时的 celld (评审 P2)", () => {
+  const sh = readFileSync(join(root, "install.sh"), "utf8");
+  // 随包版本须与 prepare-release-assets.sh 的上游 tag 一致
+  assert.match(sh, /CELLD_BUNDLED_VERSION="0\.3\.0"/);
+  const prep = readFileSync(join(root, "scripts/prepare-release-assets.sh"), "utf8");
+  const bundled = sh.match(/CELLD_BUNDLED_VERSION="([\d.]+)"/)[1];
+  assert.match(prep, new RegExp(`CELLD_UPSTREAM_TAG:-v${bundled.replace(/\./g, "\\.")}`),
+    "install.sh 的随包版本必须与上游 tag 同步");
+  // 发现已装 celld 后要比版本, 过时则清空 CELLD 走下载分支
+  assert.match(sh, /CELLD_PREV/);
+  assert.match(sh, /低于随包/);
+  assert.match(sh, /sort -V/);
+  // 未知版本保守保留; 升级失败回滚, 不把可用安装变砖
+  assert.match(sh, /无法识别已装 celld 版本/);
+  assert.match(sh, /回滚到已装的/);
+});
