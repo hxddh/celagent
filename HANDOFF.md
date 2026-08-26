@@ -50,7 +50,8 @@ TUI 交互 (pi-coding-agent 引擎, 全量工具)
 | `docs/v038-scope.md` | v0.3.8 实现合同(再下一刀: 非 BOS 真桶实测,需凭证,无凭证不开 PR) |
 | `docs/v040-scope.md` | v0.4.0 实现合同(已发布: Pi JSONL 权威会话 + SessionManager.open) |
 | `docs/v041-scope.md` | v0.4.1 实现合同(已发布: 深度审查 7 项修复 — JSONL 谱系覆盖保护、旧格式不隐式迁移、启动读失败拒绝绑定) |
-| `docs/v042-scope.md` | v0.4.2 实现合同(本刀: `migrate` 命令给旧格式出路、崩溃恢复保留本地、blocked 自愈、写放大告警) |
+| `docs/v043-scope.md` | v0.4.3 实现合同(本刀: 依赖全面跟随上游最新 + 显式采纳 celld v0.3 能力) |
+| `docs/v042-scope.md` | v0.4.2 实现合同(已发布: `migrate` 命令给旧格式出路、崩溃恢复保留本地、blocked 自愈、写放大告警) |
 | `scripts/store_env.sh` | 运维脚本共用的 endpoint/region/profile 读取(endpoint fail-closed) |
 | `scripts/release-smoke.sh` | 无凭证发布冒烟(下载+SHA256+version/help) |
 | `docs/evaluation-followup.md` | PR#2 评估项对照(已在 v0.3.1 落地) |
@@ -113,14 +114,18 @@ node bin/celagent-tui.mjs task ledger
 - **凭证优先级**:完整环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` 优先(必须成对);否则用 `AWS_PROFILE=bos`(不把 SK 读进脚本变量/Node 堆).两者不混用
 - **install.sh 可配置 env**:`CELAGENT_REPO`(仓库地址)、`CELAGENT_SRC`(开发模式)、`CELAGENT_ROOT`(安装根目录,默认 ~/.local)、`CELAGENT_BUCKET`(强制 bucket)、`CELLD_ESBUILD`(esbuild 路径)
 - **默认 bucket**:`celagent-<rand8>-<ts>`(随机后缀, 不含 whoami)
-- **Celld**:不在仓库内;发布随包 **v0.2.0**(linux-x64/arm64、darwin-arm64)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。评估见 `docs/celld-v02-evaluation.md`
-- **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` v0.84.x(不 fork,库用)
+- **Celld**:不在仓库内;发布随包 **v0.3.0**(linux-x64/arm64、darwin-arm64;上游 tag 在 `scripts/prepare-release-assets.sh` 的 `CELLD_UPSTREAM_TAG`)。启动必须双监听:Worker `--listen 127.0.0.1:18090|18091`,内部 `--internal-listen/--advertise` 为 port+2。v0.2 适配评估见 `docs/celld-v02-evaluation.md`
+  - v0.2.0→v0.3.0 对本产品的参数面**纯增量、零移除**(实测:6 个 flag + 5 个 env 全部健在,用完整组合实跑到 bucket 校验才停)
+  - spawn 显式声明 `CELLD_DURABILITY=fleet` 与 `CELLD_STORAGE_PROBE=1`:前者是 celld v0.3 新增的耐久性档位(会话权威写直连对象存储、不经 celld,celld 只持可重建缓存,故取快的一档),后者让 celld 启动即自验条件写。**显式写出来是为了上游改默认值时不会悄悄改变我们的姿态**
+  - 未采用:`--trust-forwarded-headers`(本产品仅环回,启用会削弱来源可信)、`az://`(无实测不宣称)、`celld d1`(不适用)
+- **Pi 引擎**:npm 包 `@earendil-works/pi-coding-agent` **0.84.3**(上游最新;不 fork,库用)。`chalk` 不是本仓库直接依赖 —— 源码从不 import,pi 精确钉 5.6.2 自带
 
-## 3. 发布状态(Latest v0.4.2)
+## 3. 发布状态(Latest v0.4.3)
 
-仓库:`https://github.com/hxddh/celagent`。Latest:[v0.4.2](https://github.com/hxddh/celagent/releases/tag/v0.4.2)。
+仓库:`https://github.com/hxddh/celagent`。Latest:[v0.4.3](https://github.com/hxddh/celagent/releases/tag/v0.4.3)。
 
-- **tag `v0.4.2`** 指向 PR #22 合并进 main 的提交;Release 资产由此 SHA 构建
+- **tag `v0.4.3`** 指向 PR #23 合并进 main 的提交;Release 资产由此 SHA 构建(**随包 celld 升为 v0.3.0**)
+- **v0.4.2**(`f9593e4`,PR #22)随包 celld 仍是 v0.2.0,pi 停在 0.84.1
 - **v0.4.1**(`ea2c2f6`,PR #21)旧 `.json` 会话是死胡同(无迁移出路);启动用远端覆盖本地,崩溃领先的轮次会被毁
 - **v0.4.0**(`f9e6e0a`,PR #19)JSONL 整体写无谱系保护:启动读抖动/双机同 id 可整体覆盖历史,旧 .json 隐式迁移会被 50 轮摘要遮蔽
 - **v0.3.7**(`fa872c9`,PR #17) persist 主路径 GET/PUT 瞬时失败留队;恢复非 miss 不回退 worker;权威对象仍是 turns JSON + steer 50 轮
@@ -138,8 +143,8 @@ node bin/celagent-tui.mjs task ledger
 - ✅ **安全净化(2026-08-12)**:当前树 + 可达 git 历史已 `filter-repo`;CI 含 Secret/PII 门禁;零密钥硬编码
   - ⚠️ GitHub 对 **已推送过的旧 SHA** 可能仍短期通过直接 commit URL 提供内容;彻底抹掉需向 GitHub Support 申请 purge
 - ✅ 构建:`.github/workflows/release.yml` 匿名路径 bun 交叉编译 + 拉取 `denoland/celld` + `SHA256SUMS`
-- ✅ **v0.4.2 资产清单**(形态同 v0.4.1):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是新增 `celagent migrate`、崩溃恢复保留本地领先文件、blocked 自愈、写放大告警**
-- ✅ 安装校验:`scripts/release-smoke.sh v0.4.2` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.4.2`;不需要 BOS/celld)
+- ✅ **v0.4.3 资产清单**(形态同 v0.4.2, 但 celld 为 v0.3.0):celagent 五平台; celld-linux-x64 / celld-linux-arm64 / celld-darwin-arm64; install.sh / install.ps1 / worker.tar.gz / SHA256SUMS。**差异是依赖全面跟随上游最新: celld v0.3.0、pi 0.84.3、移除多余的 chalk 直接依赖**
+- ✅ 安装校验:`scripts/release-smoke.sh v0.4.3` 下载 linux 包、核对 SHA256、跑 `version`/`help`(输出 `celagent v0.4.3`;不需要 BOS/celld)
 
 ### 已知边界(不是本仓库能补的)
 - 上游 `denoland/celld` **没有** Intel Mac (`celld-darwin-x64`) 与 Windows 包;`install.sh` 回退 `celld.dev` / Windows 跳过 celld
@@ -152,10 +157,10 @@ node bin/celagent-tui.mjs task ledger
 0. ✅ docs/archive 已删除
 1. ✅ 仓库已推送
 2. ✅ CI 绿 (node 22/24)
-3. ✅ tag `v0.4.2` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
+3. ✅ tag `v0.4.3` 已推送,资产已上传;publish 路径已设 `GH_REPO`(PR #5)
 4. ✅ 跨平台 celagent 由 Release workflow 在 `/tmp/anon-build` 编译
 5. ✅ install.sh 正式模式从 GitHub Release 下载,有 `SHA256SUMS` 则校验
-6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.4.2` 或 `latest`(SHA256 + version/help)
+6. ✅ 无凭证冒烟脚本:`./scripts/release-smoke.sh v0.4.3` 或 `latest`(SHA256 + version/help)
 
 ## 4. 版本与里程碑
 
@@ -174,7 +179,8 @@ node bin/celagent-tui.mjs task ledger
 | v0.3.7 | persist 主路径与探针对齐:GET/PUT 瞬时失败留队重试;恢复非 miss 不回退 worker;抽出 `src/persist.js` + 内存 store 测试;保证句可辩护化 | ✅ 已发布 |
 | v0.4.0 | 质变:权威对象从轮次 JSON+steer 换成 Pi JSONL;`celagent <id>` 走 `SessionManager.open` | ✅ 历史 |
 | v0.4.1 | 深度审查 7 项修复:JSONL 谱系覆盖保护、旧 `.json` 按轮合并不隐式迁移、启动读失败拒绝绑定、rm 残留报错、search 回退、settings 损坏终态、warn 去重 | ✅ 历史 |
-| v0.4.2 | 给旧格式出路 + 崩溃恢复:`celagent migrate`(自检可打开才写、绝不删旧对象)、启动保留本地领先文件并补写回、blocked 自愈、写放大告警 | ✅ 本刀 |
+| v0.4.2 | 给旧格式出路 + 崩溃恢复:`celagent migrate`(自检可打开才写、绝不删旧对象)、启动保留本地领先文件并补写回、blocked 自愈、写放大告警 | ✅ 历史 |
+| v0.4.3 | 依赖全面跟随上游最新:celld v0.2.0→v0.3.0(参数面三重实测)、pi 0.84.1→0.84.3、移除从未 import 的 chalk 直接依赖;显式声明 `CELLD_DURABILITY`/`CELLD_STORAGE_PROBE` 不吃默认值 | ✅ 本刀 |
 
 下一刀:**v0.3.8** 至少一种非 BOS 合格后端实测(R2 或 S3,需凭证)。不要把 region 贯穿当成「已支持 R2」。不要插队做 provider 认证/快照 TUI/会话合并。
 

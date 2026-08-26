@@ -385,8 +385,8 @@ test("源码锚定: worker 已删除未调用的 SigV4 bosPut", () => {
   assert.match(w, /async function bosPutProxy/);
 });
 
-test("源码锚定: 版本 0.4.2 与 release-smoke", () => {
-  assert.match(tui, /CELAGENT_VERSION = "0\.4\.2"/);
+test("源码锚定: 版本 0.4.3 与 release-smoke", () => {
+  assert.match(tui, /CELAGENT_VERSION = "0\.4\.3"/);
   const smoke = readFileSync(join(root, "scripts/release-smoke.sh"), "utf8");
   assert.match(smoke, /sha256sum --ignore-missing/);
   assert.match(smoke, /celagent-linux-x64/);
@@ -493,4 +493,28 @@ test("源码锚定: v0.4.2 评审三项 — 迁移并发守卫 / 封锁期缓冲
   assert.match(persist, /export function sanitizeLocalJsonl/);
   assert.match(tui, /sanitizeLocalJsonl\(readFileSync\(localJsonl/);
   assert.doesNotMatch(tui, /isJsonlBody\(localBody\) && localBody !== hist\.jsonl/);
+});
+
+test("源码锚定: 依赖跟随上游最新 — 无过时钉版, celld 新能力已显式声明", () => {
+  // celld 随包 tag 不得停留在过时版本
+  const prep = readFileSync(join(root, "scripts/prepare-release-assets.sh"), "utf8");
+  assert.match(prep, /CELLD_UPSTREAM_TAG:-v0\.3\.0/);
+  assert.doesNotMatch(prep, /CELLD_UPSTREAM_TAG:-v0\.2\.0/);
+  // 6 个 spawn 点都要显式声明耐久性与启动探针 (不吃上游默认值)
+  for (const rel of [
+    "bin/celagent-tui.mjs", "setup.sh", "install.sh",
+    "scripts/node_mgr.sh", "scripts/cluster_mgr.sh", "scripts/celld-bos-test.sh",
+  ]) {
+    const src = readFileSync(join(root, rel), "utf8");
+    assert.match(src, /CELLD_DURABILITY/, `${rel} 应显式声明 CELLD_DURABILITY`);
+    assert.match(src, /CELLD_STORAGE_PROBE/, `${rel} 应显式声明 CELLD_STORAGE_PROBE`);
+    // 仅环回部署, 绝不信任转发头
+    assert.doesNotMatch(src, /trust-forwarded-headers|CELLD_TRUST_FORWARDED_HEADERS/, `${rel} 不得启用转发头信任`);
+  }
+  // npm 侧: pi 三件套跟随最新; chalk 已移除 (源码从不 import, 留着只会与 pi 精确钉的 5.6.2 重复)
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  for (const p of ["pi-coding-agent", "pi-agent-core", "pi-ai"]) {
+    assert.match(pkg.dependencies[`@earendil-works/${p}`], /\^0\.84\.3/, `${p} 应跟随最新`);
+  }
+  assert.equal(pkg.dependencies.chalk, undefined, "chalk 不应是直接依赖");
 });
