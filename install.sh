@@ -1,12 +1,12 @@
 #!/bin/bash
-# celagent v0.4.2 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
+# celagent v0.4.3 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
 # 正式模式: 从 GitHub Release 下载对应平台二进制 (含 celld 随包 + worker 源码包)
 # 开发模式: CELAGENT_SRC=<源码目录> ./install.sh (软链直指源码, 改即生效)
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
-VERSION="0.4.2"
+VERSION="0.4.3"
 REPO="https://github.com/hxddh/celagent"
 RELEASE_URL="${CELAGENT_RELEASE_URL:-$REPO/releases/latest/download}"
 
@@ -317,7 +317,7 @@ else
   for port in 18090 18091; do
     nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
       CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 \
-      CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_MAX_RESIDENT_CELLS=128 \
+      CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_DURABILITY=fleet CELLD_STORAGE_PROBE=1 CELLD_MAX_RESIDENT_CELLS=128 \
       AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
       CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
       CELLD_VAR_CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \

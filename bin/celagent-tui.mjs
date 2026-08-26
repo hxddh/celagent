@@ -214,6 +214,13 @@ async function ensureCelld() {
                 CELLD_ALARM_RESIDENT_MS: "60000",
                 CELLD_ADMISSION_WAIT_MS: "2000",
                 CELLD_MAX_RESIDENT_CELLS: "128",
+                // celld v0.3 起可配耐久性与启动探针 — 显式声明本产品的取舍, 不吃默认值:
+                // fleet = follower-fsync quorum 即 ack, 后台向桶分层。会话权威写是**直连
+                // 对象存储、不经 celld**(ADR 1/3), celld 只持有可重建的缓存, 故取快的一档;
+                // 显式写出来, 上游改默认值也不会悄悄改变我们的耐久性姿态
+                CELLD_DURABILITY: "fleet",
+                // 本产品的全部承诺建立在条件写之上, 让 celld 启动即自验, 且不容默认值被翻转
+                CELLD_STORAGE_PROBE: "1",
                 CELAGENT_WORKER_TOKEN: workerToken,
                 CELLD_VAR_CELAGENT_WORKER_TOKEN: workerToken,
               },
@@ -448,7 +455,7 @@ async function listSessions() {
 }
 
 // ---- 版本/帮助 ----
-const CELAGENT_VERSION = "0.4.2";
+const CELAGENT_VERSION = "0.4.3";
 function printVersion() {
   console.log(`celagent v${CELAGENT_VERSION} — Pi TUI + Celld/BOS 对象存储持久化`);
 }

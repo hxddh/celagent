@@ -8,7 +8,7 @@ OUT="${1:-"$ROOT/dist/release"}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
-CELLD_UPSTREAM_TAG="${CELLD_UPSTREAM_TAG:-v0.2.0}"
+CELLD_UPSTREAM_TAG="${CELLD_UPSTREAM_TAG:-v0.3.0}"
 CELLD_UPSTREAM_BASE="https://github.com/denoland/celld/releases/download/${CELLD_UPSTREAM_TAG}"
 
 fetch_celld() {
