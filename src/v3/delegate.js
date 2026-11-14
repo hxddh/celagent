@@ -9,7 +9,8 @@ import {
 import { branchName, createWorktree, removeWorktree, repoDirty, repoHead, repoRoot, worktreePathFor } from "./worktree.js";
 
 const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });
+// 轮询必须持有事件循环：unref 会让 `celagent delegate wait` 在结果出来前直接退出。
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export function validSessionId(id) {
   return typeof id === "string" && SESSION_ID_RE.test(id) && !id.includes("..");

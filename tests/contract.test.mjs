@@ -7,11 +7,11 @@ import { join } from "node:path";
 const root = new URL("..", import.meta.url).pathname;
 const read = (p) => readFileSync(join(root, p), "utf8");
 
-test("v3.0.0 版本三处一致", () => {
+test("v3.0.1 版本三处一致", () => {
   const pkg = JSON.parse(read("package.json"));
-  assert.equal(pkg.version, "3.0.0");
-  assert.match(read("bin/celagent-tui.mjs"), /CELAGENT_VERSION = "3\.0\.0"/);
-  assert.match(read("install.sh"), /VERSION="3\.0\.0"/);
+  assert.equal(pkg.version, "3.0.1");
+  assert.match(read("bin/celagent-tui.mjs"), /CELAGENT_VERSION = "3\.0\.1"/);
+  assert.match(read("install.sh"), /VERSION="3\.0\.1"/);
 });
 
 test("Pi 精确钉 1.5.2（不吃 caret）", () => {

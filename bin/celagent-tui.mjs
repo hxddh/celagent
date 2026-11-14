@@ -42,7 +42,7 @@ import {
 const require = createRequire(import.meta.url);
 const CONFIG_DIR = join(homedir(), ".config", "celagent");
 const AGENT_DIR = join(CONFIG_DIR, "pi-runtime");
-const CELAGENT_VERSION = "3.0.0";
+const CELAGENT_VERSION = "3.0.1";
 const CELD_HEALTH = "/.well-known/celld/health";
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091"];
 const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });

@@ -104,15 +104,16 @@ node bin/celagent-tui.mjs logs <dlg-id>
 
 ## 3. 发布状态
 
-- 版本：**3.0.0**
-- Latest：[v3.0.0](https://github.com/hxddh/celagent/releases/tag/v3.0.0)（待发布后回填时间）
-- tag：`v3.0.0` → `TBD`（main）
+- 版本：**3.0.1**
+- Latest：[v3.0.1](https://github.com/hxddh/celagent/releases/tag/v3.0.1)（待发布后回填时间）
+- tag：`v3.0.1` → `TBD`（main）
 - 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`；tmux；git（委派）
 - 资产（12 个）：celagent 五平台、celld linux-x64/linux-arm64/darwin-arm64、`install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
 - 发布流水线：`.github/workflows/release.yml`；Release run `TBD`
 - CI：main `TBD`（Node 22/24）
-- 无凭证冒烟：`./scripts/release-smoke.sh v3.0.0`（待发布后跑）
+- 无凭证冒烟：`./scripts/release-smoke.sh v3.0.1`（待发布后跑）
 - 3.0 核心：delegate spawn/wait/send/list、子 agent 独立 worktree、父死子不死、interrupted 不重放
+- 3.0.0 → 3.0.1：`delegate wait` 的轮询定时器不再 unref（Node 22 下事件循环提前退出）；产品行为不变
 
 ## 4. 版本里程碑
 
@@ -121,7 +122,8 @@ node bin/celagent-tui.mjs logs <dlg-id>
 | 0.4.3 | 最后 0.x：Pi JSONL 权威、整文件 CAS | 历史 |
 | 1.0.0 | 分段 JSONL + manifest CAS + journal + lease + outbox + workspace + headless + import-v0 | 历史 |
 | **2.0.0** | tmux supervisor/watchdog + attach/detach + 增量工作区检查点 + usage + trigger preview | 历史 |
-| **3.0.0** | durable delegation：delegate spawn/wait/send/list + 子 agent 独立 worktree/session + 父死子不死 | 已发布 |
+| **3.0.0** | durable delegation 首发；Node 22 CI 因 wait 定时器 unref 失败 | 历史 |
+| **3.0.1** | 修复 wait 轮询持有事件循环；Node 22/24 全绿 | 已发布 |
 | 3.1 | cron/webhook/审批/预算、services.yaml、FTS/记忆、语义 UI、子 agent TUI attach、真实后端矩阵 | 候选 |
 
 ## 5. 工程约定
@@ -163,8 +165,8 @@ node bin/celagent-tui.mjs logs <dlg-id>
 2. 版本号：`package.json`、`bin/celagent-tui.mjs`、`install.sh` 三处一致。
 3. `npm pack --dry-run` 检查文件。
 4. commit → push main。
-5. tag `v3.0.0` → push tag；Release workflow 构建资产。
-6. `./scripts/release-smoke.sh v3.0.0` 验证下载/SHA/version/help。
+5. tag `v3.0.1` → push tag；Release workflow 构建资产。
+6. `./scripts/release-smoke.sh v3.0.1` 验证下载/SHA/version/help。
 7. 更新本文 §3 的 Release 链接与资产状态。
 
 ## 8. 相关文档

@@ -1,12 +1,12 @@
 #!/bin/bash
-# celagent v3.0.0 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
+# celagent v3.0.1 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
 # 正式模式: 从 GitHub Release 下载对应平台二进制 (含 celld 随包 + worker 源码包)
 # 开发模式: CELAGENT_SRC=<源码目录> ./install.sh (软链直指源码, 改即生效)
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
-VERSION="3.0.0"
+VERSION="3.0.1"
 # 随包 celld 版本 — 必须与 scripts/prepare-release-assets.sh 的 CELLD_UPSTREAM_TAG 一致。
 # 就地升级时用它判断已装 celld 是否过时 (否则老用户永远停在旧运行时)
 CELLD_BUNDLED_VERSION="0.6.3"
