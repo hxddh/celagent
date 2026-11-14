@@ -40,7 +40,7 @@ start_node() {
     CELLD_IDLE_EVICT_S=30 \
     CELLD_ALARM_RESIDENT_MS=60000 \
     CELLD_ADMISSION_WAIT_MS=2000 \
-    CELLD_DURABILITY=fleet CELLD_STORAGE_PROBE=1 CELLD_MAX_RESIDENT_CELLS=128 \
+    CELLD_DURABILITY=fleet CELLD_MAX_RESIDENT_CELLS=128 \
     AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
     CELAGENT_WORKER_TOKEN="$TOKEN" \
     CELLD_VAR_CELAGENT_WORKER_TOKEN="$TOKEN" \
@@ -56,7 +56,7 @@ start_node() {
 wait_ready() {
   local port=$1
   for i in $(seq 1 20); do
-    if curl -s -m 2 "http://127.0.0.1:${port}/__celld/health" 2>/dev/null | grep -q ok; then
+    if curl -s -m 2 "http://127.0.0.1:${port}/.well-known/celld/health" 2>/dev/null | grep -q ok; then
       echo "  ✓ 节点 $port ready"
       return 0
     fi
@@ -75,7 +75,7 @@ stop_local() {
   for i in $(seq 1 15); do
     up=0
     for p in 18090 18091 19000; do
-      curl -s -m 1 "http://127.0.0.1:${p}/__celld/health" 2>/dev/null | grep -q ok && up=1
+      curl -s -m 1 "http://127.0.0.1:${p}/.well-known/celld/health" 2>/dev/null | grep -q ok && up=1
     done
     [ "$up" = 0 ] && return 0
     sleep 1
@@ -110,7 +110,7 @@ case "${1:-status}" in
       python3 -c "import json,sys; ks=json.load(sys.stdin); print(f'  {len(ks)} 个节点'); [print(f'  - {k.split(chr(95))[1][:12]}...') for k in ks]" 2>/dev/null || echo "  查询失败"
     echo "本地节点:"
     for p in 18090 18091 19000; do
-      if curl -s -m 1 "http://127.0.0.1:${p}/__celld/health" 2>/dev/null | grep -q ok; then
+      if curl -s -m 1 "http://127.0.0.1:${p}/.well-known/celld/health" 2>/dev/null | grep -q ok; then
         echo "  ✓ $p 运行中"
       fi
     done

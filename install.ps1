@@ -11,4 +11,4 @@ Write-Host "下载 celagent-windows-x64.exe ..."
 Invoke-WebRequest -Uri "$Release/celagent-windows-x64.exe" -OutFile $Exe -UseBasicParsing
 Write-Host "已安装 $Exe"
 Write-Host "把 $Bin 加入 PATH 后运行: celagent"
-Write-Host "注意: 上游 celld 无 Windows 包; 持久化需 AWS CLI 的 [bos] profile。"
+Write-Host "注意: 上游 celld 无 Windows 包; 持久化需 AWS CLI（BOS/S3 条件写）与 bucket 配置。"

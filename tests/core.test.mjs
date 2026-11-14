@@ -20,7 +20,7 @@ let celldUp = false;
 before(async () => {
   for (const base of NODES) {
     try {
-      const r = await fetch(`${base}/__celld/health`, { signal: AbortSignal.timeout(2000) });
+      const r = await fetch(`${base}/.well-known/celld/health`, { signal: AbortSignal.timeout(2000) });
       if (r.ok) { celldUp = true; break; }
     } catch (e) { /* down */ }
   }
@@ -67,7 +67,9 @@ async function celld(action, params = {}) {
 
 // ---- 真实 BOS 链路 (来自 src/bos.js) ----
 let bucket, endpoint;
+let hasAws = false;
 before(async () => {
+  try { execFileSync("aws", ["--version"], { timeout: 5000 }); hasAws = true; } catch (e) { hasAws = false; }
   try {
     const cfg = JSON.parse(readFileSync(join(homedir(), ".config", "celagent", "settings.json"), "utf8"));
     bucket = cfg.persistence?.bucket;
@@ -112,7 +114,7 @@ test("3. kv-put/get/list/delete 往返", async (t) => {
 
 // ---- BOS 直写链路 (Bug 75/76 的回归保护) ----
 test("4. BOS 写→读→ETag 往返 (CAS 基础)", async (t) => {
-  if (!bucket) return t.skip("无 bucket 配置");
+  if (!bucket || !hasAws) return t.skip("无 bucket 配置或 aws CLI");
   const { bosPut, bosGet } = await import("../src/bos.js");
   const key = `tests/cas-basic-${Date.now()}.json`;
   const put = await bosPut(key, { id: "t", turns: [{ turn: 1, msg: "x" }] }, { bucket, endpoint });
@@ -126,7 +128,7 @@ test("4. BOS 写→读→ETag 往返 (CAS 基础)", async (t) => {
 });
 
 test("5. CAS 冲突检测 (旧 ETag 写 → 412)", async (t) => {
-  if (!bucket) return t.skip("无 bucket 配置");
+  if (!bucket || !hasAws) return t.skip("无 bucket 配置或 aws CLI");
   const { bosPut, bosGet } = await import("../src/bos.js");
   const key = `tests/cas-conflict-${Date.now()}.json`;
   await bosPut(key, { id: "t", turns: [] }, { bucket, endpoint });
@@ -142,7 +144,7 @@ test("5. CAS 冲突检测 (旧 ETag 写 → 412)", async (t) => {
 });
 
 test("6. If-None-Match 首写保护 (Bug 76 回归)", async (t) => {
-  if (!bucket) return t.skip("无 bucket 配置");
+  if (!bucket || !hasAws) return t.skip("无 bucket 配置或 aws CLI");
   const { bosPut, bosGet } = await import("../src/bos.js");
   const key = `tests/inm-${Date.now()}.json`;
   // 首写 (不存在) → 成功

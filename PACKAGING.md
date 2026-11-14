@@ -1,16 +1,16 @@
-# celagent 单二进制打包 (Bun)
+# celagent 1.0 单二进制打包 (Bun)
 
 ## 状态
 
-> **已验证 (2026-08-10)**: TUI 版 Bun 单二进制编译通过, 全功能运行正常。
+> **已验证 (2026-11-14)**: TUI 版 Bun 单二进制编译通过, 全功能运行正常。
 > - 修复 Bug 84: 动态 import(file://路径) 无法被 Bun 打包 → 改为静态 import,
->   2985 modules 全部内联
+>   实测 2,125 modules（linux-x64 / darwin-arm64 交叉编译） 全部内联
 > - ⚠️ 当时的构建物 `celagent-bin` 已废弃(内含本机绝对路径, 第八轮安全检查发现),
 >   发布构建必须按下方「注意 0」在匿名路径或 CI 执行
 
 ## 验证过的命令
 
-- 二进制: 单文件 (~72MB, 含 Bun 运行时 + pi 全部依赖);当时构建物 `celagent-bin` 已废弃
+- 二进制: 单文件 (~116MB, 含 Bun 运行时 + Pi 1.5.2 全部依赖; MCP/codemode 体积更大);当时构建物 `celagent-bin` 已废弃
 - 命令: `bun build bin/celagent-tui.mjs --compile --outfile <匿名路径>/celagent-<平台>`
   (⚠️ 必须在匿名路径构建, 见「注意 0」; 禁止在仓库目录直接构建)
 - 已验证功能:
@@ -70,12 +70,15 @@ GitHub Release:
    或直接用 CI (GitHub Actions runner 路径 /home/runner/work/..., 天然干净)。
    仓库目录下的旧 `celagent-bin` (含本机路径) 已废弃, 严禁上传 Release。
 1. 二进制不含 API key — 凭证运行时从环境变量 (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) 或 ~/.aws/credentials 的 [bos] profile 动态读取
-2. Celld 运行时独立下载 (install.sh 处理), 不打包进 celagent 二进制
+2. Celld 0.6.3 运行时独立下载 (install.sh 处理), 不打包进 celagent 二进制
 3. TUI 版动态 import: 需重新验证 Bun 编译 (打包前必做)
 4. **发布前置**: 仓库已是 `https://github.com/hxddh/celagent.git`。CI 含 test/build,以及 **Release job**
    (`.github/workflows/release.yml`): tag `v*` 或 workflow_dispatch 时在 `/tmp/anon-build` bun 交叉编译,
    拉取 `denoland/celld` 官方 gzip,打包 `worker.tar.gz`,生成 `SHA256SUMS` 并 `gh release upload --clobber`。
    本地:`./scripts/prepare-release-assets.sh dist/release`
-5. **上游 celld 平台**(denoland/celld v0.2.0): 有 linux-x64 / linux-arm64 / darwin-arm64。
+5. **上游 celld 平台**(denoland/celld v0.6.3): 有 linux-x64 / linux-arm64 / darwin-arm64。
    **无** darwin-x64 / Windows — `install.sh` 这两平台回退 celld.dev 或跳过。
    `install.sh` 正式模式下载 `SHA256SUMS` 并校验; 文件不存在则警告(可 `CELAGENT_REQUIRE_CHECKSUM=1` 强制失败)。
+
+6. **1.0 前置**：`aws` CLI 是运行时硬依赖（BOS/S3 读写）；`install.sh` 会检查。
+7. **1.0 版本三处一致**：`package.json`、`bin/celagent-tui.mjs`、`install.sh`。

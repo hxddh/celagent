@@ -39,7 +39,7 @@ echo ""
 
 # 0. 前置: 节点必须运行
 echo "[前置] 检查节点..."
-if ! curl -s -m 3 "$NODE1/__celld/health" 2>/dev/null | grep -q ok; then
+if ! curl -s -m 3 "$NODE1/.well-known/celld/health" 2>/dev/null | grep -q ok; then
   echo "  ❌ 节点 $NODE1 未运行 (先: ./scripts/node_mgr.sh start)"
   exit 1
 fi
@@ -128,11 +128,7 @@ if [ -n "$NODE1_PID" ]; then
   echo "  等待 LTX 复制 (10s)..."
   sleep 10
   kill "$NODE1_PID" 2>/dev/null
-  # 清理残留 own.json (Celld GC 不及时, 生产由自动启动清理)
-  echo "  清理残留 ownership..."
-  for k in $(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "cells/" --endpoint-url "$EP" --query 'Contents[?ends_with(Key, `own.json`)].Key' --output text 2>/dev/null); do
-    aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "$EP" >/dev/null 2>&1
-  done
+  # v1.0: 不删除 own.json；等待 lease 过期后由新节点接管
   # 等待 lease 过期 + 接管 + 从 BOS 恢复 (最多 30s)
   echo "  等待接管恢复 (最多 30s)..."
   RES=""
@@ -152,7 +148,7 @@ if [ -n "$NODE1_PID" ]; then
   check "原会话 LTX 保留在 BOS (≥1)" "$([ "$LTX_AFTER" -gt 0 ] 2>/dev/null && echo ok || echo fail)"
   # 恢复节点1 (凭证卫生: AWS_PROFILE, 不物化 SK; 传入 worker token 与 node_mgr 一致)
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    CELLD_IDLE_EVICT_S=30 CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_DURABILITY=fleet CELLD_STORAGE_PROBE=1 CELLD_MAX_RESIDENT_CELLS=128 \
+    CELLD_IDLE_EVICT_S=30 CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_DURABILITY=fleet CELLD_MAX_RESIDENT_CELLS=128 \
     AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
     CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$TOKEN}" \
     CELLD_VAR_CELAGENT_WORKER_TOKEN="${CELAGENT_WORKER_TOKEN:-$TOKEN}" \

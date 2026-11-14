@@ -1,15 +1,15 @@
 #!/bin/bash
-# celagent v0.4.3 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
+# celagent v1.0.0 一键安装: CLI 二进制 + Celld 运行时 + 对象存储持久化
 # 正式模式: 从 GitHub Release 下载对应平台二进制 (含 celld 随包 + worker 源码包)
 # 开发模式: CELAGENT_SRC=<源码目录> ./install.sh (软链直指源码, 改即生效)
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 CELAGENT_ROOT="${CELAGENT_ROOT:-${HOME}/.local}"
-VERSION="0.4.3"
+VERSION="1.0.0"
 # 随包 celld 版本 — 必须与 scripts/prepare-release-assets.sh 的 CELLD_UPSTREAM_TAG 一致。
 # 就地升级时用它判断已装 celld 是否过时 (否则老用户永远停在旧运行时)
-CELLD_BUNDLED_VERSION="0.3.0"
+CELLD_BUNDLED_VERSION="0.6.3"
 REPO="https://github.com/hxddh/celagent"
 RELEASE_URL="${CELAGENT_RELEASE_URL:-$REPO/releases/latest/download}"
 
@@ -343,7 +343,7 @@ else
   for port in 18090 18091; do
     nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
       CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 \
-      CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_DURABILITY=fleet CELLD_STORAGE_PROBE=1 CELLD_MAX_RESIDENT_CELLS=128 \
+      CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_DURABILITY=fleet CELLD_MAX_RESIDENT_CELLS=128 \
       AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
       CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
       CELLD_VAR_CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
@@ -355,8 +355,8 @@ else
   done
   echo "  ✓ 节点 18090/18091 启动"
   for i in $(seq 1 20); do
-    R1=$(curl -s -m 2 "http://127.0.0.1:18090/__celld/health" 2>/dev/null || echo "")
-    R2=$(curl -s -m 2 "http://127.0.0.1:18091/__celld/health" 2>/dev/null || echo "")
+    R1=$(curl -s -m 2 "http://127.0.0.1:18090/.well-known/celld/health" 2>/dev/null || echo "")
+    R2=$(curl -s -m 2 "http://127.0.0.1:18091/.well-known/celld/health" 2>/dev/null || echo "")
     if echo "$R1" | grep -q ok && echo "$R2" | grep -q ok; then
       echo "  ✓ 双节点就绪"
       break

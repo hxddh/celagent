@@ -33,7 +33,7 @@ start_node() {
     CELLD_IDLE_EVICT_S=30 \
     CELLD_ALARM_RESIDENT_MS=60000 \
     CELLD_ADMISSION_WAIT_MS=2000 \
-    CELLD_DURABILITY=fleet CELLD_STORAGE_PROBE=1 CELLD_MAX_RESIDENT_CELLS=128 \
+    CELLD_DURABILITY=fleet CELLD_MAX_RESIDENT_CELLS=128 \
     AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
     CELAGENT_WORKER_TOKEN="$TOKEN" \
     CELLD_VAR_CELAGENT_WORKER_TOKEN="$TOKEN" \
@@ -48,7 +48,7 @@ start_node() {
 wait_ready() {
   local port=$1
   for i in $(seq 1 20); do
-    if curl -s -m 2 "http://127.0.0.1:${port}/__celld/health" 2>/dev/null | grep -q ok; then
+    if curl -s -m 2 "http://127.0.0.1:${port}/.well-known/celld/health" 2>/dev/null | grep -q ok; then
       echo "node $port ready"
       return 0
     fi
@@ -68,7 +68,7 @@ stop_all() {
   for i in $(seq 1 20); do
     up=0
     for p in 18090 18091; do
-      if curl -s -m 1 "http://127.0.0.1:${p}/__celld/health" 2>/dev/null | grep -q ok; then
+      if curl -s -m 1 "http://127.0.0.1:${p}/.well-known/celld/health" 2>/dev/null | grep -q ok; then
         up=1
       fi
     done
@@ -82,20 +82,7 @@ stop_all() {
 case "${1:-status}" in
   start)
     stop_all || true
-    # 优雅停机后不扫 own.json; 仅崩溃残留(health 仍在)或 CELAGENT_CLEAN_OWN=1
-    STILL_UP=0
-    curl -s -m 1 "http://127.0.0.1:18090/__celld/health" 2>/dev/null | grep -q ok && STILL_UP=1
-    curl -s -m 1 "http://127.0.0.1:18091/__celld/health" 2>/dev/null | grep -q ok && STILL_UP=1
-    if [ "${CELAGENT_CLEAN_OWN:-}" = "1" ] || { [ "$STILL_UP" = "1" ] && echo "$BUCKET" | grep -q '^celagent-'; }; then
-      OWN_KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --endpoint-url "$EP" \
-        --prefix "cells/" --query "Contents[?ends_with(Key, \`own.json\`)].Key" --output json 2>/dev/null || echo "[]")
-      for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
-        aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "$EP" >/dev/null 2>&1
-        echo "cleaned stale ownership: $k"
-      done
-    else
-      echo "skip own.json wipe (graceful drain 或非 celagent- 桶; CELAGENT_CLEAN_OWN=1 强制)"
-    fi
+    # v1.0: 不再按 bucket 前缀清理 own.json；清理只能基于 nodes/ lease 或 celld cell gc
     aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$EP" >/dev/null 2>&1 || true
     start_node 18090 "$WATCH1" "$LOG1"
     start_node 18091 "$WATCH2" "$LOG2"
@@ -108,7 +95,7 @@ case "${1:-status}" in
     ;;
   status)
     for p in 18090 18091; do
-      if curl -s -m 1 "http://127.0.0.1:${p}/__celld/health" 2>/dev/null | grep -q ok; then
+      if curl -s -m 1 "http://127.0.0.1:${p}/.well-known/celld/health" 2>/dev/null | grep -q ok; then
         echo "node $p: running"
         ST=$(curl -s -m 1 "http://127.0.0.1:$((p + 2))/state" 2>/dev/null || true)
         [ -n "$ST" ] && echo "  $ST"

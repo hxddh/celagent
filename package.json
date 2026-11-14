@@ -1,7 +1,7 @@
 {
   "name": "celagent",
-  "version": "0.4.3",
-  "description": "独立开源 agent — Pi TUI + Celld/BOS 对象存储持久化，CAS 成功的 Pi JSONL 可跨机打开",
+  "version": "1.0.0",
+  "description": "Durable agent runtime — 分段 Pi JSONL + manifest CAS + 工具 journal + 租约，可跨机接管",
   "type": "module",
   "bin": {
     "celagent": "./bin/celagent-tui.mjs"
@@ -9,7 +9,8 @@
   "exports": {
     "./bos": "./src/bos.js",
     "./bos-tools": "./src/bos-tools.js",
-    "./persist": "./src/persist.js"
+    "./persist": "./src/persist.js",
+    "./v2": "./src/v2/index.js"
   },
   "files": [
     "bin/",
@@ -28,7 +29,8 @@
     "start": "node bin/celagent-tui.mjs",
     "test": "node --test tests/*.test.mjs",
     "doctor": "node bin/celagent-tui.mjs doctor",
-    "list": "node bin/celagent-tui.mjs list"
+    "list": "node bin/celagent-tui.mjs list",
+    "run": "node bin/celagent-tui.mjs run"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -38,14 +40,17 @@
     "cli",
     "llm",
     "durable",
+    "execution",
+    "journal",
+    "lease",
     "rpo0",
     "celld",
     "bos"
   ],
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.84.3",
-    "@earendil-works/pi-ai": "^0.84.3",
-    "@earendil-works/pi-coding-agent": "^0.84.3"
+    "@earendil-works/pi-agent-core": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2"
   },
   "license": "MIT",
   "devDependencies": {

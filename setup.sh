@@ -12,6 +12,7 @@ echo "=== celagent 一键部署 (Celld + 对象存储持久化) ==="
 
 # Bug 90: jq 是 bucket 复用逻辑的依赖, 缺失时静默新建 bucket 覆盖配置
 command -v jq >/dev/null 2>&1 || { echo "  ✗ 需要 jq (brew install jq)"; exit 1; }
+command -v aws >/dev/null 2>&1 || { echo "  ✗ 需要 aws CLI（BOS/S3 读写与 CAS 探针）: https://aws.amazon.com/cli/"; exit 1; }
 
 celagent_load_store || exit 1
 
@@ -107,19 +108,6 @@ mkdir -p "$STATE_DIR"
 pkill -f 'celld.*1809' 2>/dev/null || true
 sleep 2
 
-# Bug 94: 与 node_mgr.sh 一致 — 启动前清理残留 own.json (旧节点被强杀后
-# own.json 指向死节点, 阻塞新节点接管 → RestoreFailed)
-OWN_KEYS=$(aws s3api list-objects-v2 --bucket "$BUCKET" --endpoint-url "$STORE_EP" \
-  --prefix "cells/" --query "Contents[?ends_with(Key, \`own.json\`)].Key" --output json 2>/dev/null || echo "[]")
-if [ "${CELAGENT_CLEAN_OWN:-}" = "1" ] || echo "$BUCKET" | grep -q '^celagent-'; then
-  for k in $(echo "$OWN_KEYS" | jq -r '.[]?' 2>/dev/null); do
-    aws s3api delete-object --bucket "$BUCKET" --key "$k" --endpoint-url "$STORE_EP" >/dev/null 2>&1
-    echo "cleaned stale ownership: $k"
-  done
-else
-  echo "skip own.json wipe (bucket=$BUCKET 非 celagent- 前缀; CELAGENT_CLEAN_OWN=1 强制)"
-fi
-
 # Bug 71: 移除本地 worker.js 打包/检查死代码 — BOS 模式节点从 bucket 的
 # deploy/current.json 加载 worker (上面 celld deploy 已部署), 本地 worker.js
 # 从未被引用; 原逻辑 esbuild 失败还会错误地 exit 1 中止已成功的部署。
@@ -131,7 +119,7 @@ for port in 18090 18091; do
   # 凭证卫生: celld 走 AWS_PROFILE=bos, 清除可能残留的显式密钥 env
   nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     CELLD_WATCH="$STATE_DIR/node$port" CELLD_IDLE_EVICT_S=30 \
-    CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_DURABILITY=fleet CELLD_STORAGE_PROBE=1 CELLD_MAX_RESIDENT_CELLS=128 \
+    CELLD_ALARM_RESIDENT_MS=60000 CELLD_ADMISSION_WAIT_MS=2000 CELLD_DURABILITY=fleet CELLD_MAX_RESIDENT_CELLS=128 \
     AWS_PROFILE="$STORE_PROFILE" AWS_REGION="$STORE_REGION" \
     CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
     CELLD_VAR_CELAGENT_WORKER_TOKEN="$WORKER_TOKEN" \
@@ -146,8 +134,8 @@ done
 # 等待就绪
 echo "  等待节点就绪..."
 for i in $(seq 1 20); do
-  R1=$(curl -s -m 2 "http://127.0.0.1:18090/__celld/health" 2>/dev/null || echo "")
-  R2=$(curl -s -m 2 "http://127.0.0.1:18091/__celld/health" 2>/dev/null || echo "")
+  R1=$(curl -s -m 2 "http://127.0.0.1:18090/.well-known/celld/health" 2>/dev/null || echo "")
+  R2=$(curl -s -m 2 "http://127.0.0.1:18091/.well-known/celld/health" 2>/dev/null || echo "")
   if echo "$R1" | grep -q ok && echo "$R2" | grep -q ok; then
     echo "  ✓ 双节点就绪"
     break

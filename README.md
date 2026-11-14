@@ -1,162 +1,211 @@
-# celagent
+# celagent 1.0
 
-独立开源 agent — **Pi 完整 TUI + Celld/BOS 对象存储持久化**。
-会话权威落盘在对象存储:**CAS 成功后**可跨机被 Pi 打开(原生 JSONL,不是 50 轮文本摘要)。恢复读 BOS;仅 BOS miss 才回退 worker 缓存。网络抖动时写入留队重试,读失败不把截断缓存当成完整历史。
+**Durable agent runtime** — Pi 1.5 TUI + 分段 Pi JSONL + manifest CAS + 工具 journal + 租约。会话不是一段聊天记录，而是一个可接管、可回放、可迁移的执行日志。
 
-## 特性
+```text
+已提交 step 不丢
+进行中的工具最多一个 unknown
+有幂等键的副作用不重复
+没有幂等键的副作用绝不静默重放
+```
 
-- **完整 Pi TUI**:复用 pi-coding-agent 引擎(不 fork),bash/read/write/grep/find/edit/ls 全量工具,多模型切换
-- **会话权威在 BOS**:每轮对话双写 — worker 缓存 + **BOS 直写**(CAS 乐观锁 + 幂等去重 + 异步队列);GET/PUT 瞬时失败留队重试,不静默丢轮
-- **跨机恢复**:`celagent <id>` 打开 BOS 上的 Pi JSONL(工具调用/thinking/分支都在)。旧 `sessions/<id>.json` 仍可读,走文本注入。完整对象可用 `export` / `history_search`
-- **分布式任务**:`celagent task submit/status/ledger` — celld 状态机,断点续跑 + 单 cell ledger 去重(exactly-once 限于同一 cell; 多机见 docs/distributed-deployment.md)
-- **本地会话恢复**:TUI 内 `/resume` 切换本机会话,`/new` 开新会话(自动独立持久化 ID)
-- **一键部署**:setup.sh 检测凭证 → 建 bucket → 部署 worker → 启动双节点 → 写配置
-- **settings 配置**:`~/.config/celagent/settings.json` 自定义
+---
+
+## 1.0 变了什么
+
+| 维度 | 0.4.x | 1.0 |
+|---|---|---|
+| 持久化单位 | turn | **step**（message / tool call / tool result / compaction） |
+| 写入 | 每轮整份 JSONL GET+PUT | **不可变 segment + manifest CAS** |
+| 执行 | TUI 进程内的 hook | **durability extension + `celagent run` headless** |
+| 并发 | 第二写者静默停写 | **lease + epoch，明确报锁 / 过期接管** |
+| 工作区 | 不保存 | **`workspace snapshot/restore`** |
+| 旧格式 | `.json`/steer/迁移 | **一次性 `import-v0`，运行时只认 v2** |
+| 任务 | worker 模拟 step | **删除**（没有假任务） |
+
+破坏性变更：不再读写 `sessions/<id>.json`，不再把 50 轮 steer 注入当恢复。旧会话用 `celagent import-v0 <id>` 一次性导入；旧对象保留。
+
+---
 
 ## 安装
 
+前置：
+
+- Node.js **>= 22.19**
+- `aws` CLI（BOS/S3/R2 的签名与条件写；`install.sh` 会检查）
+- 一个支持条件写的 bucket：BOS（默认）、AWS S3、Cloudflare R2、Tigris
+- LLM：`DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`，或 Pi `/login`
+
 ```bash
-# 一键安装 (GitHub Release 二进制, 含 celld 运行时)
+# 一键安装（GitHub Release 二进制 + 随包 celld 0.6.3）
 curl -fsSL https://github.com/hxddh/celagent/releases/latest/download/install.sh | sh
 
-# Windows (仅 CLI; 上游 celld 无 Windows 包)
-irm https://github.com/hxddh/celagent/releases/latest/download/install.ps1 | iex
-
-# 或开发模式 (源码目录需含 bin//src//package.json, 软链直指源码改即生效)
+# 或源码模式（改即生效）
 CELAGENT_SRC=~/celagent ./install.sh
+
+# 首次部署：建/复用 bucket、CAS 探针、celld 节点、写 settings
+CELAGENT_SRC=~/celagent ./setup.sh
+
+export DEEPSEEK_API_KEY=sk-...
+celagent
 ```
 
-## 使用
+非 BOS：
 
 ```bash
-export DEEPSEEK_API_KEY=sk-xxx    # 真实 LLM (deepseek, OpenAI 兼容)
-
-celagent                   # 启动 TUI (自动生成唯一会话 ID)
-celagent <id>              # 续写指定会话 (打开 BOS 上的 Pi JSONL)
-celagent list              # 列出 BOS 里所有可恢复会话
-celagent export <id>       # 导出会话 (优先 JSONL)
-celagent rm <id>           # 删除会话 (需确认)
-celagent migrate <id>      # 旧 .json 会话转 Pi JSONL (保留原对象)
-celagent doctor            # 自检: 配置/凭证/节点/BOS 连通
-celagent config get persistence.bucket
-celagent config set model deepseek-v4-flash
-celagent task submit write-report 5   # 提交分布式任务 (celld 状态机, 断点续跑)
-celagent task status <taskId>         # 任务状态
-celagent task ledger                  # 幂等 ledger (单 cell 去重)
-celagent version           # 显示版本
-celagent help              # 全部命令
+celagent config set persistence.endpoint https://<account>.r2.cloudflarestorage.com
+celagent config set persistence.region auto
+celagent config set persistence.profile r2
+celagent doctor          # CAS 探针必须通过
 ```
 
-无 `DEEPSEEK_API_KEY` 时自动降级为 mock 回复(验证链路用)。
+---
 
-## 会话持久化模型
-
-```
-TUI 交互 (pi-coding-agent 引擎, 全量工具)
-   │  turn_end 钩子 (不阻塞对话)
-   ├─▶ worker SQLite (快速缓存, 2s 超时, 丢了可重建)
-   └─▶ BOS 直写队列 (权威源, CAS If-Match 乐观锁 + 同会话 JSONL 合并)
-                                │
-                    sessions/<id>.jsonl   Pi 原生会话 (权威)
-                    sessions/<id>.json    旧轮次 JSON (只读兼容)
-```
-
-恢复优先级:**BOS 是权威源** — `celagent <id>` 先打开 `sessions/<id>.jsonl`;仅 JSONL miss 才读旧 `.json`(文本注入最近 50 轮);再 miss 才回退 worker 缓存。BOS 超时/5xx/权限失败**不回退**(避免把 8000 字截断缓存当成完整历史)。JSONL 路径用 `SessionManager.open`,不是 steer 作文。`/resume` 从本地 JSONL 恢复,persistId = 文件名 stem;`/new` 与 `/fork` 均分配独立持久化 ID。
-
-## agent 内置 BOS 记忆工具 (P1)
-
-对话中 agent 可主动调用(经 customTools 注入):
-
-| 工具 | 功能 |
-|------|------|
-| `history_search` | 跨会话检索 BOS 历史记忆(关键词/限定会话/条数), 返回匹配轮次片段 |
-| `session_snapshot` | 将当前会话状态保存为 BOS 快照(显式记忆锚点, snapshots/ 前缀) |
-
-示例: agent 可说 "搜索一下我之前关于并发问题的讨论" → 调用 history_search 找回并引用。
-
-## 命令一览
+## 命令
 
 | 命令 | 作用 |
-|------|------|
-| `celagent` | 启动 TUI,唯一会话 ID |
-| `celagent <id>` | 打开 BOS 上的 Pi JSONL |
-| `celagent list [--bucket B]` | 列会话(settings 丢失自动扫描 bucket) |
-| `celagent export <id>` | 导出(优先 JSONL) |
-| `celagent rm <id>` | 删除会话(需确认) |
-| `celagent migrate <id>` | 旧 `.json` 会话转 Pi JSONL(自检可打开才写,旧对象保留) |
+|---|---|
+| `celagent` | 启动 TUI（新会话） |
+| `celagent <id>` | 续写 v2 会话（跨机从对象存储恢复） |
+| `celagent run --prompt "..."` | 无头运行；`--session <id>`、`--json`、`--cwd` |
+| `celagent list` | 列出 v2 会话；旧格式单独标注 |
+| `celagent export <id>` | 导出 Pi JSONL |
+| `celagent rm <id> --yes` | 删除 v2 segments + 旧对象 |
+| `celagent import-v0 <id> --yes` | 旧 `.jsonl`/`.json` 一次性导入 |
+| `celagent status [id]` | durable seq / segments / 租约 / outbox |
+| `celagent workspace snapshot <id> [--cwd dir]` | 工作区 tar 快照 |
+| `celagent workspace restore <id> [--cwd dir] [--force]` | 恢复工作区 |
+| `celagent doctor` | 配置 / aws CLI / 凭证 / CAS / Pi 版本 / 可选 celld |
+| `celagent cas-probe` | 条件写探测（exit 2 = 未完成，无法判定） |
 | `celagent config get/set` | 配置读写 |
-| `celagent doctor` | 六维自检(含 CAS) |
-| `celagent cas-probe` | 探测存储条件写(RPO=0 门禁) |
-| `celagent task submit <type> [steps]` | 提交分布式任务 (celld 状态机, 断点续跑) |
-| `celagent task status [taskId]` | 任务状态 |
-| `celagent task ledger` | 幂等 ledger (单 cell 去重, 非跨节点共识) |
-| `/resume` (TUI 内) | 切换本地会话 |
-| `/new` (TUI 内) | 新会话,打印持久化 ID |
 
-## 配置
+TUI 内：`/new`、`/fork`、`/resume`、`/compact` 仍由 Pi 提供；`/quit` 会先 flush outbox 并释放租约。
 
-`~/.config/celagent/settings.json`:
-
-```json
-{
-  "provider": "deepseek",
-  "model": "deepseek-v4-flash",
-  "persistence": {
-    "bucket": "celagent-<rand>-<ts>",
-    "endpoint": "https://s3.bj.bcebos.com",
-    "region": "bj"
-  }
-}
-```
-
-凭证:环境变量 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,或 `~/.aws/credentials` 的 profile(默认 `[bos]`,可用 `persistence.profile` 覆盖;两者不混用)。
-
-非 BOS 合格 endpoint(AWS S3 / Cloudflare R2 / Tigris 的 https host)可以 `config set persistence.endpoint`,并必须显式 `persistence.region`(R2 一般为 `auto`)。这只表示配置能写进去;**不表示该后端已实测 CAS**。非法地址会报错,不会静默写到百度 BOS。
-
-install.sh 可配置环境变量(全部有默认值):
-
-| 变量 | 作用 | 默认 |
-|------|------|------|
-| `CELAGENT_REPO` | 正式模式源码仓库地址 | `https://github.com/hxddh/celagent.git` |
-| `CELAGENT_SRC` | 开发模式本地源码目录 | 空(正式模式走仓库) |
-| `CELAGENT_ROOT` | 安装根目录 | `~/.local` |
-| `CELAGENT_BUCKET` | 强制指定 bucket(覆盖复用逻辑) | 空(自动创建/复用) |
-| `CELLD_ESBUILD` | esbuild 路径(worker 部署用) | 自动探测 |
+---
 
 ## 架构
 
-```
-celagent (TUI, bin/celagent-tui.mjs)
-   ├── pi-coding-agent 引擎 (交互/LLM/工具)
-   ├── Celld 节点 (18090/18091 自动启动, 19000 候选, 端口预检)
-   └── BOS 直写 (src/bos.js, CAS + 重试 + 异步队列)
+```text
+TUI / CLI / CI
+      │  local process
+      ▼
+Pi 1.5 AgentSession
+  └─ durability extension（before tool: journal.start；after: journal.finish）
+      │
+      ▼
+celagent v2 engine
+  ├─ lease：单写者 + epoch，过期可接管
+  ├─ outbox：~/.config/celagent/outbox，先 fsync 本地再上云
+  ├─ segments：按 entry 分块，不可变，hash 校验
+  └─ manifest：CAS 提交 head / segments / workspace
+      │
+      ▼
+对象存储（BOS / S3 / R2 / Tigris）
+  sessions/<id>/manifest.json
+  sessions/<id>/segments/000001-000005-<hash>.jsonl
+  sessions/<id>/journal/<toolCallId>.json
+  sessions/<id>/workspace/<hash>.tar.gz
+  snapshots/<name>-<ts>.json          # pointer: session + seq
 ```
 
-## 开发
+**权限**：会话权威仍在对象存储；celld 0.6.3 是可选执行底座（lease/alarm/container），核心不依赖它。worker 只保留可选缓存接口，不再有模拟任务。
+
+**读路径**：`celagent <id>` → `materialize` 拉 manifest + segments → 写本地 Pi JSONL → `SessionManager.open`。每个 segment 都校验 SHA-256；manifest head 必须与最后一个 entry 一致。
+
+**写路径**：每收到 `message_end` / `turn_end` / `session_compact`，durability engine 读本地 JSONL 的新 entry，写不可变 segment，CAS manifest，成功后清 outbox。失败留 outbox，下次启动重放。
+
+---
+
+## 跨机 / 接管
 
 ```bash
-cd <仓库路径>
-node --version                         # 需 >= 22 (pi 依赖链 undici 8.x 要求)
-npm install                            # 依赖 (pi 引擎等)
-CELAGENT_SRC=<仓库路径> ./setup.sh     # 首次: 建 bucket + 部署 worker + 写配置 + 启动节点
-node bin/celagent-tui.mjs doctor       # 自检
-npm test                               # 回归 (core + proof; Celld 用例需: scripts/node_mgr.sh start)
-./scripts/node_mgr.sh start|stop|status|restart
+# 机器 A
+celagent fix-auth
+
+# 机器 B（同一 bucket）
+celagent fix-auth
 ```
 
-## 测试记录
+机器 A 仍持有租约时，B 会明确报：
 
-- 回归: `npm test` (core CLI + proof 源码锚定; Celld/BOS 用例无节点时 skip)
-- BOS 链路: 写→读→ETag→CAS 冲突→并发写 (无重复无丢失)
-- 20 次高频写压测: 序号连续 1-20 无重复
-- Bug 1-97 修复: 覆盖持久化完整性、并发安全、信号处理、安装部署、worker 部署、凭证混用、首轮丢失
+```text
+会话 fix-auth 正被 host-a (epoch 3) 持有；先在该机器退出，或等待租约过期后接管
+```
 
-## 开发者 / Agent 接手
+A 正常退出会释放；A 崩溃时，同机 pid 已死可立即接管，跨机等 TTL（15 秒）后 epoch+1 接管。旧写者的后续 CAS 会被 fencing 拒绝。
 
-- **HANDOFF.md** — 项目交接文档(代码地图/发布状态/工程约定),新 agent 或开发者从它开始
-- **docs/architecture.md** — 架构权威(三层模型/数据流/机制原理/设计决策/扩展点)
-- **PACKAGING.md** — 打包与发布流程
-- **docs/distributed-deployment.md** — 多机部署
+工作区：
+
+```bash
+celagent workspace snapshot fix-auth --cwd ~/repo
+# 另一台机器
+celagent workspace restore fix-auth --cwd ~/repo --force
+```
+
+快照是 tar.gz，忽略 `.git`、`node_modules`、`.venv`、`dist`、`build`；单次默认上限 500 MB。容器化 workspace 在 1.1。
+
+---
+
+## 加密（可选）
+
+```bash
+export CELAGENT_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+```
+
+设置后所有对象 body 用 AES-256-GCM 加密（manifest / segments / journal / workspace）。**key 丢失 = 数据不可读**；跨机必须使用同一 key。未设置 key 读到密文对象会明确报 `CELAGENT_ENCRYPTION_KEY`，不会把它当损坏数据。
+
+---
+
+## 从 0.4.x 升级
+
+```bash
+celagent import-v0 <id> --yes
+```
+
+- 优先读旧 `sessions/<id>.jsonl`，其次旧 turns JSON；
+- 写成 v2 segments + manifest；
+- 旧对象保留；
+- 运行时不保留双读/steer 路径。
+
+---
+
+## 测试
+
+```bash
+npm test
+```
+
+- `tests/v2.test.mjs`：分段写/恢复、hash 校验、租约/接管、outbox、journal、加密、import、workspace。
+- `tests/persist.test.mjs`：旧 `jsonlFromTurns`/谱系/尾行修复（`import-v0` 仍用）。
+- `tests/core.test.mjs` / `cas-probe.test.mjs` / `p0-p2-bugs.test.mjs`：CLI、CAS 探针、存储边界。
+- 需要 `celld` / 真实桶的用例无节点时 skip。
+
+本地 S3 兼容验证（moto）：
+
+```bash
+npm test
+# 另见 docs/v1.0.md 的端到端记录
+```
+
+---
+
+## 边界
+
+- **单写者**，不做并发多写；跨机是顺序接管。
+- **不承诺任意副作用 exactly-once**。非幂等工具崩溃后标 `unknown`，需要人看 journal/工作区 diff。
+- **LLM 流中断会重发**，可能重复花 token；不重复工具副作用。
+- `workspace` 是 opt-in 快照，不是实时同步。
+- 加密是整桶模式；同一个 bucket 不要混用加密/非加密写入。
+- celld 是可选执行层；`doctor` 离线不报核心失败。
+- Pi 精确钉 `1.5.2`；升级需跑完整 TUI + headless + journal 冒烟。
+
+## 文档
+
+- [`docs/architecture.md`](docs/architecture.md) — v1.0 架构与数据流
+- [`docs/v1.0.md`](docs/v1.0.md) — 1.0 实现合同与端到端验证
+- [`docs/distributed-deployment.md`](docs/distributed-deployment.md) — 多机/接管
+- [`docs/s3-compat-evaluation.md`](docs/s3-compat-evaluation.md) — 合格后端与 CAS 门禁
+- [`HANDOFF.md`](HANDOFF.md) — 接手入口
 
 ## License
 

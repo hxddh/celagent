@@ -1,4 +1,4 @@
-# store_env.sh — 从 settings.json 读对象存储配置 (v0.3.3)
+# store_env.sh — 从 settings.json 读对象存储配置 (v1.0)
 # 设置 STORE_BUCKET STORE_EP STORE_REGION STORE_PROFILE, 并 export AWS_PROFILE AWS_REGION
 # 用法: . "$(dirname "$0")/store_env.sh"  或  . "$SCRIPT_DIR/scripts/store_env.sh"
 # shellcheck shell=bash

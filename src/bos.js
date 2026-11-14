@@ -237,6 +237,35 @@ export async function bosGet(key, { bucket, endpoint, profile, region } = {}) {
   }
 }
 
+export async function bosList(prefix, { bucket, endpoint, profile, region } = {}) {
+  if (!bucket) return { ok: false, error: "no-bucket" };
+  const resolved = resolvePutGetEndpoint(endpoint);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  const out = [];
+  let token;
+  for (let page = 0; page < 200; page++) {
+    const args = [
+      "s3api", "list-objects-v2",
+      "--bucket", bucket,
+      "--prefix", prefix,
+      "--endpoint-url", resolved.ep,
+      "--output", "json",
+    ];
+    if (token) args.push("--continuation-token", token);
+    const r = await runAws(args, { profile, region });
+    if (!r.ok) return { ok: false, error: r.error };
+    let j;
+    try { j = JSON.parse(r.stdout || "{}"); }
+    catch (e) { return { ok: false, error: "invalid-json" }; }
+    for (const c of j.Contents || []) {
+      out.push({ key: c.Key, size: c.Size, lastModified: c.LastModified });
+    }
+    if (!j.IsTruncated || !j.NextContinuationToken) break;
+    token = j.NextContinuationToken;
+  }
+  return { ok: true, keys: out };
+}
+
 export async function bosDelete(key, { bucket, endpoint, profile, region } = {}) {
   if (!bucket) return { ok: false, error: "no-bucket" };
   const resolved = resolvePutGetEndpoint(endpoint);
