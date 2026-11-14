@@ -77,10 +77,13 @@ node bin/celagent-tui.mjs status demo
 ## 3. 发布状态
 
 - 版本：**1.0.0**
+- Latest：[v1.0.0](https://github.com/hxddh/celagent/releases/tag/v1.0.0)（2026-11-14）
+- tag：`v1.0.0` → `3838475`（main）
 - 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`
-- 资产：celagent 五平台 + celld linux-x64/linux-arm64/darwin-arm64 + `install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
-- 发版：`.github/workflows/release.yml` 在 tag `v*` 时构建并上传
-- 无凭证冒烟：`./scripts/release-smoke.sh v1.0.0` 或 `latest`
+- 资产（12 个）：celagent 五平台、celld linux-x64/linux-arm64/darwin-arm64、`install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
+- 发布流水线：`.github/workflows/release.yml`；本次 Release run `43546449612` success
+- 无凭证冒烟：`./scripts/release-smoke.sh v1.0.0` 已通过（SHA256 + version/help）
+- CI：main `43546447185` success（Node 22/24）
 
 ## 4. 版本里程碑
 
