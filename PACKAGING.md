@@ -1,4 +1,4 @@
-# celagent 1.0 单二进制打包 (Bun)
+# celagent 2.0 单二进制打包 (Bun)
 
 ## 状态
 
@@ -80,5 +80,5 @@ GitHub Release:
    **无** darwin-x64 / Windows — `install.sh` 这两平台回退 celld.dev 或跳过。
    `install.sh` 正式模式下载 `SHA256SUMS` 并校验; 文件不存在则警告(可 `CELAGENT_REQUIRE_CHECKSUM=1` 强制失败)。
 
-6. **1.0 前置**：`aws` CLI 是运行时硬依赖（BOS/S3 读写）；`install.sh` 会检查。
-7. **1.0 版本三处一致**：`package.json`、`bin/celagent-tui.mjs`、`install.sh`。
+6. **2.0 前置**：`aws` CLI 是运行时硬依赖（BOS/S3 读写）；`tmux` 是 `up/attach` 依赖；`install.sh` 会检查/提示。
+7. **2.0 版本三处一致**：`package.json`、`bin/celagent-tui.mjs`、`install.sh`。

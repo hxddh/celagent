@@ -1,7 +1,7 @@
 {
   "name": "celagent",
-  "version": "1.0.0",
-  "description": "Durable agent runtime — 分段 Pi JSONL + manifest CAS + 工具 journal + 租约，可跨机接管",
+  "version": "2.0.0",
+  "description": "Durable agent computer — tmux supervisor + 增量工作区检查点 + 分段 Pi JSONL + manifest CAS + journal/lease",
   "type": "module",
   "bin": {
     "celagent": "./bin/celagent-tui.mjs"

@@ -1,4 +1,4 @@
-// tests/v1-contract.test.mjs — v1.0 发布合同（只锚定跨文件必须一致的事实）
+// tests/v2-contract.test.mjs — v2.0 发布合同（只锚定跨文件必须一致的事实）
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
@@ -7,11 +7,11 @@ import { join } from "node:path";
 const root = new URL("..", import.meta.url).pathname;
 const read = (p) => readFileSync(join(root, p), "utf8");
 
-test("v1.0.0 版本三处一致", () => {
+test("v2.0.0 版本三处一致", () => {
   const pkg = JSON.parse(read("package.json"));
-  assert.equal(pkg.version, "1.0.0");
-  assert.match(read("bin/celagent-tui.mjs"), /CELAGENT_VERSION = "1\.0\.0"/);
-  assert.match(read("install.sh"), /VERSION="1\.0\.0"/);
+  assert.equal(pkg.version, "2.0.0");
+  assert.match(read("bin/celagent-tui.mjs"), /CELAGENT_VERSION = "2\.0\.0"/);
+  assert.match(read("install.sh"), /VERSION="2\.0\.0"/);
 });
 
 test("Pi 精确钉 1.5.2（不吃 caret）", () => {
@@ -39,11 +39,11 @@ test("health 路径使用 celld 0.6 的新地址；不再自动清 own.json", ()
 });
 
 test("v2 模块与 CLI 命令存在", () => {
-  for (const f of ["src/v2/session.js", "src/v2/manifest.js", "src/v2/lease.js", "src/v2/outbox.js", "src/v2/journal.js", "src/v2/workspace.js"]) {
+  for (const f of ["src/v2/session.js", "src/v2/manifest.js", "src/v2/lease.js", "src/v2/outbox.js", "src/v2/journal.js", "src/v2/workspace.js", "src/v2/workspace-cas.js", "src/v2/supervisor.js"]) {
     assert.equal(existsSync(join(root, f)), true, f);
   }
   const help = read("bin/celagent-tui.mjs");
-  for (const cmd of ["run", "status", "import-v0", "workspace"]) {
+  for (const cmd of ["run", "status", "import-v0", "workspace", "up", "attach", "down", "ps"]) {
     assert.match(help, new RegExp(`celagent ${cmd}`), cmd);
   }
 });

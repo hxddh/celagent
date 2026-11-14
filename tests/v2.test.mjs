@@ -206,3 +206,18 @@ test("durability extension: journal 不可用时 block 工具; tool_result 传 c
   assert.equal(calls.length, 1);
   assert.equal(calls[0].info.result.content[0].text, "ok");
 });
+
+test("lease: 心跳在 TTL 内续租", async () => {
+  const store = createMemoryAdapter();
+  const a = createLeaseManager(store, { owner: "A", ttlMs: 50 });
+  const first = await a.acquire("s-heartbeat");
+  const stop = a.startHeartbeat("s-heartbeat");
+  try {
+    await new Promise((r) => setTimeout(r, 1200));
+    const got = await a.read("s-heartbeat");
+    assert.ok(got.lease.expiresAt > first.expiresAt, "心跳应延长 expiresAt");
+  } finally {
+    stop();
+    await a.release("s-heartbeat");
+  }
+});

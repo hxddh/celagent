@@ -28,4 +28,18 @@ export {
 } from "./session.js";
 export { readManifest, writeManifest, createManifest, ManifestCorruptError } from "./manifest.js";
 export { durabilityExtension } from "./extension.js";
+export {
+  checkpointWorkspace, restoreWorkspaceCheckpoint, listWorkspaceCheckpoints,
+  readWorkspaceCheckpoint, createCheckpointRunner, DEFAULT_EXCLUDES,
+} from "./workspace-cas.js";
+export { createUsageRecorder } from "./usage.js";
+export {
+  startSupervisor, stopSupervisor, attachTmux, supervisorStatus,
+  tmuxAvailable, tmuxHasSession, watchSupervisor,
+} from "./supervisor.js";
+export {
+  addTrigger, listTriggers, readTrigger, removeTrigger, dueTriggers,
+  spawnTriggerRun, runTriggerForeground, startTriggerDaemon, stopTriggerDaemon,
+  triggerDaemonStatus, runTriggerDaemon,
+} from "./triggers.js";
 export * from "./keys.js";

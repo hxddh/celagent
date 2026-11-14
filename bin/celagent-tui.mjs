@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-// celagent 1.0 — durable agent runtime
-// Pi 1.5 TUI + 分段 JSONL + manifest CAS + 工具 journal + 租约 + 本地 outbox
+// celagent 2.0 — durable agent computer
+// tmux supervisor + Pi 1.5 TUI + 分段 JSONL + manifest CAS + 工具 journal + 租约 + 增量工作区检查点
 import { homedir, hostname } from "node:os";
-import { join, basename, dirname } from "node:path";
+import { join, basename, dirname, resolve } from "node:path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, copyFileSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import * as pi from "@earendil-works/pi-coding-agent";
 import { awsEnv, resolveEndpoint, isAllowedEndpoint, probeStoreCas } from "../src/bos.js";
@@ -17,13 +18,26 @@ import {
   SessionLockedError, LeaseLostError, LineageMismatchError,
 } from "../src/v2/index.js";
 import { sessionStatus } from "../src/v2/status.js";
-import { snapshotWorkspace, restoreWorkspace } from "../src/v2/workspace.js";
+import { restoreWorkspace as restoreLegacyWorkspace } from "../src/v2/workspace.js";
+import { createUsageRecorder } from "../src/v2/usage.js";
+import {
+  checkpointWorkspace, listWorkspaceCheckpoints, restoreWorkspaceCheckpoint,
+  readWorkspaceCheckpoint, createCheckpointRunner,
+} from "../src/v2/workspace-cas.js";
+import {
+  attachTmux, listStates, logPath, startSupervisor, stopSupervisor, supervisorStatus,
+  tmuxAvailable, tmuxHasSession, tmuxListSessions, watchSupervisor, writeStop,
+} from "../src/v2/supervisor.js";
 import { history_search, session_snapshot } from "../src/bos-tools.js";
+import {
+  addTrigger, listTriggers, removeTrigger, runTriggerForeground,
+  startTriggerDaemon, stopTriggerDaemon, triggerDaemonStatus, runTriggerDaemon,
+} from "../src/v2/triggers.js";
 
 const require = createRequire(import.meta.url);
 const CONFIG_DIR = join(homedir(), ".config", "celagent");
 const AGENT_DIR = join(CONFIG_DIR, "pi-runtime");
-const CELAGENT_VERSION = "1.0.0";
+const CELAGENT_VERSION = "2.0.0";
 const CELD_HEALTH = "/.well-known/celld/health";
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091"];
 const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });
@@ -77,6 +91,38 @@ function sessionDirFor(cwd) {
   return join(AGENT_DIR, "sessions", encodeURIComponent(cwd.replace(/\//g, "-")));
 }
 
+function launcher() {
+  const isBun = Boolean(process.versions.bun);
+  if (isBun) return { node: process.execPath, bin: null };
+  const bin = resolve(process.argv[1] || fileURLToPath(import.meta.url));
+  return { node: process.execPath, bin };
+}
+
+function workspaceOpts(cfg = loadConfig()) {
+  const w = cfg.workspace && typeof cfg.workspace === "object" ? cfg.workspace : {};
+  return {
+    excludes: Array.isArray(w.excludes) && w.excludes.length > 0 ? w.excludes : undefined,
+    maxBytes: Number(w.maxBytes) > 0 ? Number(w.maxBytes) : undefined,
+    maxFileBytes: Number(w.maxFileBytes) > 0 ? Number(w.maxFileBytes) : undefined,
+    auto: w.auto !== false,
+  };
+}
+
+function makeCheckpointRunner(v2, sessionId, cwd, { quiet = false } = {}) {
+  const opts = workspaceOpts();
+  if (!opts.auto) return null;
+  return createCheckpointRunner({
+    store: v2.store, sessionId, cwd, lease: v2.lease,
+    excludes: opts.excludes, maxBytes: opts.maxBytes, maxFileBytes: opts.maxFileBytes,
+    onProgress: (r) => {
+      if (!quiet && r.uploaded > 0) {
+        warn(`  ✓ 工作区检查点 ${r.checkpointId}（seq ${r.seq}，${r.files} 文件，上传 ${r.uploaded} blob）`);
+      }
+    },
+    onError: (e) => { if (e.code !== "no-manifest") warn(`  (工作区检查点警告: ${e.message})`); },
+  });
+}
+
 function bindSessionFile(sm, dest) {
   if (!sm?.getSessionFile || !sm?.setSessionFile) return dest;
   mkdirSync(dirname(dest), { recursive: true });
@@ -94,10 +140,13 @@ function bindSessionFile(sm, dest) {
 
 async function prepareSession(v2, sessionId, localFile, { allowNew = true } = {}) {
   await v2.lease.acquire(sessionId);
+  // 心跳从 acquire 后立即开始：大历史 materialize 可能超过 15 秒 TTL。
+  const stopHeartbeat = v2.lease.startHeartbeat(sessionId, (e) => warn(`  (租约警告: ${e.message})`));
   let mat = null;
   try {
     mat = await materialize(v2.store, sessionId, localFile);
   } catch (e) {
+    stopHeartbeat();
     await v2.lease.release(sessionId).catch(() => {});
     throw e;
   }
@@ -105,18 +154,20 @@ async function prepareSession(v2, sessionId, localFile, { allowNew = true } = {}
     const lj = await v2.store.get(legacyJsonlKey(sessionId));
     const lt = await v2.store.get(legacyTurnsKey(sessionId));
     if (lj.ok || lt.ok) {
+      stopHeartbeat();
       await v2.lease.release(sessionId).catch(() => {});
       throw new Error(`会话 ${sessionId} 是旧格式；先运行 celagent import-v0 ${sessionId}`);
     }
     if (!allowNew) {
+      stopHeartbeat();
       await v2.lease.release(sessionId).catch(() => {});
       throw new Error(`会话 ${sessionId} 不存在`);
     }
   }
-  return mat;
+  return { mat, stopHeartbeat };
 }
 
-function makeAppender({ v2, sessionId, localFile, onError }) {
+function makeAppender({ v2, sessionId, localFile, onError, onAppended }) {
   let chain = Promise.resolve();
   let stopped = false;
   let lastError = null;
@@ -125,6 +176,7 @@ function makeAppender({ v2, sessionId, localFile, onError }) {
       try {
         await appendFromFile(v2.store, sessionId, localFile, { lease: v2.lease });
         v2.outbox.clear(sessionId);
+        try { onAppended?.(); } catch (e) { onError?.(e); }
         return;
       } catch (e) {
         lastError = e;
@@ -153,39 +205,52 @@ function makeAppender({ v2, sessionId, localFile, onError }) {
 }
 
 function printVersion() {
-  console.log(`celagent v${CELAGENT_VERSION} — durable agent runtime`);
+  console.log(`celagent v${CELAGENT_VERSION} — durable agent computer`);
 }
 
 function printHelp() {
   printVersion();
   console.log(`
 用法:
-  celagent                         启动 TUI（新会话）
-  celagent <id>                    续写指定会话（v2 manifest）
+  celagent                         启动/附着本会话的 supervisor（2.0 默认）
+  celagent <id>                    启动/附着指定会话
+  celagent up [id] [--cwd dir]     后台启动 supervisor（--attach 可直接附着）
+  celagent attach <id>             附着到运行中的 supervisor（关闭终端 = detach）
+  celagent down <id>               停止 supervisor（会话与检查点保留）
+  celagent ps                      列出 supervisor
+  celagent logs <id>               查看 supervisor 日志
   celagent run --prompt "..."      无头运行（CI/脚本）
       [--session <id>] [--json] [--cwd <dir>]
   celagent list [--bucket B]       列出 v2 会话（旧格式单独标注）
   celagent export <id> [--bucket B]  导出 Pi JSONL
   celagent rm <id> [--yes]         删除会话（v2 + 旧对象）
   celagent import-v0 <id> [--yes]  旧 .jsonl/.json 一次性导入 v2
-  celagent status [id]             持久化状态（durable seq / 租约 / outbox）
-  celagent workspace snapshot <id> [--cwd dir]
-  celagent workspace restore <id> [--cwd dir] [--force]
-  celagent doctor                  自检（配置/凭证/aws CLI/CAS/版本）
+  celagent status [id]             持久化状态（durable seq / 租约 / outbox / 工作区）
+  celagent workspace checkpoint <id> [--cwd dir]   生成增量工作区检查点
+  celagent workspace list <id>     列出检查点
+  celagent workspace restore <id> [--checkpoint id] [--cwd dir] [--force]
+  celagent workspace status <id>   当前检查点指针
+  celagent trigger add <id> --prompt ... [--cwd dir] [--every 60]
+  celagent trigger list|rm|run <id> | daemon [--start|--stop|--status]
+  celagent doctor                  自检（配置/凭证/aws CLI/tmux/CAS/版本）
   celagent cas-probe               存储条件写探测（RPO 门禁）
   celagent config get [key]        读取配置
   celagent config set <key> <val>  写入配置（如 model deepseek-v4-flash）
   celagent version                 显示版本
   celagent help                    显示帮助
 
-保证:
-  已提交 step 不丢；进行中的工具最多一个 unknown；
+2.0 保证:
+  客户端断开 / 终端关闭，supervisor 继续执行；
+  工具结果后自动生成增量工作区检查点；
+  崩溃后从最后一个检查点和 manifest 恢复；未完成工具最多一个 unknown；
   有幂等键的副作用不重复；没有幂等键的副作用绝不静默重放。
 
 示例:
+  celagent up fix-auth --cwd ~/repo --attach
+  # 关闭终端后，在另一台机器（同一 bucket）：
+  celagent up fix-auth --cwd ~/repo --restore --attach
+  celagent workspace list fix-auth
   celagent run --prompt "修复这个测试" --session fix-1
-  celagent status fix-1
-  celagent import-v0 sess-old-1
 `);
 }
 
@@ -277,7 +342,8 @@ async function doctorCommand() {
     } catch (e) { /* down */ }
   }
   const enc = Boolean(process.env.CELAGENT_ENCRYPTION_KEY);
-  console.log(`[6/6] 可选: celld ${celldUp ? "✓ 在线" : "⚠ 离线（v1 核心不依赖）"}；加密 ${enc ? "✓ 开启" : "⚠ 未开启"}`);
+  const tmux = await tmuxAvailable();
+  console.log(`[6/6] 2.0 supervisor: tmux ${tmux ? "✓ " + tmux : "✗ 未安装（up/attach 需要）"}；celld ${celldUp ? "✓ 在线" : "⚠ 离线（可选）"}；加密 ${enc ? "✓ 开启" : "⚠ 未开启"}`);
   if (ok && store.bucket) {
     try {
       const listed = await listSessions(createBosAdapter(store));
@@ -410,23 +476,247 @@ async function statusCommand(id) {
   console.log(JSON.stringify(st, null, 2));
 }
 
+function parseUpArgs(args) {
+  let id = null, cwd = process.cwd(), attach = false, restore = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--cwd") { cwd = args[++i] || cwd; continue; }
+    if (a === "--attach") { attach = true; continue; }
+    if (a === "--no-attach") { attach = false; continue; }
+    if (a === "--restore") { restore = true; continue; }
+    if (a.startsWith("-")) throw new Error(`未知选项: ${a}`);
+    if (!id) id = a;
+    else throw new Error(`多余的参数: ${a}`);
+  }
+  return { id, cwd: resolve(cwd), attach, restore };
+}
+
+async function restoreLatestBeforeUp(id, cwd) {
+  const v2 = openV2();
+  await v2.lease.acquire(id);
+  try {
+    const cp = await readWorkspaceCheckpoint(v2.store, id);
+    if (!cp) {
+      const m = await readManifest(v2.store, id);
+      if (m?.workspace?.key && m.workspace.format !== "cas-v1") {
+        const r = await restoreLegacyWorkspace({ store: v2.store, sessionId: id, cwd, force: true });
+        console.log(`✓ 已恢复 1.0 工作区 tar ${r.snapshotId}（${(r.bytes / 1024).toFixed(1)} KB）`);
+      } else {
+        warn("  (没有工作区检查点，跳过 --restore)");
+      }
+      return;
+    }
+    const r = await restoreWorkspaceCheckpoint({
+      store: v2.store, sessionId: id, checkpointId: cp.id, cwd, force: true,
+    });
+    console.log(`✓ 已恢复工作区检查点 ${r.checkpointId}（seq ${r.seq}，${r.files} 文件）`);
+  } finally {
+    await v2.lease.release(id).catch(() => {});
+  }
+}
+
+async function upCommand(args) {
+  const { id: rawId, cwd, attach, restore } = parseUpArgs(args);
+  const id = rawId || `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  assertSafeSessionId(id);
+  const tmux = await tmuxAvailable();
+  if (!tmux) throw new Error("2.0 supervisor 需要 tmux；安装 tmux 后重试");
+  if (restore) await restoreLatestBeforeUp(id, cwd);
+  const { node, bin } = launcher();
+  const r = await startSupervisor({ configDir: CONFIG_DIR, id, cwd, bin, node });
+  // 给 TUI 一个启动窗口；如果它在 900ms 内退出（配置/租约/密钥错误），把日志带出来。
+  await new Promise((res) => setTimeout(res, 900));
+  if (!(await tmuxHasSession(id))) {
+    let tail = "";
+    try { tail = readFileSync(logPath(CONFIG_DIR, id), "utf8").split("\n").slice(-20).join("\n"); } catch (e) { /* ignore */ }
+    await stopSupervisor({ configDir: CONFIG_DIR, id }).catch(() => {});
+    throw new Error(`supervisor 启动后立即退出${tail ? `:\n${tail}` : ""}`);
+  }
+  console.log(`✓ supervisor ${id} ${r.already ? "已在运行" : "已启动"}（tmux ${"celagent-" + id}）`);
+  console.log(`  cwd: ${cwd}`);
+  console.log(`  日志: ${logPath(CONFIG_DIR, id)}`);
+  console.log(`  attach: celagent attach ${id}`);
+  console.log(`  detach: Ctrl-b d；停止: celagent down ${id}`);
+  if (attach) await attachTmux(id);
+}
+
+async function attachCommand(args) {
+  const id = args.find((a) => !a.startsWith("-"));
+  if (!id) throw new Error("用法: celagent attach <id>");
+  assertSafeSessionId(id);
+  await attachTmux(id);
+}
+
+async function downCommand(args) {
+  const id = args.find((a) => !a.startsWith("-"));
+  if (!id) throw new Error("用法: celagent down <id>");
+  assertSafeSessionId(id);
+  const st = await supervisorStatus({ configDir: CONFIG_DIR, id });
+  if (!st.running && !st.watchdog?.alive && !st.state) {
+    console.log(`(会话 ${id} 没有运行中的 supervisor)`);
+    return;
+  }
+  await stopSupervisor({ configDir: CONFIG_DIR, id, gracefulMs: 5000 });
+  // tmux kill 可能只发 SIGHUP；显式清理本机已死 owner 的 lease，避免等 15 秒。
+  try {
+    const v2 = openV2();
+    await v2.lease.releaseIfLocalDead(id);
+  } catch (e) { /* 加密 key 缺失等场景留给 TTL */ }
+  console.log(`✓ 已停止 ${id}（会话数据与工作区检查点保留）`);
+}
+
+async function psCommand() {
+  const states = listStates(CONFIG_DIR);
+  const sessions = await tmuxListSessions();
+  const byName = new Map(sessions.map((s) => [s.name, s]));
+  if (states.length === 0 && sessions.filter((s) => s.name.startsWith("celagent-")).length === 0) {
+    console.log("(没有 supervisor)");
+    return;
+  }
+  console.log("ID\t状态\ttmux\twatchdog\tcwd");
+  for (const s of states) {
+    const active = byName.get(`celagent-${s.id}`);
+    const pid = s.watchdogPid;
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch (e) { alive = false; }
+    console.log(`${s.id}\t${active ? "running" : "stopped"}\t${active ? "yes" : "no"}\t${alive ? "yes" : "no"}\t${s.cwd}`);
+  }
+  for (const s of sessions) {
+    if (!s.name.startsWith("celagent-")) continue;
+    if (states.some((x) => `celagent-${x.id}` === s.name)) continue;
+    console.log(`${s.name.slice("celagent-".length)}\torphan-tmux\tyes\t-\t-`);
+  }
+}
+
+function logsCommand(args) {
+  const id = args.find((a) => !a.startsWith("-"));
+  if (!id) throw new Error("用法: celagent logs <id>");
+  assertSafeSessionId(id);
+  const file = logPath(CONFIG_DIR, id);
+  if (!existsSync(file)) { console.log("(没有日志)"); return; }
+  const lines = readFileSync(file, "utf8").split("\n");
+  process.stdout.write(lines.slice(-200).join("\n"));
+}
+
+async function triggerCommand(args) {
+  const [op, id] = args;
+  if (!op || !["add", "list", "rm", "run", "daemon"].includes(op)) {
+    console.error("用法: celagent trigger add <id> --prompt ... [--cwd dir] [--every 60] | list | rm <id> | run <id> | daemon [--start|--stop|--status]");
+    process.exit(1);
+  }
+  if (op === "list") {
+    const list = listTriggers(CONFIG_DIR);
+    if (list.length === 0) { console.log("(没有 trigger)"); return; }
+    console.log("ID\tevery\tlastRun\tlastSession\tprompt");
+    for (const t of list) {
+      console.log(`${t.id}\t${t.everyMinutes}m\t${t.lastRunAt ? new Date(t.lastRunAt).toISOString().slice(0, 19) : "-"}\t${t.lastSession || "-"}\t${String(t.prompt).replace(/\s+/g, " ").slice(0, 80)}`);
+    }
+    return;
+  }
+  if (op === "daemon") {
+    const mode = args.includes("--stop") ? "stop" : args.includes("--status") ? "status" : "start";
+    if (mode === "status") {
+      const st = triggerDaemonStatus(CONFIG_DIR);
+      console.log(JSON.stringify(st, null, 2));
+      return;
+    }
+    if (mode === "stop") {
+      await stopTriggerDaemon(CONFIG_DIR);
+      console.log("✓ trigger daemon 已停止");
+      return;
+    }
+    const idx = args.indexOf("--interval");
+    const intervalMs = idx > 0 ? Math.max(1000, Number(args[idx + 1]) || 30000) : 30000;
+    const { node, bin } = launcher();
+    const r = startTriggerDaemon({ configDir: CONFIG_DIR, bin, node, intervalMs });
+    console.log(r.started ? `✓ trigger daemon 已启动 (pid ${r.pid})` : `trigger daemon 已在运行 (pid ${r.pid})`);
+    console.log(`  日志: ${triggerDaemonStatus(CONFIG_DIR).log}`);
+    console.log("  只支持 --every 分钟；cron/webhook/审批在 2.1");
+    return;
+  }
+  if (!id) throw new Error(`trigger ${op} 需要 id`);
+  assertSafeSessionId(id);
+  if (op === "add") {
+    let prompt = "", cwd = process.cwd(), every = 60, timeout = 1800;
+    for (let i = 2; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--prompt") { prompt = args[++i] || ""; continue; }
+      if (a === "--cwd") { cwd = resolve(args[++i] || cwd); continue; }
+      if (a === "--every") { every = Number(args[++i]); continue; }
+      if (a === "--timeout") { timeout = Number(args[++i]); continue; }
+      throw new Error(`trigger add 未知选项: ${a}`);
+    }
+    const t = addTrigger(CONFIG_DIR, { id, prompt, cwd, everyMinutes: every, timeoutSeconds: timeout });
+    console.log(`✓ trigger ${t.id}: every ${t.everyMinutes}m, cwd=${t.cwd}`);
+    console.log(`  首次运行: celagent trigger run ${t.id}`);
+    console.log(`  后台调度: celagent trigger daemon --start`);
+    return;
+  }
+  if (op === "rm") {
+    if (!removeTrigger(CONFIG_DIR, id)) throw new Error(`trigger 不存在: ${id}`);
+    console.log(`✓ 已删除 trigger ${id}`);
+    return;
+  }
+  if (op === "run") {
+    const { node, bin } = launcher();
+    const r = await runTriggerForeground({ configDir: CONFIG_DIR, id, bin, node });
+    if (r.code !== 0) process.exitCode = r.code;
+    return;
+  }
+}
+
 async function workspaceCommand(args) {
   const [op, id] = args;
-  if (!op || !id || !["snapshot", "restore"].includes(op)) {
-    console.error("用法: celagent workspace snapshot <id> [--cwd dir] | workspace restore <id> [--cwd dir] [--force]");
+  const valid = ["snapshot", "checkpoint", "list", "restore", "status"];
+  if (!op || !id || !valid.includes(op)) {
+    console.error("用法: celagent workspace checkpoint|snapshot <id> [--cwd dir] | list <id> | restore <id> [--checkpoint id] [--cwd dir] [--force] | status <id>");
     process.exit(1);
   }
   assertSafeSessionId(id);
   const cwdIdx = process.argv.indexOf("--cwd");
-  const cwd = cwdIdx > 0 ? process.argv[cwdIdx + 1] : process.cwd();
+  const cwd = cwdIdx > 0 ? resolve(process.argv[cwdIdx + 1]) : process.cwd();
+  const cpIdx = process.argv.indexOf("--checkpoint");
+  const checkpointId = cpIdx > 0 ? process.argv[cpIdx + 1] : undefined;
   const v2 = openV2();
+  if (op === "list") {
+    const r = await listWorkspaceCheckpoints(v2.store, id);
+    if (r.checkpoints.length === 0) { console.log("(没有工作区检查点)"); return; }
+    console.log(`工作区检查点 ${id}（latest=${r.latest || "-"}）\n`);
+    console.log("ID                seq    文件   大小       创建时间");
+    for (const c of r.checkpoints) {
+      console.log(`${c.id.padEnd(16)} ${String(c.seq).padStart(5)} ${String(c.files).padStart(6)} ${((c.bytes || 0) / 1024).toFixed(1).padStart(8)} KB  ${String(c.createdAt || "").slice(0, 19)}${c.current ? "  *" : ""}`);
+    }
+    return;
+  }
+  if (op === "status") {
+    const m = await readManifest(v2.store, id);
+    console.log(JSON.stringify({ session: id, workspace: m?.workspace || null }, null, 2));
+    return;
+  }
+  await v2.lease.acquire(id);
   try {
-    if (op === "snapshot") {
-      const r = await snapshotWorkspace({ store: v2.store, sessionId: id, cwd });
-      console.log(`✓ 工作区快照 ${r.snapshotId}（${(r.bytes / 1024).toFixed(1)} KB）`);
+    if (op === "snapshot" || op === "checkpoint") {
+      const opts = workspaceOpts();
+      const r = await checkpointWorkspace({
+        store: v2.store, sessionId: id, cwd, lease: v2.lease,
+        excludes: opts.excludes, maxBytes: opts.maxBytes, maxFileBytes: opts.maxFileBytes,
+      });
+      console.log(`✓ 工作区检查点 ${r.checkpointId}（seq ${r.seq}，${r.files} 文件，${(r.bytes / 1024).toFixed(1)} KB，上传 ${r.uploaded} blob${r.reused ? "，复用" : ""}）`);
+      if (r.warnings?.length) for (const w of r.warnings) warn(`  ⚠ ${w}`);
     } else {
-      const r = await restoreWorkspace({ store: v2.store, sessionId: id, cwd, force: process.argv.includes("--force") });
-      console.log(`✓ 已恢复工作区 ${r.snapshotId}（${(r.bytes / 1024).toFixed(1)} KB）`);
+      if (!checkpointId) {
+        const m = await readManifest(v2.store, id);
+        if (m?.workspace?.key && m.workspace.format !== "cas-v1") {
+          const r = await restoreLegacyWorkspace({ store: v2.store, sessionId: id, cwd, force: process.argv.includes("--force") });
+          console.log(`✓ 已恢复 1.0 工作区 tar ${r.snapshotId}（${(r.bytes / 1024).toFixed(1)} KB）`);
+          return;
+        }
+      }
+      const r = await restoreWorkspaceCheckpoint({
+        store: v2.store, sessionId: id, checkpointId, cwd,
+        force: process.argv.includes("--force"),
+      });
+      console.log(`✓ 已恢复工作区检查点 ${r.checkpointId}（seq ${r.seq}，${r.files} 文件，${(r.bytes / 1024).toFixed(1)} KB，删除 ${r.removed} 项）`);
     }
   } finally {
     await v2.lease.release(id).catch(() => {});
@@ -439,6 +729,7 @@ function buildServices(cwd, holder, v2) {
     getSessionId: () => holder.id,
     journal: v2.journal,
     onError: (e) => warn(`  (journal 警告: ${e.message})`),
+    onToolResult: (info) => holder.onToolResult?.(info),
   });
   return pi.createAgentSessionServices({
     cwd,
@@ -477,8 +768,11 @@ async function runHeadless(args) {
   const holder = { id: sessionId };
   let session = null;
   let release = null;
+  let stopHeartbeat = null;
   try {
-    const mat = await prepareSession(v2, sessionId, localFile);
+    const prepared = await prepareSession(v2, sessionId, localFile);
+    const mat = prepared.mat;
+    stopHeartbeat = prepared.stopHeartbeat;
     const sm = mat
       ? pi.SessionManager.open(localFile, dir, cwd)
       : pi.SessionManager.create(cwd, dir);
@@ -491,18 +785,32 @@ async function runHeadless(args) {
       customTools: [history_search, session_snapshot],
     });
     session = created.session;
+    const checkpoint = makeCheckpointRunner(v2, sessionId, cwd, { quiet: true });
+    const usage = createUsageRecorder({ store: v2.store, sessionId, lease: v2.lease, onError: (e) => { if (e.code !== "no-manifest") warn(`  (usage 警告: ${e.message})`); } });
     const app = makeAppender({
       v2, sessionId, localFile,
       onError: (e) => warn(`  (持久化警告: ${e.message})`),
+      onAppended: () => { checkpoint?.request("append"); usage?.flush(); },
     });
-    activeRuntime = { v2, sessionId, app };
+    holder.onToolResult = () => checkpoint?.request("tool");
+    activeRuntime = { v2, sessionId, app, checkpoint, usage, stopHeartbeat };
     if (mat?.needsAppend || v2.outbox.get(sessionId)) app.append();
     release = async () => {
       await app.flush(10000);
+      checkpoint?.request("release");
+      await checkpoint?.flush(15000).catch(() => {});
+      await usage.flush().catch(() => {});
+      await usage.close().catch(() => {});
+      stopHeartbeat?.();
       await v2.lease.release(sessionId).catch(() => {});
     };
     session.subscribe((event) => {
-      if (["message_end", "turn_end", "session_compact"].includes(event?.type)) app.append();
+      if (["message_end", "turn_end", "session_compact"].includes(event?.type)) {
+        app.append();
+      }
+      if (event?.type === "message_end" && event.message?.role === "assistant" && event.message.usage) {
+        usage.add(event.message.usage);
+      }
       if (json && event?.type === "message_end" && event.message?.role === "assistant") {
         const text = Array.isArray(event.message.content)
           ? event.message.content.filter((b) => b.type === "text").map((b) => b.text).join("\n")
@@ -534,6 +842,11 @@ async function flushOnExit() {
     try {
       const r = await activeRuntime.app.flush(10000);
       if (r.pending) warn("  (警告: 仍有未上传的会话尾部，已保存在本地 outbox，下次启动重试)");
+      activeRuntime.checkpoint?.request("exit");
+      await activeRuntime.checkpoint?.flush(15000).catch(() => {});
+      await activeRuntime.usage?.flush().catch(() => {});
+      await activeRuntime.usage?.close().catch(() => {});
+      activeRuntime.stopHeartbeat?.();
       await activeRuntime.v2.lease.release(activeRuntime.sessionId).catch(() => {});
     } catch (e) { /* ignore */ }
   })();
@@ -544,6 +857,7 @@ function scheduleSignalExit(code) {
 }
 process.on("SIGINT", () => { scheduleSignalExit(130); void flushOnExit(); });
 process.on("SIGTERM", () => { scheduleSignalExit(143); void flushOnExit(); });
+process.on("SIGHUP", () => { scheduleSignalExit(129); void flushOnExit(); });
 
 // Pi 的 /quit 会直接 process.exit(0)，绕过 main 的 finally；拦截一次，先 flush + release lease。
 const realExit = process.exit.bind(process);
@@ -551,10 +865,56 @@ let exitFlushStarted = false;
 process.exit = (code) => {
   if (exitFlushStarted) return realExit(code);
   exitFlushStarted = true;
+  if (process.env.CELAGENT_SUPERVISED === "1" && process.env.CELAGENT_SESSION_ID) {
+    try { writeStop(CONFIG_DIR, process.env.CELAGENT_SESSION_ID, "exit"); } catch (e) { /* ignore */ }
+  }
   Promise.race([flushOnExit(), sleep(12000)]).finally(() => realExit(code));
 };
 
 async function main() {
+  if (process.env.CELAGENT_ENV_FILE) {
+    try {
+      const env = JSON.parse(readFileSync(process.env.CELAGENT_ENV_FILE, "utf8"));
+      for (const [k, v] of Object.entries(env)) {
+        if (typeof v === "string") process.env[k] = v;
+      }
+    } catch (e) {
+      console.error(`无法读取 supervisor env 文件: ${e.message}`);
+    }
+  }
+  if (process.argv[2] === "__triggerd") {
+    const { node, bin } = launcher();
+    const idx = process.argv.indexOf("--interval");
+    const intervalMs = idx > 0 ? Math.max(1000, Number(process.argv[idx + 1]) || 30000) : 30000;
+    await runTriggerDaemon({ configDir: CONFIG_DIR, bin, node, intervalMs });
+    return;
+  }
+  if (process.argv[2] === "__watch") {
+    const id = process.argv[3];
+    const cwdIdx = process.argv.indexOf("--cwd");
+    const cwd = cwdIdx > 0 ? resolve(process.argv[cwdIdx + 1]) : process.cwd();
+    const envIdx = process.argv.indexOf("--env-file");
+    const envFile = envIdx > 0 ? process.argv[envIdx + 1] : null;
+    if (!id) { console.error("__watch 缺少会话 ID"); process.exit(1); }
+    assertSafeSessionId(id);
+    const { node, bin } = launcher();
+    await watchSupervisor({ configDir: CONFIG_DIR, id, cwd, bin, node, envFile });
+    return;
+  }
+
+  const forceForeground = process.argv.includes("--foreground");
+  if (forceForeground) process.argv = process.argv.filter((a) => a !== "--foreground");
+
+  if (process.argv[2] === "__tui") {
+    const id = process.argv[3];
+    const cwdIdx = process.argv.indexOf("--cwd");
+    const cwd = cwdIdx > 0 ? resolve(process.argv[cwdIdx + 1]) : process.cwd();
+    if (!id) { console.error("__tui 缺少会话 ID"); process.exit(1); }
+    assertSafeSessionId(id);
+    process.chdir(cwd);
+    process.argv = [process.argv[0], process.argv[1], id];
+  }
+
   const cwd = process.cwd();
   const cmd = process.argv[2];
   if (cmd === "help" || cmd === "--help" || cmd === "-h") { printHelp(); return; }
@@ -569,7 +929,31 @@ async function main() {
   if (cmd === "status") { await statusCommand(process.argv[3]); return; }
   if (cmd === "workspace") { await workspaceCommand(process.argv.slice(3)); return; }
   if (cmd === "run") { await runHeadless(process.argv.slice(3)); return; }
+  if (cmd === "trigger") { await triggerCommand(process.argv.slice(3)); return; }
+  if (cmd === "up") { await upCommand(process.argv.slice(3)); return; }
+  if (cmd === "attach") { await attachCommand(process.argv.slice(3)); return; }
+  if (cmd === "down" || cmd === "stop") { await downCommand(process.argv.slice(3)); return; }
+  if (cmd === "ps" || cmd === "supervisors") { await psCommand(); return; }
+  if (cmd === "logs") { logsCommand(process.argv.slice(3)); return; }
   if (cmd && cmd.startsWith("-")) { console.error(`未知选项: ${cmd}（celagent help）`); process.exit(1); }
+
+  const known = new Set([
+    "help", "version", "config", "doctor", "cas-probe", "list", "export", "rm",
+    "import-v0", "status", "workspace", "run", "trigger", "up", "attach", "down", "stop",
+    "ps", "supervisors", "logs",
+  ]);
+  const shouldSupervise = !forceForeground && !process.env.CELAGENT_SUPERVISED
+    && process.env.CELAGENT_NO_SUPERVISOR !== "1"
+    && (!cmd || (!known.has(cmd) && !cmd.startsWith("-")));
+  if (shouldSupervise) {
+    if (await tmuxAvailable()) {
+      const args = process.argv.slice(2);
+      if (process.stdin.isTTY) args.push("--attach");
+      await upCommand(args);
+      return;
+    }
+    warn("  (tmux 不可用，退回进程内 TUI；无 detach/自动重启)");
+  }
 
   if (process.argv[2]) assertSafeSessionId(process.argv[2]);
   const sessionId = process.argv[2] || `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -582,8 +966,12 @@ async function main() {
   catch (e) { console.error(`✗ ${e.message}`); process.exit(1); }
 
   let mat;
-  try { mat = await prepareSession(v2, sessionId, localFile); }
-  catch (e) {
+  let stopHeartbeat;
+  try {
+    const prepared = await prepareSession(v2, sessionId, localFile);
+    mat = prepared.mat;
+    stopHeartbeat = prepared.stopHeartbeat;
+  } catch (e) {
     if (e instanceof SessionLockedError || e instanceof LeaseLostError || e instanceof LineageMismatchError) {
       console.error(`✗ ${e.message}`); process.exit(1);
     }
@@ -600,28 +988,41 @@ async function main() {
 
   const holder = { id: sessionId };
   attachSnapshotTurns(v2, holder);
-  const app = makeAppender({ v2, sessionId, localFile, onError: (e) => warn(`  (持久化警告: ${e.message})`) });
-  activeRuntime = { v2, sessionId, app };
+  const checkpoint = makeCheckpointRunner(v2, sessionId, cwd);
+  const usage = createUsageRecorder({ store: v2.store, sessionId, lease: v2.lease, onError: (e) => { if (e.code !== "no-manifest") warn(`  (usage 警告: ${e.message})`); } });
+  const app = makeAppender({ v2, sessionId, localFile, onError: (e) => warn(`  (持久化警告: ${e.message})`), onAppended: () => { checkpoint?.request("append"); usage?.flush(); } });
+  holder.onToolResult = () => checkpoint?.request("tool");
+  activeRuntime = { v2, sessionId, app, checkpoint, usage, stopHeartbeat };
   if (mat?.needsAppend || v2.outbox.get(sessionId)) app.append();
 
   let services;
   try { services = await buildServices(cwd, holder, v2); }
   catch (e) { console.error(`services 失败: ${e.message}`); process.exit(1); }
 
-  let current = { sessionId, localFile, manager, app };
+  let current = { sessionId, localFile, manager, app, checkpoint, usage, stopHeartbeat };
 
   const switchSession = async (nextId, nextFile) => {
     if (current) {
       await current.app.flush(5000);
+      current.checkpoint?.request("switch");
+      await current.checkpoint?.flush(10000).catch(() => {});
+      current.checkpoint?.close();
+      await current.usage?.flush().catch(() => {});
+      await current.usage?.close().catch(() => {});
+      current.stopHeartbeat?.();
       await v2.lease.release(current.sessionId).catch(() => {});
       current.app.stop();
     }
     await v2.lease.acquire(nextId);
+    const nextStopHeartbeat = v2.lease.startHeartbeat(nextId, (e) => warn(`  (租约警告: ${e.message})`));
     holder.id = nextId;
     globalThis.__celagentPersistId = nextId;
-    const nextApp = makeAppender({ v2, sessionId: nextId, localFile: nextFile, onError: (e) => warn(`  (持久化警告: ${e.message})`) });
-    current = { sessionId: nextId, localFile: nextFile, manager: manager, app: nextApp };
-    activeRuntime = { v2, sessionId: nextId, app: nextApp };
+    const nextCheckpoint = makeCheckpointRunner(v2, nextId, cwd);
+    const nextUsage = createUsageRecorder({ store: v2.store, sessionId: nextId, lease: v2.lease, onError: (e) => { if (e.code !== "no-manifest") warn(`  (usage 警告: ${e.message})`); } });
+    const nextApp = makeAppender({ v2, sessionId: nextId, localFile: nextFile, onError: (e) => warn(`  (持久化警告: ${e.message})`), onAppended: () => { nextCheckpoint?.request("append"); nextUsage?.flush(); } });
+    holder.onToolResult = () => nextCheckpoint?.request("tool");
+    current = { sessionId: nextId, localFile: nextFile, manager: manager, app: nextApp, checkpoint: nextCheckpoint, usage: nextUsage, stopHeartbeat: nextStopHeartbeat };
+    activeRuntime = { v2, sessionId: nextId, app: nextApp, checkpoint: nextCheckpoint, usage: nextUsage, stopHeartbeat: nextStopHeartbeat };
     return nextApp;
   };
 
@@ -649,7 +1050,12 @@ async function main() {
         customTools: [history_search, session_snapshot],
       });
       result.session.subscribe((event) => {
-        if (["message_end", "turn_end", "session_compact"].includes(event?.type)) current.app.append();
+        if (["message_end", "turn_end", "session_compact"].includes(event?.type)) {
+          current.app.append();
+        }
+        if (event?.type === "message_end" && event.message?.role === "assistant" && event.message.usage) {
+          current.usage?.add(event.message.usage);
+        }
       });
       if (current.app) current.app.append();
       return { ...result, services, diagnostics: [] };
@@ -662,6 +1068,9 @@ async function main() {
     const interactive = new pi.InteractiveMode(runtime, { verbose: true, tuiMode: "regular" });
     await interactive.init();
     await interactive.run();
+    if (process.env.CELAGENT_SUPERVISED === "1" && process.env.CELAGENT_SESSION_ID) {
+      writeStop(CONFIG_DIR, process.env.CELAGENT_SESSION_ID, "quit");
+    }
   } finally {
     await flushOnExit();
     try { await manager.dispose?.(); } catch (e) { /* ignore */ }

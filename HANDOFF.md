@@ -1,53 +1,61 @@
-# HANDOFF — celagent 1.0
+# HANDOFF — celagent 2.0
 
-> 唯一权威交接入口。先读本文，再读 `docs/architecture.md`（架构）与 `docs/v1.0.md`（实现合同/验证）。
-> 用户视角见 `README.md`。旧 v0.3/v0.4 文档已移到 `docs/archive/`，不要按它们改当前代码。
+> 唯一权威交接入口。先读本文，再读 `docs/architecture.md`（架构）与 `docs/v2.0.md`（实现合同/验证）。
+> 用户视角见 `README.md`。1.0 历史合同在 `docs/v1.0.md`；旧 0.x 文档在 `docs/archive/`，不要按它们改当前代码。
 
 ## 0. 项目定位
 
-**celagent 1.0 = durable agent runtime。**
+**celagent 2.0 = durable agent computer。**
 
 - Pi 1.5 负责 agent 语义（LLM、工具、compaction、TUI）；
+- tmux supervisor + watchdog 负责执行者：客户端 detach 后工作继续；崩溃后拉起；
 - celagent 负责把每个 step 变成对象存储里的不可变对象；
-- 会话权威是 v2 manifest + segments；工具副作用先写 journal；
-- 单写者 lease + epoch，跨机可接管；
-- 工作区可快照/恢复；
-- celld 0.6.3 是可选执行底座，核心不依赖。
+- 工作区是内容寻址的增量检查点，不是手动 tar；
+- 单写者 lease + epoch + 心跳，跨机可顺序接管；
+- 本地 interval trigger preview；cron/webhook/审批在 2.1；
+- celld 0.6.3 是可选后端，核心不依赖。
 
 保证：
 
-```
-已提交 step 不丢
-进行中的工具最多一个 unknown
-有幂等键的副作用不重复
-没有幂等键的副作用绝不静默重放
+```text
+客户端断开 / 终端关闭，supervisor 继续执行
+工具结果后自动生成增量工作区检查点
+崩溃后从最后一个检查点和 manifest 恢复
+进行中的工具最多一个 unknown；没有幂等键的副作用绝不静默重放
 ```
 
 ## 1. 代码地图
 
 | 路径 | 职责 |
 |---|---|
-| `bin/celagent-tui.mjs` | CLI/TUI/headless：命令解析、v2 装配、TUI runtime、`run`、`status`、`import-v0`、`workspace` |
+| `bin/celagent-tui.mjs` | CLI/TUI/headless/up/attach/down/ps/logs/trigger；v2 装配、checkpoint runner、usage |
 | `src/v2/session.js` | 分段 JSONL：append、materialize、readSession、list、delete、importV0 |
 | `src/v2/manifest.js` | manifest 校验 / 读 / CAS 写 |
 | `src/v2/lease.js` | 单写者租约、epoch、同机死 pid 接管、心跳 |
 | `src/v2/outbox.js` | 本地 fsync 发件箱；失败留到下次启动 |
 | `src/v2/journal.js` | 工具 journal start/finish/reconcile |
-| `src/v2/extension.js` | Pi 1.5 durability extension（`tool_call` block / `tool_result`） |
+| `src/v2/extension.js` | Pi 1.5 durability extension（tool_call block / tool_result / checkpoint 请求） |
+| `src/v2/workspace.js` | 1.0 tar workspace（保留兼容/测试） |
+| `src/v2/workspace-cas.js` | **2.0 内容寻址增量检查点**：scan/blob/checkpoint/restore/runner |
+| `src/v2/supervisor.js` | **tmux supervisor/watchdog**：start/attach/stop/status |
+| `src/v2/usage.js` | Pi usage → manifest stats |
+| `src/v2/triggers.js` | **本地 interval trigger preview**：配置/到期/daemon |
 | `src/v2/adapter.js` | 对象存储适配器（BOS/S3 经 aws CLI；内存 store 测试） |
 | `src/v2/crypto.js` | 可选 AES-256-GCM 信封加密 |
-| `src/v2/workspace.js` | tar.gz 工作区快照/恢复 |
-| `src/v2/status.js` | durable seq / lease / outbox 状态 |
+| `src/v2/status.js` | durable seq / lease / outbox / workspace / journal / stats |
 | `src/bos.js` | aws CLI 原语：get/put/list/delete、CAS 探针、endpoint 门禁 |
 | `src/bos-tools.js` | `history_search` / `session_snapshot`（v2） |
-| `src/persist.js` | 旧格式工具函数（`jsonlFromTurns` 仍被 `import-v0` 用）；旧队列/legacy 路径不在 1.0 运行时 |
-| `worker/src/index.js` | celld 可选缓存 worker（checkpoint/resume/sync/hibernate/wake；无模拟任务） |
+| `src/persist.js` | 旧格式工具函数（`jsonlFromTurns` 仍被 `import-v0` 用） |
+| `worker/src/index.js` | celld 可选缓存 worker（无模拟任务） |
 | `scripts/node_mgr.sh` | 本机 celld 节点管理（0.6.3 health 路径） |
 | `scripts/cluster_mgr.sh` | 多机 celld 节点管理（可选） |
-| `install.sh` / `setup.sh` | 安装 / 部署（celld 0.6.3，不再传 CELLD_STORAGE_PROBE） |
-| `tests/v2.test.mjs` | 分段/租约/outbox/journal/加密/import/workspace 行为 |
-| `tests/v1-contract.test.mjs` | 1.0 发布合同（版本/依赖/health/CLI） |
-| `tests/persist.test.mjs` | 旧 JSONL 转换/谱系/尾行（import-v0 仍用） |
+| `install.sh` / `setup.sh` | 安装 / 部署（celld 0.6.3；tmux 检查） |
+| `tests/v2-checkpoint.test.mjs` | 增量检查点/blob 复用/symlink/force/runner |
+| `tests/v2-supervisor.test.mjs` | tmux supervisor 生命周期 |
+| `tests/v2-triggers.test.mjs` | trigger 配置/到期/删除 |
+| `tests/v2-usage.test.mjs` | usage → manifest.stats |
+| `tests/v2-contract.test.mjs` | 2.0 发布合同（版本/依赖/模块/CLI） |
+| `tests/v2.test.mjs` | 1.0 分段/租约/outbox/journal/加密/import/旧 workspace |
 | `tests/core.test.mjs` | CLI + 可选 celld/BOS |
 | `tests/cas-probe.test.mjs` | CAS 探针语义 |
 | `tests/p0-p2-bugs.test.mjs` | endpoint/store_env 回归 |
@@ -60,38 +68,41 @@ npm install
 npm test                       # 无 celld/真实桶时相关用例 skip
 
 # 本地 S3 兼容（moto）端到端
-# 需要 aws CLI；见 docs/v1.0.md §10
+# 需要 aws CLI + moto；见 docs/v2.0.md §8
 node bin/celagent-tui.mjs doctor
 node bin/celagent-tui.mjs run --session demo --prompt "hello" --json
 node bin/celagent-tui.mjs status demo
+node bin/celagent-tui.mjs up demo --cwd /tmp/ws
+node bin/celagent-tui.mjs attach demo
+node bin/celagent-tui.mjs down demo
 ```
 
 环境事实：
 
 - **BOS 默认**：`https://s3.bj.bcebos.com`，region `bj`，profile `bos`。
-- **aws CLI 是硬依赖**：`install.sh` 会检查；缺失时 `doctor` 明确报错，不再把 ENOENT 当网络抖动。
-- **Pi 精确 1.5.2**：不要升 caret；升级要跑 TUI + headless + journal 冒烟。
-- **celld 0.6.3**：health 是 `/.well-known/celld/health`；`CELLD_STORAGE_PROBE` 已移除；不要按 bucket 前缀删 `own.json`。
+- **aws CLI 是硬依赖**：`install.sh` 会检查；缺失时 `doctor` 明确报错。
+- **tmux 是 2.0 supervisor 依赖**：`up/attach` 需要；`run/list/workspace` 不需要。
+- **Pi 精确 1.5.2**：不要升 caret；升级要跑 TUI + headless + journal + checkpoint 冒烟。
+- **celld 0.6.3**：health 是 `/.well-known/celld/health`；不要按 bucket 前缀删 `own.json`。
 - **加密**：`CELAGENT_ENCRYPTION_KEY` 32 字节 base64；整桶模式；key 丢失不可读。
+- **workspace**：增量内容寻址；默认排除 `.git`/`node_modules`/`.venv`/`dist`/`build`/`.cache`/`target`/`vendor`；单文件 128 MB、总量 1 GB。
 
 ## 3. 发布状态
 
-- 版本：**1.0.0**
-- Latest：[v1.0.0](https://github.com/hxddh/celagent/releases/tag/v1.0.0)（2026-11-14）
-- tag：`v1.0.0` → `3838475`（main）
-- 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`
-- 资产（12 个）：celagent 五平台、celld linux-x64/linux-arm64/darwin-arm64、`install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
-- 发布流水线：`.github/workflows/release.yml`；本次 Release run `43546449612` success
-- 无凭证冒烟：`./scripts/release-smoke.sh v1.0.0` 已通过（SHA256 + version/help）
-- CI：main `43546447185` success（Node 22/24）
+- 版本：**2.0.0**（待发布；发布后填 Release 链接）
+- 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`；tmux
+- 发布流水线：`.github/workflows/release.yml`
+- 无凭证冒烟：`./scripts/release-smoke.sh v2.0.0`（发布后）
+- 2.0 核心：supervisor/attach/detach、增量 checkpoint、usage stats、trigger preview
 
 ## 4. 版本里程碑
 
 | 版本 | 内容 | 状态 |
 |---|---|---|
 | 0.4.3 | 最后 0.x：Pi JSONL 权威、整文件 CAS | 历史 |
-| **1.0.0** | 分段 JSONL + manifest CAS + journal + lease + outbox + workspace + headless + import-v0；pi 1.5.2；celld 0.6.3 | 本刀 |
-| 1.1 | TUI attach supervisor；celld container workspace；FTS 索引；真实崩溃注入/后端矩阵 | 候选 |
+| 1.0.0 | 分段 JSONL + manifest CAS + journal + lease + outbox + workspace + headless + import-v0 | 历史 |
+| **2.0.0** | tmux supervisor/watchdog + attach/detach + 增量工作区检查点 + usage + trigger preview | 本刀 |
+| 2.1 | cron/webhook/审批/预算、services.yaml、多 agent/worktree、语义 UI、FTS、真实后端矩阵 | 候选 |
 
 ## 5. 工程约定
 
@@ -107,19 +118,20 @@ node bin/celagent-tui.mjs status demo
    - 按 bucket 前缀批量删 `own.json`；
    - `CELLD_STORAGE_PROBE`；
    - 旧 `/__celld/health`；
-   - 源码字符串锚定代替行为测试。
+   - 源码字符串锚定代替行为测试；
+   - 客户端进程内 lease/append（2.0 由 supervisor 持有）。
 
 ## 6. 已知债 / 边界
 
 - **单写者**：不做并发多写；跨机顺序接管。
 - **任意副作用 exactly-once 不承诺**；非幂等工具崩溃后 `unknown`。
-- **LLM 流中断重发**，可能重复 token。
-- **workspace**：opt-in tar 快照，不是实时同步；容器化 1.1。
-- **加密**：整桶；不能混用；key 管理是用户责任。
+- **工作区检查点**：首次全量可能慢；不保存进程内存/socket/数据库；excluded 目录由用户重建。
+- **本地 supervisor**：笔记本休眠暂停；真正 always-on 需要远程主机或 celld 常驻。
+- **trigger preview**：只支持 `--every`；无 cron/webhook、无硬预算、无审批。
+- **celld**：容器磁盘临时、迁移停容器；2.0 不宣称实时迁移。
 - **Pi 1.5.2**：扩展/事件 API 仍演进；精确钉版本。
-- **真实后端**：BOS/R2/S3 的长时间压测/多机故障注入尚未在 CI 跑。
-- **FTS 索引**：1.0 仍是按需读 segment；1.1 再做。
-- **TUI supervisor**：1.0 的 TUI 仍是进程内 runtime；headless `run` 已 step-durable，TUI 的 `/quit`/信号会 flush + release，但 TUI 被 kill -9 时 agent 也随之结束。1.1 做 attach。
+- **真实后端**：BOS/R2/S3 长时间压测、1 GB/20k 文件 benchmark、多机分区未在 CI 跑。
+- **FTS/语义 UI/多 agent**：2.1。
 
 ## 7. 发版流程
 
@@ -127,16 +139,17 @@ node bin/celagent-tui.mjs status demo
 2. 版本号：`package.json`、`bin/celagent-tui.mjs`、`install.sh` 三处一致。
 3. `npm pack --dry-run` 检查文件。
 4. commit → push main。
-5. tag `v1.0.0` → push tag；Release workflow 构建资产。
-6. `./scripts/release-smoke.sh v1.0.0` 验证下载/SHA/version/help。
+5. tag `v2.0.0` → push tag；Release workflow 构建资产。
+6. `./scripts/release-smoke.sh v2.0.0` 验证下载/SHA/version/help。
 7. 更新本文 §3 的 Release 链接与资产状态。
 
 ## 8. 相关文档
 
 - `README.md` — 用户安装/命令/保证
-- `docs/architecture.md` — 架构与 ADR
-- `docs/v1.0.md` — 实现合同与 2026-11-14 验证记录
+- `docs/architecture.md` — 2.0 架构与 ADR
+- `docs/v2.0.md` — 2.0 实现合同与验证记录
 - `docs/distributed-deployment.md` — 多机/接管
 - `docs/s3-compat-evaluation.md` — 合格后端/CAS 门禁
 - `docs/bos-compat.md` — BOS 实测边界（历史，仍适用）
-- `docs/archive/` — v0.3/v0.4 历史文档，不要据此改代码
+- `docs/v1.0.md` — 1.0 历史合同
+- `docs/archive/` — 0.x 历史文档，不要据此改代码

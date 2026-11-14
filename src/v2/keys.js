@@ -24,6 +24,15 @@ export function journalKey(sessionId, toolCallId) {
 export function workspaceKey(sessionId, snapshotId) {
   return `${SESSIONS_PREFIX}${sessionId}/workspace/${snapshotId}.tar.gz`;
 }
+export function workspaceCheckpointPrefix(sessionId) {
+  return `${SESSIONS_PREFIX}${sessionId}/workspace/checkpoints/`;
+}
+export function workspaceCheckpointKey(sessionId, checkpointId) {
+  return `${workspaceCheckpointPrefix(sessionId)}${checkpointId}.json`;
+}
+export function workspaceBlobKey(sessionId, hash) {
+  return `${SESSIONS_PREFIX}${sessionId}/workspace/blobs/${String(hash).replace(/^sha256:/, "")}`;
+}
 export function sessionPrefix(sessionId) {
   return `${SESSIONS_PREFIX}${sessionId}/`;
 }

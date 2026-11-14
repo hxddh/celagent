@@ -108,6 +108,23 @@ export function createLeaseManager(store, opts = {}) {
     return Boolean(del.ok);
   }
 
+  async function releaseIfLocalDead(sessionId) {
+    const { lease } = await read(sessionId);
+    if (!lease) return false;
+    if (lease.owner === owner) {
+      const del = await store.delete(leaseKey(sessionId));
+      return Boolean(del.ok);
+    }
+    const m = /^(.*)-(\d+)$/.exec(String(lease.owner || ""));
+    if (!m || m[1] !== hostname()) return false;
+    let alive = true;
+    try { process.kill(Number(m[2]), 0); alive = true; }
+    catch (e) { alive = e.code === "EPERM"; }
+    if (alive) return false;
+    const del = await store.delete(leaseKey(sessionId));
+    return Boolean(del.ok);
+  }
+
   function startHeartbeat(sessionId, onLost) {
     const t = setInterval(() => {
       renew(sessionId).catch((e) => {
@@ -119,5 +136,5 @@ export function createLeaseManager(store, opts = {}) {
     return () => clearInterval(t);
   }
 
-  return { owner, ttlMs, acquire, assert, renew, release, startHeartbeat, read };
+  return { owner, ttlMs, acquire, assert, renew, release, releaseIfLocalDead, startHeartbeat, read };
 }
