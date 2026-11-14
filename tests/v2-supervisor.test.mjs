@@ -108,3 +108,35 @@ test("supervisor: 同 ID 重复 start 返回 already, 不重复建 tmux", async 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("supervisor: goalId 传给 __tui", async (t) => {
+  if (!(await tmuxAvailable())) return t.skip("tmux 不可用");
+  const dir = mkdtempSync(join(tmpdir(), "celagent-sup-goal-"));
+  const configDir = join(dir, "cfg");
+  const cwd = join(dir, "ws");
+  mkdirSync(cwd, { recursive: true });
+  const bin = join(dir, "fake.mjs");
+  writeFileSync(bin, [
+    'import { writeFileSync } from "node:fs";',
+    'import { join } from "node:path";',
+    'if (process.argv[2] === "__tui") {',
+    '  writeFileSync(join(process.cwd(), "tui-args.json"), JSON.stringify(process.argv));',
+    '}',
+    "setTimeout(() => {}, 60000);",
+  ].join("\n"));
+  const id = `goal-${Date.now().toString(36)}`;
+  try {
+    await startSupervisor({ configDir, id, cwd, bin, node: process.execPath, kind: "tui", goalId: "goal-x" });
+    const argsFile = join(cwd, "tui-args.json");
+    for (let i = 0; i < 30 && !existsSync(argsFile); i++) await new Promise((res) => setTimeout(res, 100));
+    assert.equal(existsSync(argsFile), true, "fake TUI 没有收到参数");
+    const argv = JSON.parse(readFileSync(argsFile, "utf8"));
+    assert.equal(argv[2], "__tui");
+    assert.equal(argv[argv.indexOf("--goal") + 1], "goal-x");
+    const st = await supervisorStatus({ configDir, id });
+    assert.equal(st.state.goalId, "goal-x");
+  } finally {
+    await stopSupervisor({ configDir, id }).catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

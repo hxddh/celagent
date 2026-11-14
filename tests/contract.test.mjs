@@ -7,11 +7,11 @@ import { join } from "node:path";
 const root = new URL("..", import.meta.url).pathname;
 const read = (p) => readFileSync(join(root, p), "utf8");
 
-test("v3.0.1 版本三处一致", () => {
+test("v4.0.0 版本三处一致", () => {
   const pkg = JSON.parse(read("package.json"));
-  assert.equal(pkg.version, "3.0.1");
-  assert.match(read("bin/celagent-tui.mjs"), /CELAGENT_VERSION = "3\.0\.1"/);
-  assert.match(read("install.sh"), /VERSION="3\.0\.1"/);
+  assert.equal(pkg.version, "4.0.0");
+  assert.match(read("bin/celagent-tui.mjs"), /CELAGENT_VERSION = "4\.0\.0"/);
+  assert.match(read("install.sh"), /VERSION="4\.0\.0"/);
 });
 
 test("Pi 精确钉 1.5.2（不吃 caret）", () => {
@@ -62,4 +62,15 @@ test("v3 委派模块与命令存在", () => {
 
 test("worker 不再暴露模拟任务 CLI", () => {
   assert.doesNotMatch(read("bin/celagent-tui.mjs"), /taskCommand|task submit/);
+});
+
+test("v4 goal 模块与命令存在", () => {
+  for (const f of ["src/v4/index.js", "src/v4/goal.js", "src/v4/extension.js"]) {
+    assert.equal(existsSync(join(root, f)), true, f);
+  }
+  const bin = read("bin/celagent-tui.mjs");
+  for (const cmd of ["celagent goal start", "celagent goal status", "celagent goal answer", "celagent goal stop"]) {
+    assert.match(bin, new RegExp(cmd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), cmd);
+  }
+  assert.match(bin, /--goal/);
 });

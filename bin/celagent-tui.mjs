@@ -37,12 +37,19 @@ import {
   createDelegateTool, createDelegator, readChildState, readChildResult, listInbox, consumeInbox,
   takeNextPrompt, patchChildState, writeChildResult, lastAssistantTextFromTurns,
   commitWorktree, worktreeSummary, appendOutput, outputLogPath,
+  repoRoot, repoHead, repoDirty, createWorktree, removeWorktree, branchName, worktreePathFor,
 } from "../src/v3/index.js";
+import {
+  goalExtension, newGoalId, validGoalId, readGoal, patchGoal, writeGoal, writeGoalDoc,
+  writeAnswer, listGoals, DEFAULT_PROTECT,
+  DEFAULT_MAX_ATTEMPTS, DEFAULT_BUDGET_USD, DEFAULT_MAX_HOURS,
+} from "../src/v4/index.js";
 
 const require = createRequire(import.meta.url);
 const CONFIG_DIR = join(homedir(), ".config", "celagent");
 const AGENT_DIR = join(CONFIG_DIR, "pi-runtime");
-const CELAGENT_VERSION = "3.0.1";
+const CELAGENT_VERSION = "4.0.0";
+let cliGoalId = null;
 const CELD_HEALTH = "/.well-known/celld/health";
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091"];
 const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });
@@ -230,6 +237,11 @@ function printHelp() {
   celagent delegate list [--all]   列出子 agent
   celagent delegate wait <id> [--timeout ms]
   celagent delegate send <id> "<msg>"
+  celagent goal start "<objective>" --accept "npm test" [--cwd dir]
+      [--budget 5] [--max-attempts 8] [--max-hours 2] [--protect tests/**,...] [--in-place]
+  celagent goal status [id] | list
+  celagent goal answer <id> "<answer>"
+  celagent goal stop <id> | resume <id>
   celagent list [--bucket B]       列出 v2 会话（旧格式单独标注）
   celagent export <id> [--bucket B]  导出 Pi JSONL
   celagent rm <id> [--yes]         删除会话（v2 + 旧对象）
@@ -259,6 +271,12 @@ function printHelp() {
   父进程退出或崩溃，子 agent 继续跑；结果可再取回；
   kill 在 turn 中间只标记 interrupted，不重放；
   子 agent 不能再 delegate，也不会自动 push；合并由人决定。
+
+4.0 保证:
+  goal 只有验收命令 exit 0 才算完成；
+  验收在 agent 之外跑，失败输出自动喂回；
+  预算 / 墙钟 / 尝试数 / 同一失败 ×3 / 改测试 → 停或问人；
+  默认独立 worktree，不自动 merge/push。
 
 示例:
   celagent up fix-auth --cwd ~/repo --attach
@@ -580,6 +598,142 @@ async function downCommand(args) {
   console.log(`✓ 已停止 ${id}（会话数据与工作区检查点保留）`);
 }
 
+async function goalCommand(args) {
+  const sub = args[0] || "list";
+  const opt = (name) => { const i = args.indexOf(name); return i > 0 ? args[i + 1] : null; };
+  const { node, bin } = launcher();
+
+  if (sub === "start") {
+    const positional = [];
+    for (let i = 1; i < args.length; i++) {
+      const a = args[i];
+      if (["--accept", "--cwd", "--budget", "--max-attempts", "--max-hours", "--protect", "--objective"].includes(a)) { i += 1; continue; }
+      if (a.startsWith("--")) continue;
+      positional.push(a);
+    }
+    const objective = (opt("--objective") || positional.join(" ")).trim();
+    const accept = (opt("--accept") || "").trim();
+    if (!objective || !accept) throw new Error('用法: celagent goal start "<objective>" --accept "npm test" [--cwd dir]');
+    const cwd = opt("--cwd") ? resolve(opt("--cwd")) : process.cwd();
+    if (!loadConfig().persistence?.bucket) throw new Error("未配置 persistence.bucket（goal 需要持久化会话）");
+    if (!(await tmuxAvailable())) throw new Error("goal 需要 tmux");
+    const inPlace = args.includes("--in-place");
+    const repo = repoRoot(cwd);
+    if (!inPlace && !repo) throw new Error(`${cwd} 不是 git 仓库；用 --in-place 在当前目录跑`);
+    const budgetUsd = Number(opt("--budget")) > 0 ? Number(opt("--budget")) : DEFAULT_BUDGET_USD;
+    const maxAttempts = Number(opt("--max-attempts")) > 0 ? Math.floor(Number(opt("--max-attempts"))) : DEFAULT_MAX_ATTEMPTS;
+    const maxHours = Number(opt("--max-hours")) > 0 ? Number(opt("--max-hours")) : DEFAULT_MAX_HOURS;
+    const protectArg = opt("--protect");
+    const protect = protectArg === "none" ? [] : (protectArg ? protectArg.split(",").map((x) => x.trim()).filter(Boolean) : [...DEFAULT_PROTECT]);
+    const dirty = repo ? repoDirty(repo) : { dirty: false, files: [] };
+    const id = newGoalId();
+    const worktree = inPlace ? cwd : worktreePathFor({ configDir: CONFIG_DIR, child: id });
+    const branch = inPlace ? null : branchName("goal", id);
+    const baseCommit = repo ? repoHead(repo) : null;
+    const now = Date.now();
+    const goal = {
+      id, objective, accept, cwd, worktree, branch, baseCommit,
+      createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(),
+      deadline: new Date(now + maxHours * 3600 * 1000).toISOString(),
+      status: "running", attempts: 0, checks: 0, cost: 0, tokens: 0,
+      budgetUsd, maxAttempts, maxHours, protect, allowProtected: false, failureStreak: 0,
+      sessionId: id, inPlace,
+    };
+    writeGoalDoc(CONFIG_DIR, id, goal);
+    writeGoal(CONFIG_DIR, id, goal);
+    try {
+      if (!inPlace) createWorktree({ repo, path: worktree, branch, base: baseCommit });
+      await startSupervisor({ configDir: CONFIG_DIR, id, cwd: worktree, bin, node, kind: "tui", goalId: id });
+    } catch (e) {
+      if (!inPlace) { try { removeWorktree({ repo, path: worktree, branch }); } catch (e2) { /* ignore */ } }
+      patchGoal(CONFIG_DIR, id, { status: "error", error: e.message });
+      throw e;
+    }
+    console.log(`✓ goal ${id} 已启动`);
+    console.log(`  objective: ${objective}`);
+    console.log(`  accept:    ${accept}`);
+    console.log(`  worktree:  ${worktree}${branch ? ` (${branch})` : " (in-place)"}`);
+    if (dirty.dirty) console.log(`  注意: 仓库有 ${dirty.files.length} 个未提交文件${inPlace ? "，会参与 in-place 验收" : "，未带入 worktree"}`);
+    console.log(`  进度:      celagent goal status ${id}`);
+    console.log(`  接管:      celagent attach ${id}`);
+    return;
+  }
+
+  if (sub === "list" || (sub === "status" && !args[1])) {
+    const goals = listGoals(CONFIG_DIR);
+    if (goals.length === 0) { console.log("(没有 goal)"); return; }
+    console.log("ID\t状态\t尝试\t成本\t目标");
+    for (const g of goals) {
+      console.log(`${g.id}\t${g.status}\t${g.attempts || 0}/${g.maxAttempts}\t$${Number(g.cost || 0).toFixed(4)}\t${String(g.objective).slice(0, 60)}`);
+    }
+    return;
+  }
+
+  if (sub === "status") {
+    const id = args[1];
+    const g = readGoal(CONFIG_DIR, id);
+    if (!g) throw new Error(`找不到 goal: ${id}`);
+    const st = await supervisorStatus({ configDir: CONFIG_DIR, id }).catch(() => null);
+    console.log(`goal ${g.id}  ${g.status}  attempt ${g.attempts || 0}/${g.maxAttempts}  $${Number(g.cost || 0).toFixed(4)}/$${g.budgetUsd}  deadline ${g.deadline}`);
+    console.log(`objective: ${g.objective}`);
+    console.log(`accept:    ${g.accept}`);
+    console.log(`worktree:  ${g.worktree}${g.branch ? ` (${g.branch})` : " (in-place)"}`);
+    if (g.blockedQuestion) console.log(`question:  ${g.blockedQuestion}`);
+    if (st) console.log(`supervisor: ${st.running ? "running" : "stopped"}`);
+    if (g.lastCheck) {
+      console.log(`last check: exit ${g.lastCheck.exitCode}${g.lastCheck.timedOut ? " (timeout)" : ""} in ${g.lastCheck.durationMs}ms  ${g.lastCheckLog || ""}`);
+      const tail = String(g.lastCheck.output || "").trim().split("\n").slice(-6).join("\n");
+      if (tail) console.log(tail.split("\n").map((l) => `  ${l}`).join("\n"));
+    }
+    if (g.summary) console.log(`diff:      ${g.summary}`);
+    console.log(`session:   ${g.sessionId}  (celagent attach ${g.sessionId})`);
+    return;
+  }
+
+  if (sub === "answer") {
+    const id = args[1];
+    const text = (opt("--text") || args.slice(2).filter((a) => !a.startsWith("--")).join(" ")).trim();
+    if (!id || !text) throw new Error('用法: celagent goal answer <id> "<answer>"');
+    const g = readGoal(CONFIG_DIR, id);
+    if (!g) throw new Error(`找不到 goal: ${id}`);
+    if (g.status !== "blocked") throw new Error(`goal 当前是 ${g.status}，只在 blocked 时回答`);
+    const st = await supervisorStatus({ configDir: CONFIG_DIR, id }).catch(() => null);
+    if (!st?.running) throw new Error(`goal ${id} 的 supervisor 没在运行；先 celagent goal resume ${id}`);
+    const allowProtected = g.blockedReason === "protected"
+      && /允许|可以|同意|allow|yes/i.test(text)
+      && !/不允许|不可以|不要|禁止|\bno\b/i.test(text);
+    writeAnswer(CONFIG_DIR, id, text, { allowProtected });
+    console.log(`✓ 已回答 ${id}${allowProtected ? "（允许保护路径改动）" : ""}；goal 会继续`);
+    return;
+  }
+
+  if (sub === "resume") {
+    const id = args[1];
+    if (!id) throw new Error("用法: celagent goal resume <id>");
+    const g = readGoal(CONFIG_DIR, id);
+    if (!g) throw new Error(`找不到 goal: ${id}`);
+    if (g.status === "done") throw new Error(`goal ${id} 已经完成，不需要 resume`);
+    const nextStatus = g.status === "blocked" ? "blocked" : "running";
+    patchGoal(CONFIG_DIR, id, { status: nextStatus, stoppedReason: null, error: null });
+    await startSupervisor({ configDir: CONFIG_DIR, id, cwd: g.worktree || g.cwd, bin, node, kind: "tui", goalId: id });
+    console.log(`✓ goal ${id} 已恢复（${nextStatus}）`);
+    return;
+  }
+
+  if (sub === "stop") {
+    const id = args[1];
+    if (!id) throw new Error("用法: celagent goal stop <id>");
+    const g = readGoal(CONFIG_DIR, id);
+    if (!g) throw new Error(`找不到 goal: ${id}`);
+    if (g.status !== "done") patchGoal(CONFIG_DIR, id, { status: "stopped", stoppedReason: "manual", finishedAt: new Date().toISOString() });
+    await stopSupervisor({ configDir: CONFIG_DIR, id, gracefulMs: 3000 }).catch(() => {});
+    console.log(`✓ 已停止 ${id}`);
+    return;
+  }
+
+  throw new Error("用法: celagent goal start|list|status|answer|stop ...");
+}
+
 async function delegateCommand(args) {
   const sub = args[0] || "list";
   const { node, bin } = launcher();
@@ -810,7 +964,7 @@ async function workspaceCommand(args) {
   }
 }
 
-function buildServices(cwd, holder, v2) {
+function buildServices(cwd, holder, v2, { goalId = null } = {}) {
   const settingsManager = pi.SettingsManager.create(cwd, AGENT_DIR, { projectTrusted: false });
   const ext = durabilityExtension({
     getSessionId: () => holder.id,
@@ -818,12 +972,14 @@ function buildServices(cwd, holder, v2) {
     onError: (e) => warn(`  (journal 警告: ${e.message})`),
     onToolResult: (info) => holder.onToolResult?.(info),
   });
+  const factories = [ext];
+  if (goalId) factories.push(goalExtension({ configDir: CONFIG_DIR, goalId, cwd }));
   return pi.createAgentSessionServices({
     cwd,
     agentDir: AGENT_DIR,
     settingsManager,
     modelRuntimeSignal: AbortSignal.timeout(15000),
-    resourceLoaderOptions: { extensionFactories: [ext] },
+    resourceLoaderOptions: { extensionFactories: factories },
   });
 }
 
@@ -1163,10 +1319,12 @@ async function main() {
     const taskFile = taskIdx > 0 ? process.argv[taskIdx + 1] : null;
     const parentIdx = process.argv.indexOf("--parent");
     const parent = parentIdx > 0 ? process.argv[parentIdx + 1] : null;
+    const goalIdx = process.argv.indexOf("--goal");
+    const goalId = goalIdx > 0 ? process.argv[goalIdx + 1] : null;
     if (!id) { console.error("__watch 缺少会话 ID"); process.exit(1); }
     assertSafeSessionId(id);
     const { node, bin } = launcher();
-    await watchSupervisor({ configDir: CONFIG_DIR, id, cwd, bin, node, envFile, kind, taskFile, parent });
+    await watchSupervisor({ configDir: CONFIG_DIR, id, cwd, bin, node, envFile, kind, taskFile, parent, goalId });
     return;
   }
 
@@ -1177,6 +1335,9 @@ async function main() {
     const id = process.argv[3];
     const cwdIdx = process.argv.indexOf("--cwd");
     const cwd = cwdIdx > 0 ? resolve(process.argv[cwdIdx + 1]) : process.cwd();
+    const goalIdx = process.argv.indexOf("--goal");
+    cliGoalId = goalIdx > 0 ? process.argv[goalIdx + 1] : null;
+    if (cliGoalId && !validGoalId(cliGoalId)) { console.error("✗ 无效 goal ID"); process.exit(1); }
     if (!id) { console.error("__tui 缺少会话 ID"); process.exit(1); }
     assertSafeSessionId(id);
     process.chdir(cwd);
@@ -1201,6 +1362,7 @@ async function main() {
   if (cmd === "up") { await upCommand(process.argv.slice(3)); return; }
   if (cmd === "attach") { await attachCommand(process.argv.slice(3)); return; }
   if (cmd === "down" || cmd === "stop") { await downCommand(process.argv.slice(3)); return; }
+  if (cmd === "goal") { await goalCommand(process.argv.slice(3)); return; }
   if (cmd === "delegate") { await delegateCommand(process.argv.slice(3)); return; }
   if (cmd === "ps" || cmd === "supervisors") { await psCommand(process.argv.slice(3)); return; }
   if (cmd === "logs") { logsCommand(process.argv.slice(3)); return; }
@@ -1209,7 +1371,7 @@ async function main() {
   const known = new Set([
     "help", "version", "config", "doctor", "cas-probe", "list", "export", "rm",
     "import-v0", "status", "workspace", "run", "trigger", "up", "attach", "down", "stop",
-    "ps", "supervisors", "logs", "delegate",
+    "ps", "supervisors", "logs", "delegate", "goal",
   ]);
   const shouldSupervise = !forceForeground && !process.env.CELAGENT_SUPERVISED
     && process.env.CELAGENT_NO_SUPERVISOR !== "1"
@@ -1265,7 +1427,7 @@ async function main() {
   if (mat?.needsAppend || v2.outbox.get(sessionId)) app.append();
 
   let services;
-  try { services = await buildServices(cwd, holder, v2); }
+  try { services = await buildServices(cwd, holder, v2, { goalId: cliGoalId }); }
   catch (e) { console.error(`services 失败: ${e.message}`); process.exit(1); }
 
   let current = { sessionId, localFile, manager, app, checkpoint, usage, stopHeartbeat };

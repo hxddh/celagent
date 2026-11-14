@@ -1,31 +1,33 @@
-# celagent 3.0
+# celagent 4.0
 
-**Durable agent computer** — 客户端只是窗口，执行在工作区里。3.0 让 agent 能把任务交给子 agent：每个子 agent 是完整的 celagent session，有自己的 git worktree、lease、journal、检查点。关终端、断网、父进程被 kill，子 agent 继续跑；结果可以再取回。
+**Durable agent computer** — 客户端只是窗口，执行在工作区里。4.0 让 agent 不再“说完就停”：给一个目标和一条验收命令，它每轮结束自动跑验收，没通过就带着失败输出继续，直到通过、超预算或需要人。
 
 ```text
-父 session ──delegate──> 子 session A / B / C
-                          各自 tmux + worktree + lease + journal + checkpoint
-父进程退出或崩溃，子 agent 继续执行
-子 agent 在 turn 中间被 kill：标记 interrupted，不重放
+goal：目标 + 验收命令
+  → agent 尝试 → 验收命令（agent 之外）
+      → 失败：输出喂回，继续
+      → 通过：done
+      → 预算 / 墙钟 / 同一失败 ×3 / 改测试：停或问人
 合并永远由人决定
 ```
 
-3.0 保持 2.0 的底线：会话权威是对象存储里的 manifest + segments；Pi 的 JSONL 是语义源；单写者 lease + epoch；不承诺任意副作用 exactly-once。
+4.0 保持 3.0 的底线：子 agent 是完整 session；会话权威是对象存储里的 manifest + segments；单写者 lease + epoch；不承诺任意副作用 exactly-once。
 
 ---
 
-## 3.0 变了什么
+## 4.0 变了什么
 
-| 维度 | 2.0 | 3.0 |
+| 维度 | 3.0 | 4.0 |
 |---|---|---|
-| 执行单位 | 一个 session | **一棵 session 树** |
-| 并行 | 人手动开多个 `up` | **agent 自己 `delegate`** |
-| 隔离 | 一个工作区 | **每个子 agent 独立 worktree + 分支** |
-| 恢复 | 父 session 恢复 | **父死子不死；父恢复后收回结果** |
-| 成本 | 父 session stats | **每个子 agent 独立 tokens/cost** |
-| 合并 | 无 | **子分支 + diff + 人合并** |
+| 停止条件 | 模型说 done | **验收命令 exit 0** |
+| 重试 | 人读结果、再催 | **runtime 自动重试** |
+| 长任务 | 一次 prompt 内 | **跨多次尝试、数小时** |
+| 信任 | 模型自述 | **验收输出 + 日志 + 保护路径** |
+| 成本 | 事后看 stats | **预算 / 墙钟 / 尝试数硬停** |
+| 协作 | attach / send | **blocked 回答 + attach** |
+| 合并 | 人 | **人（不变）** |
 
-1.0 把会话/工具调用做成可恢复；2.0 把执行者和工作区也做成可恢复；3.0 把“agent 派出去的 agent”纳入同一套恢复语义。
+1.0 把会话做成可恢复；2.0 把执行者和工作区做成可恢复；3.0 把委派树做成可恢复；4.0 把“意图”做成可恢复——目标不会因为一次失败或一次崩溃而丢失。
 
 ---
 
@@ -34,8 +36,8 @@
 前置：
 
 - Node.js **>= 22.19**
-- `tmux`（`up` / `attach` / `delegate` 需要；`run` / `list` / `workspace` 不需要）
-- `git`（3.0 委派需要：子 agent 默认从 `HEAD` 建 worktree）
+- `tmux`（`up` / `attach` / `delegate` / `goal` 需要；`run` / `list` / `workspace` 不需要）
+- `git`（3.0 委派 / 4.0 goal 需要：默认从 `HEAD` 建 worktree）
 - `aws` CLI（BOS/S3/R2 的签名与条件写；`install.sh` 会检查）
 - 一个支持条件写的 bucket：BOS（默认）、AWS S3、Cloudflare R2、Tigris
 - LLM：`DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`，或 Pi `/login`
@@ -113,6 +115,25 @@ celagent delegate wait dlg-...
 
 ---
 
+## 目标循环
+
+```bash
+celagent goal start "把 npm test 修绿" --accept "npm test" --cwd ~/repo
+celagent goal status
+celagent attach <goal-id>          # 进 TUI 看/接管；goal 继续
+celagent goal answer <id> "允许改测试"
+celagent goal stop <id>
+```
+
+- 只有 `--accept` 命令 exit 0 才算完成；验收在 agent 之外跑。
+- 默认创建 worktree + 分支 `celagent/goal/<id>`；`--in-place` 才写当前目录。
+- 每轮只把最近一次失败输出喂回；agent 需要人时输出 `BLOCKED: <问题>`，goal 转 blocked，不烧 token。
+- 硬停：预算（默认 $5）、尝试数（8）、墙钟（2 小时）、同一失败 ×3、改保护路径。
+- 默认保护 `tests/`、`test/`、`*.test.*`、`*.spec.*`；改了要人回答“允许”。
+- 通过后仍由人看 diff、合并；不自动 push/merge。
+
+---
+
 ## 命令
 
 | 命令 | 作用 |
@@ -128,6 +149,10 @@ celagent delegate wait dlg-...
 | `celagent delegate list [--all]` | 列出子 agent 与状态 |
 | `celagent delegate wait <id>` | 等子 agent 结束（超时返回 running） |
 | `celagent delegate send <id> "<msg>"` | 在 turn 边界追加指令 |
+| `celagent goal start "<objective>" --accept "npm test"` | 目标循环；验收通过才停 |
+| `celagent goal status [id]` / `list` | 进度、成本、最近验收、diff |
+| `celagent goal answer <id> "<answer>"` | 回答 blocked 问题 |
+| `celagent goal stop <id>` / `resume <id>` | 停止 / 从同一 session 恢复 |
 | `celagent run --prompt "..."` | 无头运行；`--session <id>`、`--json`、`--cwd` |
 | `celagent list` | 列出 v2 会话；旧格式单独标注 |
 | `celagent export <id>` | 导出 Pi JSONL |
@@ -204,6 +229,17 @@ output.log     子 agent 的可读输出（celagent logs）
 
 这些文件是本地控制面；会话本身仍以对象存储的 manifest 为权威。子 agent 的 worktree 在 `~/.config/celagent/worktrees/<child>/`，分支由 git 保存。
 
+**4.0 目标循环**：
+
+```text
+goal session（celagent-<goalId>，TUI）
+  ├─ goal extension：agent_settled → 跑验收 → 失败输出喂回 → 下一轮
+  ├─ 验收命令：独立进程，cwd = goal worktree，超时杀进程组
+  └─ ~/.config/celagent/goals/<id>/{goal.json,GOAL.md,checks,answer.json}
+```
+
+goal 是一个 Pi 扩展，不是新 daemon；session 仍是普通 2.0 session，可 attach、可崩溃恢复。
+
 **读路径**：`celagent <id>` → `materialize` 拉 manifest + segments → 写本地 Pi JSONL → `SessionManager.open`。每个 segment 校验 SHA-256；manifest head 必须与最后一个 entry 一致。
 
 **写路径**：`message_end` / `turn_end` / `session_compact` → 追加不可变 segment → CAS manifest → 清 outbox；工具 `tool_call` 先写 journal，失败则 block 工具（fail-closed）。
@@ -222,6 +258,8 @@ output.log     子 agent 的可读输出（celagent logs）
 - 子 agent 被 `kill -9`：watchdog 拉起同一个 `__child`；如果 turn 已标记开始但没结束，写 `interrupted`，**不重放 prompt**。
 - 父 session 被 `kill -9`：子 agent 不受影响；父恢复后 `delegate list` 找到子 session，`delegate wait` 取回结果。
 - 子 agent 正常结束：写 `result.json`，写 stop 标记，watchdog 退出；worktree 和分支保留，等人工合并。
+- goal 的 TUI 被 `kill -9`：watchdog 拉起；goal 扩展重跑验收，失败就发新 prompt；journal 的未完成工具仍是 `unknown`，不重放。
+- goal 在 blocked 时崩溃：重启后继续等 `answer.json`，不烧 token。
 - 工作区可能比 manifest 落后：`status` 显示 `workspace.seq`；如果检查点上传失败，会保留警告，下一次触发重试。没有静默的“假装已保存”。
 
 ---
@@ -272,12 +310,12 @@ ssh -t agent-host 'celagent attach fix-auth'
 
 ---
 
-## 从 2.0 升级
+## 从 3.0 升级
 
-- 3.0 继续读 2.0 的 manifest/segments/journal/checkpoint；已有 session 不需要迁移。
-- 新增的是 `delegate` 与 `src/v3`，不改 2.0 的对象格式。
-- `celagent ps` 输出多了“类型”列（`tui` / `child`）；解析脚本需要适配。
-- 子 agent 需要 `tmux` 与 git 仓库；没有 bucket 不能跑（子 session 仍要持久化）。
+- 4.0 继续读 3.0 的 session/manifest/checkpoint；已有会话不需要迁移。
+- 新增的是 `goal` 与 `src/v4`，不改 session 对象格式。
+- goal 需要 `tmux`、bucket 和 git 仓库（`--in-place` 除外）。
+- `goal` 是一个扩展；它只影响带 `--goal` 的 TUI，普通 `up`/`run` 行为不变。
 - 加密、bucket、profile、region 配置不变；跨机必须同一个 key。
 - 2.0 → 1.0 的旧说明仍在 `docs/v2.0.md`。
 
@@ -294,6 +332,8 @@ npm test
 - `tests/v3-child.test.mjs`：子 agent 状态机（task / inbox / interrupted / finalize）。
 - `tests/v3-worktree.test.mjs`：worktree 创建/提交/清理、父仓库脏改动不带入。
 - `tests/v3-delegate.test.mjs`：spawn / wait / send / list、并发上限、非 git 回退。
+- `tests/v4-goal.test.mjs`：验收 exit/output/timeout、五种守卫、保护路径、状态与 prompt。
+- `tests/v4-extension.test.mjs`：假 Pi 驱动 goal loop（基线、重试、blocked、回答）。
 - `tests/v2-supervisor.test.mjs`：tmux supervisor 启动/停止/watchdog/重复启动/child kind。
 - `tests/v2-triggers.test.mjs`：trigger 配置/到期/删除。
 - `tests/v2-usage.test.mjs`：Pi usage → manifest.stats。
@@ -321,6 +361,7 @@ npm test
 ## 文档
 
 - [`docs/architecture.md`](docs/architecture.md) — 架构与数据流
+- [`docs/v4.0.md`](docs/v4.0.md) — 4.0 实现合同与验证
 - [`docs/v3.0.md`](docs/v3.0.md) — 3.0 实现合同与验证
 - [`docs/v2.0.md`](docs/v2.0.md) — 2.0 实现合同与端到端验证
 - [`docs/distributed-deployment.md`](docs/distributed-deployment.md) — 多机/接管

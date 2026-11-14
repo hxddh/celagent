@@ -1,7 +1,7 @@
 # celagent 架构
 
-> 3.0 = durable delegation：2.0 的 supervisor/lease/checkpoint 之上，agent 可以派出子 agent。
-> 配套：`README.md`（用户）、`docs/v3.0.md`（3.0 合同）、`docs/v2.0.md`（2.0 合同）、`HANDOFF.md`（接手）。
+> 4.0 = durable intent：3.0 的委派之上，agent 追一个 goal，验收命令不通过就继续。
+> 配套：`README.md`（用户）、`docs/v4.0.md`（4.0 合同）、`docs/v3.0.md`（3.0 合同）、`docs/v2.0.md`（2.0 合同）、`HANDOFF.md`（接手）。
 
 ## 1. 一句话
 
@@ -117,7 +117,28 @@ sessions/<id>/workspace/blobs/<sha256>
 
 父子控制面是本地文件 `delegations/<child>/`（task/state/result/inbox/output.log），不是新的持久化层；会话权威仍在对象存储。
 
-## 11. ADR
+## 11. 4.0：目标循环
+
+goal 不是新 daemon，而是一个 Pi 扩展，长在普通 TUI session 里：
+
+```text
+goal session（celagent-<goalId>，TUI）
+  ├─ session_start → baseline 验收
+  ├─ agent_settled → 跑验收
+  │     ├─ 通过 → done
+  │     ├─ 失败 → sendMessage({triggerTurn}) 下一轮
+  │     └─ 守卫触发 → stopped / blocked
+  ├─ blocked → 等 answer.json → 注入人的回答
+  └─ 验收命令：独立进程，cwd = goal worktree
+```
+
+- 停止条件从“模型说 done”变成“验收命令 exit 0”。
+- 判断仍在模型上下文里；runtime 只跑验收、喂回失败、执行硬停。
+- 守卫：预算、墙钟、尝试数、同一失败 ×3、保护路径被改。
+- 没有 mission/DAG/coordinator/reviewer/审批状态机。
+- session 仍是普通 2.0 session，可 attach、可崩溃恢复；goal 状态在 `~/.config/celagent/goals/<id>/`。
+
+## 12. ADR
 
 | 决策 | 选择 | 原因 |
 |---|---|---|
@@ -129,3 +150,6 @@ sessions/<id>/workspace/blobs/<sha256>
 | 版本 | 2.0 破坏默认 CLI 行为 | `celagent` 从进程内 TUI 变为 up+attach；`--foreground` 保留旧路径 |
 | 委派 | 子 agent = 完整 session + worktree | 复用 2.0 的持久化；不引入调度器 |
 | 子 agent UI | headless + logs/send | 保持确定性结果；TUI attach 留 3.1 |
+| goal 循环 | Pi 扩展 + `agent_settled` | 不新增 daemon；保留 attach |
+| 验收 | agent 之外的独立进程 | “done”是命令结果，不是模型自述 |
+| goal 默认隔离 | worktree + 分支 | 不碰用户工作区；合并仍由人 |
