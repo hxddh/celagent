@@ -105,13 +105,13 @@ node bin/celagent-tui.mjs logs <dlg-id>
 ## 3. 发布状态
 
 - 版本：**3.0.1**
-- Latest：[v3.0.1](https://github.com/hxddh/celagent/releases/tag/v3.0.1)（待发布后回填时间）
-- tag：`v3.0.1` → `TBD`（main）
+- Latest：[v3.0.1](https://github.com/hxddh/celagent/releases/tag/v3.0.1)（2026-11-14T04:47:40Z）
+- tag：`v3.0.1` → `33a9e6f`（main）
 - 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`；tmux；git（委派）
 - 资产（12 个）：celagent 五平台、celld linux-x64/linux-arm64/darwin-arm64、`install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
-- 发布流水线：`.github/workflows/release.yml`；Release run `TBD`
-- CI：main `TBD`（Node 22/24）
-- 无凭证冒烟：`./scripts/release-smoke.sh v3.0.1`（待发布后跑）
+- 发布流水线：`.github/workflows/release.yml`；Release run `43558298856` success
+- CI：main `43558297351` success（Node 22/24）
+- 无凭证冒烟：`./scripts/release-smoke.sh v3.0.1` 通过（SHA256 + version/help）
 - 3.0 核心：delegate spawn/wait/send/list、子 agent 独立 worktree、父死子不死、interrupted 不重放
 - 3.0.0 → 3.0.1：`delegate wait` 的轮询定时器不再 unref（Node 22 下事件循环提前退出）；产品行为不变
 
