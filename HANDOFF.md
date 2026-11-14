@@ -118,13 +118,13 @@ node bin/celagent-tui.mjs goal stop <goal-id>
 ## 3. 发布状态
 
 - 版本：**4.0.0**
-- Latest：[v4.0.0](https://github.com/hxddh/celagent/releases/tag/v4.0.0)（待发布后回填）
-- tag：`v4.0.0` → `TBD`（main）
+- Latest：[v4.0.0](https://github.com/hxddh/celagent/releases/tag/v4.0.0)（2026-11-14T23:16:21Z）
+- tag：`v4.0.0` → `455df80`（main）
 - 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`；tmux；git（委派/goal）
 - 资产（12 个）：celagent 五平台、celld linux-x64/linux-arm64/darwin-arm64、`install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
-- 发布流水线：`.github/workflows/release.yml`；Release run `TBD`
-- CI：main `TBD`（Node 22/24）
-- 无凭证冒烟：`./scripts/release-smoke.sh v4.0.0`（待发布后跑）
+- 发布流水线：`.github/workflows/release.yml`；Release run `43652276644` success
+- CI：main `43652273587` success（Node 22/24）
+- 无凭证冒烟：`./scripts/release-smoke.sh v4.0.0` 通过（SHA256 + version/help）
 - 4.0 核心：goal loop（验收 → 失败喂回 → 再试）、预算/墙钟/尝试/同一失败/保护路径守卫
 - 3.0.0 → 3.0.1：`delegate wait` 的轮询定时器不再 unref；产品行为不变
 
