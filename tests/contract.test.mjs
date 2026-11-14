@@ -1,4 +1,4 @@
-// tests/v2-contract.test.mjs — v2.0 发布合同（只锚定跨文件必须一致的事实）
+// tests/contract.test.mjs — 发布合同（只锚定跨文件必须一致的事实）
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
@@ -7,11 +7,11 @@ import { join } from "node:path";
 const root = new URL("..", import.meta.url).pathname;
 const read = (p) => readFileSync(join(root, p), "utf8");
 
-test("v2.0.0 版本三处一致", () => {
+test("v3.0.0 版本三处一致", () => {
   const pkg = JSON.parse(read("package.json"));
-  assert.equal(pkg.version, "2.0.0");
-  assert.match(read("bin/celagent-tui.mjs"), /CELAGENT_VERSION = "2\.0\.0"/);
-  assert.match(read("install.sh"), /VERSION="2\.0\.0"/);
+  assert.equal(pkg.version, "3.0.0");
+  assert.match(read("bin/celagent-tui.mjs"), /CELAGENT_VERSION = "3\.0\.0"/);
+  assert.match(read("install.sh"), /VERSION="3\.0\.0"/);
 });
 
 test("Pi 精确钉 1.5.2（不吃 caret）", () => {
@@ -46,6 +46,18 @@ test("v2 模块与 CLI 命令存在", () => {
   for (const cmd of ["run", "status", "import-v0", "workspace", "up", "attach", "down", "ps"]) {
     assert.match(help, new RegExp(`celagent ${cmd}`), cmd);
   }
+});
+
+test("v3 委派模块与命令存在", () => {
+  for (const f of ["src/v3/index.js", "src/v3/child.js", "src/v3/worktree.js", "src/v3/delegate.js"]) {
+    assert.equal(existsSync(join(root, f)), true, f);
+  }
+  const bin = read("bin/celagent-tui.mjs");
+  for (const cmd of ["celagent delegate spawn", "celagent delegate list", "celagent delegate wait", "celagent delegate send", "celagent ps"]) {
+    assert.match(bin, new RegExp(cmd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), cmd);
+  }
+  assert.match(bin, /__child/);
+  assert.match(bin, /ps --tree|--tree/);
 });
 
 test("worker 不再暴露模拟任务 CLI", () => {

@@ -33,11 +33,16 @@ import {
   addTrigger, listTriggers, removeTrigger, runTriggerForeground,
   startTriggerDaemon, stopTriggerDaemon, triggerDaemonStatus, runTriggerDaemon,
 } from "../src/v2/triggers.js";
+import {
+  createDelegateTool, createDelegator, readChildState, readChildResult, listInbox, consumeInbox,
+  takeNextPrompt, patchChildState, writeChildResult, lastAssistantTextFromTurns,
+  commitWorktree, worktreeSummary, appendOutput, outputLogPath,
+} from "../src/v3/index.js";
 
 const require = createRequire(import.meta.url);
 const CONFIG_DIR = join(homedir(), ".config", "celagent");
 const AGENT_DIR = join(CONFIG_DIR, "pi-runtime");
-const CELAGENT_VERSION = "2.0.0";
+const CELAGENT_VERSION = "3.0.0";
 const CELD_HEALTH = "/.well-known/celld/health";
 const CELD_NODES = ["http://127.0.0.1:18090", "http://127.0.0.1:18091"];
 const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });
@@ -212,15 +217,19 @@ function printHelp() {
   printVersion();
   console.log(`
 用法:
-  celagent                         启动/附着本会话的 supervisor（2.0 默认）
+  celagent                         启动/附着本会话的 supervisor（默认）
   celagent <id>                    启动/附着指定会话
   celagent up [id] [--cwd dir]     后台启动 supervisor（--attach 可直接附着）
   celagent attach <id>             附着到运行中的 supervisor（关闭终端 = detach）
   celagent down <id>               停止 supervisor（会话与检查点保留）
-  celagent ps                      列出 supervisor
+  celagent ps                      列出 supervisor（--tree 按父子关系）
   celagent logs <id>               查看 supervisor 日志
   celagent run --prompt "..."      无头运行（CI/脚本）
       [--session <id>] [--json] [--cwd <dir>]
+  celagent delegate spawn "<task>" [--cwd dir] [--no-isolate]  派一个子 agent
+  celagent delegate list [--all]   列出子 agent
+  celagent delegate wait <id> [--timeout ms]
+  celagent delegate send <id> "<msg>"
   celagent list [--bucket B]       列出 v2 会话（旧格式单独标注）
   celagent export <id> [--bucket B]  导出 Pi JSONL
   celagent rm <id> [--yes]         删除会话（v2 + 旧对象）
@@ -244,6 +253,12 @@ function printHelp() {
   工具结果后自动生成增量工作区检查点；
   崩溃后从最后一个检查点和 manifest 恢复；未完成工具最多一个 unknown；
   有幂等键的副作用不重复；没有幂等键的副作用绝不静默重放。
+
+3.0 保证:
+  子 agent 是完整 session：独立 worktree / lease / journal / checkpoint；
+  父进程退出或崩溃，子 agent 继续跑；结果可再取回；
+  kill 在 turn 中间只标记 interrupted，不重放；
+  子 agent 不能再 delegate，也不会自动 push；合并由人决定。
 
 示例:
   celagent up fix-auth --cwd ~/repo --attach
@@ -565,7 +580,60 @@ async function downCommand(args) {
   console.log(`✓ 已停止 ${id}（会话数据与工作区检查点保留）`);
 }
 
-async function psCommand() {
+async function delegateCommand(args) {
+  const sub = args[0] || "list";
+  const { node, bin } = launcher();
+  const delegator = createDelegator({
+    configDir: CONFIG_DIR, startSupervisor, stopSupervisor, bin, node,
+    maxChildren: delegateMaxChildren(),
+  });
+  const opt = (name) => { const i = args.indexOf(name); return i > 0 ? args[i + 1] : null; };
+  const parent = opt("--parent") || "cli";
+  if (sub === "spawn") {
+    const positional = [];
+    for (let i = 1; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--cwd" || a === "--parent" || a === "--task") { i += 1; continue; }
+      if (a.startsWith("--")) continue;
+      positional.push(a);
+    }
+    const task = opt("--task") || positional.join(" ");
+    if (!task) throw new Error('用法: celagent delegate spawn "<task>" [--cwd dir] [--no-isolate]');
+    const cwd = opt("--cwd") ? resolve(opt("--cwd")) : process.cwd();
+    const r = await delegator.spawn({ parent, cwd, task, isolate: !args.includes("--no-isolate") });
+    console.log(`✓ 子 agent ${r.session}`);
+    if (r.branch) console.log(`  branch:  ${r.branch}`);
+    console.log(`  worktree: ${r.worktree}`);
+    if (r.parentDirty) console.log(`  注意: 父仓库有 ${r.parentDirtyFiles} 个未提交文件，未带入 worktree`);
+    console.log(`  取结果: celagent delegate wait ${r.session}`);
+    return;
+  }
+  if (sub === "list") {
+    const rows = delegator.list({ parent: args.includes("--all") ? null : parent });
+    if (rows.length === 0) { console.log("(没有子 agent)"); return; }
+    console.log("ID\t状态\t父\t分支\t任务");
+    for (const r of rows) console.log(`${r.session}\t${r.status}\t${r.parent}\t${r.branch || "-"}\t${r.task}`);
+    return;
+  }
+  if (sub === "wait") {
+    const id = args[1];
+    if (!id) throw new Error("用法: celagent delegate wait <id> [--timeout ms]");
+    const r = await delegator.wait({ child: id, timeoutMs: Number(opt("--timeout")) || 600000 });
+    console.log(JSON.stringify(r, null, 2));
+    return;
+  }
+  if (sub === "send") {
+    const id = args[1];
+    const message = opt("--message") || args.slice(2).filter((a) => !a.startsWith("--")).join(" ");
+    if (!id || !message) throw new Error('用法: celagent delegate send <id> "<message>"');
+    const r = await delegator.send({ child: id, message });
+    console.log(`✓ ${r.session}: ${r.status}`);
+    return;
+  }
+  throw new Error("用法: celagent delegate spawn|list|wait|send ...");
+}
+
+async function psCommand(args = []) {
   const states = listStates(CONFIG_DIR);
   const sessions = await tmuxListSessions();
   const byName = new Map(sessions.map((s) => [s.name, s]));
@@ -573,18 +641,35 @@ async function psCommand() {
     console.log("(没有 supervisor)");
     return;
   }
-  console.log("ID\t状态\ttmux\twatchdog\tcwd");
+  const running = (s) => Boolean(byName.get(`celagent-${s.id}`));
+  if (args.includes("--tree")) {
+    const children = new Map();
+    for (const s of states) {
+      const parent = s.parent && states.some((x) => x.id === s.parent) ? s.parent : null;
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(s);
+    }
+    const print = (parent, depth) => {
+      for (const s of children.get(parent) || []) {
+        const mark = depth === 0 ? "" : `${"  ".repeat(depth - 1)}└ `;
+        console.log(`${mark}${s.id}\t${s.kind || "tui"}\t${running(s) ? "running" : "stopped"}\t${s.cwd}`);
+        print(s.id, depth + 1);
+      }
+    };
+    print(null, 0);
+    return;
+  }
+  console.log("ID\t类型\t状态\ttmux\twatchdog\tcwd");
   for (const s of states) {
-    const active = byName.get(`celagent-${s.id}`);
     const pid = s.watchdogPid;
     let alive = false;
     try { process.kill(pid, 0); alive = true; } catch (e) { alive = false; }
-    console.log(`${s.id}\t${active ? "running" : "stopped"}\t${active ? "yes" : "no"}\t${alive ? "yes" : "no"}\t${s.cwd}`);
+    console.log(`${s.id}\t${s.kind || "tui"}\t${running(s) ? "running" : "stopped"}\t${running(s) ? "yes" : "no"}\t${alive ? "yes" : "no"}\t${s.cwd}`);
   }
   for (const s of sessions) {
     if (!s.name.startsWith("celagent-")) continue;
     if (states.some((x) => `celagent-${x.id}` === s.name)) continue;
-    console.log(`${s.name.slice("celagent-".length)}\torphan-tmux\tyes\t-\t-`);
+    console.log(`${s.name.slice("celagent-".length)}\t?\torphan-tmux\tyes\t-\t-`);
   }
 }
 
@@ -592,7 +677,9 @@ function logsCommand(args) {
   const id = args.find((a) => !a.startsWith("-"));
   if (!id) throw new Error("用法: celagent logs <id>");
   assertSafeSessionId(id);
-  const file = logPath(CONFIG_DIR, id);
+  // 子 agent 有可读输出就优先看它；否则看 supervisor/watchdog 日志。
+  const childLog = outputLogPath(CONFIG_DIR, id);
+  const file = existsSync(childLog) ? childLog : logPath(CONFIG_DIR, id);
   if (!existsSync(file)) { console.log("(没有日志)"); return; }
   const lines = readFileSync(file, "utf8").split("\n");
   process.stdout.write(lines.slice(-200).join("\n"));
@@ -740,6 +827,26 @@ function buildServices(cwd, holder, v2) {
   });
 }
 
+function customToolsFor(cwd, holder, { allowDelegate = true } = {}) {
+  const tools = [history_search, session_snapshot];
+  if (allowDelegate) {
+    const { node, bin } = launcher();
+    tools.push(createDelegateTool({
+      configDir: CONFIG_DIR,
+      getParent: () => holder.id,
+      getCwd: () => cwd,
+      startSupervisor, stopSupervisor, bin, node,
+      maxChildren: delegateMaxChildren(),
+    }));
+  }
+  return tools;
+}
+
+function delegateMaxChildren() {
+  const n = Number(loadConfig()?.delegate?.maxChildren);
+  return Number.isFinite(n) && n > 0 ? Math.min(8, Math.floor(n)) : 4;
+}
+
 function attachSnapshotTurns(v2, holder) {
   globalThis.__celagentPersistId = holder.id;
   globalThis.__celagentSnapshotTurns = async () => {
@@ -782,7 +889,7 @@ async function runHeadless(args) {
     const created = await pi.createAgentSessionFromServices({
       services, sessionManager: sm,
       sessionStartEvent: { type: "session_start", reason: "startup" },
-      customTools: [history_search, session_snapshot],
+      customTools: customToolsFor(cwd, holder),
     });
     session = created.session;
     const checkpoint = makeCheckpointRunner(v2, sessionId, cwd, { quiet: true });
@@ -825,6 +932,157 @@ async function runHeadless(args) {
     }
   } catch (e) {
     console.error(`✗ run 失败: ${e.message}`);
+    process.exitCode = 1;
+  } finally {
+    if (release) await release();
+    activeRuntime = null;
+    try { session?.dispose?.(); } catch (e) { /* ignore */ }
+  }
+}
+
+/**
+ * __child：可恢复的 headless 子 agent。
+ * 只跑 task 一次；send 追加的消息在 turn 边界消费；崩在 turn 中间标记 interrupted，不重放。
+ */
+async function runChild(args) {
+  const id = args[0];
+  if (!id) { console.error("__child 缺少会话 ID"); process.exit(1); }
+  assertSafeSessionId(id);
+  const cwdIdx = args.indexOf("--cwd");
+  const cwd = cwdIdx > 0 ? resolve(args[cwdIdx + 1]) : process.cwd();
+  const taskIdx = args.indexOf("--task");
+  const taskFile = taskIdx > 0 ? resolve(args[taskIdx + 1]) : null;
+  process.chdir(cwd);
+  const dir = sessionDirFor(cwd);
+  const localFile = join(dir, `${id}.jsonl`);
+  mkdirSync(dir, { recursive: true });
+
+  const state0 = readChildState(CONFIG_DIR, id);
+  if (!state0) { console.error(`✗ 找不到子会话状态: ${id}`); process.exit(1); }
+  const inbox0 = listInbox(CONFIG_DIR, id);
+  if (readChildResult(CONFIG_DIR, id) && inbox0.length === 0) return;
+  const task = taskFile ? readFileSync(taskFile, "utf8").trim() : "";
+  appendOutput(CONFIG_DIR, id, `▶ 开始: ${(task.split("\n")[0] || id).slice(0, 120)}`);
+
+  const holder = { id };
+  let session = null;
+  let release = null;
+  let usage = null;
+
+  async function finalize(status, error = null) {
+    await usage?.flush().catch(() => {});
+    let commit = null;
+    let diffStat = "";
+    let dirtyFiles = 0;
+    let worktreeError = null;
+    if (state0.isolated) {
+      try {
+        const firstLine = (task.split("\n")[0] || id).slice(0, 72);
+        commit = commitWorktree({ path: cwd, message: `celagent: ${firstLine}` });
+      } catch (e) { worktreeError = e.message; }
+    }
+    try {
+      const sum = worktreeSummary({ path: cwd, base: state0.baseCommit });
+      diffStat = sum.diffStat;
+      dirtyFiles = sum.dirtyFiles;
+    } catch (e) { /* ignore */ }
+    let text = "";
+    try { text = lastAssistantTextFromTurns(turnsFromJsonl(readFileSync(localFile, "utf8"))); } catch (e) { /* ignore */ }
+    const cur = readChildState(CONFIG_DIR, id) || {};
+    writeChildResult(CONFIG_DIR, id, {
+      status, text, commit, diffStat, dirtyFiles,
+      tokens: usage?.tokens || 0, cost: usage?.cost || 0,
+      turns: cur.turns || 0,
+      worktree: cwd, branch: state0.branch || null, baseCommit: state0.baseCommit || null,
+      error: error || worktreeError,
+    });
+    patchChildState(CONFIG_DIR, id, { status, promptDone: true, commit, error: error || worktreeError, finishedAt: new Date().toISOString() });
+    appendOutput(CONFIG_DIR, id, `■ ${status}${(error || worktreeError) ? `: ${error || worktreeError}` : ""}`);
+    writeStop(CONFIG_DIR, id, `child-${status}`);
+  }
+
+  try {
+    const v2 = openV2();
+    const prepared = await prepareSession(v2, id, localFile);
+    const mat = prepared.mat;
+    const stopHeartbeat = prepared.stopHeartbeat;
+    const sm = mat
+      ? pi.SessionManager.open(localFile, dir, cwd)
+      : pi.SessionManager.create(cwd, dir);
+    if (!mat) bindSessionFile(sm, localFile);
+    const services = await buildServices(cwd, holder, v2);
+    attachSnapshotTurns(v2, holder);
+    const created = await pi.createAgentSessionFromServices({
+      services, sessionManager: sm,
+      sessionStartEvent: { type: "session_start", reason: "startup" },
+      customTools: customToolsFor(cwd, holder, { allowDelegate: false }),
+    });
+    session = created.session;
+    const checkpoint = makeCheckpointRunner(v2, id, cwd, { quiet: true });
+    usage = createUsageRecorder({
+      store: v2.store, sessionId: id, lease: v2.lease,
+      onError: (e) => { if (e.code !== "no-manifest") warn(`  (usage 警告: ${e.message})`); },
+    });
+    const app = makeAppender({
+      v2, sessionId: id, localFile,
+      onError: (e) => warn(`  (持久化警告: ${e.message})`),
+      onAppended: () => { checkpoint?.request("append"); usage?.flush(); },
+    });
+    holder.onToolResult = () => checkpoint?.request("tool");
+    activeRuntime = { v2, sessionId: id, app, checkpoint, usage, stopHeartbeat };
+    if (mat?.needsAppend || v2.outbox.get(id)) app.append();
+    release = async () => {
+      await app.flush(10000);
+      checkpoint?.request("release");
+      await checkpoint?.flush(15000).catch(() => {});
+      await usage.flush().catch(() => {});
+      await usage.close().catch(() => {});
+      stopHeartbeat?.();
+      await v2.lease.release(id).catch(() => {});
+    };
+    session.subscribe((event) => {
+      if (["message_end", "turn_end", "session_compact"].includes(event?.type)) app.append();
+      if (event?.type === "message_end" && event.message?.role === "assistant") {
+        if (event.message.usage) usage.add(event.message.usage);
+        const text = Array.isArray(event.message.content)
+          ? event.message.content.filter((b) => b.type === "text").map((b) => b.text).join("\n")
+          : String(event.message.content || "");
+        if (text) appendOutput(CONFIG_DIR, id, text);
+      }
+    });
+
+    let turns = 0;
+    for (;;) {
+      const cur = readChildState(CONFIG_DIR, id) || {};
+      const inbox = listInbox(CONFIG_DIR, id);
+      const step = takeNextPrompt({ state: cur, task, inbox });
+      if (step.kind === "prompt") {
+        if (step.inboxName) consumeInbox(CONFIG_DIR, id, step.inboxName);
+        patchChildState(CONFIG_DIR, id, {
+          status: "running", prompted: true, promptDone: false,
+          error: null, turns: (cur.turns || 0) + 1,
+        });
+        await session.prompt(step.text);
+        patchChildState(CONFIG_DIR, id, { promptDone: true });
+        turns += 1;
+        if (turns > 20) { await finalize("error", "超过 20 轮，停止"); break; }
+        continue;
+      }
+      if (step.kind === "finalize") { await finalize("done"); break; }
+      if (step.kind === "interrupted") { await finalize("interrupted", step.reason); break; }
+      break;
+    }
+  } catch (e) {
+    console.error(`✗ 子 agent 失败: ${e.message}`);
+    appendOutput(CONFIG_DIR, id, `✗ error: ${e.message}`);
+    try {
+      writeChildResult(CONFIG_DIR, id, {
+        status: "error", text: "", error: e.message,
+        worktree: cwd, branch: state0.branch || null, baseCommit: state0.baseCommit || null,
+      });
+      patchChildState(CONFIG_DIR, id, { status: "error", error: e.message, finishedAt: new Date().toISOString() });
+      writeStop(CONFIG_DIR, id, "child-error");
+    } catch (e2) { /* ignore */ }
     process.exitCode = 1;
   } finally {
     if (release) await release();
@@ -889,16 +1147,26 @@ async function main() {
     await runTriggerDaemon({ configDir: CONFIG_DIR, bin, node, intervalMs });
     return;
   }
+  if (process.argv[2] === "__child") {
+    await runChild(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "__watch") {
     const id = process.argv[3];
     const cwdIdx = process.argv.indexOf("--cwd");
     const cwd = cwdIdx > 0 ? resolve(process.argv[cwdIdx + 1]) : process.cwd();
     const envIdx = process.argv.indexOf("--env-file");
     const envFile = envIdx > 0 ? process.argv[envIdx + 1] : null;
+    const kindIdx = process.argv.indexOf("--kind");
+    const kind = kindIdx > 0 ? process.argv[kindIdx + 1] : "tui";
+    const taskIdx = process.argv.indexOf("--task");
+    const taskFile = taskIdx > 0 ? process.argv[taskIdx + 1] : null;
+    const parentIdx = process.argv.indexOf("--parent");
+    const parent = parentIdx > 0 ? process.argv[parentIdx + 1] : null;
     if (!id) { console.error("__watch 缺少会话 ID"); process.exit(1); }
     assertSafeSessionId(id);
     const { node, bin } = launcher();
-    await watchSupervisor({ configDir: CONFIG_DIR, id, cwd, bin, node, envFile });
+    await watchSupervisor({ configDir: CONFIG_DIR, id, cwd, bin, node, envFile, kind, taskFile, parent });
     return;
   }
 
@@ -933,14 +1201,15 @@ async function main() {
   if (cmd === "up") { await upCommand(process.argv.slice(3)); return; }
   if (cmd === "attach") { await attachCommand(process.argv.slice(3)); return; }
   if (cmd === "down" || cmd === "stop") { await downCommand(process.argv.slice(3)); return; }
-  if (cmd === "ps" || cmd === "supervisors") { await psCommand(); return; }
+  if (cmd === "delegate") { await delegateCommand(process.argv.slice(3)); return; }
+  if (cmd === "ps" || cmd === "supervisors") { await psCommand(process.argv.slice(3)); return; }
   if (cmd === "logs") { logsCommand(process.argv.slice(3)); return; }
   if (cmd && cmd.startsWith("-")) { console.error(`未知选项: ${cmd}（celagent help）`); process.exit(1); }
 
   const known = new Set([
     "help", "version", "config", "doctor", "cas-probe", "list", "export", "rm",
     "import-v0", "status", "workspace", "run", "trigger", "up", "attach", "down", "stop",
-    "ps", "supervisors", "logs",
+    "ps", "supervisors", "logs", "delegate",
   ]);
   const shouldSupervise = !forceForeground && !process.env.CELAGENT_SUPERVISED
     && process.env.CELAGENT_NO_SUPERVISOR !== "1"
@@ -1047,7 +1316,7 @@ async function main() {
         cwd, agentDir: AGENT_DIR, services,
         sessionManager: effManager,
         sessionStartEvent: opts?.sessionStartEvent || { type: "session_start", reason: "startup" },
-        customTools: [history_search, session_snapshot],
+        customTools: customToolsFor(cwd, holder),
       });
       result.session.subscribe((event) => {
         if (["message_end", "turn_end", "session_compact"].includes(event?.type)) {

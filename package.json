@@ -1,6 +1,6 @@
 {
   "name": "celagent",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Durable agent computer — tmux supervisor + 增量工作区检查点 + 分段 Pi JSONL + manifest CAS + journal/lease",
   "type": "module",
   "bin": {

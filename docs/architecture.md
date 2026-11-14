@@ -1,7 +1,7 @@
-# celagent 2.0 架构
+# celagent 架构
 
-> 2.0 = durable agent computer。1.0 把会话/工具调用做成可恢复；2.0 把执行者和工作区也做成可恢复。
-> 配套：`README.md`（用户）、`docs/v2.0.md`（实现合同/验证）、`HANDOFF.md`（接手）。
+> 3.0 = durable delegation：2.0 的 supervisor/lease/checkpoint 之上，agent 可以派出子 agent。
+> 配套：`README.md`（用户）、`docs/v3.0.md`（3.0 合同）、`docs/v2.0.md`（2.0 合同）、`HANDOFF.md`（接手）。
 
 ## 1. 一句话
 
@@ -83,7 +83,7 @@ sessions/<id>/workspace/blobs/<sha256>
 
 - 配置在 `~/.config/celagent/triggers/<id>.json`；`everyMinutes` 到期。
 - daemon 每 30 秒检查；每次启动新的 headless `run` session；`lastPid` 存活则跳过。
-- 不做 cron/webhook/审批/硬预算；2.1 补。
+- 不做 cron/webhook/审批/硬预算；3.1 补。
 
 ## 9. 2.0 边界
 
@@ -94,13 +94,38 @@ sessions/<id>/workspace/blobs/<sha256>
 - 本地 supervisor 受笔记本休眠影响；真正 always-on 用远程 Linux 主机或 celld 常驻。
 - 触发器 preview 无审批；无人值守写操作请用独立 worktree/cwd。
 
-## 10. ADR
+## 10. 3.0：委派
+
+角色多了一层，但对象还是 2.0 的 session：
+
+```text
+父 session（celagent-<parent>，TUI 或 run）
+  └─ delegate 工具
+       ├─ spawn：git worktree + 分支 + startSupervisor(kind="child")
+       ├─ wait：轮询 delegations/<child>/result.json
+       ├─ send：写 inbox，下一个 turn 边界消费
+       └─ list：扫 delegations/*/state.json
+子 session（celagent-<child>，headless __child）
+  └─ 同一个 v2 engine：manifest / segments / journal / checkpoint / lease
+```
+
+- **父会话是调度者。** 拆几个任务、谁先谁后、结果够不够好，由模型在上下文里决定；没有 mission/DAG/coordinator。
+- **每个子 agent 一个 worktree。** 默认从 `HEAD` 创建分支 `celagent/<parent>/<child>`；父会话未提交改动不带入。
+- **子 agent 是完整 session。** 有独立 manifest/journal/checkpoint/lease，能跨机器恢复；父进程死亡不影响它。
+- **headless。** 子 agent 不提供 TUI attach；人用 `celagent logs` / `delegate send` 接管。
+- **不自动合并。** 子 agent 只提交到自己的分支，返回 commit/diff；人用 git 合并。
+
+父子控制面是本地文件 `delegations/<child>/`（task/state/result/inbox/output.log），不是新的持久化层；会话权威仍在对象存储。
+
+## 11. ADR
 
 | 决策 | 选择 | 原因 |
 |---|---|---|
-| UI 附着 | PTY/tmux，不重写 Pi TUI | 保留 Pi 的键位/扩展/审批；语义 UI 留 2.1 |
+| UI 附着 | PTY/tmux，不重写 Pi TUI | 保留 Pi 的键位/扩展/审批；语义 UI 留 3.1 |
 | 执行者 | supervisor 进程 | 客户端死亡不影响执行 |
 | 工作区 | 内容寻址增量 blob，不依赖 restic | 无额外二进制；与现有加密/存储适配器一致 |
 | 并发 | 单写者 lease | 避免多写冲突；顺序接管已够用 |
 | 远程 | SSH 主机 + celld preview | 不把 2.0 绑在 celld beta 上 |
 | 版本 | 2.0 破坏默认 CLI 行为 | `celagent` 从进程内 TUI 变为 up+attach；`--foreground` 保留旧路径 |
+| 委派 | 子 agent = 完整 session + worktree | 复用 2.0 的持久化；不引入调度器 |
+| 子 agent UI | headless + logs/send | 保持确定性结果；TUI attach 留 3.1 |
