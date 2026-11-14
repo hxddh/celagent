@@ -89,10 +89,14 @@ node bin/celagent-tui.mjs down demo
 
 ## 3. 发布状态
 
-- 版本：**2.0.0**（待发布；发布后填 Release 链接）
+- 版本：**2.0.0**
+- Latest：[v2.0.0](https://github.com/hxddh/celagent/releases/tag/v2.0.0)（2026-11-14T04:01:52Z）
+- tag：`v2.0.0` → `30878b7`（main）
 - 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`；tmux
-- 发布流水线：`.github/workflows/release.yml`
-- 无凭证冒烟：`./scripts/release-smoke.sh v2.0.0`（发布后）
+- 资产（12 个）：celagent 五平台、celld linux-x64/linux-arm64/darwin-arm64、`install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
+- 发布流水线：`.github/workflows/release.yml`；Release run `43554453180` success
+- CI：main `43554436546` success（Node 22/24）
+- 无凭证冒烟：`./scripts/release-smoke.sh v2.0.0` 通过（SHA256 + version/help）
 - 2.0 核心：supervisor/attach/detach、增量 checkpoint、usage stats、trigger preview
 
 ## 4. 版本里程碑
@@ -101,7 +105,7 @@ node bin/celagent-tui.mjs down demo
 |---|---|---|
 | 0.4.3 | 最后 0.x：Pi JSONL 权威、整文件 CAS | 历史 |
 | 1.0.0 | 分段 JSONL + manifest CAS + journal + lease + outbox + workspace + headless + import-v0 | 历史 |
-| **2.0.0** | tmux supervisor/watchdog + attach/detach + 增量工作区检查点 + usage + trigger preview | 本刀 |
+| **2.0.0** | tmux supervisor/watchdog + attach/detach + 增量工作区检查点 + usage + trigger preview | 已发布 |
 | 2.1 | cron/webhook/审批/预算、services.yaml、多 agent/worktree、语义 UI、FTS、真实后端矩阵 | 候选 |
 
 ## 5. 工程约定

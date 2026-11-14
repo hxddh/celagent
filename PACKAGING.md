@@ -16,6 +16,7 @@
 - 已验证功能:
   - version/help/doctor/list ✅
   - TUI 完整启动 (services + 会话 + 渲染) ✅
+  - 2.0 supervisor (`up`/`down`) 二进制冒烟 ✅
   - 动态 import `../src/bos.js` ✅
 
 ## 跨平台构建
