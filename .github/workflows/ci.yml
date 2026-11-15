@@ -5,74 +5,59 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [22, 24]  # undici 8.x 要求 node >= 22
+  linux:
+    # The release is built on 22.04 for glibc compatibility; test there too.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
-      - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v5
+      - name: Install GPUI Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libvulkan-dev libfontconfig1-dev \
+            libfreetype-dev libssl-dev pkg-config cmake clang
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: 'npm'
-      - name: Install dependencies
-        run: npm ci
-      - name: Syntax check all sources
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Build release binaries
+        run: cargo build --release --locked -p lenslet -p lenslet-ui
+      - name: CLI smoke test
         run: |
-          set -euo pipefail
-          node --version
-          fail=0
-          for f in bin/*.mjs src/*.js tests/*.mjs worker/src/*.js; do
-            [ -f "$f" ] || continue
-            node --check "$f" || { echo "SYNTAX FAIL: $f"; fail=1; }
-          done
-          exit "$fail"
-      - name: CLI smoke test (help/version, no celld needed)
-        run: |
-          timeout 30 node bin/celagent-tui.mjs help >/dev/null || { echo "HELP FAILED exit=$?"; exit 1; }
-          timeout 30 node bin/celagent-tui.mjs version | grep -q "celagent v" || { echo "VERSION FAILED"; exit 1; }
-      - name: Unit tests (no celld required)
-        run: npm test
-      - name: Secret / PII scan
-        run: |
-          set -euo pipefail
-          # 拦截密钥形态 + 红线禁止的本机绝对路径
-          # 已知泄漏 session 前缀拆开拼接, 避免仓库再出现完整指纹明文
-          # 注意: ripgrep 的 -E 是 --encoding, 不是扩展正则; rg 默认即正则
-          LEAKED_SESS="sess-mso""i63et"
-          LEAKED_SESS2="serious-""final"
-          PATTERN="${LEAKED_SESS}|${LEAKED_SESS2}|/Users/[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/(celagent|celld)|ALTAK[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|aws_secret_access_key[[:space:]]*=[[:space:]]*[^[:space:]<$]"
-          hit=0
-          if command -v rg >/dev/null 2>&1; then
-            if rg -n --glob '!package-lock.json' --glob '!.git/**' --glob '!node_modules/**' -e "$PATTERN" .; then
-              hit=1
-            fi
-          else
-            if grep -RIn --exclude=package-lock.json --exclude-dir=.git --exclude-dir=node_modules -E "$PATTERN" .; then
-              hit=1
-            fi
-          fi
-          if [ "$hit" -eq 1 ]; then
-            echo "::error::Secret/PII scan failed — 命中敏感模式"
-            exit 1
-          fi
-          echo "OK: secret/PII scan clean"
-      - name: Shell syntax check
-        run: |
-          bash -n install.sh setup.sh scripts/*.sh
+          ./target/release/lenslet --version
+          ./target/release/lenslet run -- true 2>&1 | tee smoke.txt || true
+          grep -q "no emulator credentials\|emulator CA" smoke.txt
 
-  build:
-    runs-on: ubuntu-latest
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 22
-          cache: 'npm'
-      - run: npm ci
-      - name: Package check (npm pack dry-run)
-        run: npm pack --dry-run
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Build release binaries
+        run: cargo build --release --locked -p lenslet -p lenslet-ui
+      - name: Package macOS app
+        run: bash scripts/package-macos.sh 0.0.0-ci dist
