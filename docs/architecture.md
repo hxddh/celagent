@@ -1,7 +1,7 @@
 # celagent 架构
 
 > 4.1 = durable intent：3.0 的委派之上，goal 由一个独立 runner 追到验收通过。
-> 配套：`README.md`（用户）、`docs/v4.1.md`（4.1 合同）、`docs/v3.0.md`（3.0 合同）、`docs/v2.0.md`（2.0 合同）、`HANDOFF.md`（接手）。
+> 配套：`docs/celagent-4.1.md`（用户）、`docs/v4.1.md`（4.1 合同）、`docs/v3.0.md`（3.0 合同）、`docs/v2.0.md`（2.0 合同）、`HANDOFF.md`（接手）。
 
 ## 1. 一句话
 
