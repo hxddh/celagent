@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing lenslet-v* tag to publish'
+        description: 'lenslet-v* tag to publish (created at the dispatched commit if it does not exist)'
         required: true
         default: 'lenslet-v2.0.0'
 
@@ -18,14 +18,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The commit to build: the tag's, or (dispatch with a new tag) the dispatched one.
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in lenslet-v[0-9]*) ;; *) echo "not a lenslet-v* tag: $TAG"; exit 1 ;; esac
+          if ! SHA=$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq .sha 2>/dev/null); then
+            SHA="${GITHUB_SHA}"   # new tag: release the dispatched commit
+          fi
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad sha: $SHA"; exit 1; }
+          echo "building ${TAG} at ${SHA}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve
     # Oldest supported runner: the binaries need the glibc they were built with.
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
       - name: Install GPUI Linux dependencies
         run: |
           sudo apt-get update
@@ -44,7 +68,7 @@ jobs:
       - name: Package Linux x86_64
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="${{ needs.resolve.outputs.tag }}"
           VERSION="${TAG#lenslet-v}"
           NAME="lenslet-${VERSION}-linux-x86_64"
           mkdir -p "dist/${NAME}"
@@ -73,12 +97,13 @@ jobs:
           retention-days: 14
 
   build-macos:
+    needs: resolve
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
@@ -87,7 +112,7 @@ jobs:
         run: cargo build --release --locked -p lenslet -p lenslet-ui
       - name: Package macOS app
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="${{ needs.resolve.outputs.tag }}"
           bash scripts/package-macos.sh "${TAG#lenslet-v}" dist
 
       - uses: actions/upload-artifact@v4
@@ -100,7 +125,7 @@ jobs:
           retention-days: 14
 
   publish:
-    needs: [build, build-macos]
+    needs: [resolve, build, build-macos]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/lenslet-v')
     runs-on: ubuntu-latest
     permissions:
@@ -108,7 +133,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           name: lenslet-linux-x86_64
@@ -121,7 +146,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           set -euo pipefail
           VERSION="${TAG#lenslet-v}"
@@ -131,6 +157,7 @@ jobs:
             gh release upload "$TAG" "${FILES[@]}" --clobber
           else
             gh release create "$TAG" "${FILES[@]}" \
+              --target "$SHA" \
               --title "Lenslet ${VERSION}" \
               --notes-file RELEASE_NOTES.md
           fi
