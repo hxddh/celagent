@@ -174,7 +174,7 @@ impl LensletApp {
 
         let mut top = div().flex().items_center().gap(px(8.0)).child(service);
         top = top.child(div().flex_1());
-        if let Some(id) = trace.id.as_deref() {
+        if let Some(id) = Some(trace.id.as_str()).filter(|id| !id.is_empty()) {
             top = top.child(
                 div()
                     .font_family(fonts::mono())
@@ -403,7 +403,7 @@ impl LensletApp {
                 "Request ID",
                 mono_value(request_id.unwrap_or("—").to_string()),
             ));
-        if let Some(id) = trace.id.as_deref() {
+        if let Some(id) = Some(trace.id.as_str()).filter(|id| !id.is_empty()) {
             routing = routing.child(meta_row("Trace ID", mono_value(id.to_string())));
         }
 
@@ -455,6 +455,7 @@ impl LensletApp {
             .flex_col()
             .gap(px(14.0))
             .children(problem_panel(trace))
+            .children(access_section(trace))
             .child(section("CALL", call))
             .child(section("ROUTING", routing))
             .child(section("AUTH & BODIES", bodies))
@@ -831,4 +832,47 @@ fn problem_panel(trace: &Trace) -> Option<Div> {
         panel = panel.child(note_text(error.to_string()));
     }
     Some(panel)
+}
+
+/// The permissions this call needs: its own, and implied ones elsewhere.
+fn access_section(trace: &Trace) -> Option<Div> {
+    let entries: Vec<trace::Access> = trace.access().collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let mut list = div().flex().flex_col();
+    for (index, access) in entries.iter().enumerate() {
+        let implied = index > 0 || trace.action.is_none();
+        let mut name = div().flex().items_center().gap(px(6.0)).child(
+            div()
+                .font_family(fonts::mono())
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT))
+                .child(access.action.clone()),
+        );
+        if implied {
+            name = name.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("implied"),
+            );
+        }
+        if trace.new && index == 0 {
+            name = name.child(new_pill("NOT IN LOCK"));
+        }
+        list = list.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .py(px(6.0))
+                .border_b_1()
+                .border_color(rgb(theme::BORDER_SUBTLE))
+                .child(name)
+                .child(mono_value(access.resource.clone())),
+        );
+    }
+    Some(section("ACCESS", list))
 }

@@ -1,96 +1,103 @@
-# Lenslet trace
+# Lenslet run files (format 3)
 
-Each `lenslet run` / `lenslet proxy` session appends one JSON object per call to
-its own file, `~/.lenslet/runs/YYYYMMDD-HHMMSS-PID.jsonl` (or `--trace PATH`).
-The window follows the newest run, or `LENSLET_TRACE` when set. The schema is
-additive: 2.0 adds fields, removes none, and readers ignore unknown fields.
+Each `lenslet run` writes one JSONL file: `~/.lenslet/runs/YYYYMMDD-HHMMSS-PID.jsonl`,
+or `--trace PATH`. Every line is an object with a `type`:
 
-## Top level
-
-| field | type | meaning |
-| --- | --- | --- |
-| `id` | string | unique call id (hex nanoseconds + sequence) |
-| `at` | string | RFC3339 request-arrival time |
-| `method` | string | HTTP method |
-| `path` | string | path and query exactly as sent |
-| `host` | string | original Host header |
-| `service` | string | SigV4 scope service (header or presigned URL); `s3` for SigV2; else `aws` |
-| `region` | string? | SigV4 scope region (2.0) |
-| `operation` | string | protocol-derived operation, S3 REST shape, or HTTP method |
-| `status` | number | HTTP status; `0` while pending |
-| `ms` | number | complete exchange duration in milliseconds |
-| `authorization` | bool | an Authorization header was present |
-| `pending` | bool? | `true` on a line written for a call still running after 1 s (2.0) |
-| `error` | string? | proxy-side failure, e.g. the emulator was unreachable |
-| `problem` | object? | why the call failed, for status ≥ 400 or a proxy failure (2.0) |
-| `request` | object | captured request |
-| `response` | object | captured response |
-
-### Pending lines
-
-A call that has not finished one second after it arrived gets a line with
-`"pending": true`, `"status": 0` and no bodies. When it finishes, a second line
-with the **same `id`** is written. Readers keep the last line per `id`. Fast
-calls are written once.
-
-### `problem`
-
-```json
-{"code": "NoSuchKey", "message": "The specified key does not exist.",
- "hint": "The resource does not exist in the emulator. Was it created in this run, in the same region?"}
+```text
+{"type":"run", ...}      first line: what the run is
+{"type":"call", ...}     one per proxied call (a slow call may also get an earlier pending line)
+{"type":"end", ...}      last line, once the run ends: the report
 ```
 
-- `code`: from a JSON body (`__type`, `code`), an XML body (`<Code>`, including
-  Query `<Error>`), or the `x-amzn-ErrorType` / `x-amzn-query-error` header;
-  otherwise the HTTP reason (`NotFound`). A proxy failure is
-  `EmulatorUnreachable`.
-- `message`: the error message, when one was sent.
-- `hint`: a one-line likely cause, only for codes with an obvious one.
+Lenslet computes every fact once, when it writes the line: the error, the
+IAM action, whether the access is new. The window and `--json` only read
+those facts, so they always agree. Readers ignore unknown fields. Format 3 is
+not compatible with earlier files.
 
-## Message
+## `run`
 
-```json
-{
-  "headers": [{"name": "content-type", "value": "application/json"}],
-  "content_type": "application/json",
-  "body": {"text": "…", "bytes": 39, "truncated": false, "binary": false, "sha256": "…"}
-}
+| field | meaning |
+| --- | --- |
+| `version` | `3` |
+| `run` | the file stem, e.g. `20261115-095354-9655` |
+| `command` | argv of the program; empty for a bare proxy session |
+| `cwd` | where `lenslet run` was started (the lock is `cwd/lenslet.lock`) |
+| `pid` | Lenslet's process id (to tell a live run from a crashed one) |
+| `endpoint` | what SDKs point at, e.g. `http://127.0.0.1:37505` |
+| `upstream` | the emulator, e.g. `https://127.0.0.1:9298` |
+| `started` | RFC3339 |
+| `lock` | `lenslet.lock` when the run is compared with one |
+
+## `call`
+
+| field | meaning |
+| --- | --- |
+| `id` | unique call id; a later line with the same id replaces an earlier one |
+| `at` | RFC3339 request-arrival time |
+| `method`, `path`, `host` | as sent; `path` includes the query |
+| `service` | SigV4 scope service (header or presigned URL); `s3` for SigV2; else `aws` |
+| `region` | SigV4 scope region |
+| `operation` | from `x-amz-target`, `x-id`, the Query `Action=`, the S3 or Lambda REST shape, or the HTTP method |
+| `status`, `ms` | HTTP status (`0` while pending) and full exchange time |
+| `authorization` | an Authorization header was present |
+| `pending` | `true` on a line for a call still running after 1 s |
+| `error` | proxy-side failure, e.g. the emulator was unreachable |
+| `problem` | `{code, message?, hint?}` for status ≥ 400 or a proxy failure |
+| `action`, `resource` | the IAM action and resource ARN pattern this call needs |
+| `implied` | `[{action, resource}]` needed elsewhere (SSE-KMS key, passed role) |
+| `new` | the call's access is not in the lock |
+| `request`, `response` | `{headers, content_type?, body?}` |
+
+`body` is `{text?, bytes, truncated, binary, sha256}`. Headers are raw and
+duplicate-preserving, with no redaction. `text` holds the first 64 KiB of a text
+body and is absent for binary or content-encoded bodies. `bytes` and `sha256`
+cover the whole body.
+
+### Access derivation
+
+- **Action**: `{iam prefix}:{operation}`, plus exceptions. The SigV4 names
+  `monitoring` and `email` become `cloudwatch` and `ses`. S3 `ListObjectsV2`
+  becomes `s3:ListBucket`, `HeadObject` becomes `s3:GetObject`, multipart calls
+  become `s3:PutObject`, and Lambda `Invoke` becomes `lambda:InvokeFunction`.
+  `sts:GetCallerIdentity` needs nothing.
+- **Resource**: read from the request for S3, DynamoDB (tables and indexes,
+  batch and transact), SQS, SNS, Lambda, Secrets Manager, KMS, STS, IAM,
+  EventBridge and Step Functions; otherwise `*`. Account and region are `*`.
+- **Normalization**: UUIDs, runs of six or more digits, and long hex segments
+  become `*`, so generated test names do not churn the lock.
+- A call whose operation is only an HTTP method gets no action. Lenslet does
+  not guess.
+
+## `end`
+
+The report: the same object `lenslet run --json` and `lenslet last --json`
+print.
+
+| field | meaning |
+| --- | --- |
+| `run`, `command`, `exit_code`, `ended`, `duration_ms` | the run; `exit_code` is the program's (`null` for a proxy session) |
+| `calls`, `errors`, `unfinished`, `services` | counts |
+| `failures` | `[{id, service, operation, status, code, message?, hint?}]` |
+| `access` | `[{action, resource, calls, errors, implied?, new?}]`, sorted |
+| `lock` | the lock file compared with, or `null` |
+| `access_added` | used by this run, not in the lock |
+| `access_unused` | in the lock, not used by this run |
+| `regressions` | `{previous_run, previous_exit_code, new_failures, fixed}` compared with the previous run of the same command in the same directory, or `null` |
+| `trace`, `endpoint`, `upstream` | where to look |
+
+## `lenslet.lock`
+
+```text
+# AWS access observed by `lenslet run`: action, resource.
+dynamodb:GetItem   arn:aws:dynamodb:*:*:table/orders
+kms:Decrypt        arn:aws:kms:*:*:key/*  # implied
 ```
 
-- Headers are raw and duplicate-preserving. There is no redaction.
-- `body` is absent when the body was empty.
-- `text` is absent for binary/non-text bodies (including content-encoded
-  bodies). `binary` is true for those.
-- `bytes` is the full body length; `sha256` covers the full body.
-- `truncated` means `text` holds only the first 64 KiB.
+The file has one `action  resource` pair per line, sorted. Text after `#` is a
+comment. Only `lenslet run --update` writes it, and only when the command
+succeeded.
 
-## Operation naming
+## Retention
 
-1. `x-amz-target` last segment
-2. `x-id` query parameter
-3. `Action=` in an `application/x-www-form-urlencoded` request body
-4. S3 only: the REST shape — method, bucket/key, and query subresource
-   (`GET /b/k` → `GetObject`, `GET /b?list-type=2` → `ListObjectsV2`,
-   `PUT /b/k?tagging` → `PutObjectTagging`, multipart, …)
-5. HTTP method
-
-## Run sidecar
-
-Next to each trace, `X.run.json` describes the session:
-
-```json
-{"kind": "run", "command": ["npm", "test"], "pid": 4242,
- "endpoint": "http://127.0.0.1:43761", "upstream": "https://127.0.0.1:9298",
- "started": "2026-11-15T05:46:28Z", "ended": "2026-11-15T05:46:29Z", "exit_code": 0}
-```
-
-`kind` is `run` or `proxy`; `ended` and `exit_code` appear when the session
-ends. Only the newest 20 runs are kept.
-
-## Files
-
-- `~/.lenslet/runs/`: traces and sidecars, owner-only.
-- `~/.lenslet/proxy-cert.pem` / `proxy-key.pem`: self-signed TLS identity for
-  `https://` clients (`127.0.0.1`, `localhost`, `::1`). Keep the key private.
-- `~/.aws/emulator/PORT/`: the emulator's credentials, config and CA
-  (`ca.pem`), read by the proxy and `lenslet run`.
+Lenslet keeps the newest 20 finished runs. A run without an `end` line whose
+process is still alive is never deleted.

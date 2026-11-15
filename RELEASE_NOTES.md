@@ -1,92 +1,94 @@
-# Lenslet 2.0.0
+# Lenslet 3.0.0
 
-Lenslet 1.0 showed the AWS calls your code made, after you had started three
-processes and exported four variables. 2.0 is one command, and it tells you why
-a call failed.
+2.0 told you what your code did against local AWS and why calls failed. 3.0
+adds what it **needs**: the IAM access your tests exercised, kept in a file
+you review like code.
 
 ```bash
-lenslet run -- npm test
+lenslet run --update -- npm test    # write lenslet.lock, commit it
+lenslet run --check -- npm test     # CI: exit 3 when a change widens AWS access
 ```
 
-## What changed
+AWS Emulator does not evaluate IAM, so a call AWS would deny still succeeds
+locally. 3.0 is aimed at that gap.
 
-**One command, no setup.**
-- `lenslet run -- <command>` starts a proxy on a free loopback port, sets
-  `AWS_ENDPOINT_URL` and the emulator's credentials/config for the child, runs
-  it, and prints a summary. The exit code is the child's.
-- SDKs talk plain HTTP to the proxy, so no certificate needs to be trusted. TLS
-  still works on the same port for 1.x setups.
-- `lenslet proxy` keeps a proxy running on `127.0.0.1:9297`.
-- `lenslet ui` (or bare `lenslet`) opens the window.
+## New
 
-**Why it failed.**
-- Every failed call carries its AWS error code and message (JSON, XML, Query or
-  header), plus a one-line likely cause for common local failures.
-- The stream shows the error instead of the path, and the inspector opens with
-  a "Why it failed" panel.
+**Access**
+- Every call is mapped to an IAM action and resource ARN pattern. Implied
+  permissions are included: `kms:Decrypt` / `kms:GenerateDataKey` behind
+  SSE-KMS objects, and `iam:PassRole` for roles passed to Lambda, Step
+  Functions and ECS.
+- Generated names (UUIDs, timestamps, long hex) become `*`, so the lock stays
+  stable.
+- `lenslet.lock` holds one `action  resource` line per permission, sorted for
+  diffing.
+  - `--update` writes it, and only when the command succeeded.
+  - `--check` exits `3` when the run used access the lock does not list.
+- `lenslet policy` prints the lock as an IAM policy document, labelled as
+  observed access.
 
-**Works without a window.**
-- The summary goes to stderr; `--json PATH` (or `-`) writes it as JSON for CI
-  and agents.
-- The `lenslet` binary has no graphics dependencies.
+**Regressions**
+- Each run is compared with the previous run of the same command in the same
+  directory: new failures and fixed ones.
 
-**Better data.**
-- Calls running for more than 1 s appear as pending, then resolve in place.
-- S3 operations are named from the REST shape, so boto3 and the AWS CLI show
-  `GetObject` instead of `GET`.
-- Presigned URLs (SigV4 and SigV2) are attributed to their service.
-- The SigV4 region is recorded.
+**Agents**
+- One report object, in three places: the run file's last line,
+  `lenslet run --json`, and the new `lenslet last --json`.
+- Exit codes are documented: the command's own code when it fails, `3` for
+  access growth under `--check`, `2` for Lenslet errors.
 
-**Window.**
-- Status is real: the window probes the run's proxy and emulator, and shows
-  when a run ended and with which exit code.
-- It follows the newest run automatically.
-- JSON and XML bodies are formatted (Copy stays raw).
-- Text is larger, and the window opens at 1280×800.
+**Window**
+- New **Access** view (`a`): one row per permission, with call counts and
+  `NEW` / `implied` markers. Click a row to filter the stream to its calls.
+- Run switcher: `[` and `]`, or `‹ 2/7 ›` in the header. On an older run the
+  view stays put; step back to the newest to follow live runs again.
+- The header shows the run at a glance: command, exit code, `+N access`, new
+  failures.
+- Calls that widened access are marked `NEW ACCESS`; the inspector shows each
+  call's access.
 
-## Fixes from the 1.0 review
+**Naming**
+- Lambda REST operations are named from the path (`CreateFunction`, `Invoke`,
+  …), so boto3 calls get real names.
 
-- The footer said "proxy :9297 watching" even when nothing was running. Ports
-  and status are no longer hard-coded.
-- Traces with large bodies showed as few as 10 calls on load. Reload now reads
-  backwards until it has the last 500.
-- Multi-byte characters split across two reads were corrupted. Lines are now
-  decoded only once complete.
-- Any `PUT` ending in `/` was named `CreateBucket`, in every service.
-- `x-id` matched as a substring of other query parameters.
-- The truncation note reported the full body size as "captured".
-- The proxy certificate now also covers `localhost` and `::1`.
-- The 502 trace keeps the cause of the failure ("connection refused"), not just
-  "client error (Connect)".
-- Traces no longer grow forever: one file per session, newest 20 kept.
-- Accent borders were drawn in the wrong color (an `rgba`/`rgb` mix-up).
-- The 1.0 Linux archive was built on a glibc 2.43 runner and did not start on
-  Ubuntu 24.04 or older. 2.0 builds Linux on Ubuntu 22.04.
+## Simpler
 
-## Repository
+Earlier formats are not supported, which allowed these cuts:
 
-The celagent 4.x agent runtime is removed from `main`. It remains at tag
-[v4.1.0](https://github.com/hxddh/celagent/tree/v4.1.0). Lenslet now lives at
-the repository root (`crates/cli`, `crates/ui`).
+- One file per run, written as an event stream (`run` header, `call` lines,
+  `end` report). The `.run.json` sidecar is gone.
+- Every fact (error, IAM action, resource, new-vs-lock) is computed by the CLI
+  at write time. The window only displays and groups what it reads, so the
+  window and `--json` cannot disagree.
+- `lenslet proxy` is now `lenslet run` with no command.
+- The proxy listens on plain HTTP only. The TLS listener, certificate
+  generation and two dependencies (`rcgen`, `tokio-rustls`) are removed. The
+  proxy still connects to the emulator over TLS.
+- 1.x/2.x trace readers, field aliases and the legacy trace path are removed.
+- `demo.rs`, 492 lines of hand-written JSON, is replaced by a recorded run file.
 
-## Compatibility
+## Fixes
 
-- The trace format is additive: new fields are `region`, `pending` and
-  `problem`. Traces from 1.0 still load.
-- `lenslet-proxy` is now `lenslet proxy`, with the same options. The default
-  trace moves from `~/.lenslet/trace.jsonl` to `~/.lenslet/runs/`. The window
-  shows the old file until the first run exists.
-- The app binary is now `lenslet-ui`.
+- `lenslet run` now unsets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+  `AWS_SESSION_TOKEN` when it injects the emulator's credentials. Before, keys
+  in the environment took precedence, so a real access key id could be signed
+  into requests and written to the local trace.
+
+## Breaking
+
+- The run file format is 3. 2.x traces do not load.
+- `lenslet proxy` → `lenslet run`. `--cert` and `--key` are gone, and
+  `https://` endpoints are no longer accepted.
 
 ## Verification
 
-- `cargo test --workspace`: 49 CLI tests (including an end-to-end `lenslet run`)
-  and 30 window/model tests.
-- Real SDKs through `lenslet run` over plain HTTP: boto3 (S3, SQS, DynamoDB,
-  IAM, CloudWatch, a presigned GET), AWS SDK for JavaScript v3 (S3, SQS,
-  DynamoDB), and AWS CLI v1. Also checked: the HTTPS path with
-  `NODE_EXTRA_CA_CERTS`, `lenslet proxy`, an unreachable emulator, and
-  exit-code pass-through. The upstream was a moto server standing in for AWS
-  Emulator.
-- The window was rendered headlessly (Xvfb + lavapipe) with demo data and with
-  live runs.
+- `cargo test --workspace`: 58 CLI unit tests, 3 end-to-end tests of the real
+  binary, and 30 window/model tests. The end-to-end tests cover the lock
+  workflow, exit codes, `last` and `policy`.
+- Real boto3 through `lenslet run` against a moto server standing in for AWS
+  Emulator: S3 (with SSE-KMS), DynamoDB, SQS, KMS, IAM and Lambda.
+  `--update` → `--check` caught a new `dynamodb:DeleteItem` with exit 3, and
+  the implied `kms:*` and `iam:PassRole` were derived.
+- The window was rendered headlessly (Xvfb + lavapipe). The Calls and Access
+  screenshots are of real runs.

@@ -103,12 +103,37 @@ fn percent_decode(value: &str) -> String {
 /// subresource), and some SDKs (boto3, the AWS CLI) do not send `x-id`, so S3
 /// gets its shape rules. Everything else keeps the HTTP method.
 pub fn fallback_operation(service: &str, method: &str, path: &str, headers: &HeaderMap) -> String {
-    if service == "s3"
-        && let Some(operation) = s3_operation(method, path, headers)
-    {
-        return operation;
-    }
-    method.to_string()
+    let shaped = match service {
+        "s3" => s3_operation(method, path, headers),
+        "lambda" => lambda_operation(method, path),
+        _ => None,
+    };
+    shaped.unwrap_or_else(|| method.to_string())
+}
+
+/// Lambda's REST API: `/2015-03-31/functions/{name}/...`.
+fn lambda_operation(method: &str, path: &str) -> Option<String> {
+    let bare = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = bare.split('/').filter(|s| !s.is_empty()).collect();
+    let operation = match (method, segments.get(1..).unwrap_or(&[])) {
+        ("POST", ["functions"]) => "CreateFunction",
+        ("GET", ["functions"]) => "ListFunctions",
+        ("GET", ["functions", _]) => "GetFunction",
+        ("DELETE", ["functions", _]) => "DeleteFunction",
+        ("POST", ["functions", _, "invocations"]) => "Invoke",
+        ("POST", ["functions", _, "invoke-async"]) => "InvokeAsync",
+        ("POST", ["functions", _, "response-streaming-invocations"]) => "InvokeWithResponseStream",
+        ("PUT", ["functions", _, "code"]) => "UpdateFunctionCode",
+        ("GET", ["functions", _, "configuration"]) => "GetFunctionConfiguration",
+        ("PUT", ["functions", _, "configuration"]) => "UpdateFunctionConfiguration",
+        ("POST", ["functions", _, "versions"]) => "PublishVersion",
+        ("POST", ["functions", _, "aliases"]) => "CreateAlias",
+        ("POST", ["functions", _, "policy"]) => "AddPermission",
+        ("POST", ["event-source-mappings"]) => "CreateEventSourceMapping",
+        ("GET", ["event-source-mappings"]) => "ListEventSourceMappings",
+        _ => return None,
+    };
+    Some(operation.to_string())
 }
 
 fn s3_operation(method: &str, path: &str, headers: &HeaderMap) -> Option<String> {
@@ -377,6 +402,33 @@ mod tests {
             );
         }
         assert_eq!(fallback_operation("s3", "PATCH", "/b/k", &none), "PATCH");
+    }
+
+    #[test]
+    fn names_lambda_rest_operations_by_shape() {
+        let none = HeaderMap::new();
+        for (method, path, expected) in [
+            ("POST", "/2015-03-31/functions", "CreateFunction"),
+            ("POST", "/2015-03-31/functions/f/invocations", "Invoke"),
+            (
+                "PUT",
+                "/2015-03-31/functions/f/configuration",
+                "UpdateFunctionConfiguration",
+            ),
+            ("GET", "/2015-03-31/functions/f", "GetFunction"),
+            (
+                "POST",
+                "/2015-03-31/event-source-mappings/",
+                "CreateEventSourceMapping",
+            ),
+            ("PATCH", "/2015-03-31/functions/f", "PATCH"),
+        ] {
+            assert_eq!(
+                fallback_operation("lambda", method, path, &none),
+                expected,
+                "{method} {path}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
-//! The Lenslet proxy: accept SDK calls on loopback (plain HTTP or TLS on the
-//! same port), preserve Host/SigV4, forward to AWS Emulator, and append one
-//! JSONL trace entry per call.
+//! The Lenslet proxy: accept SDK calls over plain HTTP on loopback, preserve
+//! Host/SigV4, forward to AWS Emulator (HTTPS), and record one trace line per
+//! call.
 //!
 //! Forwarding is streamed, never buffered: request and response bodies pass
 //! through unchanged, so SigV4 signatures stay valid and large uploads or
@@ -13,9 +13,9 @@
 //! file is owner-only (0600) on Unix.
 
 use std::{
+    collections::BTreeSet,
     convert::Infallible,
-    fs::{self, File, OpenOptions},
-    io::{BufReader, Write},
+    fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -35,15 +35,14 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
-use rcgen::{CertifiedKey, generate_simple_self_signed};
-use rustls::{RootCertStore, ServerConfig};
+use rustls::RootCertStore;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
 
 use crate::{
+    access::Access,
     capture::{self, Capture, Content, TeeBody},
     problem,
-    trace::{self, Message, Trace, TraceSink},
+    trace::{self, Message, RunHeader, Trace, TraceSink},
     wire,
 };
 
@@ -79,7 +78,7 @@ struct Pending {
 impl Pending {
     fn finish(mut self) {
         self.finished.store(true, Ordering::SeqCst);
-        self.trace.ms = self.started.elapsed().as_millis();
+        self.trace.ms = self.started.elapsed().as_millis() as u64;
         self.trace.request.body = snapshot(&self.request_capture, &self.request_content);
         self.trace.response.body = snapshot(&self.response_capture, &self.response_content);
         resolve_operation(
@@ -97,7 +96,7 @@ impl Pending {
                 .as_ref()
                 .and_then(|body| body.text.as_deref()),
         );
-        self.state.trace.record(&self.trace);
+        self.state.trace.record(self.trace);
     }
 }
 
@@ -149,7 +148,7 @@ fn next_id() -> String {
     format!("{nanos:x}-{sequence:x}")
 }
 
-/// Settings shared by `lenslet run` and `lenslet proxy`.
+/// Proxy settings for `lenslet run`.
 pub struct Options {
     /// Loopback port for SDK clients; `0` picks a free one.
     pub listen: u16,
@@ -157,8 +156,6 @@ pub struct Options {
     /// CA that signs the emulator's certificate; derived from the upstream
     /// port when not given (`~/.aws/emulator/PORT/ca.pem`).
     pub emulator_ca: Option<PathBuf>,
-    pub cert: PathBuf,
-    pub key: PathBuf,
     /// Fixed trace file; by default each session gets its own run file.
     pub trace: Option<PathBuf>,
     pub home: PathBuf,
@@ -170,8 +167,6 @@ impl Options {
             listen,
             upstream: Upstream::parse("9298").expect("default upstream"),
             emulator_ca: None,
-            cert: home.join(".lenslet/proxy-cert.pem"),
-            key: home.join(".lenslet/proxy-key.pem"),
             trace: None,
             home: home.to_path_buf(),
         }
@@ -188,8 +183,6 @@ impl Options {
             }
             "--upstream" => self.upstream = Upstream::parse(&value()?)?,
             "--emulator-ca" => self.emulator_ca = Some(PathBuf::from(value()?)),
-            "--cert" => self.cert = PathBuf::from(value()?),
-            "--key" => self.key = PathBuf::from(value()?),
             "--trace" => self.trace = Some(PathBuf::from(value()?)),
             _ => return Ok(false),
         }
@@ -301,85 +294,6 @@ pub fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn write_file(path: &Path, contents: &[u8], private: bool) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(if private { 0o600 } else { 0o644 });
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("write {}", path.display()))?;
-    file.write_all(contents)
-        .with_context(|| format!("write {}", path.display()))?;
-    file.sync_all().ok();
-    // A pre-existing file keeps its old mode, so set it explicitly.
-    set_mode(path, if private { 0o600 } else { 0o644 })
-}
-
-fn ensure_cert(cert: &Path, key: &Path) -> Result<()> {
-    match (cert.exists(), key.exists()) {
-        (true, true) => {
-            // Never leak the signing key, even if it was created by hand.
-            set_mode(key, 0o600)?;
-            return Ok(());
-        }
-        (false, false) => {}
-        _ => bail!(
-            "{} and {} must both exist; delete both to regenerate the proxy certificate",
-            cert.display(),
-            key.display()
-        ),
-    }
-    for path in [cert, key] {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            && !parent.exists()
-        {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create directory {}", parent.display()))?;
-            set_mode(parent, 0o700)?;
-        }
-    }
-    let CertifiedKey {
-        cert: generated,
-        signing_key,
-    } = generate_simple_self_signed(vec![
-        "127.0.0.1".to_string(),
-        "localhost".to_string(),
-        "::1".to_string(),
-    ])
-    .context("generate proxy certificate")?;
-    write_file(key, signing_key.serialize_pem().as_bytes(), true)?;
-    write_file(cert, generated.pem().as_bytes(), false)?;
-    eprintln!("lenslet: generated TLS certificate {}", cert.display());
-    Ok(())
-}
-
-fn server_config(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>> {
-    let certs = rustls_pemfile::certs(&mut BufReader::new(
-        File::open(cert).with_context(|| format!("open certificate {}", cert.display()))?,
-    ))
-    .collect::<std::result::Result<Vec<_>, _>>()
-    .with_context(|| format!("parse certificate {}", cert.display()))?;
-    if certs.is_empty() {
-        bail!("no certificates in {}", cert.display());
-    }
-    let key = rustls_pemfile::private_key(&mut BufReader::new(
-        File::open(key).with_context(|| format!("open private key {}", key.display()))?,
-    ))
-    .with_context(|| format!("parse private key {}", key.display()))?
-    .with_context(|| format!("no private key in {}", key.display()))?;
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("certificate and key do not form a TLS pair")?;
-    Ok(Arc::new(config))
-}
-
 fn emulator_roots(path: &Path) -> Result<RootCertStore> {
     let pem = fs::read(path).with_context(|| {
         format!(
@@ -481,6 +395,10 @@ where
         pending: false,
         error: None,
         problem: None,
+        action: None,
+        resource: None,
+        implied: Vec::new(),
+        new: false,
         request: Message {
             headers: request_headers,
             content_type: request_content.content_type.clone(),
@@ -504,7 +422,7 @@ where
         tokio::spawn(async move {
             tokio::time::sleep(PENDING_AFTER).await;
             if !finished.load(Ordering::SeqCst) {
-                state.trace.record(&pending);
+                state.trace.record(pending);
             }
         });
     }
@@ -550,7 +468,7 @@ where
             let detail = error_chain(&error);
             let mut trace = Trace {
                 status: StatusCode::BAD_GATEWAY.as_u16(),
-                ms: started.elapsed().as_millis(),
+                ms: started.elapsed().as_millis() as u64,
                 problem: Some(problem::unreachable(&state.upstream, &detail)),
                 error: Some(detail),
                 ..trace
@@ -562,7 +480,7 @@ where
                 &request_capture,
                 &request_content,
             );
-            state.trace.record(&trace);
+            state.trace.record(trace);
             Ok(error_response(StatusCode::BAD_GATEWAY, "upstream error"))
         }
     }
@@ -605,8 +523,14 @@ pub struct Server {
 }
 
 impl Server {
-    /// Validate everything, bind loopback, and start serving in the background.
-    pub async fn start(options: &Options, trace_path: PathBuf) -> Result<Server> {
+    /// Validate everything, bind loopback, write the run header, and start
+    /// serving in the background.
+    pub async fn start(
+        options: &Options,
+        trace_path: PathBuf,
+        mut header: RunHeader,
+        locked: Option<BTreeSet<Access>>,
+    ) -> Result<Server> {
         options.validate()?;
         // rustls needs a crypto provider before any TLS config is built.
         rustls::crypto::ring::default_provider()
@@ -619,24 +543,23 @@ impl Server {
             // A plain-HTTP upstream has no TLS certificate to trust.
             RootCertStore::empty()
         };
-        let trace = Arc::new(TraceSink::new(trace_path)?);
-        ensure_cert(&options.cert, &options.key)?;
-        let tls = TlsAcceptor::from(server_config(&options.cert, &options.key)?);
+        let listener = TcpListener::bind((IpAddr::from([127, 0, 0, 1]), options.listen))
+            .await
+            .with_context(|| format!("bind 127.0.0.1:{}", options.listen))?;
+        let addr = listener.local_addr().context("read the bound address")?;
+        header.endpoint = format!("http://{addr}");
+        header.upstream = options.upstream.base.clone();
+        let trace = Arc::new(TraceSink::new(trace_path, &header, locked)?);
         let state = Arc::new(State {
             client: client(roots),
             upstream: options.upstream.base.clone(),
             trace,
         });
-
-        let listener = TcpListener::bind((IpAddr::from([127, 0, 0, 1]), options.listen))
-            .await
-            .with_context(|| format!("bind 127.0.0.1:{}", options.listen))?;
-        let addr = listener.local_addr().context("read the bound address")?;
-        let task = tokio::spawn(serve(listener, tls, state.clone()));
+        let task = tokio::spawn(serve(listener, state.clone()));
         Ok(Server { addr, state, task })
     }
 
-    /// The endpoint SDKs should use (plain HTTP; TLS also works on this port).
+    /// The endpoint SDKs should use.
     pub fn endpoint(&self) -> String {
         format!("http://{}", self.addr)
     }
@@ -651,41 +574,17 @@ impl Server {
     }
 }
 
-/// TLS records start with a handshake byte (0x16); anything else is plain HTTP.
-const TLS_HANDSHAKE: u8 = 0x16;
-
-async fn serve(listener: TcpListener, tls: TlsAcceptor, state: Arc<State>) {
+async fn serve(listener: TcpListener, state: Arc<State>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
-        let tls = tls.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            let mut first = [0u8; 1];
-            // A probe that connects and closes sends nothing: not an error.
-            let Ok(1) = stream.peek(&mut first).await else {
-                return;
-            };
             let service = service_fn(move |req| handle(req, state.clone()));
-            let result = if first[0] == TLS_HANDSHAKE {
-                match tls.accept(stream).await {
-                    Ok(stream) => {
-                        http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await
-                    }
-                    Err(error) => {
-                        eprintln!("lenslet: TLS handshake failed: {error}");
-                        return;
-                    }
-                }
-            } else {
-                http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-            };
-            if let Err(error) = result
+            if let Err(error) = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
                 && !error.is_incomplete_message()
             {
                 eprintln!("lenslet: connection error: {error}");
@@ -838,7 +737,7 @@ mod tests {
         Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: upstream.to_string(),
-            trace: Arc::new(TraceSink::new(trace).unwrap()),
+            trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), None).unwrap()),
         })
     }
 
@@ -886,7 +785,10 @@ mod tests {
         fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
-            .map(|line| serde_json::from_str(line).expect("trace line is a Trace"))
+            .filter_map(|line| match serde_json::from_str(line).expect("a record") {
+                trace::Record::Call(trace) => Some(*trace),
+                _ => None,
+            })
             .collect()
     }
 
@@ -1021,7 +923,11 @@ mod tests {
         ] {
             assert!(serialized.contains(raw), "{raw} missing from the trace");
         }
-        assert_eq!(serialized.lines().count(), 1, "one line per call");
+        assert_eq!(
+            serialized.lines().count(),
+            2,
+            "the run header, then one line per call"
+        );
 
         // A 100 KiB response keeps forwarding everything and captures a prefix.
         let request = sdk_request("GET", "/bucket/big", b"");
@@ -1230,16 +1136,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_port_serves_plain_http_and_tls() {
+    async fn server_writes_a_run_header_then_calls() {
         let (port, _upstream) = spawn_upstream().await;
         let temp = TempDir::new("server");
         fs::create_dir_all(&temp.0).unwrap();
         let mut options = Options::new(&temp.0, 0);
         options.upstream = Upstream::parse(&format!("http://127.0.0.1:{port}")).unwrap();
-        let server = Server::start(&options, temp.trace()).await.unwrap();
+        let header = RunHeader {
+            run: "r".into(),
+            command: vec!["npm".into(), "test".into()],
+            ..RunHeader::default()
+        };
+        let server = Server::start(&options, temp.trace(), header, None)
+            .await
+            .unwrap();
         assert!(server.endpoint().starts_with("http://127.0.0.1:"));
 
-        // Plain HTTP: no certificate trust needed by the SDK.
         let plain: Client<HttpConnector, Full<Bytes>> =
             Client::builder(TokioExecutor::new()).build_http();
         let request = Request::builder()
@@ -1254,70 +1166,60 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let _ = response.into_body().collect().await.unwrap();
 
-        // TLS on the same port, trusting the generated certificate, via localhost.
-        let mut roots = RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut &fs::read(&options.cert).unwrap()[..]) {
-            roots.add(cert.unwrap()).unwrap();
-        }
-        let tls_client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(
-            HttpsConnectorBuilder::new()
-                .with_tls_config(
-                    rustls::ClientConfig::builder()
-                        .with_root_certificates(roots)
-                        .with_no_client_auth(),
-                )
-                .https_only()
-                .enable_http1()
-                .build(),
-        );
-        let request = Request::builder()
-            .uri(format!(
-                "https://localhost:{}/bucket/key",
-                server.addr.port()
-            ))
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let response = tls_client.request(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let _ = response.into_body().collect().await.unwrap();
-
-        // A bare TCP probe (as the UI does) is not a call.
+        // A bare TCP probe (as the window does) is not a call.
         drop(TcpStream::connect(server.addr).await.unwrap());
 
         let state = server.state.clone();
         server.stop(Duration::from_secs(1)).await;
-        assert_eq!(state.trace.summary().calls, 2);
-        assert_eq!(traces(&temp.trace()).len(), 2);
+        assert_eq!(state.trace.summary().calls, 1);
+        let lines: Vec<serde_json::Value> = fs::read_to_string(temp.trace())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["type"], "run");
+        assert_eq!(lines[0]["endpoint"], state_endpoint(&lines[0]));
+        assert_eq!(lines[1]["type"], "call");
+        assert_eq!(lines[1]["action"], "s3:GetObject");
+        assert_eq!(lines[1]["resource"], "arn:aws:s3:::bucket/*");
     }
 
-    #[test]
-    fn cert_and_key_must_agree() {
-        let temp = TempDir::new("cert");
-        fs::create_dir_all(&temp.0).unwrap();
-        let cert = temp.0.join("cert.pem");
-        let key = temp.0.join("key.pem");
-        ensure_cert(&cert, &key).unwrap();
-        assert!(cert.exists() && key.exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&key).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "private key is not readable by others");
-        }
-        // A usable pair builds a TLS config, and an existing cert is reused
-        // instead of being regenerated behind the SDK's trust store.
-        server_config(&cert, &key).unwrap();
-        let trusted = fs::read(&cert).unwrap();
-        ensure_cert(&cert, &key).unwrap();
-        assert_eq!(fs::read(&cert).unwrap(), trusted);
+    fn state_endpoint(header: &serde_json::Value) -> String {
+        let endpoint = header["endpoint"].as_str().unwrap();
+        assert!(endpoint.starts_with("http://127.0.0.1:"));
+        endpoint.to_string()
+    }
 
-        // A half-present pair must not silently replace the trusted cert.
-        fs::remove_file(&key).unwrap();
-        assert!(ensure_cert(&cert, &key).is_err());
-        // A cert without a usable key is an error, not a panic.
-        fs::write(&cert, "not a certificate").unwrap();
-        assert!(server_config(&cert, &temp.0.join("missing.pem")).is_err());
-        assert!(emulator_roots(&temp.0.join("missing-ca.pem")).is_err());
+    #[tokio::test]
+    async fn calls_outside_the_lock_are_marked_new() {
+        let (port, _upstream) = spawn_upstream().await;
+        let temp = TempDir::new("lock");
+        let locked: BTreeSet<Access> = [Access {
+            action: "s3:GetObject".into(),
+            resource: "arn:aws:s3:::bucket/*".into(),
+        }]
+        .into();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            trace: Arc::new(
+                TraceSink::new(temp.trace(), &RunHeader::default(), Some(locked)).unwrap(),
+            ),
+        });
+        for request in [
+            sdk_request("GET", "/bucket/key?x-id=GetObject", b""),
+            sdk_request("DELETE", "/bucket/key?x-id=DeleteObject", b""),
+        ] {
+            let response = handle(request, state.clone()).await.unwrap();
+            let _ = response.into_body().collect().await.unwrap();
+        }
+        let written = traces(&temp.trace());
+        assert!(!written[0].new);
+        assert!(written[1].new);
+        assert_eq!(written[1].action.as_deref(), Some("s3:DeleteObject"));
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
