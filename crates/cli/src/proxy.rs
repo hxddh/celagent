@@ -395,8 +395,7 @@ where
         pending: false,
         error: None,
         problem: None,
-        action: None,
-        resource: None,
+        access: Vec::new(),
         implied: Vec::new(),
         new: false,
         request: Message {
@@ -1180,8 +1179,8 @@ mod tests {
         assert_eq!(lines[0]["type"], "run");
         assert_eq!(lines[0]["endpoint"], state_endpoint(&lines[0]));
         assert_eq!(lines[1]["type"], "call");
-        assert_eq!(lines[1]["action"], "s3:GetObject");
-        assert_eq!(lines[1]["resource"], "arn:aws:s3:::bucket/*");
+        assert_eq!(lines[1]["access"][0]["action"], "s3:GetObject");
+        assert_eq!(lines[1]["access"][0]["resource"], "arn:aws:s3:::bucket/*");
     }
 
     fn state_endpoint(header: &serde_json::Value) -> String {
@@ -1219,7 +1218,7 @@ mod tests {
         let written = traces(&temp.trace());
         assert!(!written[0].new);
         assert!(written[1].new);
-        assert_eq!(written[1].action.as_deref(), Some("s3:DeleteObject"));
+        assert_eq!(written[1].access[0].action, "s3:DeleteObject");
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {

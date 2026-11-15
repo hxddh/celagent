@@ -29,25 +29,95 @@ impl Access {
     }
 }
 
-/// The access one call needs, plus permissions it implies on other resources
-/// (the KMS key behind an SSE-KMS object, the role passed to Lambda).
-pub fn derive(trace: &Trace) -> (Option<Access>, Vec<Access>) {
+/// The access one call needs, and the permissions it implies on other
+/// resources (the KMS key behind an SSE-KMS object, the role passed to Lambda).
+///
+/// One call can need several permissions: a batch names several tables, a
+/// DynamoDB transaction needs each item's own action, and a copy reads its
+/// source as well as writing its destination.
+pub fn derive(trace: &Trace) -> (Vec<Access>, Vec<Access>) {
     let operation = trace.operation.as_str();
     if operation.is_empty()
         || operation == trace.method
         || trace.service == "aws"
         || !operation.bytes().all(|byte| byte.is_ascii_alphanumeric())
     {
-        return (None, Vec::new());
+        return (Vec::new(), Vec::new());
     }
     let prefix = iam_prefix(&trace.service);
-    let Some(action) = action_name(prefix, operation) else {
-        return (None, Vec::new());
-    };
     let body = Body::parse(trace);
-    let resource = resource(prefix, operation, trace, &body);
     let implied = implied(prefix, operation, trace, &body);
-    (Some(Access::new(action, resource)), implied)
+    if prefix == "dynamodb" && operation.starts_with("Transact") {
+        return (transaction(&body), implied);
+    }
+    let Some(action) = action_name(prefix, operation) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut own: Vec<Access> = resources(prefix, operation, trace, &body)
+        .into_iter()
+        .map(|resource| Access::new(action.clone(), resource))
+        .collect();
+    if prefix == "s3"
+        && let Some(source) = copy_source(trace)
+    {
+        own.push(Access::new("s3:GetObject", source));
+    }
+    (own, implied)
+}
+
+/// `TransactWriteItems` / `TransactGetItems` are not IAM actions: each item
+/// needs its own (`PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem`,
+/// `GetItem`) on its table. A body that cannot be read yields nothing rather
+/// than a guess.
+fn transaction(body: &Body) -> Vec<Access> {
+    let Body::Json(value) = body else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("TransactItems").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Access> = items
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|item| item.iter())
+        .filter_map(|(kind, request)| {
+            let action = match kind.as_str() {
+                "Put" => "PutItem",
+                "Update" => "UpdateItem",
+                "Delete" => "DeleteItem",
+                "ConditionCheck" => "ConditionCheckItem",
+                "Get" => "GetItem",
+                _ => return None,
+            };
+            let table = request.get("TableName")?.as_str()?;
+            Some(Access::new(
+                format!("dynamodb:{action}"),
+                arn("dynamodb", &format!("table/{}", normalize(table))),
+            ))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The bucket a `CopyObject` / `UploadPartCopy` reads from, as an object ARN.
+fn copy_source(trace: &Trace) -> Option<String> {
+    let value = trace
+        .request
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("x-amz-copy-source"))?
+        .value
+        .as_str();
+    let decoded = wire::query_param(&format!("?v={value}"), "v")?;
+    let path = decoded.split('?').next().unwrap_or(&decoded);
+    if path.starts_with("arn:") {
+        // An access point or Outposts ARN, not a bucket name.
+        return Some("*".to_string());
+    }
+    let bucket = path.trim_start_matches('/').split('/').next()?;
+    (!bucket.is_empty()).then(|| format!("arn:aws:s3:::{}/*", normalize(bucket)))
 }
 
 /// SigV4 signing names that differ from the IAM action prefix.
@@ -269,33 +339,32 @@ fn last_segment(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// The resources an action applies to: usually one; one per table for a
+/// DynamoDB batch, since an IAM resource names exactly one table.
+fn resources(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<String> {
+    if prefix != "dynamodb" {
+        return vec![resource(prefix, operation, trace, body)];
+    }
+    let tables = body.tables();
+    match tables.as_slice() {
+        [] => vec!["*".to_string()],
+        [one] => vec![match body.field("IndexName") {
+            Some(index) => arn(
+                "dynamodb",
+                &format!("table/{}/index/{}", normalize(one), normalize(&index)),
+            ),
+            None => arn("dynamodb", &format!("table/{}", normalize(one))),
+        }],
+        many => many
+            .iter()
+            .map(|table| arn("dynamodb", &format!("table/{}", normalize(table))))
+            .collect(),
+    }
+}
+
 fn resource(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String {
     match prefix {
         "s3" => s3_resource(operation, trace),
-        "dynamodb" => {
-            let tables = body.tables();
-            match tables.as_slice() {
-                [] => "*".to_string(),
-                [one] => match body.field("IndexName") {
-                    Some(index) => arn(
-                        "dynamodb",
-                        &format!("table/{}/index/{}", normalize(one), normalize(&index)),
-                    ),
-                    None => arn("dynamodb", &format!("table/{}", normalize(one))),
-                },
-                // Several tables: one entry per call keeps the lock readable.
-                many => arn(
-                    "dynamodb",
-                    &format!(
-                        "table/{}",
-                        many.iter()
-                            .map(|table| normalize(table))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    ),
-                ),
-            }
-        }
         "sqs" => body
             .field("QueueUrl")
             .or_else(|| body.field("QueueName"))
@@ -501,8 +570,7 @@ mod tests {
             pending: false,
             error: None,
             problem: None,
-            action: None,
-            resource: None,
+            access: Vec::new(),
             implied: Vec::new(),
             new: false,
             request: Message {
@@ -525,8 +593,17 @@ mod tests {
     }
 
     fn access(trace: &Trace) -> (String, String) {
-        let access = derive(trace).0.expect("has access");
-        (access.action, access.resource)
+        let own = derive(trace).0;
+        assert_eq!(own.len(), 1, "one permission: {own:?}");
+        (own[0].action.clone(), own[0].resource.clone())
+    }
+
+    fn all(trace: &Trace) -> Vec<(String, String)> {
+        derive(trace)
+            .0
+            .into_iter()
+            .map(|access| (access.action, access.resource))
+            .collect()
     }
 
     #[test]
@@ -573,16 +650,25 @@ mod tests {
                 "arn:aws:dynamodb:*:*:table/orders/index/byUser".into()
             )
         );
+        // An IAM resource names one table: a batch gets one entry per table.
         assert_eq!(
-            access(&call(
+            all(&call(
                 "dynamodb",
                 "BatchWriteItem",
                 "POST",
                 "/",
                 Some(r#"{"RequestItems":{"orders":[],"users":[]}}"#)
-            ))
-            .1,
-            "arn:aws:dynamodb:*:*:table/orders,users"
+            )),
+            vec![
+                (
+                    "dynamodb:BatchWriteItem".to_string(),
+                    "arn:aws:dynamodb:*:*:table/orders".to_string()
+                ),
+                (
+                    "dynamodb:BatchWriteItem".to_string(),
+                    "arn:aws:dynamodb:*:*:table/users".to_string()
+                ),
+            ]
         );
         assert_eq!(
             access(&call(
@@ -653,24 +739,98 @@ mod tests {
     }
 
     #[test]
+    fn transactions_need_each_item_action() {
+        let write = call(
+            "dynamodb",
+            "TransactWriteItems",
+            "POST",
+            "/",
+            Some(
+                r#"{"TransactItems":[{"Put":{"TableName":"orders","Item":{}}},{"Delete":{"TableName":"carts","Key":{}}},{"ConditionCheck":{"TableName":"users","Key":{}}}]}"#,
+            ),
+        );
+        assert_eq!(
+            all(&write),
+            vec![
+                (
+                    "dynamodb:ConditionCheckItem".to_string(),
+                    "arn:aws:dynamodb:*:*:table/users".to_string()
+                ),
+                (
+                    "dynamodb:DeleteItem".to_string(),
+                    "arn:aws:dynamodb:*:*:table/carts".to_string()
+                ),
+                (
+                    "dynamodb:PutItem".to_string(),
+                    "arn:aws:dynamodb:*:*:table/orders".to_string()
+                ),
+            ]
+        );
+        let read = call(
+            "dynamodb",
+            "TransactGetItems",
+            "POST",
+            "/",
+            Some(r#"{"TransactItems":[{"Get":{"TableName":"orders","Key":{}}}]}"#),
+        );
+        assert_eq!(
+            access(&read),
+            (
+                "dynamodb:GetItem".into(),
+                "arn:aws:dynamodb:*:*:table/orders".into()
+            )
+        );
+        // A truncated body cannot be read: no guess.
+        let truncated = call(
+            "dynamodb",
+            "TransactWriteItems",
+            "POST",
+            "/",
+            Some(r#"{"TransactItems":[{"Put":"#),
+        );
+        assert!(derive(&truncated).0.is_empty());
+    }
+
+    #[test]
+    fn copies_read_their_source_and_write_their_destination() {
+        let mut copy = call("s3", "CopyObject", "PUT", "/archive/2026/a.png", None);
+        copy.request.headers = vec![HeaderTrace {
+            name: "x-amz-copy-source".into(),
+            value: "uploads/a%20b.png?versionId=3".into(),
+        }];
+        assert_eq!(
+            all(&copy),
+            vec![
+                (
+                    "s3:PutObject".to_string(),
+                    "arn:aws:s3:::archive/*".to_string()
+                ),
+                (
+                    "s3:GetObject".to_string(),
+                    "arn:aws:s3:::uploads/*".to_string()
+                ),
+            ]
+        );
+        copy.request.headers[0].value = "/uploads/a.png".into();
+        assert_eq!(all(&copy)[1].1, "arn:aws:s3:::uploads/*");
+    }
+
+    #[test]
     fn calls_without_a_named_operation_or_permission_have_no_access() {
         assert!(
             derive(&call("s3", "PATCH", "PATCH", "/b/k", None))
                 .0
-                .is_none()
+                .is_empty()
         );
-        assert!(derive(&call("aws", "GET", "GET", "/", None)).0.is_none());
-        assert!(
-            derive(&call(
-                "sts",
-                "GetCallerIdentity",
-                "POST",
-                "/",
-                Some("Action=GetCallerIdentity")
-            ))
-            .0
-            .is_none()
+        assert!(derive(&call("aws", "GET", "GET", "/", None)).0.is_empty());
+        let identity = call(
+            "sts",
+            "GetCallerIdentity",
+            "POST",
+            "/",
+            Some("Action=GetCallerIdentity"),
         );
+        assert!(derive(&identity).0.is_empty());
     }
 
     #[test]
@@ -719,8 +879,8 @@ mod tests {
             "/2015-03-31/functions",
             Some(r#"{"FunctionName":"f","Role":"arn:aws:iam::000000000000:role/lambda-exec"}"#),
         );
-        let (main, implied) = derive(&create);
-        assert_eq!(main.unwrap().resource, "arn:aws:lambda:*:*:function:f");
+        let (own, implied) = derive(&create);
+        assert_eq!(own[0].resource, "arn:aws:lambda:*:*:function:f");
         assert_eq!(
             implied,
             vec![Access::new(

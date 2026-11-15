@@ -685,7 +685,7 @@ impl LensletApp {
             std::collections::BTreeMap::new();
         for row in self.rows.iter().filter(|row| !row.pending) {
             for (index, access) in row.access().enumerate() {
-                let own = index == 0 && row.action.is_some();
+                let own = index < row.access.len();
                 let entry = table
                     .entry(access.clone())
                     .or_insert_with(|| trace::AccessEntry {

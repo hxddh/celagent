@@ -43,7 +43,7 @@ not compatible with earlier files.
 | `pending` | `true` on a line for a call still running after 1 s |
 | `error` | proxy-side failure, e.g. the emulator was unreachable |
 | `problem` | `{code, message?, hint?}` for status ≥ 400 or a proxy failure |
-| `action`, `resource` | the IAM action and resource ARN pattern this call needs |
+| `access` | `[{action, resource}]` this call needs: usually one; one per table for a batch; each item's action for a DynamoDB transaction; the source read for an S3 copy |
 | `implied` | `[{action, resource}]` needed elsewhere (SSE-KMS key, passed role) |
 | `new` | the call's access is not in the lock |
 | `request`, `response` | `{headers, content_type?, body?}` |
@@ -59,9 +59,13 @@ cover the whole body.
   `monitoring` and `email` become `cloudwatch` and `ses`. S3 `ListObjectsV2`
   becomes `s3:ListBucket`, `HeadObject` becomes `s3:GetObject`, multipart calls
   become `s3:PutObject`, and Lambda `Invoke` becomes `lambda:InvokeFunction`.
-  `sts:GetCallerIdentity` needs nothing.
-- **Resource**: read from the request for S3, DynamoDB (tables and indexes,
-  batch and transact), SQS, SNS, Lambda, Secrets Manager, KMS, STS, IAM,
+  `sts:GetCallerIdentity` needs nothing. `TransactWriteItems` and
+  `TransactGetItems` are not IAM actions: each item contributes its own
+  (`PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem`, `GetItem`).
+  `CopyObject` and `UploadPartCopy` also need `s3:GetObject` on the source from
+  `x-amz-copy-source`.
+- **Resource**: read from the request for S3, DynamoDB (tables and indexes;
+  one entry per table, since an IAM resource names one table), SQS, SNS, Lambda, Secrets Manager, KMS, STS, IAM,
   EventBridge and Step Functions; otherwise `*`. Account and region are `*`.
 - **Normalization**: UUIDs, runs of six or more digits, and long hex segments
   become `*`, so generated test names do not churn the lock.

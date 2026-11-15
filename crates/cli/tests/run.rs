@@ -181,7 +181,7 @@ fn run_explains_failures_keeps_the_exit_code_and_writes_one_run_file() {
     assert_eq!(records[0]["type"], "run");
     assert_eq!(records[0]["command"][0], "sh");
     assert_eq!(records[1]["type"], "call");
-    assert_eq!(records[1]["action"], "sqs:SendMessage");
+    assert_eq!(records[1]["access"][0]["action"], "sqs:SendMessage");
     let end = records.last().unwrap();
     assert_eq!(end["type"], "end");
     assert_eq!(end["exit_code"], 4);
@@ -251,7 +251,7 @@ fn the_lock_workflow_catches_new_access_and_regressions() {
     let records = lines(PathBuf::from(report["trace"].as_str().unwrap()).as_path());
     let delete = records
         .iter()
-        .find(|record| record["action"] == "sqs:DeleteMessage")
+        .find(|record| record["access"][0]["action"] == "sqs:DeleteMessage")
         .unwrap();
     assert_eq!(
         delete["new"], true,

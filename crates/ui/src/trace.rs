@@ -253,11 +253,10 @@ pub struct Trace {
     pub error: Option<String>,
     #[serde(default)]
     pub problem: Option<Problem>,
-    /// IAM action this call needs (`s3:GetObject`), when known.
+    /// The IAM permissions this call needs (several for batches,
+    /// transactions and copies).
     #[serde(default)]
-    pub action: Option<String>,
-    #[serde(default)]
-    pub resource: Option<String>,
+    pub access: Vec<Access>,
     /// Permissions the call implies elsewhere (SSE-KMS key, passed role).
     #[serde(default)]
     pub implied: Vec<Access>,
@@ -374,15 +373,7 @@ impl Trace {
 
     /// Every permission this call accounts for: its own, then implied ones.
     pub fn access(&self) -> impl Iterator<Item = Access> + '_ {
-        let own = self
-            .action
-            .as_ref()
-            .zip(self.resource.as_ref())
-            .map(|(action, resource)| Access {
-                action: action.clone(),
-                resource: resource.clone(),
-            });
-        own.into_iter().chain(self.implied.iter().cloned())
+        self.access.iter().chain(self.implied.iter()).cloned()
     }
 
     pub fn uses(&self, access: &Access) -> bool {
@@ -1236,7 +1227,7 @@ mod tests {
     fn run_files_carry_a_header_calls_and_a_report() {
         let text = [
             r#"{"type":"run","version":3,"run":"r1","command":["npm","test"],"cwd":"/w","pid":1,"endpoint":"http://127.0.0.1:4100","upstream":"https://127.0.0.1:9298","started":"s","lock":"lenslet.lock","future":true}"#,
-            r#"{"type":"call","id":"c1","at":"2026-11-15T00:00:01Z","method":"POST","path":"/","service":"sqs","operation":"SendMessage","status":200,"ms":2,"action":"sqs:SendMessage","resource":"arn:aws:sqs:*:*:jobs","new":true,"implied":[{"action":"kms:Decrypt","resource":"arn:aws:kms:*:*:key/*"}]}"#,
+            r#"{"type":"call","id":"c1","at":"2026-11-15T00:00:01Z","method":"POST","path":"/","service":"sqs","operation":"SendMessage","status":200,"ms":2,"access":[{"action":"sqs:SendMessage","resource":"arn:aws:sqs:*:*:jobs"}],"new":true,"implied":[{"action":"kms:Decrypt","resource":"arn:aws:kms:*:*:key/*"}]}"#,
             r#"{"type":"end","run":"r1","exit_code":3,"ended":"e","access":[{"action":"sqs:SendMessage","resource":"arn:aws:sqs:*:*:jobs","calls":1,"errors":0,"new":true}],"lock":"lenslet.lock","access_added":[{"action":"sqs:SendMessage","resource":"arn:aws:sqs:*:*:jobs"}],"regressions":{"previous_run":"r0","new_failures":[{"service":"sqs","operation":"GetQueueUrl","code":"QueueDoesNotExist"}],"fixed":[]}}"#,
         ]
         .join("\n");

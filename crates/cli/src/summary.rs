@@ -75,8 +75,9 @@ impl Summary {
             let entry = self.access.entry(access).or_default();
             entry.calls += 1;
             entry.errors += usize::from(failed);
-            // The first entry is the call's own action when it has one.
-            let own = index == 0 && trace.action.is_some();
+            // Own permissions come first, then implied ones. An entry is
+            // implied only if no call ever needed it directly.
+            let own = index < trace.access.len();
             entry.implied = if entry.calls == 1 {
                 !own
             } else {
@@ -365,8 +366,10 @@ mod tests {
             pending: false,
             error: None,
             problem: problem::from_response(status, &[], body),
-            action: Some(format!("{service}:SendMessage")),
-            resource: Some(format!("arn:aws:{service}:*:*:jobs")),
+            access: vec![Access {
+                action: format!("{service}:SendMessage"),
+                resource: format!("arn:aws:{service}:*:*:jobs"),
+            }],
             implied: Vec::new(),
             new: false,
             request: Message::default(),

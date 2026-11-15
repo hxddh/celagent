@@ -842,7 +842,7 @@ fn access_section(trace: &Trace) -> Option<Div> {
     }
     let mut list = div().flex().flex_col();
     for (index, access) in entries.iter().enumerate() {
-        let implied = index > 0 || trace.action.is_none();
+        let implied = index >= trace.access.len();
         let mut name = div().flex().items_center().gap(px(6.0)).child(
             div()
                 .font_family(fonts::mono())

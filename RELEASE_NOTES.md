@@ -19,6 +19,11 @@ locally. 3.0 is aimed at that gap.
   permissions are included: `kms:Decrypt` / `kms:GenerateDataKey` behind
   SSE-KMS objects, and `iam:PassRole` for roles passed to Lambda, Step
   Functions and ECS.
+- One call can need several permissions:
+  - a DynamoDB batch gets one entry per table;
+  - a transaction needs each item's own action (`PutItem`, `DeleteItem`, …),
+    not `TransactWriteItems`;
+  - an S3 copy also needs `s3:GetObject` on its source.
 - Generated names (UUIDs, timestamps, long hex) become `*`, so the lock stays
   stable.
 - `lenslet.lock` holds one `action  resource` line per permission, sorted for
@@ -83,7 +88,7 @@ Earlier formats are not supported, which allowed these cuts:
 
 ## Verification
 
-- `cargo test --workspace`: 58 CLI unit tests, 3 end-to-end tests of the real
+- `cargo test --workspace`: 60 CLI unit tests, 3 end-to-end tests of the real
   binary, and 30 window/model tests. The end-to-end tests cover the lock
   workflow, exit codes, `last` and `policy`.
 - Real boto3 through `lenslet run` against a moto server standing in for AWS

@@ -98,12 +98,11 @@ pub struct Trace {
     /// Error code, message and likely cause of a failed call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<Problem>,
-    /// IAM action this call needs, e.g. `s3:GetObject`; absent when unknown.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-    /// Resource ARN pattern the action applies to (`*` when not derivable).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource: Option<String>,
+    /// The IAM permissions this call needs (`s3:GetObject` on a bucket):
+    /// usually one; several for batches, transactions and copies; none when
+    /// the operation is unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<Access>,
     /// Permissions the call implies elsewhere (SSE-KMS key, passed role).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implied: Vec<Access>,
@@ -247,12 +246,9 @@ impl TraceSink {
     /// Write one call. Never fails the caller: trace problems are logged to
     /// stderr and the proxy keeps forwarding.
     pub fn record(&self, mut trace: Trace) {
-        if !trace.pending && trace.action.is_none() {
-            let (access, implied) = access::derive(&trace);
-            if let Some(access) = access {
-                trace.action = Some(access.action);
-                trace.resource = Some(access.resource);
-            }
+        if !trace.pending && trace.access.is_empty() {
+            let (own, implied) = access::derive(&trace);
+            trace.access = own;
             trace.implied = implied;
         }
         if let Some(locked) = self.locked.as_ref() {
@@ -275,17 +271,9 @@ impl TraceSink {
     }
 }
 
-/// Every permission one call accounts for: its own and the implied ones.
+/// Every permission one call accounts for: its own, then the implied ones.
 pub fn trace_access(trace: &Trace) -> impl Iterator<Item = Access> + '_ {
-    let own = trace
-        .action
-        .as_ref()
-        .zip(trace.resource.as_ref())
-        .map(|(action, resource)| Access {
-            action: action.clone(),
-            resource: resource.clone(),
-        });
-    own.into_iter().chain(trace.implied.iter().cloned())
+    trace.access.iter().chain(trace.implied.iter()).cloned()
 }
 
 fn open_trace(path: &Path) -> std::io::Result<File> {
@@ -359,8 +347,7 @@ mod tests {
             pending: false,
             error: None,
             problem: None,
-            action: None,
-            resource: None,
+            access: Vec::new(),
             implied: Vec::new(),
             new: false,
             request: Message {
