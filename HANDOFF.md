@@ -121,13 +121,13 @@ node bin/celagent-tui.mjs goal stop <goal-id>
 ## 3. 发布状态
 
 - 版本：**4.1.0**
-- Latest：[v4.1.0](https://github.com/hxddh/celagent/releases/tag/v4.1.0)（待发布后回填）
-- tag：`v4.1.0` → `TBD`（main）
+- Latest：[v4.1.0](https://github.com/hxddh/celagent/releases/tag/v4.1.0)
+- tag：`v4.1.0` → `82b3f86`（main）
 - 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`；tmux；git（委派/goal）
 - 资产（12 个）：celagent 五平台、celld linux-x64/linux-arm64/darwin-arm64、`install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
-- 发布流水线：`.github/workflows/release.yml`；Release run `TBD`
-- CI：main `TBD`（Node 22/24）
-- 无凭证冒烟：`./scripts/release-smoke.sh v4.1.0`（待发布后跑）
+- 发布流水线：`.github/workflows/release.yml`；Release run `43657287809`（2026-11-15）
+- CI：main `43657285910`（Node 22/24 全绿）
+- 无凭证冒烟：`./scripts/release-smoke.sh v4.1.0` 已通过（12 个资产，version/help/SHA256）
 - 4.1 核心：`__goal` runner、headless attempt、杀进程组硬停、blocked 等待 answer
 - 4.0.0 → 4.1.0：goal 从 Pi 扩展换成独立 runner；goal 不再 attach，goal 内禁用 delegate
 
@@ -141,7 +141,7 @@ node bin/celagent-tui.mjs goal stop <goal-id>
 | **3.0.0** | durable delegation 首发；Node 22 CI 因 wait 定时器 unref 失败 | 历史 |
 | **3.0.1** | 修复 wait 轮询持有事件循环；Node 22/24 全绿 | 历史 |
 | **4.0.0** | goal loop 以 Pi 扩展首发；Esc/硬停/孤儿进程有缺陷 | 历史 |
-| **4.1.0** | Goal Runner：独立 `__goal`、headless attempt、杀进程组硬停 | 待发布 |
+| **4.1.0** | Goal Runner：独立 `__goal`、headless attempt、杀进程组硬停 | 已发布 2026-11-15 |
 | 4.2 | Ship Pipeline（PR/CI）、Live Workspace、memory、Web/URL | 候选 |
 
 ## 5. 工程约定
