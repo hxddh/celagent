@@ -61,7 +61,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: lenslet-linux-x86_64
-          path: dist/
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
 
@@ -88,7 +90,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: lenslet-macos
-          path: dist/
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-macos
           if-no-files-found: error
           retention-days: 14
 
@@ -116,10 +120,12 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${TAG#lenslet-v}"
+          FILES=(dist/linux/*.tar.gz dist/linux/SHA256SUMS dist/macos/*.tar.gz dist/macos/SHA256SUMS-macos)
+          ls -lh "${FILES[@]}"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/linux/* dist/macos/* --clobber
+            gh release upload "$TAG" "${FILES[@]}" --clobber
           else
-            gh release create "$TAG" dist/linux/* dist/macos/* \
+            gh release create "$TAG" "${FILES[@]}" \
               --title "Lenslet ${VERSION}" \
               --notes-file lenslet/RELEASE_NOTES.md
           fi
