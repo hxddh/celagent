@@ -21,8 +21,17 @@ pub fn path_in(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
 }
 
-/// The locked access, or `None` when there is no lock file.
-pub fn read(path: &Path) -> Result<Option<BTreeSet<Access>>> {
+/// A lock file: the access it lists, and which of it is test-only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lock {
+    pub access: BTreeSet<Access>,
+    /// Lines marked `# test`: needed by the tests themselves (fixtures that
+    /// create tables or buckets), kept for `--check`, left out of `policy`.
+    pub test: BTreeSet<Access>,
+}
+
+/// The lock, or `None` when there is no lock file.
+pub fn read(path: &Path) -> Result<Option<Lock>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -31,22 +40,31 @@ pub fn read(path: &Path) -> Result<Option<BTreeSet<Access>>> {
     Ok(Some(parse(&text)))
 }
 
-pub fn parse(text: &str) -> BTreeSet<Access> {
-    text.lines()
-        .map(|line| line.split('#').next().unwrap_or("").trim())
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let action = fields.next()?;
-            let resource = fields.next().unwrap_or("*");
-            Some(Access {
-                action: action.to_string(),
-                resource: resource.to_string(),
-            })
-        })
-        .collect()
+pub fn parse(text: &str) -> Lock {
+    let mut lock = Lock::default();
+    for line in text.lines() {
+        let (entry, comment) = line.split_once('#').unwrap_or((line, ""));
+        let mut fields = entry.split_whitespace();
+        let Some(action) = fields.next() else {
+            continue;
+        };
+        let access = Access {
+            action: action.to_string(),
+            resource: fields.next().unwrap_or("*").to_string(),
+        };
+        if comment
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == "test")
+        {
+            lock.test.insert(access.clone());
+        }
+        lock.access.insert(access);
+    }
+    lock
 }
 
-pub fn render(access: &BTreeMap<Access, AccessUse>) -> String {
+/// The lock file text. `test` marks carry over from the previous lock.
+pub fn render(access: &BTreeMap<Access, AccessUse>, test: &BTreeSet<Access>) -> String {
     let width = access
         .keys()
         .map(|access| access.action.len())
@@ -54,27 +72,39 @@ pub fn render(access: &BTreeMap<Access, AccessUse>) -> String {
         .unwrap_or(0);
     let mut out = String::from(
         "# AWS access observed by `lenslet run`: action, resource.\n\
-         # Regenerate with `lenslet run --update -- <tests>`; review changes like code.\n",
+         # Regenerate with `lenslet run --update -- <tests>`; review changes like code.\n\
+         # Mark a line `# test` when only the tests need it; `lenslet policy` leaves it out.\n",
     );
     for (access, used) in access {
         out.push_str(&format!("{:<width$}  {}", access.action, access.resource));
+        let mut notes = Vec::new();
+        if test.contains(access) {
+            notes.push("test");
+        }
         if used.implied {
-            out.push_str("  # implied");
+            notes.push("implied");
+        }
+        if !notes.is_empty() {
+            out.push_str(&format!("  # {}", notes.join(", ")));
         }
         out.push('\n');
     }
     out
 }
 
-pub fn write(path: &Path, access: &BTreeMap<Access, AccessUse>) -> Result<()> {
-    fs::write(path, render(access)).with_context(|| format!("write {}", path.display()))
+pub fn write(
+    path: &Path,
+    access: &BTreeMap<Access, AccessUse>,
+    test: &BTreeSet<Access>,
+) -> Result<()> {
+    fs::write(path, render(access, test)).with_context(|| format!("write {}", path.display()))
 }
 
-/// An IAM policy document granting exactly the locked access.
-pub fn policy(access: &BTreeSet<Access>) -> serde_json::Value {
+/// An IAM policy document granting the locked access, without `test` lines.
+pub fn policy(lock: &Lock) -> serde_json::Value {
     // One statement per resource, actions sorted: compact and reviewable.
     let mut by_resource: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for entry in access {
+    for entry in lock.access.difference(&lock.test) {
         by_resource
             .entry(entry.resource.as_str())
             .or_default()
@@ -112,40 +142,60 @@ mod tests {
             AccessUse::default(),
         );
         used.insert(
+            access("dynamodb:CreateTable", "arn:aws:dynamodb:*:*:table/orders"),
+            AccessUse::default(),
+        );
+        used.insert(
             access("kms:Decrypt", "arn:aws:kms:*:*:key/*"),
             AccessUse {
                 implied: true,
                 ..AccessUse::default()
             },
         );
-        let text = render(&used);
-        assert!(text.contains("kms:Decrypt      arn:aws:kms:*:*:key/*  # implied\n"));
+        let test: BTreeSet<Access> = [access(
+            "dynamodb:CreateTable",
+            "arn:aws:dynamodb:*:*:table/orders",
+        )]
+        .into();
+        let text = render(&used, &test);
         assert!(
-            text.find("kms:").unwrap() < text.find("sqs:").unwrap(),
-            "sorted"
+            text.contains("kms:Decrypt           arn:aws:kms:*:*:key/*  # implied\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("dynamodb:CreateTable  arn:aws:dynamodb:*:*:table/orders  # test\n"),
+            "{text}"
         );
         let parsed = parse(&text);
-        assert_eq!(parsed, used.keys().cloned().collect());
+        assert_eq!(parsed.access, used.keys().cloned().collect());
+        assert_eq!(parsed.test, test, "test marks survive a rewrite");
         assert_eq!(
-            parse("s3:ListAllMyBuckets\n# note\n\n"),
+            parse("s3:ListAllMyBuckets\n# note\n\n").access,
             [access("s3:ListAllMyBuckets", "*")].into()
+        );
+        assert!(
+            parse("s3:GetObject arn  # tested elsewhere\n")
+                .test
+                .is_empty(),
+            "whole word only"
         );
     }
 
     #[test]
-    fn missing_lock_is_none_and_policy_groups_by_resource() {
+    fn missing_lock_is_none_and_policy_leaves_out_test_lines() {
         let dir = std::env::temp_dir().join(format!("lenslet-lock-{}", std::process::id()));
         assert!(read(&path_in(&dir)).unwrap().is_none());
 
-        let locked: BTreeSet<Access> = [
-            access("sqs:SendMessage", "arn:aws:sqs:*:*:jobs"),
-            access("sqs:ReceiveMessage", "arn:aws:sqs:*:*:jobs"),
-            access("s3:GetObject", "arn:aws:s3:::assets/*"),
-        ]
-        .into();
-        let policy = policy(&locked);
+        let lock = parse(
+            "sqs:SendMessage  arn:aws:sqs:*:*:jobs\n\
+             sqs:ReceiveMessage  arn:aws:sqs:*:*:jobs\n\
+             s3:GetObject  arn:aws:s3:::assets/*\n\
+             s3:CreateBucket  arn:aws:s3:::assets  # test\n",
+        );
+        let policy = policy(&lock);
         let statements = policy["Statement"].as_array().unwrap();
-        assert_eq!(statements.len(), 2);
+        assert_eq!(statements.len(), 2, "{policy}");
+        assert_eq!(statements[0]["Resource"], "arn:aws:s3:::assets/*");
         assert_eq!(statements[1]["Resource"], "arn:aws:sqs:*:*:jobs");
         assert_eq!(
             statements[1]["Action"],

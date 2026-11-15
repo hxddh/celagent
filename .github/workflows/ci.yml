@@ -14,50 +14,103 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GPUI_DEPS: >-
+    libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev
+    libxcb1-dev libvulkan-dev libfontconfig1-dev libfreetype-dev libssl-dev
+    pkg-config cmake clang musl-tools
+
 jobs:
   linux:
-    # The release is built on 22.04 for glibc compatibility; test there too.
-    runs-on: ubuntu-22.04
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v5
-      - name: Install GPUI Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-xcb-dev libxcb1-dev libvulkan-dev libfontconfig1-dev \
-            libfreetype-dev libssl-dev pkg-config cmake clang
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Test workspace
-        run: cargo test --workspace --locked
-      - name: Build release binaries
-        run: cargo build --release --locked -p lenslet -p lenslet-ui
-      - name: CLI smoke test
-        run: |
-          ./target/release/lenslet --version
-          ./target/release/lenslet run -- true 2>&1 | tee smoke.txt || true
-          grep -q "no emulator credentials\|emulator CA" smoke.txt
-
-  macos:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.04: the binaries need the glibc they were built with.
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y $GPUI_DEPS
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - run: rustup target add "$(uname -m)-unknown-linux-musl"
       - uses: Swatinem/rust-cache@v2
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Test workspace
-        run: cargo test --workspace --locked
-      - name: Build release binaries
-        run: cargo build --release --locked -p lenslet -p lenslet-ui
-      - name: Package macOS app
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p lenslet -p lenslet-ui
+      - run: cargo build --release --locked -p lenslet --target "$(uname -m)-unknown-linux-musl"
+      - name: Package (as the release does)
+        run: bash scripts/package-linux.sh 0.0.0-ci dist
+      - name: install.sh against the packaged CLI
+        run: |
+          (cd dist && sha256sum lenslet-cli-*.tar.gz > SHA256SUMS)
+          (cd dist && python3 -m http.server 8765 >/dev/null 2>&1 &)
+          sleep 1
+          LENSLET_BASE_URL=http://127.0.0.1:8765 sh install.sh --version 0.0.0-ci --dir "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/lenslet" --version
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked --target aarch64-apple-darwin -p lenslet -p lenslet-ui
+      - run: cargo build --release --locked --target x86_64-apple-darwin -p lenslet -p lenslet-ui
+      - name: Package (as the release does)
         run: bash scripts/package-macos.sh 0.0.0-ci dist
+
+  action:
+    # The GitHub Action, end to end, against moto and the example project.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p lenslet
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install boto3 'moto[server]'
+      - name: Unchanged access passes (strict)
+        id: same
+        uses: ./
+        with:
+          binary: target/release/lenslet
+          emulator: moto_server -p 9298
+          upstream: http://127.0.0.1:9298
+          working-directory: examples/python
+          command: python test_shop.py
+          strict: 'true'
+          comment: 'false'
+      - name: Fresh emulator state
+        run: curl -fsS -X POST http://127.0.0.1:9298/moto-api/reset
+      - name: New access fails with exit 3
+        id: grown
+        continue-on-error: true
+        uses: ./
+        with:
+          binary: target/release/lenslet
+          upstream: http://127.0.0.1:9298
+          working-directory: examples/python
+          command: SHOP_REFUNDS=1 python test_shop.py
+          comment: 'false'
+      - name: Check the outcomes
+        env:
+          SAME: ${{ steps.same.outputs.exit-code }}
+          GROWN: ${{ steps.grown.outputs.exit-code }}
+          GROWN_OUTCOME: ${{ steps.grown.outcome }}
+        run: |
+          set -x
+          test "$SAME" = 0
+          test "$GROWN" = 3
+          test "$GROWN_OUTCOME" = failure

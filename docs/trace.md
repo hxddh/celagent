@@ -21,12 +21,12 @@ not compatible with earlier files.
 | `version` | `3` |
 | `run` | the file stem, e.g. `20261115-095354-9655` |
 | `command` | argv of the program; empty for a bare proxy session |
-| `cwd` | where `lenslet run` was started (the lock is `cwd/lenslet.lock`) |
+| `cwd` | where `lenslet run` was started (the default lock is `cwd/lenslet.lock`) |
 | `pid` | Lenslet's process id (to tell a live run from a crashed one) |
 | `endpoint` | what SDKs point at, e.g. `http://127.0.0.1:37505` |
 | `upstream` | the emulator, e.g. `https://127.0.0.1:9298` |
 | `started` | RFC3339 |
-| `lock` | `lenslet.lock` when the run is compared with one |
+| `lock` | the lock path (relative to `cwd` when inside it) when the run is compared with one |
 
 ## `call`
 
@@ -75,14 +75,15 @@ cover the whole body.
 ## `end`
 
 The report: the same object `lenslet run --json` and `lenslet last --json`
-print.
+print. `lenslet run --markdown PATH` renders it for PR comments and job
+summaries.
 
 | field | meaning |
 | --- | --- |
 | `run`, `command`, `exit_code`, `ended`, `duration_ms` | the run; `exit_code` is the program's (`null` for a proxy session) |
 | `calls`, `errors`, `unfinished`, `services` | counts |
 | `failures` | `[{id, service, operation, status, code, message?, hint?}]` |
-| `access` | `[{action, resource, calls, errors, implied?, new?}]`, sorted |
+| `access` | `[{action, resource, calls, errors, implied?, new?, via?}]`, sorted; `via` names the first calls that needed it, e.g. `DYNAMODB DeleteItem` |
 | `lock` | the lock file compared with, or `null` |
 | `access_added` | used by this run, not in the lock |
 | `access_unused` | in the lock, not used by this run |
@@ -98,8 +99,10 @@ kms:Decrypt        arn:aws:kms:*:*:key/*  # implied
 ```
 
 The file has one `action  resource` pair per line, sorted. Text after `#` is a
-comment. Only `lenslet run --update` writes it, and only when the command
-succeeded.
+comment. A comment containing the word `test` marks a line that only the tests
+need: `--check` still counts it, but `lenslet policy` leaves it out. Only
+`lenslet run --update` writes the file, only when the command succeeded, and
+it keeps the `test` marks. `--lock PATH` uses another file.
 
 ## Retention
 
