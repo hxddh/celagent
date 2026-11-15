@@ -131,4 +131,7 @@ test("renderPrompt: 带目标、验收、失败输出", () => {
   assert.match(text, /npm test/);
   assert.match(text, /AssertionError/);
   assert.match(text, /第 3 \/ 8 次/);
+  const answered = renderPrompt({ goal: goal({ lastAnswer: "用 mock 替换外部 API" }), check: check(), attempt: 2 });
+  assert.match(answered, /人对上一次 blocked 的回答/);
+  assert.match(answered, /用 mock 替换外部 API/);
 });

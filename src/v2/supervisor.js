@@ -77,7 +77,7 @@ export async function tmuxListSessions() {
   } catch (e) { return []; }
 }
 
-export async function startTmux({ id, cwd, bin, node = process.execPath, envFile = null, kind = "tui", taskFile = null, parent = null, goalId = null }) {
+export async function startTmux({ id, cwd, bin, node = process.execPath, envFile = null, kind = "tui", taskFile = null, parent = null }) {
   if (!existsSync(cwd)) throw new Error(`工作目录不存在: ${cwd}`);
   let childArgs;
   if (kind === "child") {
@@ -85,9 +85,10 @@ export async function startTmux({ id, cwd, bin, node = process.execPath, envFile
     childArgs = bin
       ? [bin, "__child", id, "--cwd", cwd, "--task", taskFile, "--parent", parent || ""]
       : ["__child", id, "--cwd", cwd, "--task", taskFile, "--parent", parent || ""];
+  } else if (kind === "goal") {
+    childArgs = bin ? [bin, "__goal", id, "--cwd", cwd] : ["__goal", id, "--cwd", cwd];
   } else {
     childArgs = bin ? [bin, "__tui", id, "--cwd", cwd] : ["__tui", id, "--cwd", cwd];
-    if (goalId) childArgs.push("--goal", goalId);
   }
   const envArgs = ["env", "CELAGENT_SUPERVISED=1", `CELAGENT_SESSION_ID=${id}`];
   if (envFile) envArgs.push(`CELAGENT_ENV_FILE=${envFile}`);
@@ -164,7 +165,7 @@ function writeWatchdogPid(configDir, id, pid) {
   atomicWrite(pidPath(configDir, id), `${pid}\n`);
 }
 
-export function startWatchdog({ configDir, id, cwd, bin, node = process.execPath, envFile = null, kind = "tui", taskFile = null, parent = null, goalId = null }) {
+export function startWatchdog({ configDir, id, cwd, bin, node = process.execPath, envFile = null, kind = "tui", taskFile = null, parent = null }) {
   ensureDir(configDir);
   const existing = readWatchdogPid(configDir, id);
   if (pidAlive(existing)) return existing;
@@ -175,8 +176,8 @@ export function startWatchdog({ configDir, id, cwd, bin, node = process.execPath
     if (kind === "child") {
       if (!taskFile) throw new Error("child watchdog 需要 taskFile");
       watchArgs.push("--kind", "child", "--task", taskFile, "--parent", parent || "");
-    } else if (goalId) {
-      watchArgs.push("--goal", goalId);
+    } else if (kind === "goal") {
+      watchArgs.push("--kind", "goal");
     }
     const child = spawn(node, bin ? [bin, ...watchArgs] : watchArgs, {
       detached: true,
@@ -209,7 +210,7 @@ const ENV_KEYS = [
   "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
 ];
 
-export async function startSupervisor({ configDir, id, cwd, bin, node = process.execPath, kind = "tui", taskFile = null, parent = null, goalId = null }) {
+export async function startSupervisor({ configDir, id, cwd, bin, node = process.execPath, kind = "tui", taskFile = null, parent = null }) {
   ensureDir(configDir);
   if (await tmuxHasSession(id)) return { started: false, already: true, session: tmuxName(id) };
   clearStop(configDir, id);
@@ -219,15 +220,17 @@ export async function startSupervisor({ configDir, id, cwd, bin, node = process.
   atomicWrite(envFile, JSON.stringify(env, null, 2) + "\n");
   let watchdogPid;
   try {
-    await startTmux({ id, cwd, bin, node, envFile, kind, taskFile, parent, goalId });
-    watchdogPid = startWatchdog({ configDir, id, cwd, bin, node, envFile, kind, taskFile, parent, goalId });
+    await startTmux({ id, cwd, bin, node, envFile, kind, taskFile, parent });
+    watchdogPid = startWatchdog({ configDir, id, cwd, bin, node, envFile, kind, taskFile, parent });
   } catch (e) {
+    // startTmux 已成功但 startWatchdog 失败时，不能留下一个没人看护的 tmux。
+    try { await stopTmux(id); } catch (e2) { /* ignore */ }
     try { unlinkSync(envFile); } catch (e2) { /* ignore */ }
     throw e;
   }
   const state = {
     id, cwd, session: tmuxName(id), version: 2, kind,
-    parent: parent || null, taskFile: taskFile || null, goalId: goalId || null,
+    parent: parent || null, taskFile: taskFile || null,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     watchdogPid, node, bin, envFile,
   };
@@ -267,7 +270,7 @@ export async function supervisorStatus({ configDir, id }) {
  * - kill -9 不会写标记，watchdog 重新拉起，TUI 从 manifest/checkpoint 恢复；
  * - 10 分钟内重启超过 20 次则退出，避免坏配置死循环。
  */
-export async function watchSupervisor({ configDir, id, cwd, bin, node = process.execPath, envFile = null, kind = "tui", taskFile = null, parent = null, goalId = null }) {
+export async function watchSupervisor({ configDir, id, cwd, bin, node = process.execPath, envFile = null, kind = "tui", taskFile = null, parent = null }) {
   ensureDir(configDir);
   writeWatchdogPid(configDir, id, process.pid);
   let stopping = false;
@@ -281,7 +284,7 @@ export async function watchSupervisor({ configDir, id, cwd, bin, node = process.
     if (!(await tmuxHasSession(id))) {
       if (hasStop(configDir, id)) return;
       try {
-        await startTmux({ id, cwd, bin, node, envFile, kind, taskFile, parent, goalId });
+        await startTmux({ id, cwd, bin, node, envFile, kind, taskFile, parent });
         restarts += 1;
         if (Date.now() - windowStart > 10 * 60 * 1000) { restarts = 1; windowStart = Date.now(); }
         if (restarts > 20) {

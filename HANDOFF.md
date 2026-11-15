@@ -1,17 +1,18 @@
-# HANDOFF — celagent 4.0
+# HANDOFF — celagent 4.1
 
-> 唯一权威交接入口。先读本文，再读 `docs/architecture.md`（架构）与 `docs/v4.0.md`（4.0 实现合同/验证）。
-> 用户视角见 `README.md`。3.0 合同在 `docs/v3.0.md`；2.0 在 `docs/v2.0.md`；1.0 在 `docs/v1.0.md`；旧 0.x 文档在 `docs/archive/`，不要按它们改当前代码。
+> 唯一权威交接入口。先读本文，再读 `docs/architecture.md`（架构）与 `docs/v4.1.md`（4.1 实现合同/验证）。
+> 用户视角见 `README.md`。3.0 在 `docs/v3.0.md`；2.0 在 `docs/v2.0.md`；1.0 在 `docs/v1.0.md`；旧 0.x 文档在 `docs/archive/`，不要按它们改当前代码。
 
 ## 0. 项目定位
 
-**celagent 4.0 = durable intent（Goal Loop）。**
+**celagent 4.1 = durable intent（Goal Runner）。**
 
 - Pi 1.5 负责 agent 语义（LLM、工具、compaction、TUI）；
 - tmux supervisor + watchdog 负责执行者：客户端 detach 后工作继续；崩溃后拉起；
 - celagent 负责把每个 step 变成对象存储里的不可变对象；
 - 3.0 让 agent 用 `delegate` 派生子 agent：每个子 agent 是完整 session，有独立 worktree/lease/journal/checkpoint；
-- 4.0 让 agent 追一个 goal：验收命令不通过就带着失败输出继续，直到通过/超预算/需要人；
+- 4.1 让 goal 跑在受 supervisor 看护的 `__goal` runner 里：每轮跑验收，失败就让 headless agent 再试；
+- goal 的 deadline/预算/stop 都是杀 attempt/check 进程组，不依赖 agent 事件；
 - 父进程退出或崩溃，子 agent 和 goal 都继续跑；结果可再取回；
 - 单写者 lease + epoch + 心跳，跨机可顺序接管；
 - 本地 interval trigger preview；cron/webhook/审批在 3.1；
@@ -25,7 +26,7 @@
 崩溃后从最后一个检查点和 manifest 恢复
 进行中的工具最多一个 unknown；没有幂等键的副作用绝不静默重放
 子 agent 独立 worktree/session；父死子不死；turn 中间崩溃不重放
-goal 只有验收命令 exit 0 才算完成；预算/无进展/改测试会停或问人
+goal 只有验收命令 exit 0 才算完成；预算/墙钟到点杀进程组；无进展/改测试会停或问人
 ```
 
 ## 1. 代码地图
@@ -50,8 +51,8 @@ goal 只有验收命令 exit 0 才算完成；预算/无进展/改测试会停�
 | `src/v3/delegate.js` | **3.0 委派**：spawn/wait/send/list；工具定义；并发上限 |
 | `src/v3/child.js` | **子 agent 本地协议**：task/state/result/inbox/output.log；prompt 状态机 |
 | `src/v3/worktree.js` | **worktree 隔离**：创建/提交/摘要/清理 |
-| `src/v4/goal.js` | **4.0 目标状态/验收/守卫**：goal.json、runAccept、nextAction、保护路径 |
-| `src/v4/extension.js` | **goal loop 扩展**：agent_settled → 验收 → sendMessage；blocked 回答 |
+| `src/v4/goal.js` | **目标状态/验收/守卫**：goal.json、runAccept、nextAction、保护路径、STOP/pid |
+| `src/v4/runner.js` | **Goal Runner**：循环、headless attempt、硬停、blocked 等待、pid 清理 |
 | `src/bos.js` | aws CLI 原语：get/put/list/delete、CAS 探针、endpoint 门禁 |
 | `src/bos-tools.js` | `history_search` / `session_snapshot`（v2） |
 | `src/persist.js` | 旧格式工具函数（`jsonlFromTurns` 仍被 `import-v0` 用） |
@@ -64,7 +65,7 @@ goal 只有验收命令 exit 0 才算完成；预算/无进展/改测试会停�
 | `tests/v3-worktree.test.mjs` | worktree 创建/提交/清理、脏父仓库 |
 | `tests/v3-delegate.test.mjs` | spawn/wait/send/list、并发上限、非 git 回退 |
 | `tests/v4-goal.test.mjs` | 验收 exit/timeout、五种守卫、保护路径、状态/prompt |
-| `tests/v4-extension.test.mjs` | 假 Pi 驱动 goal loop：基线/重试/blocked/回答 |
+| `tests/v4-runner.test.mjs` | runner 循环：基线/重试/blocked/回答/预算/墙钟/BLOCKED |
 | `tests/v2-supervisor.test.mjs` | tmux supervisor 生命周期（含 child kind） |
 | `tests/v2-triggers.test.mjs` | trigger 配置/到期/删除 |
 | `tests/v2-usage.test.mjs` | usage → manifest.stats |
@@ -99,6 +100,7 @@ node bin/celagent-tui.mjs logs <dlg-id>
 # 目标循环（需要 bucket + tmux + git）
 node bin/celagent-tui.mjs goal start "把 npm test 修绿" --accept "npm test" --cwd ~/repo
 node bin/celagent-tui.mjs goal status <goal-id>
+node bin/celagent-tui.mjs logs <goal-id>
 node bin/celagent-tui.mjs goal answer <goal-id> "允许改测试"
 node bin/celagent-tui.mjs goal stop <goal-id>
 ```
@@ -108,8 +110,9 @@ node bin/celagent-tui.mjs goal stop <goal-id>
 - **BOS 默认**：`https://s3.bj.bcebos.com`，region `bj`，profile `bos`。
 - **aws CLI 是硬依赖**：`install.sh` 会检查；缺失时 `doctor` 明确报错。
 - **tmux 是 2.0 supervisor / 3.0 子 agent 依赖**：`up/attach/delegate` 需要；`run/list/workspace` 不需要。
-- **git 是 3.0 委派 / 4.0 goal 依赖**：默认从 `HEAD` 建 worktree；goal 的 `--in-place` 例外。
-- **goal 需要 bucket**：goal 就是一个持久化 session；没有 bucket 不能 start。
+- **git 是 3.0 委派 / 4.1 goal 依赖**：默认从 `HEAD` 建 worktree；goal 的 `--in-place` 例外。
+- **goal 需要 bucket**：goal 的每次 attempt 都是一个持久化 session；没有 bucket 不能 start。
+- **goal 是 headless**：没有 attach；用 `logs`/`goal answer`，停止后 `up <id> --cwd <goal worktree>` 接管 session。
 - **Pi 精确 1.5.2**：不要升 caret；升级要跑 TUI + headless + journal + checkpoint 冒烟。
 - **celld 0.6.3**：health 是 `/.well-known/celld/health`；不要按 bucket 前缀删 `own.json`。
 - **加密**：`CELAGENT_ENCRYPTION_KEY` 32 字节 base64；整桶模式；key 丢失不可读。
@@ -117,16 +120,16 @@ node bin/celagent-tui.mjs goal stop <goal-id>
 
 ## 3. 发布状态
 
-- 版本：**4.0.0**
-- Latest：[v4.0.0](https://github.com/hxddh/celagent/releases/tag/v4.0.0)（2026-11-14T23:16:21Z）
-- tag：`v4.0.0` → `455df80`（main）
+- 版本：**4.1.0**
+- Latest：[v4.1.0](https://github.com/hxddh/celagent/releases/tag/v4.1.0)（待发布后回填）
+- tag：`v4.1.0` → `TBD`（main）
 - 依赖：pi `1.5.2`（exact）；celld `0.6.3`（随包）；Node `>=22.19`；tmux；git（委派/goal）
 - 资产（12 个）：celagent 五平台、celld linux-x64/linux-arm64/darwin-arm64、`install.sh`/`install.ps1`/`worker.tar.gz`/`SHA256SUMS`
-- 发布流水线：`.github/workflows/release.yml`；Release run `43652276644` success
-- CI：main `43652273587` success（Node 22/24）
-- 无凭证冒烟：`./scripts/release-smoke.sh v4.0.0` 通过（SHA256 + version/help）
-- 4.0 核心：goal loop（验收 → 失败喂回 → 再试）、预算/墙钟/尝试/同一失败/保护路径守卫
-- 3.0.0 → 3.0.1：`delegate wait` 的轮询定时器不再 unref；产品行为不变
+- 发布流水线：`.github/workflows/release.yml`；Release run `TBD`
+- CI：main `TBD`（Node 22/24）
+- 无凭证冒烟：`./scripts/release-smoke.sh v4.1.0`（待发布后跑）
+- 4.1 核心：`__goal` runner、headless attempt、杀进程组硬停、blocked 等待 answer
+- 4.0.0 → 4.1.0：goal 从 Pi 扩展换成独立 runner；goal 不再 attach，goal 内禁用 delegate
 
 ## 4. 版本里程碑
 
@@ -137,8 +140,9 @@ node bin/celagent-tui.mjs goal stop <goal-id>
 | **2.0.0** | tmux supervisor/watchdog + attach/detach + 增量工作区检查点 + usage + trigger preview | 历史 |
 | **3.0.0** | durable delegation 首发；Node 22 CI 因 wait 定时器 unref 失败 | 历史 |
 | **3.0.1** | 修复 wait 轮询持有事件循环；Node 22/24 全绿 | 历史 |
-| **4.0.0** | goal loop：验收驱动重试、预算/无进展/保护路径守卫 | 已发布 |
-| 4.1 | Ship Pipeline（PR/CI）、Live Workspace、memory、Web/URL | 候选 |
+| **4.0.0** | goal loop 以 Pi 扩展首发；Esc/硬停/孤儿进程有缺陷 | 历史 |
+| **4.1.0** | Goal Runner：独立 `__goal`、headless attempt、杀进程组硬停 | 待发布 |
+| 4.2 | Ship Pipeline（PR/CI）、Live Workspace、memory、Web/URL | 候选 |
 
 ## 5. 工程约定
 
@@ -172,9 +176,11 @@ node bin/celagent-tui.mjs goal stop <goal-id>
 - **不自动合并/推送**：子 agent 只提交本地分支；合并与 push 由人做。
 - **父子控制面是本地文件**：换机器恢复子 session 需要重建 delegation 目录，或直接 `up <child>`。
 - **goal 不自动合并/推送**：只产出已验证的 diff；合并由人。
+- **goal 是 headless**：没有 attach；`logs`/`answer` 是主要交互，停止后 `up` 接管 session。
+- **goal 内不提供 delegate**：单 session 追目标；并行用 3.0 的 delegate。
 - **goal 不是沙箱**：验收命令和 agent 共享环境；只跑信任的命令。
-- **验收可被绕过**：改 `package.json` test script 不会被 4.0 拦住；最终仍由人 review。
-- **FTS/语义 UI/cron/审批**：4.1。
+- **验收可被绕过**：改 `package.json` test script 不会被 4.1 拦住；最终仍由人 review。
+- **FTS/语义 UI/cron/审批**：4.2。
 
 ## 7. 发版流程
 
@@ -182,15 +188,15 @@ node bin/celagent-tui.mjs goal stop <goal-id>
 2. 版本号：`package.json`、`bin/celagent-tui.mjs`、`install.sh` 三处一致。
 3. `npm pack --dry-run` 检查文件。
 4. commit → push main。
-5. tag `v4.0.0` → push tag；Release workflow 构建资产。
-6. `./scripts/release-smoke.sh v4.0.0` 验证下载/SHA/version/help。
+5. tag `v4.1.0` → push tag；Release workflow 构建资产。
+6. `./scripts/release-smoke.sh v4.1.0` 验证下载/SHA/version/help。
 7. 更新本文 §3 的 Release 链接与资产状态。
 
 ## 8. 相关文档
 
 - `README.md` — 用户安装/命令/保证
 - `docs/architecture.md` — 架构与 ADR
-- `docs/v4.0.md` — 4.0 实现合同与验证记录
+- `docs/v4.1.md` — 4.1 实现合同与验证记录
 - `docs/v3.0.md` — 3.0 实现合同与验证记录
 - `docs/v2.0.md` — 2.0 实现合同与验证记录
 - `docs/distributed-deployment.md` — 多机/接管

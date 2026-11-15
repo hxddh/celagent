@@ -1,6 +1,6 @@
-# celagent 4.0
+# celagent 4.1
 
-**Durable agent computer** — 客户端只是窗口，执行在工作区里。4.0 让 agent 不再“说完就停”：给一个目标和一条验收命令，它每轮结束自动跑验收，没通过就带着失败输出继续，直到通过、超预算或需要人。
+**Durable agent computer** — 客户端只是窗口，执行在工作区里。4.1 让 goal 跑在一个受 supervisor 看护的 runner 里：给一个目标和一条验收命令，runner 每轮跑验收，没通过就让 agent 带着失败输出再试，直到通过、超预算或需要人。agent 是 runner 的子进程，不是宿主。
 
 ```text
 goal：目标 + 验收命令
@@ -11,23 +11,25 @@ goal：目标 + 验收命令
 合并永远由人决定
 ```
 
-4.0 保持 3.0 的底线：子 agent 是完整 session；会话权威是对象存储里的 manifest + segments；单写者 lease + epoch；不承诺任意副作用 exactly-once。
+4.1 保持 3.0 的底线：子 agent 是完整 session；会话权威是对象存储里的 manifest + segments；单写者 lease + epoch；不承诺任意副作用 exactly-once。
 
 ---
 
-## 4.0 变了什么
+## 4.1 变了什么
 
-| 维度 | 3.0 | 4.0 |
+4.0 的 goal loop 是一个 Pi 扩展，长在 agent 的 TUI 里；4.1 把它彻底换成独立 runner。
+
+| 维度 | 4.0 | 4.1 |
 |---|---|---|
-| 停止条件 | 模型说 done | **验收命令 exit 0** |
-| 重试 | 人读结果、再催 | **runtime 自动重试** |
-| 长任务 | 一次 prompt 内 | **跨多次尝试、数小时** |
-| 信任 | 模型自述 | **验收输出 + 日志 + 保护路径** |
-| 成本 | 事后看 stats | **预算 / 墙钟 / 尝试数硬停** |
-| 协作 | attach / send | **blocked 回答 + attach** |
-| 合并 | 人 | **人（不变）** |
+| 循环宿主 | agent 的 Pi 扩展 | **受 supervisor 看护的 `__goal`** |
+| agent 形态 | TUI + `sendMessage` | **每次 `celagent run`（headless）** |
+| 超时/预算 | turn 边界 | **杀进程组 + 2 秒预算轮询** |
+| 停止 | Esc 容易被忽略 | **`goal stop` 杀 attempt/check** |
+| 观察 | attach 到 goal TUI | **`logs` + `status`** |
+| 委派 | goal 内可 delegate（未接好） | **goal 内禁用 delegate** |
+| 停止条件 | 模型说 done | **验收命令 exit 0（不变）** |
 
-1.0 把会话做成可恢复；2.0 把执行者和工作区做成可恢复；3.0 把委派树做成可恢复；4.0 把“意图”做成可恢复——目标不会因为一次失败或一次崩溃而丢失。
+1.0 把会话做成可恢复；2.0 把执行者和工作区做成可恢复；3.0 把委派树做成可恢复；4.1 把“意图”做成可恢复——目标不会因为一次失败、一次崩溃或一次 Esc 而丢失。
 
 ---
 
@@ -37,7 +39,7 @@ goal：目标 + 验收命令
 
 - Node.js **>= 22.19**
 - `tmux`（`up` / `attach` / `delegate` / `goal` 需要；`run` / `list` / `workspace` 不需要）
-- `git`（3.0 委派 / 4.0 goal 需要：默认从 `HEAD` 建 worktree）
+- `git`（3.0 委派 / 4.1 goal 需要：默认从 `HEAD` 建 worktree）
 - `aws` CLI（BOS/S3/R2 的签名与条件写；`install.sh` 会检查）
 - 一个支持条件写的 bucket：BOS（默认）、AWS S3、Cloudflare R2、Tigris
 - LLM：`DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`，或 Pi `/login`
@@ -120,16 +122,18 @@ celagent delegate wait dlg-...
 ```bash
 celagent goal start "把 npm test 修绿" --accept "npm test" --cwd ~/repo
 celagent goal status
-celagent attach <goal-id>          # 进 TUI 看/接管；goal 继续
+celagent logs <goal-id>            # 看 runner / attempt 输出
 celagent goal answer <id> "允许改测试"
 celagent goal stop <id>
 ```
 
 - 只有 `--accept` 命令 exit 0 才算完成；验收在 agent 之外跑。
-- 默认创建 worktree + 分支 `celagent/goal/<id>`；`--in-place` 才写当前目录。
-- 每轮只把最近一次失败输出喂回；agent 需要人时输出 `BLOCKED: <问题>`，goal 转 blocked，不烧 token。
-- 硬停：预算（默认 $5）、尝试数（8）、墙钟（2 小时）、同一失败 ×3、改保护路径。
+- goal 是 **headless**：没有 `attach` 到 goal 的 TUI。用 `logs` 看进度、`goal answer` 回答；要看 TUI 先 `goal stop`，再 `celagent up <id> --cwd <goal worktree>` 接管同一个 session。
+- 默认创建 worktree + 分支 `celagent/goal/<id>`；`--in-place` 才写当前目录；goal 从 repo 根启动（子目录请用 `--in-place`）。
+- 每轮只把最近一次失败输出喂回；agent 需要人时输出 `BLOCKED: <问题>`，goal 转 blocked，不烧 token；`goal answer` 的回答会进入下一次 prompt。
+- 硬停：runner 在 deadline/预算到点时杀 agent/验收的进程组；同一失败 ×3、改保护路径转 blocked。
 - 默认保护 `tests/`、`test/`、`*.test.*`、`*.spec.*`；改了要人回答“允许”。
+- goal 内不提供 `delegate`：goal 是单 session 追一个目标；并行请用 3.0 的 delegate。
 - 通过后仍由人看 diff、合并；不自动 push/merge。
 
 ---
@@ -152,7 +156,7 @@ celagent goal stop <id>
 | `celagent goal start "<objective>" --accept "npm test"` | 目标循环；验收通过才停 |
 | `celagent goal status [id]` / `list` | 进度、成本、最近验收、diff |
 | `celagent goal answer <id> "<answer>"` | 回答 blocked 问题 |
-| `celagent goal stop <id>` / `resume <id>` | 停止 / 从同一 session 恢复 |
+| `celagent goal stop <id>` / `resume <id>` | 停止 / 重启 runner |
 | `celagent run --prompt "..."` | 无头运行；`--session <id>`、`--json`、`--cwd` |
 | `celagent list` | 列出 v2 会话；旧格式单独标注 |
 | `celagent export <id>` | 导出 Pi JSONL |
@@ -229,16 +233,17 @@ output.log     子 agent 的可读输出（celagent logs）
 
 这些文件是本地控制面；会话本身仍以对象存储的 manifest 为权威。子 agent 的 worktree 在 `~/.config/celagent/worktrees/<child>/`，分支由 git 保存。
 
-**4.0 目标循环**：
+**4.1 目标 runner**：
 
 ```text
-goal session（celagent-<goalId>，TUI）
-  ├─ goal extension：agent_settled → 跑验收 → 失败输出喂回 → 下一轮
-  ├─ 验收命令：独立进程，cwd = goal worktree，超时杀进程组
-  └─ ~/.config/celagent/goals/<id>/{goal.json,GOAL.md,checks,answer.json}
+tmux supervisor（celagent-<goalId>）
+  └─ __goal runner
+       ├─ 验收：/bin/sh -c <accept>（独立进程组，超时杀组）
+       ├─ 尝试：celagent run --session <id>（headless，独立进程组）
+       └─ goals/<id>/{goal.json,GOAL.md,checks,attempt.json,output.log,STOP}
 ```
 
-goal 是一个 Pi 扩展，不是新 daemon；session 仍是普通 2.0 session，可 attach、可崩溃恢复。
+goal runner 由 2.0 的 tmux + watchdog 看护；agent 是它每次拉起的子进程。session 仍是普通 2.0 session；goal 停止后可以用 `celagent up <id> --cwd <goal worktree>` 接管。
 
 **读路径**：`celagent <id>` → `materialize` 拉 manifest + segments → 写本地 Pi JSONL → `SessionManager.open`。每个 segment 校验 SHA-256；manifest head 必须与最后一个 entry 一致。
 
@@ -258,8 +263,9 @@ goal 是一个 Pi 扩展，不是新 daemon；session 仍是普通 2.0 session�
 - 子 agent 被 `kill -9`：watchdog 拉起同一个 `__child`；如果 turn 已标记开始但没结束，写 `interrupted`，**不重放 prompt**。
 - 父 session 被 `kill -9`：子 agent 不受影响；父恢复后 `delegate list` 找到子 session，`delegate wait` 取回结果。
 - 子 agent 正常结束：写 `result.json`，写 stop 标记，watchdog 退出；worktree 和分支保留，等人工合并。
-- goal 的 TUI 被 `kill -9`：watchdog 拉起；goal 扩展重跑验收，失败就发新 prompt；journal 的未完成工具仍是 `unknown`，不重放。
+- goal runner 被 `kill -9`：watchdog 拉起 `__goal`；先清 attempt/check 的残留进程组，再重跑验收；journal 的未完成工具仍是 `unknown`，不重放。
 - goal 在 blocked 时崩溃：重启后继续等 `answer.json`，不烧 token。
+- `goal stop`：写 STOP、杀 attempt/check 进程组、停 supervisor；`goal resume` 清 STOP、清残留、重启 runner。
 - 工作区可能比 manifest 落后：`status` 显示 `workspace.seq`；如果检查点上传失败，会保留警告，下一次触发重试。没有静默的“假装已保存”。
 
 ---
@@ -310,14 +316,14 @@ ssh -t agent-host 'celagent attach fix-auth'
 
 ---
 
-## 从 3.0 升级
+## 从 4.0 升级
 
-- 4.0 继续读 3.0 的 session/manifest/checkpoint；已有会话不需要迁移。
-- 新增的是 `goal` 与 `src/v4`，不改 session 对象格式。
-- goal 需要 `tmux`、bucket 和 git 仓库（`--in-place` 除外）。
-- `goal` 是一个扩展；它只影响带 `--goal` 的 TUI，普通 `up`/`run` 行为不变。
+- 4.1 继续读 4.0 的 session/manifest/checkpoint；已有会话不需要迁移。
+- 4.0 的 goal 扩展被删除；`goal start/status/answer/stop/resume` 命令保留。已有的 goal 用 `goal stop` → `goal resume` 切到新 runner。
+- **goal 不再是 TUI**：`attach` 不适用于 goal；用 `logs` / `goal answer`，停止后用 `up <id> --cwd <goal worktree>` 接管 session。
+- `goal` 内不再提供 `delegate`；需要并行先用 3.0 的 `delegate`，再让 goal 处理单个分支。
 - 加密、bucket、profile、region 配置不变；跨机必须同一个 key。
-- 2.0 → 1.0 的旧说明仍在 `docs/v2.0.md`。
+- 3.0/2.0 的旧说明仍在 `docs/v3.0.md`、`docs/v2.0.md`。
 
 ---
 
@@ -333,7 +339,7 @@ npm test
 - `tests/v3-worktree.test.mjs`：worktree 创建/提交/清理、父仓库脏改动不带入。
 - `tests/v3-delegate.test.mjs`：spawn / wait / send / list、并发上限、非 git 回退。
 - `tests/v4-goal.test.mjs`：验收 exit/output/timeout、五种守卫、保护路径、状态与 prompt。
-- `tests/v4-extension.test.mjs`：假 Pi 驱动 goal loop（基线、重试、blocked、回答）。
+- `tests/v4-runner.test.mjs`：goal runner 循环（基线、重试、blocked/回答、预算/墙钟、BLOCKED）。
 - `tests/v2-supervisor.test.mjs`：tmux supervisor 启动/停止/watchdog/重复启动/child kind。
 - `tests/v2-triggers.test.mjs`：trigger 配置/到期/删除。
 - `tests/v2-usage.test.mjs`：Pi usage → manifest.stats。
@@ -361,7 +367,7 @@ npm test
 ## 文档
 
 - [`docs/architecture.md`](docs/architecture.md) — 架构与数据流
-- [`docs/v4.0.md`](docs/v4.0.md) — 4.0 实现合同与验证
+- [`docs/v4.1.md`](docs/v4.1.md) — 4.1 实现合同与验证
 - [`docs/v3.0.md`](docs/v3.0.md) — 3.0 实现合同与验证
 - [`docs/v2.0.md`](docs/v2.0.md) — 2.0 实现合同与端到端验证
 - [`docs/distributed-deployment.md`](docs/distributed-deployment.md) — 多机/接管

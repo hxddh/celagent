@@ -1,7 +1,7 @@
 # celagent 架构
 
-> 4.0 = durable intent：3.0 的委派之上，agent 追一个 goal，验收命令不通过就继续。
-> 配套：`README.md`（用户）、`docs/v4.0.md`（4.0 合同）、`docs/v3.0.md`（3.0 合同）、`docs/v2.0.md`（2.0 合同）、`HANDOFF.md`（接手）。
+> 4.1 = durable intent：3.0 的委派之上，goal 由一个独立 runner 追到验收通过。
+> 配套：`README.md`（用户）、`docs/v4.1.md`（4.1 合同）、`docs/v3.0.md`（3.0 合同）、`docs/v2.0.md`（2.0 合同）、`HANDOFF.md`（接手）。
 
 ## 1. 一句话
 
@@ -117,26 +117,25 @@ sessions/<id>/workspace/blobs/<sha256>
 
 父子控制面是本地文件 `delegations/<child>/`（task/state/result/inbox/output.log），不是新的持久化层；会话权威仍在对象存储。
 
-## 11. 4.0：目标循环
+## 11. 4.1：Goal Runner
 
-goal 不是新 daemon，而是一个 Pi 扩展，长在普通 TUI session 里：
+goal 不是 Pi 扩展，而是一个受 supervisor 看护的循环进程：
 
 ```text
-goal session（celagent-<goalId>，TUI）
-  ├─ session_start → baseline 验收
-  ├─ agent_settled → 跑验收
-  │     ├─ 通过 → done
-  │     ├─ 失败 → sendMessage({triggerTurn}) 下一轮
-  │     └─ 守卫触发 → stopped / blocked
-  ├─ blocked → 等 answer.json → 注入人的回答
-  └─ 验收命令：独立进程，cwd = goal worktree
+tmux supervisor（celagent-<goalId>）
+  └─ __goal runner
+       ├─ 验收：/bin/sh -c <accept>（独立进程组，超时杀组）
+       ├─ 尝试：celagent run --session <id>（headless，独立进程组）
+       └─ goals/<id>/{goal.json,GOAL.md,checks,attempt.json,output.log,STOP}
 ```
 
-- 停止条件从“模型说 done”变成“验收命令 exit 0”。
-- 判断仍在模型上下文里；runtime 只跑验收、喂回失败、执行硬停。
-- 守卫：预算、墙钟、尝试数、同一失败 ×3、保护路径被改。
+- runner 每轮：读 manifest.stats → deadline/budget → 验收 → 决定 → 起一次 headless attempt。
+- agent 是子进程；deadline/budget/stop 都是杀进程组，不依赖 `agent_settled`。
+- blocked 时 runner 只等 `answer.json`，不跑 agent、不烧 token。
+- goal 内禁用 `delegate`（单 session 追目标）；并行用 3.0 的 delegate。
 - 没有 mission/DAG/coordinator/reviewer/审批状态机。
-- session 仍是普通 2.0 session，可 attach、可崩溃恢复；goal 状态在 `~/.config/celagent/goals/<id>/`。
+- goal 是 headless；停止后用 `celagent up <id> --cwd <goal worktree>` 接管同一个 session。
+- 状态在 `~/.config/celagent/goals/<id>/`；runner 是运行中的唯一写者。
 
 ## 12. ADR
 
@@ -150,6 +149,7 @@ goal session（celagent-<goalId>，TUI）
 | 版本 | 2.0 破坏默认 CLI 行为 | `celagent` 从进程内 TUI 变为 up+attach；`--foreground` 保留旧路径 |
 | 委派 | 子 agent = 完整 session + worktree | 复用 2.0 的持久化；不引入调度器 |
 | 子 agent UI | headless + logs/send | 保持确定性结果；TUI attach 留 3.1 |
-| goal 循环 | Pi 扩展 + `agent_settled` | 不新增 daemon；保留 attach |
-| 验收 | agent 之外的独立进程 | “done”是命令结果，不是模型自述 |
+| goal 循环 | 独立 `__goal` runner | 超时/预算/停止都是进程组生命周期，不依赖事件时序 |
+| 验收 | agent 进程之外的独立进程 | “done”是命令结果，不是模型自述 |
 | goal 默认隔离 | worktree + 分支 | 不碰用户工作区；合并仍由人 |
+| goal 交互 | headless + logs/answer | 不做 TUI 事件注入；会话可在停止后 up 接管 |

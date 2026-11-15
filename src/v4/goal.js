@@ -3,7 +3,7 @@
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, unlinkSync, statSync,
+  existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, unlinkSync, statSync, appendFileSync,
 } from "node:fs";
 import { join, basename, dirname } from "node:path";
 
@@ -29,6 +29,24 @@ export function goalFilePath(configDir, id) { return join(goalDir(configDir, id)
 export function goalDocPath(configDir, id) { return join(goalDir(configDir, id), "GOAL.md"); }
 export function checksDir(configDir, id) { return join(goalDir(configDir, id), "checks"); }
 export function answerPath(configDir, id) { return join(goalDir(configDir, id), "answer.json"); }
+export function stopPath(configDir, id) { return join(goalDir(configDir, id), "STOP"); }
+export function outputLogPath(configDir, id) { return join(goalDir(configDir, id), "output.log"); }
+export function attemptResultPath(configDir, id) { return join(goalDir(configDir, id), "attempt.json"); }
+export function attemptPidPath(configDir, id) { return join(goalDir(configDir, id), "attempt.pid"); }
+export function checkPidPath(configDir, id) { return join(goalDir(configDir, id), "check.pid"); }
+export function hasStop(configDir, id) { return existsSync(stopPath(configDir, id)); }
+export function writeStop(configDir, id, reason = "stop") {
+  atomicWrite(stopPath(configDir, id), JSON.stringify({ reason, at: new Date().toISOString() }) + "\n");
+}
+export function clearStop(configDir, id) {
+  try { unlinkSync(stopPath(configDir, id)); } catch (e) { /* ignore */ }
+}
+export function appendOutput(configDir, id, text) {
+  const body = String(text || "");
+  if (!body) return;
+  ensureDir(goalDir(configDir, id));
+  appendFileSync(outputLogPath(configDir, id), body, { mode: 0o600 });
+}
 
 function ensureDir(path) { mkdirSync(path, { recursive: true, mode: 0o700 }); }
 function atomicWrite(path, text) {
@@ -105,17 +123,23 @@ export function writeAnswer(configDir, id, text, { allowProtected = false } = {}
 }
 
 /** 在目标 worktree 里跑验收；超时杀进程组，输出截断。 */
-export async function runAccept({ cwd, command, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, maxOutput = MAX_OUTPUT_CHARS * 4 } = {}) {
+export async function runAccept({ cwd, command, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, maxOutput = MAX_OUTPUT_CHARS * 4, signal = null, pidFile = null } = {}) {
   if (!command) throw new Error("accept 命令不能为空");
   if (!existsSync(cwd)) throw new Error(`goal 工作目录不存在: ${cwd}`);
   const started = Date.now();
   const isWin = process.platform === "win32";
+  const env = { ...process.env };
+  delete env.CELAGENT_SUPERVISED;
+  delete env.CELAGENT_SESSION_ID;
   const child = spawn(isWin ? "cmd" : "/bin/sh", isWin ? ["/c", command] : ["-c", command], {
     cwd,
     detached: !isWin,
     stdio: ["ignore", "pipe", "pipe"],
-    env: process.env,
+    env,
   });
+  if (pidFile && child.pid) {
+    try { writeFileSync(pidFile, `${child.pid}\n`, { encoding: "utf8", mode: 0o600 }); } catch (e) { /* ignore */ }
+  }
   let stdout = "";
   let stderr = "";
   let truncated = false;
@@ -129,23 +153,34 @@ export async function runAccept({ cwd, command, timeoutMs = DEFAULT_CHECK_TIMEOU
   child.stdout.on("data", (d) => { stdout = append(stdout, d); });
   child.stderr.on("data", (d) => { stderr = append(stderr, d); });
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
+  let aborted = false;
+  const kill = () => {
     try {
       if (!isWin && child.pid) process.kill(-child.pid, "SIGKILL");
       else child.kill("SIGKILL");
     } catch (e) { /* already gone */ }
+  };
+  const onAbort = () => { aborted = true; kill(); };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    kill();
   }, Math.max(1000, timeoutMs));
   const exitCode = await new Promise((resolve) => {
     child.on("close", (code, signal) => resolve(Number.isFinite(code) ? code : (signal ? 1 : 0)));
     child.on("error", () => resolve(1));
   });
   clearTimeout(timer);
+  if (signal) signal.removeEventListener("abort", onAbort);
+  if (pidFile) { try { unlinkSync(pidFile); } catch (e) { /* ignore */ } }
   const output = [stdout, stderr].filter(Boolean).join("\n").trim();
   const normalized = output.replace(/\d+(\.\d+)?(ms|s|m)\b/g, "<time>");
   const hash = createHash("sha256").update(`${exitCode}\n${normalized}`).digest("hex").slice(0, 16);
   return {
-    exitCode, output, truncated, timedOut, hash,
+    exitCode, output, truncated, timedOut, aborted, hash,
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
@@ -261,6 +296,7 @@ export function renderPrompt({ goal, check, attempt }) {
     `目标：${goal.objective}`,
     `验收命令：${goal.accept}`,
     `尝试：第 ${attempt} / ${goal.maxAttempts} 次`,
+    ...(goal.lastAnswer ? ["", "人对上一次 blocked 的回答：", truncate(goal.lastAnswer, 2000)] : []),
     "",
     "最近一次验收：",
     "```",
