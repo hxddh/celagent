@@ -1,62 +1,122 @@
 name: Release
 
-# PR: 构建资产并挂 artifact (不上传 Release)
-# tag v* / workflow_dispatch: 构建后 clobber 上传到 GitHub Release
 on:
-  pull_request:
-    branches: [main]
   push:
-    tags: ['v*']
+    tags: ['lenslet-v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: '要更新的 Release tag'
+        description: 'Existing lenslet-v* tag to publish'
         required: true
-        default: 'v2.0.0'
+        default: 'lenslet-v2.0.0'
+
+permissions:
+  contents: write
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  assets:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+  build:
+    # Oldest supported runner: the binaries need the glibc they were built with.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
         with:
-          node-version: 22
-          cache: 'npm'
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - name: Install dependencies
-        run: npm ci
-      - name: Prepare release assets
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Install GPUI Linux dependencies
         run: |
-          chmod +x scripts/prepare-release-assets.sh scripts/sha256sums.sh
-          ./scripts/prepare-release-assets.sh dist/release
-          ls -lh dist/release
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libvulkan-dev libfontconfig1-dev \
+            libfreetype-dev libssl-dev pkg-config cmake clang
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build release binaries
+        run: cargo build --release --locked -p lenslet -p lenslet-ui
+      - name: Package Linux x86_64
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#lenslet-v}"
+          NAME="lenslet-${VERSION}-linux-x86_64"
+          mkdir -p "dist/${NAME}"
+          cp target/release/lenslet target/release/lenslet-ui "dist/${NAME}/"
+          cp README.md RELEASE_NOTES.md LICENSE "dist/${NAME}/"
+          cp -r docs "dist/${NAME}/"
+          mkdir -p "dist/${NAME}/assets/fonts"
+          cp assets/fonts/LICENSE-* "dist/${NAME}/assets/fonts/"
+          strip "dist/${NAME}/lenslet" "dist/${NAME}/lenslet-ui" || true
+          # Record the glibc floor so a too-new build is caught here, not by users.
+          for bin in lenslet lenslet-ui; do
+            FLOOR=$(objdump -T "dist/${NAME}/${bin}" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+            echo "${bin} needs ${FLOOR}"
+            test "$(printf '%s\n' "${FLOOR}" GLIBC_2.35 | sort -V | tail -1)" = GLIBC_2.35
+          done
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && sha256sum "${NAME}.tar.gz" > SHA256SUMS)
+          ls -lh dist
       - uses: actions/upload-artifact@v4
         with:
-          name: release-assets
-          path: dist/release/
+          name: lenslet-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build release binaries
+        run: cargo build --release --locked -p lenslet -p lenslet-ui
+      - name: Package macOS app
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          bash scripts/package-macos.sh "${TAG#lenslet-v}" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lenslet-macos
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-macos
           if-no-files-found: error
           retention-days: 14
 
   publish:
-    needs: assets
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    needs: [build, build-macos]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/lenslet-v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
-          name: release-assets
-          path: dist/release
+          name: lenslet-linux-x86_64
+          path: dist/linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: lenslet-macos
+          path: dist/macos
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,10 +124,14 @@ jobs:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          ls -lh dist/release
+          VERSION="${TAG#lenslet-v}"
+          FILES=(dist/linux/*.tar.gz dist/linux/SHA256SUMS dist/macos/*.tar.gz dist/macos/SHA256SUMS-macos)
+          ls -lh "${FILES[@]}"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/release/* --clobber
+            gh release upload "$TAG" "${FILES[@]}" --clobber
           else
-            gh release create "$TAG" dist/release/* --title "$TAG" --generate-notes
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "Lenslet ${VERSION}" \
+              --notes-file RELEASE_NOTES.md
           fi
-          echo "uploaded to $TAG"
+          echo "published $TAG"
