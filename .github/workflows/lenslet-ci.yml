@@ -48,3 +48,26 @@ jobs:
       - name: Build release binaries
         working-directory: lenslet
         run: cargo build --release --locked -p lenslet -p lenslet-proxy
+
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lenslet -> target
+      - name: Format check
+        working-directory: lenslet
+        run: cargo fmt --all -- --check
+      - name: Test workspace
+        working-directory: lenslet
+        run: cargo test --workspace --locked
+      - name: Build release binaries
+        working-directory: lenslet
+        run: cargo build --release --locked -p lenslet -p lenslet-proxy
+      - name: Package macOS app
+        run: bash lenslet/scripts/package-macos.sh 1.0.0 dist

@@ -21,7 +21,9 @@ and AWS Emulator and shows the actual wire calls in one GPUI window.
 - Polished single-window GPUI UI with bundled Inter / JetBrains Mono fonts,
   responsive compact layout, empty/error states and a seeded demo mode
   (`LENSLET_DEMO=1`).
-- Linux x86_64 release binaries: `lenslet` and `lenslet-proxy`.
+- Linux x86_64 archive with `lenslet` and `lenslet-proxy`.
+- macOS archive with `Lenslet.app` (ad-hoc signed, not notarized) and
+  `lenslet-proxy`; architecture is in the asset name.
 
 ## Install
 
@@ -32,12 +34,15 @@ tar xzf lenslet.tar.gz
 cd lenslet-1.0.0-linux-x86_64
 ```
 
-Run AWS Emulator on `9298`, `lenslet-proxy` on `9297`, then `lenslet`. See
-[README.md](README.md) for SDK and CLI setup.
+macOS: unpack the `macos-*` archive and `open Lenslet.app`; if Gatekeeper
+complains, remove the quarantine attribute once. Run `lenslet-proxy` from the
+same directory. Run AWS Emulator on `9298`; see [README.md](README.md) for SDK
+and CLI setup.
 
 ## Limits
 
-- Linux x86_64 is the verified build; macOS/Windows are not shipped in 1.0.
+- Linux x86_64 and macOS are shipped. The macOS app is ad-hoc signed and not
+  notarized; Windows is not shipped in 1.0.
 - AWS Emulator fidelity varies by service; Lenslet reports wire behavior, not
   AWS equivalence.
 - Text capture is a 64 KiB prefix; binary bodies keep size and SHA-256 only.

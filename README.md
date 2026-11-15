@@ -17,7 +17,7 @@ resource graph, Pi session, celld, or agent runtime in it.
 - [Release notes](lenslet/RELEASE_NOTES.md) — what changed in 1.0.0.
 - [Trace contract](lenslet/docs/trace.md) — raw request/response JSONL format.
 - [Lenslet 1.0.0 release](https://github.com/hxddh/celagent/releases/tag/lenslet-v1.0.0)
-  — Linux x86_64 binaries.
+  — Linux x86_64 and macOS app archives.
 
 ```bash
 # one terminal: emulator

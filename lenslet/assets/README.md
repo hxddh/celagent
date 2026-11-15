@@ -24,5 +24,7 @@ names. If registration fails, it falls back to the platform's generic
 
 ## Icons
 
-The Lenslet aperture mark, search, pause/play, and auth key are painted with
-GPUI primitives in `crates/app/src/glyph.rs`; there are no image assets.
+The in-window Lenslet aperture mark, search, pause/play, and auth key are
+painted with GPUI primitives in `crates/app/src/glyph.rs`. `app-icon.svg` and
+`app-icon.png` are the macOS app icon source; `scripts/package-macos.sh`
+converts them into `AppIcon.icns`.

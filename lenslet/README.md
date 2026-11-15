@@ -31,7 +31,9 @@ operation, Lenslet shows it: `x-amz-target`, S3 `x-id`, and AWS Query
 
 ## Install
 
-The first release ships Linux x86_64 binaries:
+The first release ships a Linux x86_64 archive and a macOS app archive. The
+macOS asset name includes the runner architecture (`macos-arm64` or
+`macos-x86_64`); the app is ad-hoc signed but not notarized.
 
 ```bash
 curl -fL -o lenslet.tar.gz \
@@ -47,6 +49,15 @@ EMULATOR_TELEMETRY=off aws-emulator --telemetry off --port 9298
 
 # in a third
 ./lenslet
+```
+
+For macOS, unpack the corresponding archive, then:
+
+```bash
+xattr -dr com.apple.quarantine Lenslet.app   # only if Gatekeeper complains
+open Lenslet.app
+# separate terminal, from the same directory:
+./lenslet-proxy --listen 9297 --upstream 9298
 ```
 
 The emulator writes its credentials and CA under
@@ -145,8 +156,9 @@ in the dynamic filter strip.
 
 ## Limits
 
-- Linux is the verified target. macOS/Windows builds are not yet provided;
-  GPUI itself supports them, but this release does not claim them.
+- Linux x86_64 and macOS are the shipped targets. The macOS app is ad-hoc
+  signed, not notarized; Gatekeeper may require the one-time `xattr` step.
+  Windows is not shipped in 1.0.
 - GPUI 0.2.2 pulls `xattr 0.2.3`, which does not build on Linux because
   `libc::ENOATTR` is unavailable. `vendor/xattr` substitutes `ENODATA`; remove
   the patch when GPUI fixes it.
