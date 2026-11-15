@@ -1,0 +1,175 @@
+name: Lenslet
+description: Run your tests against a local AWS emulator and report, in the PR, the AWS access they need.
+author: hxddh
+branding:
+  icon: eye
+  color: blue
+
+inputs:
+  command:
+    description: The test command, e.g. `npm test`. Runs under bash in working-directory.
+    required: true
+  upstream:
+    description: The emulator, as a port (HTTPS on 127.0.0.1) or an http(s) URL.
+    default: '9298'
+  emulator:
+    description: Optional command that starts the emulator in the background. The action then waits for `upstream` to accept connections.
+    default: ''
+  working-directory:
+    description: Where to run the command and look for the lock file.
+    default: '.'
+  lock:
+    description: Lock file path (relative to working-directory). Default lenslet.lock.
+    default: ''
+  check:
+    description: Fail when the run uses access that is not in the lock. Skipped (with a notice) while there is no lock file yet.
+    default: 'true'
+  strict:
+    description: With check, also fail when the lock lists access the run did not use.
+    default: 'false'
+  comment:
+    description: On pull requests, post the report as one comment and keep it updated. Needs `pull-requests write` permission.
+    default: 'true'
+  version:
+    description: Lenslet version to install. Default is the version this action is pinned to (for example `lenslet-v4.0.0` installs 4.0.0).
+    default: ''
+  binary:
+    description: Use this lenslet binary instead of installing one (for builds from source).
+    default: ''
+
+outputs:
+  exit-code:
+    description: lenslet's exit code (the command's own code when it failed, 3 when access changed).
+    value: ${{ steps.run.outputs.exit-code }}
+  report:
+    description: Path to the JSON report of this invocation.
+    value: ${{ steps.run.outputs.report }}
+  markdown:
+    description: Path to the Markdown report of this invocation.
+    value: ${{ steps.run.outputs.markdown }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install lenslet
+      shell: bash
+      env:
+        INPUT_BINARY: ${{ inputs.binary }}
+        INPUT_VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        if [ -n "$INPUT_BINARY" ]; then
+          bin=$(cd "$(dirname "$INPUT_BINARY")" && pwd)/$(basename "$INPUT_BINARY")
+        else
+          version="${INPUT_VERSION:-${ACTION_REF#lenslet-v}}"
+          case "$version" in
+            [0-9]*) ;;
+            *) echo "::error::Pin the action to a release (hxddh/lenslet@lenslet-vX.Y.Z) or set the version input"; exit 2 ;;
+          esac
+          sh "$GITHUB_ACTION_PATH/install.sh" --version "$version" --dir "$RUNNER_TEMP/lenslet-bin"
+          bin="$RUNNER_TEMP/lenslet-bin/lenslet"
+        fi
+        "$bin" --version
+        echo "LENSLET_BIN=$bin" >> "$GITHUB_ENV"
+
+    - name: Start the emulator
+      if: inputs.emulator != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        EMULATOR: ${{ inputs.emulator }}
+        UPSTREAM: ${{ inputs.upstream }}
+      run: |
+        set -euo pipefail
+        nohup bash -c "$EMULATOR" > "$RUNNER_TEMP/lenslet-emulator.log" 2>&1 &
+        address="${UPSTREAM#*://}"
+        address="${address%%/*}"
+        case "$address" in *:*) ;; *) address="127.0.0.1:$address" ;; esac
+        host="${address%:*}"; port="${address##*:}"
+        [ "$host" = "localhost" ] && host=127.0.0.1
+        for _ in $(seq 120); do
+          if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+            echo "emulator is up on $host:$port"
+            exit 0
+          fi
+          sleep 0.5
+        done
+        echo "::error::the emulator did not open $host:$port within 60 s"
+        tail -n 50 "$RUNNER_TEMP/lenslet-emulator.log" || true
+        exit 2
+
+    - name: Run under Lenslet
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COMMAND: ${{ inputs.command }}
+        UPSTREAM: ${{ inputs.upstream }}
+        LOCK: ${{ inputs.lock }}
+        CHECK: ${{ inputs.check }}
+        STRICT: ${{ inputs.strict }}
+      run: |
+        # GitHub runs this with `bash -e`: a failing lenslet must not end the
+        # step before the summary and outputs are written.
+        set +e -uo pipefail
+        # Each invocation gets its own files: a run that fails before writing
+        # its report must not show a previous invocation's.
+        dir=$(mktemp -d "$RUNNER_TEMP/lenslet.XXXXXX")
+        report="$dir/report.json"
+        markdown="$dir/report.md"
+        args=(run --upstream "$UPSTREAM" --json "$report" --markdown "$markdown")
+        lock="${LOCK:-lenslet.lock}"
+        args+=(--lock "$lock")
+        if [ "$CHECK" = "true" ]; then
+          if [ -f "$lock" ]; then
+            args+=(--check)
+            [ "$STRICT" = "true" ] && args+=(--strict)
+          else
+            echo "::notice::No $lock yet: reporting only. Create it with \`lenslet run --update -- $COMMAND\` and commit it."
+          fi
+        fi
+        "$LENSLET_BIN" "${args[@]}" -- bash -c "$COMMAND"
+        code=$?
+        [ -f "$markdown" ] && cat "$markdown" >> "$GITHUB_STEP_SUMMARY"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        if [ -f "$report" ]; then
+          echo "report=$report" >> "$GITHUB_OUTPUT"
+          echo "markdown=$markdown" >> "$GITHUB_OUTPUT"
+        fi
+        if [ "$code" = "3" ]; then
+          echo "::error::AWS access changed: see the job summary. Accept it with \`lenslet run --update\` and commit $lock."
+        fi
+        exit 0
+
+    - name: Comment on the pull request
+      if: inputs.comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+        MARKDOWN: ${{ steps.run.outputs.markdown }}
+      run: |
+        # Commenting is best effort (fork PRs get a read-only token).
+        set +e -uo pipefail
+        markdown="$MARKDOWN"
+        [ -n "$markdown" ] && [ -f "$markdown" ] || exit 0
+        marker="<!-- lenslet-report -->"
+        body="$marker
+        $(cat "$markdown")"
+        # Only a numeric id counts: on an API error gh prints the error body.
+        existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" 2>/dev/null \
+          | grep -E '^[0-9]+$' | head -n 1)
+        if [ -n "$existing" ]; then
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -f body="$body" > /dev/null
+        else
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" > /dev/null
+        fi || echo "::warning::Could not comment on the PR (forks get a read-only token). The report is in the job summary."
+        exit 0
+
+    - name: Result
+      shell: bash
+      env:
+        CODE: ${{ steps.run.outputs.exit-code }}
+      run: exit "${CODE:-2}"

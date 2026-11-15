@@ -1,0 +1,11 @@
+# AWS access observed by `lenslet run`: action, resource.
+# Regenerate with `lenslet run --update -- <tests>`; review changes like code.
+# Mark a line `# test` when only the tests need it; `lenslet policy` leaves it out.
+dynamodb:CreateTable  arn:aws:dynamodb:*:*:table/orders  # test
+dynamodb:GetItem      arn:aws:dynamodb:*:*:table/orders
+dynamodb:PutItem      arn:aws:dynamodb:*:*:table/orders
+s3:CreateBucket       arn:aws:s3:::shop-receipts  # test
+s3:GetObject          arn:aws:s3:::shop-receipts/*
+s3:PutObject          arn:aws:s3:::shop-receipts/*
+sqs:CreateQueue       arn:aws:sqs:*:*:fulfilment  # test
+sqs:SendMessage       arn:aws:sqs:*:*:fulfilment

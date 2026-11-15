@@ -90,6 +90,14 @@ impl Env {
     /// (it reads its calls and exit code from the environment), so runs are
     /// runs of one command, as with a real `npm test`.
     fn run(&self, flags: &[&str], targets: &[&str], exit: i32) -> Output {
+        let upstream = format!("http://127.0.0.1:{}", self.port);
+        let mut args = vec!["run", "--upstream", &upstream];
+        args.extend_from_slice(flags);
+        self.invoke(&args, targets, exit)
+    }
+
+    /// `lenslet ARGS -- sh -c SCRIPT` with the scripted calls.
+    fn invoke(&self, args: &[&str], targets: &[&str], exit: i32) -> Output {
         let script = "test -n \"$AWS_ENDPOINT_URL\" || exit 90\n\
             test -n \"$AWS_SHARED_CREDENTIALS_FILE\" || exit 91\n\
             for target in $TARGETS; do\n\
@@ -100,12 +108,9 @@ impl Env {
                 -d '{\"QueueUrl\":\"http://127.0.0.1/000000000000/jobs\"}'\n\
             done\n\
             exit $EXIT\n";
-        let upstream = format!("http://127.0.0.1:{}", self.port);
-        let mut args = vec!["run", "--upstream", &upstream];
-        args.extend_from_slice(flags);
-        args.extend_from_slice(&["--", "sh", "-c", script]);
         Command::new(env!("CARGO_BIN_EXE_lenslet"))
-            .args(&args)
+            .args(args)
+            .args(["--", "sh", "-c", script])
             .current_dir(&self.work)
             .env("HOME", &self.home)
             .env("TARGETS", targets.join(" "))
@@ -268,6 +273,175 @@ fn the_lock_workflow_catches_new_access_and_regressions() {
     let policy: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(policy["Statement"][0]["Action"][0], "sqs:SendMessage");
     assert_eq!(policy["Statement"][0]["Resource"], "arn:aws:sqs:*:*:jobs");
+}
+
+#[test]
+fn strict_markdown_custom_lock_and_test_marks() {
+    if !has_curl() {
+        eprintln!("skipping: curl is not installed");
+        return;
+    }
+    let env = Env::new();
+    let lock = env.work.join("infra/aws.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let lock_flag = lock.to_str().unwrap();
+
+    let output = env.run(
+        &["--update", "--lock", lock_flag],
+        &["SendMessage", "DeleteMessage"],
+        0,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).contains("wrote infra/aws.lock (2 permissions)"));
+
+    // A `# test` mark survives --update, and policy leaves the line out.
+    let text = std::fs::read_to_string(&lock).unwrap();
+    let marked = text.replace(
+        "sqs:DeleteMessage  arn:aws:sqs:*:*:jobs",
+        "sqs:DeleteMessage  arn:aws:sqs:*:*:jobs  # test",
+    );
+    std::fs::write(&lock, marked).unwrap();
+    let output = env.run(
+        &["--update", "--lock", lock_flag],
+        &["SendMessage", "DeleteMessage"],
+        0,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        std::fs::read_to_string(&lock)
+            .unwrap()
+            .contains("arn:aws:sqs:*:*:jobs  # test")
+    );
+    let output = env.lenslet(&["policy", "--lock", lock_flag]);
+    let policy: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        policy["Statement"][0]["Action"],
+        serde_json::json!(["sqs:SendMessage"])
+    );
+
+    // Using less than the lock: --check passes, --strict fails and says why.
+    let markdown = env.home.join("report.md");
+    let output = env.run(
+        &[
+            "--check",
+            "--lock",
+            lock_flag,
+            "--markdown",
+            markdown.to_str().unwrap(),
+        ],
+        &["SendMessage"],
+        0,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).contains("unused: 1 permission in infra/aws.lock"));
+    let md = std::fs::read_to_string(&markdown).unwrap();
+    assert!(md.contains("AWS access is within `infra/aws.lock`"), "{md}");
+    assert!(md.contains("| − | `sqs:DeleteMessage`"), "{md}");
+    let output = env.run(
+        &["--check", "--strict", "--lock", lock_flag],
+        &["SendMessage"],
+        0,
+    );
+    assert_eq!(output.status.code(), Some(3));
+
+    // New access shows in the Markdown with the call that needed it.
+    let output = env.run(
+        &[
+            "--check",
+            "--lock",
+            lock_flag,
+            "--markdown",
+            markdown.to_str().unwrap(),
+        ],
+        &["SendMessage", "DeleteMessage", "PurgeQueue"],
+        0,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let md = std::fs::read_to_string(&markdown).unwrap();
+    assert!(
+        md.contains("| + | `sqs:PurgeQueue` | `arn:aws:sqs:*:*:jobs` | SQS PurgeQueue |"),
+        "{md}"
+    );
+}
+
+#[test]
+fn init_writes_the_workflow_and_the_lock() {
+    if !has_curl() {
+        eprintln!("skipping: curl is not installed");
+        return;
+    }
+    let env = Env::new();
+    let upstream = format!("http://127.0.0.1:{}", env.port);
+    let output = env.invoke(&["init", "--upstream", &upstream], &["SendMessage"], 0);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let workflow = std::fs::read_to_string(env.work.join(".github/workflows/lenslet.yml")).unwrap();
+    assert!(workflow.contains(&format!(
+        "uses: hxddh/lenslet@lenslet-v{}",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert!(workflow.contains(&format!("upstream: 'http://127.0.0.1:{}'", env.port)));
+    assert!(workflow.contains("command: 'sh -c "), "{workflow}");
+    let lock = std::fs::read_to_string(env.work.join("lenslet.lock")).unwrap();
+    assert!(lock.contains("sqs:SendMessage"));
+
+    // Running again leaves an edited workflow alone.
+    std::fs::write(env.work.join(".github/workflows/lenslet.yml"), "# mine\n").unwrap();
+    let output = env.invoke(&["init", "--upstream", &upstream], &["SendMessage"], 0);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).contains("exists, left alone"));
+    assert_eq!(
+        std::fs::read_to_string(env.work.join(".github/workflows/lenslet.yml")).unwrap(),
+        "# mine\n"
+    );
+
+    // No emulator: init says how to start one instead of guessing.
+    let output = env.lenslet(&["init", "--upstream", "http://127.0.0.1:1", "--", "true"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("Start your emulator first"));
+}
+
+#[test]
+fn real_keys_never_reach_the_trace() {
+    if !has_curl() {
+        eprintln!("skipping: curl is not installed");
+        return;
+    }
+    let env = Env::new();
+    // No emulator credentials file at all: the case 3.0 got wrong.
+    std::fs::remove_dir_all(env.home.join(".aws")).unwrap();
+    let summary = env.home.join("s.json");
+    let script = "curl -s -o /dev/null -X POST \"$AWS_ENDPOINT_URL/\" \
+        -H \"authorization: AWS4-HMAC-SHA256 Credential=$AWS_ACCESS_KEY_ID/20261115/us-east-1/sqs/aws4_request, Signature=x\" \
+        -H 'x-amz-target: AmazonSQS.ListQueues' -d '{}'";
+    let upstream = format!("http://127.0.0.1:{}", env.port);
+    let output = Command::new(env!("CARGO_BIN_EXE_lenslet"))
+        .args([
+            "run",
+            "--upstream",
+            &upstream,
+            "--json",
+            summary.to_str().unwrap(),
+        ])
+        .args(["--", "sh", "-c", script])
+        .current_dir(&env.work)
+        .env("HOME", &env.home)
+        .env("AWS_ACCESS_KEY_ID", "AKIAREALKEYDONOTLEAK")
+        .env("AWS_SECRET_ACCESS_KEY", "real-secret")
+        .env_remove("AWS_SHARED_CREDENTIALS_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+    let trace = std::fs::read_to_string(report["trace"].as_str().unwrap()).unwrap();
+    assert!(
+        !trace.contains("AKIAREALKEYDONOTLEAK"),
+        "the real key id leaked"
+    );
+    assert!(
+        trace.contains("lenslet-local"),
+        "placeholder keys were used"
+    );
 }
 
 #[test]

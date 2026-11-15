@@ -48,7 +48,13 @@ pub struct AccessUse {
     /// Needed by another call rather than called directly (KMS, PassRole).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub implied: bool,
+    /// The calls that needed it, e.g. `DYNAMODB DeleteItem` (first few).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<String>,
 }
+
+/// Distinct calls kept per permission in `via`.
+const VIA_LIMIT: usize = 3;
 
 impl Summary {
     /// Whether a call has started and not yet been recorded as finished.
@@ -83,6 +89,10 @@ impl Summary {
             } else {
                 entry.implied && !own
             };
+            let via = format!("{} {}", trace.service.to_ascii_uppercase(), trace.operation);
+            if entry.via.len() < VIA_LIMIT && !entry.via.contains(&via) {
+                entry.via.push(via);
+            }
         }
         if let Some(problem) = trace.problem.as_ref() {
             self.errors += 1;
@@ -300,6 +310,20 @@ impl Report {
             )),
             None => {}
         }
+        if let Some(lock) = self.lock.as_deref()
+            && !self.access_unused.is_empty()
+        {
+            out.push_str(&format!(
+                "  unused: {} in {lock} not exercised by this run\n",
+                plural(self.access_unused.len(), "permission")
+            ));
+            for access in self.access_unused.iter().take(LISTED_ACCESS) {
+                out.push_str(&format!(
+                    "    - {:<32} {}\n",
+                    access.action, access.resource
+                ));
+            }
+        }
         if self.unfinished > 0 {
             out.push_str(&format!(
                 "  {} still in flight when the command exited\n",
@@ -313,6 +337,121 @@ impl Report {
         }
         out.push_str(&format!(
             "lenslet: trace {trace} · `lenslet ui` to inspect\n"
+        ));
+        out
+    }
+}
+
+impl Report {
+    /// The report as GitHub-flavored Markdown: what a PR comment or a CI job
+    /// summary shows. Access changes come first, each with the calls behind it.
+    pub fn markdown(&self) -> String {
+        let mut out = String::new();
+        let command = if self.command.is_empty() {
+            "proxy session".to_string()
+        } else {
+            format!("`{}`", self.command.join(" ").replace('`', "'"))
+        };
+        let exit = match self.exit_code {
+            Some(0) => "passed".to_string(),
+            Some(code) => format!("**failed** (exit {code})"),
+            None => "ended".to_string(),
+        };
+        out.push_str(&format!("### Lenslet · {command} {exit}\n\n"));
+        out.push_str(&format!(
+            "{} · {} · {}\n\n",
+            plural(self.calls, "AWS call"),
+            plural(self.errors, "error"),
+            plural(self.services.len(), "service")
+        ));
+
+        let via = |access: &crate::access::Access| {
+            self.access
+                .iter()
+                .find(|entry| entry.action == access.action && entry.resource == access.resource)
+                .map(|entry| {
+                    let mut text = entry.used.via.join(", ");
+                    if entry.used.implied {
+                        text.push_str(" (implied)");
+                    }
+                    text
+                })
+                .unwrap_or_default()
+        };
+        match self.lock.as_deref() {
+            Some(lock) if !self.access_added.is_empty() => {
+                out.push_str(&format!(
+                    "**{} not in `{lock}`.** Review them; if they are intended, run `lenslet run --update` and commit `{lock}`.\n\n",
+                    plural(self.access_added.len(), "permission")
+                ));
+                out.push_str("| | Permission | Resource | Needed by |\n|---|---|---|---|\n");
+                for access in &self.access_added {
+                    out.push_str(&format!(
+                        "| + | `{}` | `{}` | {} |\n",
+                        access.action,
+                        access.resource,
+                        via(access)
+                    ));
+                }
+                out.push('\n');
+            }
+            Some(lock) => out.push_str(&format!(
+                "AWS access is within `{lock}` ({} used).\n\n",
+                plural(self.access.len(), "permission")
+            )),
+            None => out.push_str(&format!(
+                "{} observed; there is no `lenslet.lock` to compare with yet.\n\n",
+                plural(self.access.len(), "permission")
+            )),
+        }
+        if let Some(lock) = self.lock.as_deref()
+            && !self.access_unused.is_empty()
+        {
+            out.push_str(&format!(
+                "<details><summary>{} in <code>{lock}</code> not exercised by this run</summary>\n\n",
+                plural(self.access_unused.len(), "permission")
+            ));
+            out.push_str("| | Permission | Resource |\n|---|---|---|\n");
+            for access in &self.access_unused {
+                out.push_str(&format!(
+                    "| − | `{}` | `{}` |\n",
+                    access.action, access.resource
+                ));
+            }
+            out.push_str("\n</details>\n\n");
+        }
+        if !self.failures.is_empty() {
+            let new: BTreeSet<FailureKind> = self
+                .regressions
+                .as_ref()
+                .map(|regressions| regressions.new_failures.iter().cloned().collect())
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "**{}**\n\n| Call | Status | Error | Likely cause |\n|---|---|---|---|\n",
+                plural(self.failures.len(), "failed call")
+            ));
+            for failure in self.failures.iter().take(LISTED_FAILURES * 2) {
+                let kind = FailureKind {
+                    service: failure.service.clone(),
+                    operation: failure.operation.clone(),
+                    code: failure.code.clone(),
+                };
+                let marker = if new.contains(&kind) { " **new**" } else { "" };
+                out.push_str(&format!(
+                    "| {} {}{marker} | {} | `{}` {} | {} |\n",
+                    failure.service.to_ascii_uppercase(),
+                    failure.operation,
+                    failure.status,
+                    failure.code,
+                    one_line(failure.message.as_deref().unwrap_or(""), 100).replace('|', "\\|"),
+                    failure.hint.as_deref().unwrap_or("").replace('|', "\\|"),
+                ));
+            }
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "<sub>Lenslet {} · observed access from this run, not a security review</sub>\n",
+            env!("CARGO_PKG_VERSION")
         ));
         out
     }
@@ -490,5 +629,57 @@ mod tests {
         let mut report = report(&summary);
         report.set_access(&summary, None);
         assert!(report.render("t").contains("--update"));
+    }
+
+    #[test]
+    fn markdown_explains_access_changes_and_failures() {
+        let mut summary = Summary::default();
+        summary.observe(&trace("a", "sqs", 200, None));
+        summary.observe(&trace(
+            "b",
+            "s3",
+            404,
+            Some(r#"<Error><Code>NoSuchKey</Code><Message>gone | away</Message></Error>"#),
+        ));
+        let mut report = report(&summary);
+        report.command = vec!["npm".into(), "test".into()];
+        report.exit_code = Some(1);
+        report.lock = Some("lenslet.lock".into());
+        let locked: BTreeSet<Access> = [
+            access("sqs:SendMessage", "arn:aws:sqs:*:*:jobs"),
+            access("sqs:DeleteMessage", "arn:aws:sqs:*:*:jobs"),
+        ]
+        .into();
+        report.set_access(&summary, Some(&locked));
+        assert_eq!(
+            summary.access[&access("s3:SendMessage", "arn:aws:s3:*:*:jobs")].via,
+            ["S3 SendMessage"]
+        );
+        let md = report.markdown();
+        assert!(
+            md.starts_with("### Lenslet · `npm test` **failed** (exit 1)"),
+            "{md}"
+        );
+        assert!(
+            md.contains("**1 permission not in `lenslet.lock`.**"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| + | `s3:SendMessage` | `arn:aws:s3:*:*:jobs` | S3 SendMessage |"),
+            "{md}"
+        );
+        assert!(
+            md.contains("1 permission in <code>lenslet.lock</code> not exercised"),
+            "{md}"
+        );
+        assert!(md.contains("| − | `sqs:DeleteMessage`"), "{md}");
+        assert!(
+            md.contains("`NoSuchKey` gone \\| away"),
+            "pipes are escaped: {md}"
+        );
+
+        let text = report.render("t");
+        assert!(text.contains("unused: 1 permission in lenslet.lock not exercised by this run"));
+        assert!(text.contains("- sqs:DeleteMessage"));
     }
 }
