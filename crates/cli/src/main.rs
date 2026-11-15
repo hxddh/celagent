@@ -1,12 +1,17 @@
-//! `lenslet`: run a program against local AWS and see every call it made.
+//! `lenslet`: run a program against local AWS and see what it did, what failed,
+//! and what AWS access it needs.
 //!
 //! ```text
-//! lenslet run -- npm test     proxy + env for one command, summary at the end
-//! lenslet proxy               long-running proxy on 127.0.0.1:9297
-//! lenslet ui                  open the window (also: bare `lenslet`)
+//! lenslet run -- npm test     proxy + env for one command; report at the end
+//! lenslet run                 a long-running proxy on 127.0.0.1:9297
+//! lenslet last                the report of the newest run
+//! lenslet policy              an IAM policy from lenslet.lock
+//! lenslet ui                  the window (also: bare `lenslet`)
 //! ```
 
+mod access;
 mod capture;
+mod lock;
 mod problem;
 mod proxy;
 mod runs;
@@ -26,39 +31,48 @@ use anyhow::{Context, Result, bail};
 use crate::{
     capture::MAX_CAPTURE_BYTES,
     proxy::{Options, Server},
-    runs::RunInfo,
+    summary::Report,
+    trace::RunHeader,
 };
+
+/// Exit code when the command passed but `--check` found access outside the lock.
+const EXIT_ACCESS_CHANGED: i32 = 3;
 
 fn usage() -> String {
     format!(
-        "lenslet {version} — see what your code sends to local AWS
+        "lenslet {version} — what your code does against local AWS, and what it needs
 
 Usage:
   lenslet run [options] [--] COMMAND [ARGS...]
-      Run COMMAND with AWS_ENDPOINT_URL pointing at Lenslet, then print what it
-      called and why calls failed. Exits with COMMAND's exit code.
-  lenslet proxy [options]
-      Keep a proxy running on 127.0.0.1:9297 (point SDKs at http://127.0.0.1:9297).
+      Run COMMAND with AWS_ENDPOINT_URL pointing at Lenslet. Prints every
+      failed call with its cause, the AWS access the run used, and what changed
+      since the last run and since lenslet.lock.
+  lenslet run [options]
+      No command: keep a proxy running on 127.0.0.1:9297 until Ctrl-C.
+  lenslet last [--json]
+      The report of the newest run.
+  lenslet policy [--lock PATH]
+      An IAM policy document granting exactly what lenslet.lock lists.
   lenslet ui
-      Open the Lenslet window (same as running `lenslet` with no arguments).
+      Open the window (same as `lenslet` with no arguments).
 
 Run options:
-  --json PATH          also write the summary as JSON (`-` for stdout)
-  --quiet              no banner or summary on stderr
-  --ui                 open the window before running COMMAND
+  --check              exit {changed} if the run used access not in ./lenslet.lock
+  --update             write ./lenslet.lock from this run
+  --json PATH          also write the report as JSON (`-` for stdout)
+  --quiet              no banner or report on stderr
+  --ui                 open the window first
   --no-env             set only AWS_ENDPOINT_URL, leave credentials/config alone
-
-Proxy options (run and proxy):
-  --listen PORT        loopback port (run: a free port; proxy: 9297)
+  --listen PORT        loopback port (default: a free port; 9297 without COMMAND)
   --upstream ADDRESS   AWS Emulator port or http(s) URL (default 9298)
   --emulator-ca PATH   emulator CA (default ~/.aws/emulator/PORT/ca.pem)
-  --trace PATH         trace file (default: a new file in ~/.lenslet/runs)
-  --cert PATH / --key PATH
-                       TLS identity for https:// clients (generated)
+  --trace PATH         run file (default: a new file in ~/.lenslet/runs)
 
-The listening port accepts plain HTTP and TLS. Bodies are forwarded unchanged;
-the trace keeps up to {kib} KiB of each text body and is owner-only (0600).",
+Exit codes: COMMAND's own code when it fails; {changed} when it passed but --check
+found new access; 2 for Lenslet's own errors; otherwise 0.
+Bodies are forwarded unchanged; traces keep up to {kib} KiB of each text body.",
         version = env!("CARGO_PKG_VERSION"),
+        changed = EXIT_ACCESS_CHANGED,
         kib = MAX_CAPTURE_BYTES / 1024,
     )
 }
@@ -87,7 +101,8 @@ fn main() -> ExitCode {
     };
     let result = match command.as_str() {
         "run" => runtime().and_then(|runtime| runtime.block_on(run(args))),
-        "proxy" => runtime().and_then(|runtime| runtime.block_on(serve_proxy(args))),
+        "last" => last(args),
+        "policy" => policy(args),
         "ui" => open_ui(None).map(|()| 0),
         "-V" | "--version" | "version" => {
             println!("lenslet {}", env!("CARGO_PKG_VERSION"));
@@ -124,6 +139,8 @@ struct RunArgs {
     quiet: bool,
     ui: bool,
     no_env: bool,
+    check: bool,
+    update: bool,
 }
 
 fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
@@ -134,7 +151,10 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
         quiet: false,
         ui: false,
         no_env: false,
+        check: false,
+        update: false,
     };
+    let mut listen_given = false;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().with_context(|| format!("{arg} requires a value"));
@@ -147,8 +167,11 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
             "--quiet" | "-q" => parsed.quiet = true,
             "--ui" => parsed.ui = true,
             "--no-env" => parsed.no_env = true,
+            "--check" => parsed.check = true,
+            "--update" => parsed.update = true,
             "-h" | "--help" => bail!("{}", usage()),
             flag if flag.starts_with('-') => {
+                listen_given |= flag == "--listen";
                 if !parsed.options.accept(flag, &mut value)? {
                     bail!("unknown option `{flag}`; try `lenslet --help`");
                 }
@@ -161,7 +184,15 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
         }
     }
     if parsed.command.is_empty() {
-        bail!("`lenslet run` needs a command, e.g. `lenslet run -- npm test`");
+        if parsed.check || parsed.update {
+            bail!("--check and --update need a command, e.g. `lenslet run --update -- npm test`");
+        }
+        if !listen_given {
+            parsed.options.listen = 9297;
+        }
+    }
+    if parsed.check && parsed.update {
+        bail!("use --check or --update, not both");
     }
     Ok(parsed)
 }
@@ -197,9 +228,17 @@ fn child_env(
             injected = true;
         }
     }
-    // A named profile from the real config does not exist in the emulator's.
+    // A named profile from the real config does not exist in the emulator's,
+    // and keys in the environment would override the emulator's credentials
+    // (and put a real access key id into the local trace).
     if injected {
-        for name in ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"] {
+        for name in [
+            "AWS_PROFILE",
+            "AWS_DEFAULT_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ] {
             if current(name).is_some() {
                 env.remove.push(name.to_string());
             }
@@ -217,63 +256,146 @@ async fn run(args: Vec<String>) -> Result<i32> {
         quiet,
         ui,
         no_env,
+        check,
+        update,
     } = parse_run(args, &home)?;
+    let cwd = std::env::current_dir().context("read the current directory")?;
+    let lock_path = lock::path_in(&cwd);
+    let locked = lock::read(&lock_path)?;
+    if check && locked.is_none() {
+        bail!(
+            "--check needs {}; create it with `lenslet run --update -- <tests>`",
+            lock::FILE_NAME
+        );
+    }
+    let runs_dir = runs::dir(&home);
     let trace_path = match options.trace.clone() {
         Some(path) => path,
-        None => runs::create(&runs::dir(&home))?,
+        None => runs::create(&runs_dir)?,
     };
-    let emulator_up = options.upstream.reachable().await;
-    if !emulator_up {
+    if !options.upstream.reachable().await {
         eprintln!(
             "lenslet: warning: nothing is listening on {} — start AWS Emulator first:\n  \
              EMULATOR_TELEMETRY=off aws-emulator --telemetry off --port {}",
             options.upstream.base, options.upstream.port
         );
     }
-    let server = Server::start(&options, trace_path.clone()).await?;
-    let endpoint = server.endpoint();
-    let mut info = RunInfo {
-        kind: "run".to_string(),
+    let header = RunHeader {
+        version: trace::VERSION,
+        run: runs::run_id(&trace_path),
         command: command.clone(),
+        cwd: cwd.display().to_string(),
         pid: std::process::id(),
+        started: runs::now(),
+        lock: locked.is_some().then(|| lock::FILE_NAME.to_string()),
+        ..RunHeader::default()
+    };
+    let server = Server::start(&options, trace_path.clone(), header, locked.clone()).await?;
+    let endpoint = server.endpoint();
+    let started = Instant::now();
+
+    let code = if command.is_empty() {
+        serve_until_interrupted(&server, &options, &home).await;
+        None
+    } else {
+        let env = child_env(&endpoint, &options.emulator_dir(), no_env, |name| {
+            std::env::var_os(name)
+        });
+        if !quiet {
+            eprintln!(
+                "lenslet: {} → {} · trace {}",
+                endpoint,
+                options.upstream.base,
+                tilde(&trace_path, &home)
+            );
+            for (name, value) in &env.set {
+                eprintln!("lenslet:   {name}={}", tilde(Path::new(value), &home));
+            }
+            for name in &env.remove {
+                eprintln!("lenslet:   unset {name} (the emulator's credentials are used instead)");
+            }
+            let injected = env
+                .set
+                .iter()
+                .any(|(name, _)| name == "AWS_SHARED_CREDENTIALS_FILE");
+            if !no_env && !injected && std::env::var_os("AWS_SHARED_CREDENTIALS_FILE").is_none() {
+                eprintln!(
+                    "lenslet: warning: no emulator credentials in {}; the program uses its own AWS config",
+                    tilde(&options.emulator_dir(), &home)
+                );
+            }
+        }
+        if ui && let Err(error) = open_ui(options.trace.as_deref()) {
+            eprintln!("lenslet: {error:#}");
+        }
+        Some(run_child(&command, &env).await?)
+    };
+
+    let state = server.state.clone();
+    server.stop(Duration::from_secs(2)).await;
+    let summary = state.trace.summary();
+    let mut report = Report {
+        version: trace::VERSION,
+        run: runs::run_id(&trace_path),
+        command: command.clone(),
+        exit_code: code,
+        ended: runs::now(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        calls: summary.calls,
+        errors: summary.errors,
+        unfinished: summary.unfinished,
+        services: summary.services.clone(),
+        failures: summary.failures.clone(),
+        lock: locked.is_some().then(|| lock::FILE_NAME.to_string()),
+        trace: trace_path.display().to_string(),
         endpoint: endpoint.clone(),
         upstream: options.upstream.base.clone(),
-        started: runs::now(),
-        ..RunInfo::default()
+        ..Report::default()
     };
-    runs::write_info(&trace_path, &info)?;
+    report.set_access(&summary, locked.as_ref());
+    let runs_dir = trace_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(runs_dir);
+    if let Some(previous) =
+        runs::previous(&runs_dir, &trace_path, &command, &cwd.display().to_string())
+    {
+        report.compare_with(&previous);
+    }
+    state.trace.end(&report);
 
-    let env = child_env(&endpoint, &options.emulator_dir(), no_env, |name| {
-        std::env::var_os(name)
-    });
     if !quiet {
-        eprintln!(
-            "lenslet: {} → {} · trace {}",
-            endpoint,
-            options.upstream.base,
-            tilde(&trace_path, &home)
-        );
-        for (name, value) in &env.set {
-            eprintln!("lenslet:   {name}={}", tilde(Path::new(value), &home));
-        }
-        for name in &env.remove {
-            eprintln!("lenslet:   unset {name} (the emulator config has no such profile)");
-        }
-        let injected = env
-            .set
-            .iter()
-            .any(|(name, _)| name == "AWS_SHARED_CREDENTIALS_FILE");
-        if !no_env && !injected && std::env::var_os("AWS_SHARED_CREDENTIALS_FILE").is_none() {
+        eprint!("{}", report.render(&tilde(&trace_path, &home)));
+    }
+    if update {
+        // A failed run stops early, so its access is incomplete: keep the old lock.
+        if code == Some(0) {
+            lock::write(&lock_path, &summary.access)?;
+            if !quiet {
+                eprintln!(
+                    "lenslet: wrote {} ({} permissions)",
+                    lock::FILE_NAME,
+                    summary.access.len()
+                );
+            }
+        } else {
             eprintln!(
-                "lenslet: warning: no emulator credentials in {}; the program uses its own AWS config",
-                tilde(&options.emulator_dir(), &home)
+                "lenslet: {} not written: the command failed, so its access may be incomplete",
+                lock::FILE_NAME
             );
         }
     }
-    if ui && let Err(error) = open_ui(options.trace.as_deref()) {
-        eprintln!("lenslet: {error:#}");
+    if let Some(target) = json {
+        write_json(&report, &target)?;
     }
+    Ok(match code {
+        Some(code) if code != 0 => code,
+        _ if check && !report.access_added.is_empty() => EXIT_ACCESS_CHANGED,
+        _ => 0,
+    })
+}
 
+async fn run_child(command: &[String], env: &ChildEnv) -> Result<i32> {
     let mut child = tokio::process::Command::new(&command[0]);
     child.args(&command[1..]).stdin(Stdio::inherit());
     for (name, value) in &env.set {
@@ -282,55 +404,102 @@ async fn run(args: Vec<String>) -> Result<i32> {
     for name in &env.remove {
         child.env_remove(name);
     }
-    let started = Instant::now();
     let mut child = match child.spawn() {
         Ok(child) => child,
         Err(error) => {
             eprintln!("lenslet: cannot start `{}`: {error}", command[0]);
-            info.ended = Some(runs::now());
-            info.exit_code = Some(127);
-            runs::write_info(&trace_path, &info).ok();
             return Ok(127);
         }
     };
     // Ctrl-C reaches the child through the terminal; Lenslet waits for it to
-    // exit so the summary still covers every call.
+    // exit so the report still covers every call.
     let interrupts = tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
     let status = child.wait().await.context("wait for the command")?;
     interrupts.abort();
-    let code = exit_code(status);
-    let elapsed = started.elapsed().as_millis();
+    Ok(exit_code(status))
+}
 
-    let state = server.state.clone();
-    server.stop(Duration::from_secs(2)).await;
-    let summary = state.trace.summary();
-    info.ended = Some(runs::now());
-    info.exit_code = Some(code);
-    runs::write_info(&trace_path, &info)?;
+async fn serve_until_interrupted(server: &Server, options: &Options, home: &Path) {
+    println!("lenslet {} · proxy until Ctrl-C", env!("CARGO_PKG_VERSION"));
+    println!("  endpoint  {}", server.endpoint());
+    println!("  upstream  {}", options.upstream.base);
+    println!(
+        "  sdk env   AWS_ENDPOINT_URL={} AWS_SHARED_CREDENTIALS_FILE={} AWS_CONFIG_FILE={}",
+        server.endpoint(),
+        tilde(&options.emulator_dir().join("emulator_credentials"), home),
+        tilde(&options.emulator_dir().join("config"), home),
+    );
+    tokio::signal::ctrl_c().await.ok();
+    eprintln!();
+}
 
-    if !quiet {
-        eprint!("{}", summary.render(&tilde(&trace_path, &home), elapsed));
+fn write_json(report: &Report, target: &str) -> Result<()> {
+    let text = serde_json::to_string_pretty(report).context("encode report")?;
+    if target == "-" {
+        println!("{text}");
+        Ok(())
+    } else {
+        std::fs::write(target, format!("{text}\n")).with_context(|| format!("write {target}"))
     }
-    if let Some(target) = json {
-        let mut value = serde_json::to_value(&summary).context("encode summary")?;
-        if let Some(object) = value.as_object_mut() {
-            object.insert("version".into(), 2.into());
-            object.insert("command".into(), command.clone().into());
-            object.insert("exit_code".into(), code.into());
-            object.insert("duration_ms".into(), (elapsed as u64).into());
-            object.insert("endpoint".into(), endpoint.into());
-            object.insert("upstream".into(), options.upstream.base.clone().into());
-            object.insert("trace".into(), trace_path.display().to_string().into());
+}
+
+/// `lenslet last [--json]`: the newest run's report, without running anything.
+fn last(args: Vec<String>) -> Result<i32> {
+    let json = match args.as_slice() {
+        [] => false,
+        [flag] if flag == "--json" => true,
+        _ => bail!("usage: lenslet last [--json]"),
+    };
+    let home = home();
+    let Some(newest) = runs::list(&runs::dir(&home)).pop() else {
+        bail!("no runs yet; try `lenslet run -- <command>`");
+    };
+    match runs::report(&newest) {
+        Some(report) if json => write_json(&report, "-").map(|()| 0),
+        Some(report) => {
+            eprint!("{}", report.render(&tilde(&newest, &home)));
+            Ok(0)
         }
-        let text = serde_json::to_string_pretty(&value).context("encode summary")?;
-        if target == "-" {
-            println!("{text}");
-        } else {
-            std::fs::write(&target, format!("{text}\n"))
-                .with_context(|| format!("write {target}"))?;
+        None => {
+            let command = runs::header(&newest)
+                .map(|header| header.command.join(" "))
+                .unwrap_or_default();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"run": runs::run_id(&newest), "running": true, "command": command})
+                );
+            } else {
+                eprintln!(
+                    "lenslet: run {} is still running: {command}",
+                    runs::run_id(&newest)
+                );
+            }
+            Ok(0)
         }
     }
-    Ok(code)
+}
+
+/// `lenslet policy [--lock PATH]`: the locked access as an IAM policy.
+fn policy(args: Vec<String>) -> Result<i32> {
+    let path = match args.as_slice() {
+        [] => lock::path_in(&std::env::current_dir().context("read the current directory")?),
+        [flag, path] if flag == "--lock" => PathBuf::from(path),
+        _ => bail!("usage: lenslet policy [--lock PATH]"),
+    };
+    let Some(locked) = lock::read(&path)? else {
+        bail!(
+            "no {}; create it with `lenslet run --update -- <tests>`",
+            path.display()
+        );
+    };
+    println!("{}", serde_json::to_string_pretty(&lock::policy(&locked))?);
+    eprintln!(
+        "lenslet: observed access from {} ({} permissions). Review before attaching it to a role.",
+        path.display(),
+        locked.len()
+    );
+    Ok(0)
 }
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -345,67 +514,6 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         }
     }
     1
-}
-
-async fn serve_proxy(args: Vec<String>) -> Result<i32> {
-    let home = home();
-    let mut options = Options::new(&home, 9297);
-    let mut it = args.into_iter();
-    while let Some(arg) = it.next() {
-        let mut value = || it.next().with_context(|| format!("{arg} requires a value"));
-        if arg == "-h" || arg == "--help" {
-            println!("{}", usage());
-            return Ok(0);
-        }
-        if !options.accept(&arg, &mut value)? {
-            bail!("unknown option `{arg}`; try `lenslet --help`");
-        }
-    }
-    let trace_path = match options.trace.clone() {
-        Some(path) => path,
-        None => runs::create(&runs::dir(&home))?,
-    };
-    let server = Server::start(&options, trace_path.clone()).await?;
-    let mut info = RunInfo {
-        kind: "proxy".to_string(),
-        pid: std::process::id(),
-        endpoint: server.endpoint(),
-        upstream: options.upstream.base.clone(),
-        started: runs::now(),
-        ..RunInfo::default()
-    };
-    runs::write_info(&trace_path, &info)?;
-
-    println!("lenslet {} proxy", env!("CARGO_PKG_VERSION"));
-    println!("  endpoint  {}  (https:// works too)", server.endpoint());
-    println!("  upstream  {}", options.upstream.base);
-    println!("  trace     {}", tilde(&trace_path, &home));
-    println!(
-        "  sdk env   AWS_ENDPOINT_URL={} AWS_SHARED_CREDENTIALS_FILE={} AWS_CONFIG_FILE={}",
-        server.endpoint(),
-        tilde(&options.emulator_dir().join("emulator_credentials"), &home),
-        tilde(&options.emulator_dir().join("config"), &home),
-    );
-    if !options.upstream.reachable().await {
-        println!(
-            "  warning   nothing is listening on {} yet",
-            options.upstream.base
-        );
-    }
-
-    tokio::signal::ctrl_c().await.ok();
-    let state = server.state.clone();
-    server.stop(Duration::from_secs(1)).await;
-    info.ended = Some(runs::now());
-    runs::write_info(&trace_path, &info)?;
-    let summary = state.trace.summary();
-    eprintln!(
-        "\nlenslet: {} calls · {} errors · trace {}",
-        summary.calls,
-        summary.errors,
-        tilde(&trace_path, &home)
-    );
-    Ok(0)
 }
 
 /// Start the window next to this binary: `lenslet-ui`, or `Lenslet.app` on
@@ -488,7 +596,14 @@ mod tests {
         assert!(parsed.quiet);
         assert_eq!(parsed.command, ["pytest", "-k", "s3"]);
 
-        assert!(parse_run(strings(&[]), home).is_err());
+        // No command: a long-running proxy on the well-known port.
+        let parsed = parse_run(strings(&[]), home).unwrap();
+        assert!(parsed.command.is_empty());
+        assert_eq!(parsed.options.listen, 9297);
+        assert!(parse_run(strings(&["--check"]), home).is_err());
+        assert!(parse_run(strings(&["--check", "--update", "x"]), home).is_err());
+        let parsed = parse_run(strings(&["--check", "npm", "test"]), home).unwrap();
+        assert!(parsed.check);
         assert!(parse_run(strings(&["--nope", "x"]), home).is_err());
     }
 
@@ -500,7 +615,7 @@ mod tests {
         std::fs::write(dir.join("config"), "[default]").unwrap();
 
         let env = child_env("http://127.0.0.1:5000", &dir, false, |name| {
-            (name == "AWS_PROFILE").then(|| OsString::from("prod"))
+            matches!(name, "AWS_PROFILE" | "AWS_ACCESS_KEY_ID").then(|| OsString::from("prod"))
         });
         let names: Vec<&str> = env.set.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
@@ -511,7 +626,7 @@ mod tests {
                 "AWS_CONFIG_FILE"
             ]
         );
-        assert_eq!(env.remove, ["AWS_PROFILE"]);
+        assert_eq!(env.remove, ["AWS_PROFILE", "AWS_ACCESS_KEY_ID"]);
 
         // The user's own settings win; only the endpoint is forced.
         let env = child_env("http://x", &dir, false, |name| {

@@ -1,12 +1,15 @@
-//! The JSONL trace schema and its on-disk sink.
+//! The trace: one JSONL file per run, and its on-disk sink.
 //!
-//! One line per proxied call. Top-level fields are kept compatible with the
-//! existing UI (`at`, `method`, `path`, `host`, `service`, `operation`, `status`,
-//! `ms`, `authorization`) and the captured exchange is added under `request` and
-//! `response`. The trace is a local development artifact: it keeps the raw wire
-//! values (headers and text bodies) and is written owner-only.
+//! A run file is an event stream. The first line is the `run` header, then one
+//! `call` line per proxied call (a slow call may also get an earlier `pending`
+//! line with the same id), and the last line is the `end` report. Every fact a
+//! reader shows (the error, the IAM action, whether the access is new) is
+//! computed here once and written down, so the window, `--json` and agents
+//! all see the same thing. The trace keeps raw headers and text bodies and is
+//! written owner-only.
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -17,7 +20,54 @@ use anyhow::{Context, Result};
 use hyper::HeaderMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{problem::Problem, summary::Summary};
+use crate::{
+    access::{self, Access},
+    problem::Problem,
+    summary::{Report, Summary},
+};
+
+/// Schema version written in every run header.
+pub const VERSION: u32 = 3;
+
+/// The first line of a run file.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RunHeader {
+    pub version: u32,
+    /// The file stem, e.g. `20261115-054628-15569`.
+    pub run: String,
+    /// The program run under Lenslet; empty for a bare proxy session.
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub cwd: String,
+    pub pid: u32,
+    /// What SDKs point at, e.g. `http://127.0.0.1:43761`.
+    pub endpoint: String,
+    pub upstream: String,
+    pub started: String,
+    /// The lock file this run is compared with, if one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<String>,
+}
+
+/// One line of a run file, for readers.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Record {
+    Run(RunHeader),
+    // Read by tests; the CLI itself only needs the header and the report.
+    #[allow(dead_code)]
+    Call(Box<Trace>),
+    End(Box<Report>),
+}
+
+/// Write `value` as `{"type": kind, ...value}`.
+#[derive(Serialize)]
+struct Tagged<'a, T: Serialize> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(flatten)]
+    value: &'a T,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trace {
@@ -33,7 +83,7 @@ pub struct Trace {
     pub operation: String,
     pub status: u16,
     /// Wall time for the complete exchange, measured after the body finished.
-    pub ms: u128,
+    pub ms: u64,
     pub authorization: bool,
     /// SigV4 signing region, when the request was signed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +98,17 @@ pub struct Trace {
     /// Error code, message and likely cause of a failed call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<Problem>,
+    /// The IAM permissions this call needs (`s3:GetObject` on a bucket):
+    /// usually one; several for batches, transactions and copies; none when
+    /// the operation is unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<Access>,
+    /// Permissions the call implies elsewhere (SSE-KMS key, passed role).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implied: Vec<Access>,
+    /// The access is not in the lock file: this run grew the footprint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool,
     pub request: Message,
     pub response: Message,
 }
@@ -98,18 +159,24 @@ pub fn headers(headers: &HeaderMap) -> Vec<HeaderTrace> {
         .collect()
 }
 
-/// Append-only JSONL sink. One line per call, writes serialized. It also keeps
-/// the in-memory [`Summary`] that `lenslet run` prints at the end.
+/// Append-only run file. Writes are serialized; the sink also keeps the
+/// in-memory [`Summary`] that becomes the `end` report.
 pub struct TraceSink {
     path: PathBuf,
     summary: Mutex<Summary>,
+    /// Access recorded in the lock file, when there is one.
+    locked: Option<BTreeSet<Access>>,
 }
 
 impl TraceSink {
     /// Create the parent directory and the trace file so failures surface at
     /// startup rather than on the first proxied call. On Unix the trace is
     /// owner-only (0600).
-    pub fn new(path: PathBuf) -> Result<Self> {
+    pub fn new(
+        path: PathBuf,
+        header: &RunHeader,
+        locked: Option<BTreeSet<Access>>,
+    ) -> Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -119,10 +186,45 @@ impl TraceSink {
         }
         open_trace(&path).with_context(|| format!("open trace file {}", path.display()))?;
         set_owner_only(&path)?;
-        Ok(TraceSink {
+        let sink = TraceSink {
             path,
             summary: Mutex::new(Summary::default()),
-        })
+            locked,
+        };
+        sink.write("run", header);
+        Ok(sink)
+    }
+
+    /// Append the `end` report. Nothing is written after it.
+    pub fn end(&self, report: &Report) {
+        let _guard = self
+            .summary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.write("end", report);
+    }
+
+    fn write<T: Serialize>(&self, kind: &'static str, value: &T) {
+        let line = match serde_json::to_string(&Tagged { kind, value }) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("lenslet: cannot encode trace: {error}");
+                return;
+            }
+        };
+        match open_trace(&self.path) {
+            Ok(mut file) => {
+                // One write per line, so a reader never sees half a record
+                // followed by another writer's line.
+                if let Err(error) = file.write_all(format!("{line}\n").as_bytes()) {
+                    eprintln!("lenslet: cannot write trace: {error}");
+                }
+            }
+            Err(error) => eprintln!(
+                "lenslet: cannot open trace {}: {error}",
+                self.path.display()
+            ),
+        }
     }
 
     /// Note a call that has started (for the in-flight count).
@@ -141,16 +243,18 @@ impl TraceSink {
             .clone()
     }
 
-    /// Write one trace entry. Never fails the caller: trace problems are logged
-    /// to stderr and the proxy keeps forwarding.
-    pub fn record(&self, trace: &Trace) {
-        let line = match serde_json::to_string(trace) {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("lenslet: cannot encode trace: {error}");
-                return;
-            }
-        };
+    /// Write one call. Never fails the caller: trace problems are logged to
+    /// stderr and the proxy keeps forwarding.
+    pub fn record(&self, mut trace: Trace) {
+        if !trace.pending && trace.access.is_empty() {
+            let (own, implied) = access::derive(&trace);
+            trace.access = own;
+            trace.implied = implied;
+        }
+        if let Some(locked) = self.locked.as_ref() {
+            let new = trace_access(&trace).any(|access| !locked.contains(&access));
+            trace.new = new;
+        }
         // The summary lock also serializes writes, so this check and the
         // write are atomic: a pending line can never land after the call's
         // final line (which would make readers show a finished call as
@@ -162,22 +266,14 @@ impl TraceSink {
         if trace.pending && !summary.in_flight(&trace.id) {
             return;
         }
-        summary.observe(trace);
-        match open_trace(&self.path) {
-            Ok(mut file) => {
-                // One write per line, so a reader never sees half a record
-                // followed by another writer's line.
-                let line = format!("{line}\n");
-                if let Err(error) = file.write_all(line.as_bytes()) {
-                    eprintln!("lenslet: cannot write trace: {error}");
-                }
-            }
-            Err(error) => eprintln!(
-                "lenslet: cannot open trace {}: {error}",
-                self.path.display()
-            ),
-        }
+        summary.observe(&trace);
+        self.write("call", &trace);
     }
+}
+
+/// Every permission one call accounts for: its own, then the implied ones.
+pub fn trace_access(trace: &Trace) -> impl Iterator<Item = Access> + '_ {
+    trace.access.iter().chain(trace.implied.iter()).cloned()
 }
 
 fn open_trace(path: &Path) -> std::io::Result<File> {
@@ -251,6 +347,9 @@ mod tests {
             pending: false,
             error: None,
             problem: None,
+            access: Vec::new(),
+            implied: Vec::new(),
+            new: false,
             request: Message {
                 headers: headers(&request_headers),
                 content_type: Some("application/json".to_string()),
@@ -388,13 +487,29 @@ mod tests {
                 .as_nanos()
         ));
         let path = dir.join("nested/trace.jsonl");
-        let sink = TraceSink::new(path.clone()).unwrap();
-        sink.record(&sample_trace());
-        sink.record(&sample_trace());
+        let sink = TraceSink::new(path.clone(), &RunHeader::default(), None).unwrap();
+        sink.record(sample_trace());
+        sink.record(sample_trace());
         let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().count(), 2);
+        assert_eq!(
+            text.lines().count(),
+            3,
+            "the run header, then one line per call"
+        );
         assert!(text.ends_with('\n'));
-        assert!(text.lines().all(|line| line.starts_with('{')));
+        let records: Vec<Record> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(matches!(records[0], Record::Run(_)));
+        assert!(matches!(records[1], Record::Call(_)));
+        sink.end(&crate::summary::Report::default());
+        let last = fs::read_to_string(&path).unwrap();
+        let last = last.lines().last().unwrap();
+        assert!(matches!(
+            serde_json::from_str(last).unwrap(),
+            Record::End(_)
+        ));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -408,7 +523,7 @@ mod tests {
     fn a_pending_line_never_follows_the_final_line() {
         let dir = std::env::temp_dir().join(format!("lenslet-sink-{}", std::process::id()));
         let path = dir.join("trace.jsonl");
-        let sink = TraceSink::new(path.clone()).unwrap();
+        let sink = TraceSink::new(path.clone(), &RunHeader::default(), None).unwrap();
         let done = sample_trace();
         let late_pending = Trace {
             pending: true,
@@ -418,10 +533,14 @@ mod tests {
 
         // The timer lost the race: the call finished first.
         sink.start(&done.id);
-        sink.record(&done);
-        sink.record(&late_pending);
+        sink.record(done.clone());
+        sink.record(late_pending);
         let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().count(), 1, "the late pending line is dropped");
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "header + call; the late pending line is dropped"
+        );
         assert_eq!(sink.summary().unfinished, 0);
         assert_eq!(sink.summary().calls, 1);
 
@@ -431,13 +550,13 @@ mod tests {
             ..done.clone()
         };
         sink.start(&other.id);
-        sink.record(&Trace {
+        sink.record(Trace {
             pending: true,
             ..other.clone()
         });
         assert_eq!(sink.summary().unfinished, 1);
-        sink.record(&other);
-        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 3);
+        sink.record(other);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 4);
         assert_eq!(sink.summary().unfinished, 0);
         let _ = fs::remove_dir_all(&dir);
     }

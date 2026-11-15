@@ -9,16 +9,18 @@ use std::{
 
 use gpui::{
     AnyElement, ClipboardItem, Context, Div, ElementId, FocusHandle, FontWeight, KeyDownEvent,
-    MouseButton, Render, ScrollStrategy, Stateful, UniformListScrollHandle, WeakEntity, Window,
-    div, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, uniform_list,
+    MouseButton, Render, ScrollStrategy, SharedString, Stateful, UniformListScrollHandle,
+    WeakEntity, Window, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba,
+    uniform_list,
 };
 
+mod access;
 mod chrome;
 mod inspector;
 mod stream;
 mod widgets;
 
-use self::widgets::*;
+use self::{stream::new_pill, widgets::*};
 use crate::{
     demo, fonts, glyph,
     search::SearchInput,
@@ -45,6 +47,13 @@ enum TraceHealth {
     Ok,
     Missing,
     Error(String),
+}
+
+/// The left pane: every call, or the permissions those calls needed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Calls,
+    Access,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +101,7 @@ pub struct LensletApp {
     filter: Filter,
     query: String,
     tab: InspectorTab,
+    pane: Pane,
     show_all_services: bool,
 
     search: gpui::Entity<SearchInput>,
@@ -106,7 +116,7 @@ pub struct LensletApp {
     source: Source,
     /// The trace file being followed right now.
     trace_path: Option<PathBuf>,
-    /// The session that wrote it, from its `.run.json` sidecar.
+    /// The run being shown: its header, and its report once it ended.
     run: Option<RunInfo>,
     probe: Probe,
     tailer: Option<Tailer>,
@@ -134,10 +144,11 @@ impl LensletApp {
         let mut health = TraceHealth::Ok;
         let mut skipped = 0;
         let mut trace_path = None;
-        let mut run = None;
+        let run: Option<trace::RunInfo>;
 
         if demo {
-            rows = demo::demo_rows().into_iter().map(Arc::new).collect();
+            rows = trace::merge(&[], demo::demo_rows());
+            run = Some(demo::demo_run());
         } else {
             let mut tail = Tailer::follow(source.clone());
             match tail.poll() {
@@ -150,7 +161,7 @@ impl LensletApp {
             }
             skipped = tail.skipped();
             trace_path = tail.path().map(Path::to_path_buf);
-            run = tail.run().cloned();
+            run = tail.run();
             tailer = Some(tail);
         }
 
@@ -164,6 +175,7 @@ impl LensletApp {
             filter: Filter::All,
             query: String::new(),
             tab: InspectorTab::Overview,
+            pane: Pane::Calls,
             show_all_services: false,
             search,
             search_focus,
@@ -343,7 +355,7 @@ impl LensletApp {
         if let Some(tailer) = self.tailer.as_ref() {
             self.skipped = tailer.skipped();
             let path = tailer.path().map(Path::to_path_buf);
-            let run = tailer.run().cloned();
+            let run = tailer.run();
             if path != self.trace_path || run != self.run {
                 if path != self.trace_path {
                     self.probe = Probe::default();
@@ -577,6 +589,16 @@ impl LensletApp {
             {
                 self.reload_now(cx)
             }
+            "a" if !search_focused && !keystroke.modifiers.modified() => {
+                let next = if self.pane == Pane::Calls {
+                    Pane::Access
+                } else {
+                    Pane::Calls
+                };
+                self.set_pane(next, cx)
+            }
+            "[" if !search_focused => self.step_run(-1, cx),
+            "]" if !search_focused => self.step_run(1, cx),
             "1" if !search_focused && !keystroke.modifiers.modified() => {
                 self.set_tab(InspectorTab::Overview, cx)
             }
@@ -588,6 +610,97 @@ impl LensletApp {
             }
             _ => {}
         }
+    }
+
+    fn set_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
+        if self.pane != pane {
+            self.pane = pane;
+            cx.notify();
+        }
+    }
+
+    /// From the access table: show the calls behind one permission.
+    fn show_access(&mut self, access: trace::Access, cx: &mut Context<Self>) {
+        self.filter = Filter::Access(access);
+        self.pane = Pane::Calls;
+        self.selection_locked = false;
+        self.refresh_view();
+        self.reveal_selected();
+        cx.notify();
+    }
+
+    /// The runs this window can step through, and where the current one is.
+    fn run_position(&self) -> Option<(usize, usize)> {
+        let Source::Runs { dir, .. } = &self.source else {
+            return None;
+        };
+        let runs = trace::list_runs(dir);
+        let current = self.trace_path.as_ref()?;
+        let index = runs.iter().position(|run| run == current)?;
+        Some((index + 1, runs.len()))
+    }
+
+    /// `[` / `]`: the previous or next run. Stepping onto the newest run
+    /// follows new runs again.
+    fn step_run(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
+        let Source::Runs { dir, .. } = &self.source else {
+            self.show_toast("pinned to LENSLET_TRACE".to_string(), cx);
+            return;
+        };
+        let dir = dir.clone();
+        let runs = trace::list_runs(&dir);
+        let Some(current) = self
+            .trace_path
+            .as_ref()
+            .and_then(|path| runs.iter().position(|run| run == path))
+        else {
+            return;
+        };
+        let target = (current as isize + delta).clamp(0, runs.len() as isize - 1) as usize;
+        if target == current {
+            return;
+        }
+        let pinned = (target + 1 < runs.len()).then(|| runs[target].clone());
+        self.source = Source::Runs { dir, pinned };
+        self.selected = None;
+        self.selection_locked = false;
+        self.filter = Filter::All;
+        self.tailer_generation += 1;
+        let mut tailer = Tailer::follow(self.source.clone());
+        let event = tailer.poll();
+        self.tailer = Some(tailer);
+        self.apply_tail(event, cx);
+        cx.notify();
+    }
+
+    /// The access table: the finished run's report, or live from the calls.
+    fn access_rows(&self) -> Vec<trace::AccessEntry> {
+        if let Some(report) = self.run.as_ref().and_then(|run| run.report.as_ref()) {
+            return report.access.clone();
+        }
+        let mut table: std::collections::BTreeMap<trace::Access, trace::AccessEntry> =
+            std::collections::BTreeMap::new();
+        for row in self.rows.iter().filter(|row| !row.pending) {
+            for (index, access) in row.access().enumerate() {
+                let own = index < row.access.len();
+                let entry = table
+                    .entry(access.clone())
+                    .or_insert_with(|| trace::AccessEntry {
+                        action: access.action.clone(),
+                        resource: access.resource.clone(),
+                        implied: !own,
+                        ..trace::AccessEntry::default()
+                    });
+                entry.calls += 1;
+                entry.errors += usize::from(row.is_error());
+                entry.implied &= !own;
+                entry.new |= row.new;
+            }
+        }
+        table.into_values().collect()
     }
 
     // -- render -------------------------------------------------------------
@@ -705,7 +818,7 @@ fn trace_source() -> Source {
             let home = home();
             Source::Runs {
                 dir: home.join(".lenslet/runs"),
-                legacy: home.join(".lenslet/trace.jsonl"),
+                pinned: None,
             }
         }
     }
@@ -767,7 +880,7 @@ impl LensletApp {
         }
         self.run
             .as_ref()
-            .and_then(|run| RunInfo::address(&run.endpoint))
+            .and_then(|run| RunInfo::address(&run.header.endpoint))
             .map(str::to_string)
             .unwrap_or_else(|| "no run yet".to_string())
     }
@@ -785,8 +898,8 @@ impl LensletApp {
                 theme::TEXT_MUTED,
             );
         };
-        if run.ended.is_some() {
-            return match run.exit_code {
+        if run.ended() {
+            return match run.exit_code() {
                 Some(0) => Light::new(
                     theme::GREEN,
                     0.6,
@@ -807,7 +920,7 @@ impl LensletApp {
                 ),
             };
         }
-        let port = RunInfo::address(&run.endpoint)
+        let port = RunInfo::address(&run.header.endpoint)
             .and_then(|address| address.rsplit(':').next())
             .unwrap_or("?");
         match self.probe.proxy {
@@ -843,7 +956,7 @@ impl LensletApp {
             ));
         }
         let run = self.run.as_ref()?;
-        let address = RunInfo::address(&run.upstream).unwrap_or("?");
+        let address = RunInfo::address(&run.header.upstream).unwrap_or("?");
         let port = address.rsplit(':').next().unwrap_or(address);
         Some(match self.probe.emulator {
             Some(true) => Light::new(
@@ -873,12 +986,10 @@ impl LensletApp {
         };
         ProbeTargets {
             // An ended run has no proxy to ask.
-            proxy: run
-                .ended
-                .is_none()
-                .then(|| RunInfo::address(&run.endpoint).map(str::to_string))
+            proxy: (!run.ended())
+                .then(|| RunInfo::address(&run.header.endpoint).map(str::to_string))
                 .flatten(),
-            emulator: RunInfo::address(&run.upstream).map(str::to_string),
+            emulator: RunInfo::address(&run.header.upstream).map(str::to_string),
         }
     }
 }

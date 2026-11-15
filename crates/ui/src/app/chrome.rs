@@ -14,7 +14,7 @@ impl LensletApp {
         } else {
             self.run
                 .as_ref()
-                .map(|run| run.kind.to_ascii_uppercase())
+                .map(|run| run.kind().to_ascii_uppercase())
                 .unwrap_or_default()
         };
         let pause_icon = if self.paused {
@@ -35,12 +35,7 @@ impl LensletApp {
                     .text_color(rgb(theme::TEXT))
                     .child("Lenslet"),
             )
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child("local AWS lens"),
-            );
+            .child(self.render_run_summary(cx));
         if self.demo {
             brand = brand.child(
                 div()
@@ -170,6 +165,29 @@ impl LensletApp {
                 cx,
             ))
             .children(visible_chips);
+        if let Filter::Access(access) = &self.filter {
+            chip_row = chip_row.child(
+                div()
+                    .id("filter-access")
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(6.0))
+                    .h(px(25.0))
+                    .px(px(8.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(theme::line(theme::ACCENT, 0.45))
+                    .bg(theme::h(theme::ACCENT, 0.08))
+                    .font_family(fonts::mono())
+                    .text_size(px(10.5))
+                    .text_color(rgb(theme::TEXT))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.set_filter(Filter::All, cx)))
+                    .child(trace::ellipsize(&access.action, 34))
+                    .child(div().text_color(rgb(theme::TEXT_MUTED)).child("×")),
+            );
+        }
 
         if hidden > 0 || self.show_all_services {
             chip_row = chip_row.child(
@@ -223,10 +241,10 @@ impl LensletApp {
             )
         } else {
             match &self.health {
-                TraceHealth::Ok => match self.run.as_ref().filter(|run| run.ended.is_some()) {
+                TraceHealth::Ok => match self.run.as_ref().filter(|run| run.ended()) {
                     Some(run) => (
                         theme::h(theme::TEXT_FAINT, 0.9),
-                        match run.exit_code {
+                        match run.exit_code() {
                             Some(code) => format!("RUN ENDED · EXIT {code}"),
                             None => "PROXY STOPPED".to_string(),
                         },
@@ -546,11 +564,140 @@ impl LensletApp {
                 .text_size(px(10.0))
                 .text_color(rgb(theme::TEXT_FAINT))
                 .child(if compact {
-                    "↑↓ select · space pause · 1 2 3"
+                    "a access · ↑↓ · space pause"
                 } else {
-                    "space pause · 1 2 3 tabs"
+                    "a access · space pause · 1 2 3 tabs"
                 }),
         );
         footer
+    }
+
+    /// `‹ 3/7 ›  $ npm test  exit 1  +2 access  1 new failure`: the run at a glance.
+    fn render_run_summary(&self, cx: &mut Context<Self>) -> Div {
+        let mut line = div().flex().items_center().gap(px(8.0)).min_w(px(0.0));
+        if let Some((position, total)) = self.run_position() {
+            let pinned = position < total;
+            line = line.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        nav_button("run-prev", "‹", position > 1)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_run(-1, cx))),
+                    )
+                    .child(
+                        div()
+                            .font_family(fonts::mono())
+                            .text_size(px(10.5))
+                            .text_color(if pinned {
+                                rgb(theme::AMBER)
+                            } else {
+                                rgb(theme::TEXT_MUTED)
+                            })
+                            .child(format!("{position}/{total}")),
+                    )
+                    .child(
+                        nav_button("run-next", "›", pinned)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_run(1, cx))),
+                    ),
+            );
+        }
+        let Some(run) = self.run.as_ref() else {
+            return line.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("local AWS lens"),
+            );
+        };
+        let command = if run.header.command.is_empty() {
+            "proxy session".to_string()
+        } else {
+            format!("$ {}", trace::ellipsize(&run.command_line(), 40))
+        };
+        line = line.child(
+            div()
+                .font_family(fonts::mono())
+                .text_size(px(11.5))
+                .text_color(rgb(theme::TEXT_SOFT))
+                .whitespace_nowrap()
+                .child(command),
+        );
+        match run.exit_code() {
+            Some(0) => line = line.child(badge("exit 0", theme::GREEN)),
+            Some(code) => line = line.child(badge(format!("exit {code}"), theme::RED)),
+            None if !run.ended() => line = line.child(badge("running", theme::ACCENT)),
+            None => {}
+        }
+        let added = match run.report.as_ref() {
+            Some(report) => report.access_added.len(),
+            None => self.access_rows().iter().filter(|row| row.new).count(),
+        };
+        if added > 0 {
+            line = line.child(badge(format!("+{added} access"), theme::AMBER));
+        }
+        if let Some(regressions) = run
+            .report
+            .as_ref()
+            .and_then(|report| report.regressions.as_ref())
+            && !regressions.new_failures.is_empty()
+        {
+            let count = regressions.new_failures.len();
+            line = line.child(badge(
+                format!(
+                    "{count} new {}",
+                    if count == 1 { "failure" } else { "failures" }
+                ),
+                theme::RED,
+            ));
+        }
+        line
+    }
+}
+
+/// A small outlined label in an accent color.
+fn badge(text: impl Into<SharedString>, color: u32) -> Div {
+    div()
+        .h(px(18.0))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(theme::line(color, 0.35))
+        .bg(theme::h(color, 0.08))
+        .font_family(fonts::mono())
+        .text_size(px(10.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(color))
+        .whitespace_nowrap()
+        .child(text.into())
+}
+
+fn nav_button(id: &'static str, label: &'static str, enabled: bool) -> Stateful<Div> {
+    let button = div()
+        .id(id)
+        .w(px(18.0))
+        .h(px(20.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .text_size(px(14.0))
+        .text_color(if enabled {
+            rgb(theme::TEXT_DIM)
+        } else {
+            rgb(theme::TEXT_FAINT)
+        })
+        .child(label);
+    if enabled {
+        button.cursor_pointer().hover(|style| {
+            style
+                .bg(theme::h(theme::TEXT, 0.06))
+                .text_color(rgb(theme::TEXT))
+        })
+    } else {
+        button
     }
 }

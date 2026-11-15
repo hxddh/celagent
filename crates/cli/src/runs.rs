@@ -1,30 +1,32 @@
-//! Run files: one trace per session in `~/.lenslet/runs`, newest last.
-//!
-//! Every `lenslet run` and `lenslet proxy` session writes its own
-//! `YYYYMMDD-HHMMSS-PID.jsonl` trace plus a `.run.json` sidecar that says what
-//! the session was (command, endpoint, upstream, exit code). The window follows
-//! the newest run. Only the last [`KEEP_RUNS`] runs are kept, so the directory
-//! never grows without bound.
+//! Run files in `~/.lenslet/runs`: one `YYYYMMDD-HHMMSS-PID.jsonl` per session,
+//! newest last by name. The first line says what the run is, the last line
+//! (once it ends) what it did. Only the last [`KEEP_RUNS`] finished runs are
+//! kept; a run that is still going is never deleted.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
-use crate::proxy::set_mode;
+use crate::{
+    proxy::set_mode,
+    summary::Report,
+    trace::{Record, RunHeader},
+};
 
 pub const KEEP_RUNS: usize = 20;
+/// The `end` report is one line; this bounds how far back we look for it.
+const MAX_LAST_LINE: u64 = 16 << 20;
 
 pub fn dir(home: &Path) -> PathBuf {
     home.join(".lenslet/runs")
 }
 
-/// Prepare the runs directory, drop old runs, and name the new trace file.
+/// Prepare the runs directory, drop old runs, and name the new run file.
 pub fn create(dir: &Path) -> Result<PathBuf> {
     if !dir.exists() {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
@@ -35,35 +37,98 @@ pub fn create(dir: &Path) -> Result<PathBuf> {
     Ok(dir.join(format!("{stamp}-{}.jsonl", std::process::id())))
 }
 
-/// Keep the newest `keep` traces (by name, which sorts by start time).
-/// A session that is still running is never deleted, however old: a
-/// long-lived `lenslet proxy` must not lose its trace to newer runs.
-fn prune(dir: &Path, keep: usize) {
+/// `…/20261115-054628-15569.jsonl` → `20261115-054628-15569`.
+pub fn run_id(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Run files, oldest first.
+pub fn list(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
-    let mut traces: Vec<PathBuf> = entries
+    let mut runs: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
-    traces.sort();
-    let excess = traces.len().saturating_sub(keep);
-    let finished = traces.into_iter().filter(|trace| !is_active(trace));
-    for trace in finished.take(excess) {
-        let _ = fs::remove_file(info_path(&trace));
-        let _ = fs::remove_file(trace);
+    runs.sort();
+    runs
+}
+
+fn prune(dir: &Path, keep: usize) {
+    let runs = list(dir);
+    let excess = runs.len().saturating_sub(keep);
+    let finished = runs.into_iter().filter(|run| !is_active(run));
+    for run in finished.take(excess) {
+        let _ = fs::remove_file(run);
     }
 }
 
-/// A session whose sidecar has not recorded an end and whose process lives.
-fn is_active(trace: &Path) -> bool {
-    let Some(info) = fs::read_to_string(info_path(trace))
-        .ok()
-        .and_then(|text| serde_json::from_str::<RunInfo>(&text).ok())
-    else {
-        return false;
+pub fn header(path: &Path) -> Option<RunHeader> {
+    let mut line = String::new();
+    BufReader::new(File::open(path).ok()?)
+        .read_line(&mut line)
+        .ok()?;
+    match serde_json::from_str(&line).ok()? {
+        Record::Run(header) => Some(header),
+        _ => None,
+    }
+}
+
+/// The run's `end` report, when it has ended.
+pub fn report(path: &Path) -> Option<Report> {
+    match serde_json::from_str(&last_line(path)?).ok()? {
+        Record::End(report) => Some(*report),
+        _ => None,
+    }
+}
+
+fn last_line(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut start = len;
+    let mut tail: Vec<u8> = Vec::new();
+    // Read backwards until the tail holds a whole last line.
+    while start > 0 && len - start < MAX_LAST_LINE {
+        let block = (64 * 1024u64).min(start);
+        start -= block;
+        let mut chunk = vec![0u8; block as usize];
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut chunk).ok()?;
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        let body = tail.strip_suffix(b"\n").unwrap_or(&tail);
+        if body.contains(&b'\n') {
+            break;
+        }
+    }
+    let body = tail.strip_suffix(b"\n").unwrap_or(&tail);
+    let line = match body.iter().rposition(|byte| *byte == b'\n') {
+        Some(ix) => &body[ix + 1..],
+        None if start == 0 => body,
+        None => return None,
     };
-    info.ended.is_none() && process_alive(info.pid)
+    Some(String::from_utf8_lossy(line).into_owned())
+}
+
+/// Not ended, and its process is alive.
+pub fn is_active(path: &Path) -> bool {
+    report(path).is_none() && header(path).is_some_and(|header| process_alive(header.pid))
+}
+
+/// The most recent finished run of the same command in the same directory,
+/// before `current`: what "did this get worse?" compares with.
+pub fn previous(dir: &Path, current: &Path, command: &[String], cwd: &str) -> Option<Report> {
+    list(dir)
+        .into_iter()
+        .rev()
+        .filter(|run| run.as_path() < current)
+        .filter(|run| {
+            header(run).is_some_and(|header| header.command == command && header.cwd == cwd)
+        })
+        .find_map(|run| report(&run))
 }
 
 #[cfg(unix)]
@@ -83,49 +148,6 @@ fn process_alive(pid: u32) -> bool {
     pid != 0
 }
 
-/// What a session was, next to its trace.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct RunInfo {
-    /// `run` or `proxy`.
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub command: Vec<String>,
-    pub pid: u32,
-    /// What SDKs point at, e.g. `http://127.0.0.1:53211`.
-    pub endpoint: String,
-    pub upstream: String,
-    pub started: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-}
-
-/// `runs/X.jsonl` → `runs/X.run.json`.
-pub fn info_path(trace: &Path) -> PathBuf {
-    trace.with_extension("run.json")
-}
-
-/// Write the sidecar atomically (owner-only), so a reader never sees half.
-pub fn write_info(trace: &Path, info: &RunInfo) -> Result<()> {
-    let path = info_path(trace);
-    let temporary = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(info).context("encode run info")?;
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("write {}", temporary.display()))?;
-    file.write_all(text.as_bytes())
-        .with_context(|| format!("write {}", temporary.display()))?;
-    fs::rename(&temporary, &path).with_context(|| format!("write {}", path.display()))
-}
-
 pub fn now() -> String {
     Utc::now().to_rfc3339()
 }
@@ -134,55 +156,87 @@ pub fn now() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn keeps_a_bounded_set_of_runs_with_their_sidecars() {
-        let dir = std::env::temp_dir().join(format!("lenslet-runs-{}", std::process::id()));
+    fn write_run(dir: &Path, name: &str, pid: u32, command: &[&str], end: Option<i32>) -> PathBuf {
+        let path = dir.join(format!("{name}.jsonl"));
+        let header = serde_json::json!({
+            "type": "run", "version": 3, "run": name, "command": command, "cwd": "/w",
+            "pid": pid, "endpoint": "http://127.0.0.1:1", "upstream": "u", "started": "s",
+        });
+        let mut text = format!("{header}\n");
+        text.push_str(r#"{"type":"call","id":"a","at":"t","method":"GET","path":"/","host":"h","service":"s3","operation":"GET","status":200,"ms":1,"authorization":false,"request":{"headers":[]},"response":{"headers":[]}}"#);
+        text.push('\n');
+        if let Some(code) = end {
+            let report = Report {
+                run: name.into(),
+                exit_code: Some(code),
+                ..Report::default()
+            };
+            let mut value = serde_json::to_value(&report).unwrap();
+            value["type"] = "end".into();
+            text.push_str(&format!("{value}\n"));
+        }
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lenslet-runs-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn keeps_a_bounded_set_of_finished_runs_and_every_live_one() {
+        let dir = temp_dir("prune");
         for index in 0..25 {
-            let trace = dir.join(format!("20261115-0000{index:02}-1.jsonl"));
-            fs::write(&trace, "").unwrap();
-            write_info(&trace, &RunInfo::default()).unwrap();
+            write_run(
+                &dir,
+                &format!("20261115-0000{index:02}-1"),
+                0,
+                &["t"],
+                Some(0),
+            );
         }
         // The oldest session is a proxy that is still running (this process).
-        let live = dir.join("20261114-000000-1.jsonl");
-        fs::write(&live, "").unwrap();
-        let live_info = RunInfo {
-            kind: "proxy".into(),
-            pid: std::process::id(),
-            ..RunInfo::default()
-        };
-        write_info(&live, &live_info).unwrap();
+        let live = write_run(&dir, "20261114-000000-1", std::process::id(), &[], None);
+        assert!(is_active(&live));
         let next = create(&dir).unwrap();
         assert!(next.extension().is_some_and(|ext| ext == "jsonl"));
-        let mut left: Vec<String> = fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        let traces = left.iter().filter(|name| name.ends_with(".jsonl")).count();
-        let infos = left
-            .iter()
-            .filter(|name| name.ends_with(".run.json"))
-            .count();
-        assert_eq!(traces, KEEP_RUNS - 1, "room is left for the new run");
-        assert_eq!(infos, KEEP_RUNS - 1);
+        let left: Vec<String> = list(&dir).iter().map(|path| run_id(path)).collect();
         assert!(live.exists(), "a running session is never pruned");
-        assert_eq!(left[0], "20261114-000000-1.jsonl");
+        assert_eq!(left[0], "20261114-000000-1");
+        assert_eq!(left.len(), KEEP_RUNS - 1, "room is left for the new run");
         assert!(
-            left[2].starts_with("20261115-000007"),
+            left[1].starts_with("20261115-000007"),
             "oldest finished runs go first: {left:?}"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
-        let info = RunInfo {
-            kind: "run".into(),
-            exit_code: Some(3),
-            ..RunInfo::default()
-        };
-        write_info(&next, &info).unwrap();
-        let read: RunInfo =
-            serde_json::from_str(&fs::read_to_string(info_path(&next)).unwrap()).unwrap();
-        assert_eq!(read.exit_code, Some(3));
+    #[test]
+    fn reads_the_header_the_report_and_the_previous_run() {
+        let dir = temp_dir("read");
+        let one = write_run(&dir, "20261115-000001-1", 0, &["npm", "test"], Some(1));
+        write_run(&dir, "20261115-000002-1", 0, &["pytest"], Some(0));
+        let three = write_run(&dir, "20261115-000003-1", 0, &["npm", "test"], None);
+        assert_eq!(header(&one).unwrap().command, ["npm", "test"]);
+        assert_eq!(report(&one).unwrap().exit_code, Some(1));
+        assert!(report(&three).is_none(), "still running");
+        let command = vec!["npm".to_string(), "test".to_string()];
+        assert_eq!(
+            previous(&dir, &three, &command, "/w").unwrap().run,
+            "20261115-000001-1"
+        );
+        assert!(previous(&dir, &three, &command, "/elsewhere").is_none());
+        assert!(previous(&dir, &one, &command, "/w").is_none());
+
+        // A long last line is still found.
+        let big = dir.join("big.jsonl");
+        fs::write(&big, format!("first\n{}\n", "x".repeat(300_000))).unwrap();
+        assert_eq!(last_line(&big).unwrap().len(), 300_000);
+        fs::write(&big, "only line\n").unwrap();
+        assert_eq!(last_line(&big).unwrap(), "only line");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

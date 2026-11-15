@@ -13,10 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use serde::{
-    Deserialize, Deserializer,
-    de::{self, Visitor},
-};
+use serde::Deserialize;
 
 pub const MAX_ROWS: usize = 500;
 /// A reload reads backwards in blocks of this size until it has `MAX_ROWS`
@@ -96,11 +93,20 @@ pub struct Problem {
     pub hint: Option<String>,
 }
 
-/// The `.run.json` sidecar next to a run trace.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub struct RunInfo {
+/// One permission: IAM action on a resource ARN pattern.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+pub struct Access {
     #[serde(default)]
-    pub kind: String,
+    pub action: String,
+    #[serde(default)]
+    pub resource: String,
+}
+
+/// The first line of a run file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct RunHeader {
+    #[serde(default)]
+    pub run: String,
     #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
@@ -108,9 +114,72 @@ pub struct RunInfo {
     #[serde(default)]
     pub upstream: String,
     #[serde(default)]
-    pub ended: Option<String>,
+    pub started: String,
+    /// Compared with this lock file.
+    #[serde(default)]
+    pub lock: Option<String>,
+}
+
+/// One line of the run's access table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct AccessEntry {
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub resource: String,
+    #[serde(default)]
+    pub calls: usize,
+    #[serde(default)]
+    pub errors: usize,
+    #[serde(default)]
+    pub implied: bool,
+    /// Not in the lock file.
+    #[serde(default)]
+    pub new: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct FailureKind {
+    #[serde(default)]
+    pub service: String,
+    #[serde(default)]
+    pub operation: String,
+    #[serde(default)]
+    pub code: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Regressions {
+    #[serde(default)]
+    pub previous_run: String,
+    #[serde(default)]
+    pub new_failures: Vec<FailureKind>,
+    #[serde(default)]
+    pub fixed: Vec<FailureKind>,
+}
+
+/// The last line of a finished run file (the same object as `--json`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Report {
     #[serde(default)]
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub ended: String,
+    #[serde(default)]
+    pub access: Vec<AccessEntry>,
+    #[serde(default)]
+    pub lock: Option<String>,
+    #[serde(default)]
+    pub access_added: Vec<Access>,
+    #[serde(default)]
+    pub regressions: Option<Regressions>,
+}
+
+/// A run as the window shows it: its header, plus the report once it ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunInfo {
+    pub header: RunHeader,
+    pub report: Option<Report>,
 }
 
 impl RunInfo {
@@ -122,14 +191,40 @@ impl RunInfo {
     }
 
     pub fn command_line(&self) -> String {
-        self.command.join(" ")
+        self.header.command.join(" ")
     }
+
+    pub fn ended(&self) -> bool {
+        self.report.is_some()
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        self.report.as_ref().and_then(|report| report.exit_code)
+    }
+
+    /// `run` for a command, `proxy` for a bare proxy session.
+    pub fn kind(&self) -> &'static str {
+        if self.header.command.is_empty() {
+            "proxy"
+        } else {
+            "run"
+        }
+    }
+}
+
+/// One line of a run file.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum Record {
+    Run(RunHeader),
+    Call(Box<Trace>),
+    End(Box<Report>),
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Trace {
     #[serde(default)]
-    pub id: Option<String>,
+    pub id: String,
     #[serde(default)]
     pub at: String,
     #[serde(default)]
@@ -144,9 +239,9 @@ pub struct Trace {
     pub operation: String,
     #[serde(default)]
     pub status: u16,
-    #[serde(default, alias = "duration_ms", deserialize_with = "deserialize_ms")]
+    #[serde(default)]
     pub ms: u64,
-    #[serde(default, alias = "auth")]
+    #[serde(default)]
     pub authorization: bool,
     #[serde(default)]
     pub region: Option<String>,
@@ -158,6 +253,16 @@ pub struct Trace {
     pub error: Option<String>,
     #[serde(default)]
     pub problem: Option<Problem>,
+    /// The IAM permissions this call needs (several for batches,
+    /// transactions and copies).
+    #[serde(default)]
+    pub access: Vec<Access>,
+    /// Permissions the call implies elsewhere (SSE-KMS key, passed role).
+    #[serde(default)]
+    pub implied: Vec<Access>,
+    /// The call used access that is not in the lock file.
+    #[serde(default)]
+    pub new: bool,
     #[serde(default)]
     pub request: Option<Exchange>,
     #[serde(default)]
@@ -216,8 +321,12 @@ impl Trace {
             haystack.push_str(region);
             haystack.push('\n');
         }
-        if let Some(id) = self.id.as_deref() {
-            haystack.push_str(id);
+        haystack.push_str(&self.id);
+        haystack.push('\n');
+        for access in self.access() {
+            haystack.push_str(&access.action);
+            haystack.push(' ');
+            haystack.push_str(&access.resource);
             haystack.push('\n');
         }
         for exchange in [self.request.as_ref(), self.response.as_ref()]
@@ -259,95 +368,78 @@ impl Trace {
 
     /// Stable identity used to keep a selection across reloads.
     pub fn key(&self) -> String {
-        self.id.clone().unwrap_or_else(|| {
-            format!(
-                "{}|{}|{}|{}|{}",
-                self.at, self.method, self.path, self.operation, self.status
-            )
-        })
+        self.id.clone()
+    }
+
+    /// Every permission this call accounts for: its own, then implied ones.
+    pub fn access(&self) -> impl Iterator<Item = Access> + '_ {
+        self.access.iter().chain(self.implied.iter()).cloned()
+    }
+
+    pub fn uses(&self, access: &Access) -> bool {
+        self.access().any(|own| &own == access)
     }
 }
 
-fn deserialize_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct MsVisitor;
-
-    impl<'de> Visitor<'de> for MsVisitor {
-        type Value = u64;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a non-negative duration in milliseconds")
-        }
-
-        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-            Ok(value)
-        }
-
-        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-            Ok(value.max(0) as u64)
-        }
-
-        fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-            if value.is_finite() && value > 0.0 {
-                Ok(value.round().min(u64::MAX as f64) as u64)
-            } else {
-                Ok(0)
+fn parse_record(line: &str) -> Option<Record> {
+    match serde_json::from_str(line.trim()).ok()? {
+        Record::Call(trace) => {
+            let trace = *trace;
+            if trace.id.is_empty() || trace.at.is_empty() {
+                return None;
             }
+            Some(Record::Call(Box::new(trace.finalize())))
         }
-
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-            Ok(value
-                .trim()
-                .parse::<f64>()
-                .map(|v| v.max(0.0) as u64)
-                .unwrap_or(0))
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(0)
-        }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(0)
-        }
+        other => Some(other),
     }
-
-    deserializer.deserialize_any(MsVisitor)
 }
 
-/// Parse a single JSONL row. Malformed lines are ignored, never fatal.
-pub fn parse_line(line: &str) -> Option<Trace> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let trace: Trace = serde_json::from_str(line).ok()?;
-    if trace.at.is_empty() || (trace.method.is_empty() && trace.path.is_empty()) {
-        return None;
-    }
-    Some(trace.finalize())
-}
-
+/// Parse one `call` line. Other records and malformed lines are `None`.
 #[cfg(test)]
-pub fn parse_lines(text: &str) -> Vec<Trace> {
-    parse_counted(text).0
+pub fn parse_line(line: &str) -> Option<Trace> {
+    match parse_record(line)? {
+        Record::Call(trace) => Some(*trace),
+        _ => None,
+    }
 }
 
-fn parse_counted(text: &str) -> (Vec<Trace>, usize) {
-    let mut rows = Vec::new();
-    let mut bad = 0;
+/// Every call in a run file's text.
+pub fn parse_lines(text: &str) -> Vec<Trace> {
+    parse_records(text).calls
+}
+
+/// The run (header and report) in a run file's text.
+pub fn parse_run(text: &str) -> RunInfo {
+    let parsed = parse_records(text);
+    RunInfo {
+        header: parsed.header.unwrap_or_default(),
+        report: parsed.report,
+    }
+}
+
+/// What a chunk of a run file holds.
+#[derive(Default)]
+struct Parsed {
+    calls: Vec<Trace>,
+    header: Option<RunHeader>,
+    report: Option<Report>,
+    bad: usize,
+}
+
+fn parse_records(text: &str) -> Parsed {
+    let mut parsed = Parsed::default();
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        match parse_line(line) {
-            Some(trace) => rows.push(trace),
-            None => bad += 1,
+        match parse_record(line) {
+            Some(Record::Call(trace)) => parsed.calls.push(*trace),
+            Some(Record::Run(header)) => parsed.header = Some(header),
+            Some(Record::End(report)) => parsed.report = Some(*report),
+            None => parsed.bad += 1,
         }
     }
-    (rows, bad)
+    parsed
 }
 
 pub fn cap_tail(mut rows: Vec<Trace>) -> Vec<Trace> {
@@ -399,15 +491,14 @@ pub enum TailEvent {
     Replaced(Vec<Trace>),
 }
 
-/// What the window follows: one fixed file, or the newest run.
+/// What the window follows: one fixed file, or a run in the runs directory
+/// (the newest, unless the viewer picked one).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
     File(PathBuf),
-    /// Newest `*.jsonl` in the runs directory; `legacy` is the 1.x trace,
-    /// used only while there are no runs.
     Runs {
         dir: PathBuf,
-        legacy: PathBuf,
+        pinned: Option<PathBuf>,
     },
 }
 
@@ -415,28 +506,37 @@ impl Source {
     fn resolve(&self) -> Option<PathBuf> {
         match self {
             Source::File(path) => Some(path.clone()),
-            Source::Runs { dir, legacy } => {
-                newest_run(dir).or_else(|| legacy.exists().then(|| legacy.clone()))
-            }
+            Source::Runs { dir, pinned } => pinned
+                .clone()
+                .filter(|path| path.exists())
+                .or_else(|| list_runs(dir).pop()),
         }
     }
 }
 
-fn newest_run(dir: &Path) -> Option<PathBuf> {
-    fs::read_dir(dir)
-        .ok()?
+/// Run files in `dir`, oldest first (names sort by start time).
+pub fn list_runs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut runs: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-        .max()
+        .collect();
+    runs.sort();
+    runs
 }
 
-/// `runs/X.jsonl` → `runs/X.run.json`.
-pub fn run_info_path(trace: &Path) -> PathBuf {
-    trace.with_extension("run.json")
-}
-
-fn read_run_info(trace: &Path) -> Option<RunInfo> {
-    serde_json::from_str(&fs::read_to_string(run_info_path(trace)).ok()?).ok()
+fn read_header(path: &Path) -> Option<RunHeader> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    io::BufReader::new(File::open(path).ok()?)
+        .read_line(&mut line)
+        .ok()?;
+    match parse_record(&line)? {
+        Record::Run(header) => Some(header),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -451,7 +551,8 @@ pub struct Tailer {
     file_key: u64,
     ready: bool,
     skipped: usize,
-    run: Option<RunInfo>,
+    header: Option<RunHeader>,
+    report: Option<Report>,
 }
 
 impl Tailer {
@@ -469,7 +570,8 @@ impl Tailer {
             file_key: 0,
             ready: false,
             skipped: 0,
-            run: None,
+            header: None,
+            report: None,
         }
     }
 
@@ -482,25 +584,30 @@ impl Tailer {
         self.path.as_deref()
     }
 
-    /// The run that produced the followed trace, when it has a sidecar.
-    pub fn run(&self) -> Option<&RunInfo> {
-        self.run.as_ref()
+    /// The followed run: its header, and its report once it has ended.
+    pub fn run(&self) -> Option<RunInfo> {
+        self.header.clone().map(|header| RunInfo {
+            header,
+            report: self.report.clone(),
+        })
     }
 
     /// One non-blocking-as-possible poll. Intended to run on a background executor.
     pub fn poll(&mut self) -> TailEvent {
         let Some(path) = self.source.resolve() else {
             self.path = None;
-            self.run = None;
+            self.header = None;
+            self.report = None;
             self.ready = false;
             return TailEvent::Missing;
         };
         if self.path.as_ref() != Some(&path) {
-            // A newer run started: follow it from the beginning.
+            // A newer (or a picked) run: follow it from the beginning.
             self.path = Some(path.clone());
+            self.header = None;
+            self.report = None;
             self.ready = false;
         }
-        self.run = read_run_info(&path);
 
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -577,9 +684,12 @@ impl Tailer {
                 &[][..]
             }
         };
-        let (rows, bad) = parse_counted(&String::from_utf8_lossy(complete));
-        self.skipped = bad;
-        TailEvent::Replaced(cap_tail(rows))
+        let parsed = parse_records(&String::from_utf8_lossy(complete));
+        self.skipped = parsed.bad;
+        // A long run's header is far before the tail that was read.
+        self.header = parsed.header.or_else(|| read_header(path));
+        self.report = parsed.report;
+        TailEvent::Replaced(cap_tail(parsed.calls))
     }
 
     fn read_new(&mut self, path: &Path) -> TailEvent {
@@ -609,12 +719,18 @@ impl Tailer {
             return TailEvent::Idle;
         };
         let complete: Vec<u8> = self.carry.drain(..=newline).collect();
-        let (rows, bad) = parse_counted(&String::from_utf8_lossy(&complete));
-        self.skipped += bad;
-        if rows.is_empty() {
+        let parsed = parse_records(&String::from_utf8_lossy(&complete));
+        self.skipped += parsed.bad;
+        if parsed.header.is_some() {
+            self.header = parsed.header;
+        }
+        if parsed.report.is_some() {
+            self.report = parsed.report;
+        }
+        if parsed.calls.is_empty() {
             TailEvent::Idle
         } else {
-            TailEvent::Appended(rows)
+            TailEvent::Appended(parsed.calls)
         }
     }
 }
@@ -627,21 +743,18 @@ pub fn merge(rows: &[Arc<Trace>], incoming: Vec<Trace>) -> Vec<Arc<Trace>> {
     let mut positions: HashMap<String, usize> = next
         .iter()
         .enumerate()
-        .filter_map(|(index, row)| row.id.clone().map(|id| (id, index)))
+        .map(|(index, row)| (row.id.clone(), index))
         .collect();
     let mut sorted = true;
     for trace in incoming {
-        let id = trace.id.clone();
-        if let Some(index) = id.as_ref().and_then(|id| positions.get(id)) {
+        if let Some(index) = positions.get(&trace.id) {
             next[*index] = Arc::new(trace);
             continue;
         }
         if next.last().is_some_and(|last| last.at > trace.at) {
             sorted = false;
         }
-        if let Some(id) = id {
-            positions.insert(id, next.len());
-        }
+        positions.insert(trace.id.clone(), next.len());
         next.push(Arc::new(trace));
     }
     if !sorted {
@@ -771,6 +884,8 @@ pub enum Filter {
     All,
     Errors,
     Service(String),
+    /// Calls that need this permission (directly or implied).
+    Access(Access),
 }
 
 impl Filter {
@@ -779,6 +894,7 @@ impl Filter {
             Filter::All => true,
             Filter::Errors => trace.is_error(),
             Filter::Service(key) => trace.service_key() == key,
+            Filter::Access(access) => trace.uses(access),
         }
     }
 }
@@ -1013,7 +1129,7 @@ mod tests {
         body: Option<&str>,
     ) -> String {
         let mut line = format!(
-            r#"{{"at":"{at}","method":"{method}","path":"{path}","host":"127.0.0.1:9297","service":"{service}","operation":"{operation}","status":{status},"ms":{ms},"authorization":true"#
+            r#"{{"type":"call","id":"{at}{path}","at":"{at}","method":"{method}","path":"{path}","host":"127.0.0.1:9297","service":"{service}","operation":"{operation}","status":{status},"ms":{ms},"authorization":true"#
         );
         if let Some(body) = body {
             line.push_str(&format!(
@@ -1042,7 +1158,7 @@ mod tests {
     #[test]
     fn parses_minimal_contract() {
         let trace = parse_line(
-            r#"{"at":"2026-11-15T02:24:19.540Z","method":"GET","path":"/demo/a.txt","host":"127.0.0.1:9297","service":"s3","operation":"GetObject","status":200,"ms":3,"authorization":false}"#,
+            r#"{"type":"call","id":"a","at":"2026-11-15T02:24:19.540Z","method":"GET","path":"/demo/a.txt","host":"127.0.0.1:9297","service":"s3","operation":"GetObject","status":200,"ms":3,"authorization":false}"#,
         )
         .expect("parses");
         assert_eq!(trace.status, 200);
@@ -1055,7 +1171,7 @@ mod tests {
 
     #[test]
     fn parses_optional_request_and_response() {
-        let line = r#"{"at":"2026-11-15T02:24:19.540507869+00:00","method":"PUT","path":"/demo/a.png?x-id=PutObject","host":"127.0.0.1:9297","service":"s3","operation":"PutObject","status":200,"ms":8,"authorization":true,"request":{"headers":[{"name":"authorization","value":"AWS4-HMAC-SHA256 Credential=demo/20261115/s3/aws4_request"}],"content_type":"image/png","body":{"text":"hello","bytes":5,"truncated":true,"binary":false,"sha256":"abc123"}},"response":{"headers":[],"body":{"text":"","bytes":0,"truncated":false,"binary":true}}}"#;
+        let line = r#"{"type":"call","id":"p","at":"2026-11-15T02:24:19.540507869+00:00","method":"PUT","path":"/demo/a.png?x-id=PutObject","host":"127.0.0.1:9297","service":"s3","operation":"PutObject","status":200,"ms":8,"authorization":true,"request":{"headers":[{"name":"authorization","value":"AWS4-HMAC-SHA256 Credential=demo/20261115/s3/aws4_request"}],"content_type":"image/png","body":{"text":"hello","bytes":5,"truncated":true,"binary":false,"sha256":"abc123"}},"response":{"headers":[],"body":{"text":"","bytes":0,"truncated":false,"binary":true}}}"#;
         let trace = parse_line(line).expect("parses");
         let request = trace.request.expect("request");
         assert_eq!(request.headers.len(), 1);
@@ -1088,6 +1204,8 @@ mod tests {
             "not json".to_string(),
             r#"{"status": 200}"#.to_string(),
             r#"{"at": "2026-11-15T02:24:20Z"}"#.to_string(),
+            // A call without an id cannot be tracked, so it is skipped.
+            r#"{"type":"call","at":"2026-11-15T02:24:20Z","method":"GET","path":"/x"}"#.to_string(),
             sample(
                 "2026-11-15T02:24:20Z",
                 "GET",
@@ -1106,20 +1224,38 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_legacy_and_extra_fields() {
-        let line = r#"{"id":"abc","at":"2026-11-15T02:24:19Z","method":"GET","path":"/","host":"h","service":"sqs","operation":"SendMessage","status":200,"ms":4,"authorization":true,"request":{"headers":[],"body":{"text":"x","bytes":1,"truncated":false,"binary":false,"redacted":true}},"future_field":{"a":1}}"#;
-        let trace = parse_line(line).expect("parses");
-        assert_eq!(trace.id.as_deref(), Some("abc"));
-        assert_eq!(trace.key(), "abc");
-        assert_eq!(trace.service_name(), "SQS");
-    }
+    fn run_files_carry_a_header_calls_and_a_report() {
+        let text = [
+            r#"{"type":"run","version":3,"run":"r1","command":["npm","test"],"cwd":"/w","pid":1,"endpoint":"http://127.0.0.1:4100","upstream":"https://127.0.0.1:9298","started":"s","lock":"lenslet.lock","future":true}"#,
+            r#"{"type":"call","id":"c1","at":"2026-11-15T00:00:01Z","method":"POST","path":"/","service":"sqs","operation":"SendMessage","status":200,"ms":2,"access":[{"action":"sqs:SendMessage","resource":"arn:aws:sqs:*:*:jobs"}],"new":true,"implied":[{"action":"kms:Decrypt","resource":"arn:aws:kms:*:*:key/*"}]}"#,
+            r#"{"type":"end","run":"r1","exit_code":3,"ended":"e","access":[{"action":"sqs:SendMessage","resource":"arn:aws:sqs:*:*:jobs","calls":1,"errors":0,"new":true}],"lock":"lenslet.lock","access_added":[{"action":"sqs:SendMessage","resource":"arn:aws:sqs:*:*:jobs"}],"regressions":{"previous_run":"r0","new_failures":[{"service":"sqs","operation":"GetQueueUrl","code":"QueueDoesNotExist"}],"fixed":[]}}"#,
+        ]
+        .join("\n");
+        let calls = parse_lines(&text);
+        assert_eq!(calls.len(), 1, "only call lines are rows");
+        let call = &calls[0];
+        assert!(call.new);
+        let access: Vec<Access> = call.access().collect();
+        assert_eq!(access.len(), 2);
+        assert_eq!(access[1].action, "kms:Decrypt");
+        assert!(call.uses(&access[1]));
+        assert!(Filter::Access(access[0].clone()).matches(call));
+        assert!(matches_search(call, &search_tokens("sqs:sendmessage")));
 
-    #[test]
-    fn accepts_float_and_string_latency() {
-        let line = r#"{"at":"t","method":"GET","path":"/","ms":12.6}"#;
-        assert_eq!(parse_line(line).expect("parses").ms, 13);
-        let line = r#"{"at":"t","method":"GET","path":"/","ms":"7"}"#;
-        assert_eq!(parse_line(line).expect("parses").ms, 7);
+        let run = parse_run(&text);
+        assert_eq!(run.command_line(), "npm test");
+        assert_eq!(run.kind(), "run");
+        assert_eq!(
+            RunInfo::address(&run.header.endpoint),
+            Some("127.0.0.1:4100")
+        );
+        assert_eq!(run.exit_code(), Some(3));
+        let report = run.report.unwrap();
+        assert_eq!(report.access_added.len(), 1);
+        assert_eq!(
+            report.regressions.unwrap().new_failures[0].code,
+            "QueueDoesNotExist"
+        );
     }
 
     #[test]
@@ -1167,7 +1303,7 @@ mod tests {
         let iam_again = trace(200, "iam", "ListUsers", None);
         let lambda = trace(202, "lambda", "Invoke", None);
         let s3 = trace(200, "s3", "GetObject", None);
-        let rows = vec![iam, iam_again, lambda, s3];
+        let rows = [iam, iam_again, lambda, s3];
 
         let facets = service_facets(rows.iter());
         let labels: Vec<&str> = facets.iter().map(|facet| facet.label.as_str()).collect();
@@ -1187,7 +1323,7 @@ mod tests {
 
         // A service with no dedicated styling still gets a real filter + label.
         let kinesis = trace(200, "kinesis", "PutRecord", None);
-        let facets = service_facets([&kinesis].into_iter());
+        let facets = service_facets([&kinesis]);
         assert_eq!(facets.len(), 1);
         assert_eq!(facets[0].label, "KINESIS");
         let kinesis_filter = Filter::Service(service_id("kinesis"));
@@ -1463,17 +1599,21 @@ mod tests {
     }
 
     #[test]
-    fn demo_rows_cover_several_services() {
+    fn demo_is_a_real_finished_run() {
         let rows = crate::demo::demo_rows();
         let facets = service_facets(rows.iter());
         assert!(facets.iter().any(|facet| facet.id == "s3"));
-        assert!(facets.iter().any(|facet| facet.id == "kinesis"));
         assert!(facets.len() >= 5);
+        assert!(rows.iter().any(|row| row.problem.is_some()));
+        assert!(rows.iter().any(|row| row.new));
+        let run = crate::demo::demo_run();
+        assert!(run.ended());
+        assert!(!run.report.unwrap().access.is_empty());
     }
 
     fn line(id: &str, at: &str, extra: serde_json::Value) -> String {
         let mut value = serde_json::json!({
-            "id": id, "at": at, "method": "POST", "path": "/", "service": "sqs",
+            "type": "call", "id": id, "at": at, "method": "POST", "path": "/", "service": "sqs",
             "operation": "SendMessage", "status": 200, "ms": 1,
         });
         if let (Some(target), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
@@ -1532,7 +1672,7 @@ mod tests {
         match tailer.poll() {
             TailEvent::Replaced(rows) => {
                 assert_eq!(rows.len(), MAX_ROWS);
-                assert_eq!(rows.last().unwrap().id.as_deref(), Some("id-519"));
+                assert_eq!(rows.last().unwrap().id, "id-519");
             }
             other => panic!("expected replace, got {other:?}"),
         }
@@ -1545,78 +1685,89 @@ mod tests {
     }
 
     #[test]
-    fn follows_the_newest_run_and_reads_its_sidecar() {
+    fn follows_the_newest_run_or_a_pinned_one() {
         let dir = temp_trace("runs").with_extension("");
-        fs::create_dir_all(&dir).unwrap();
-        let legacy = dir.join("legacy-trace.jsonl");
+        let _ = fs::remove_dir_all(&dir);
         let runs = dir.join("runs");
         let mut tailer = Tailer::follow(Source::Runs {
             dir: runs.clone(),
-            legacy: legacy.clone(),
+            pinned: None,
         });
         assert!(matches!(tailer.poll(), TailEvent::Missing));
 
-        // Before any run exists, the 1.x trace still shows.
-        fs::write(
-            &legacy,
-            format!(
-                "{}\n",
-                line("old", "2026-11-14T00:00:00Z", serde_json::json!({}))
-            ),
-        )
-        .unwrap();
-        assert!(
-            matches!(tailer.poll(), TailEvent::Replaced(rows) if rows[0].id.as_deref() == Some("old"))
-        );
-
         fs::create_dir_all(&runs).unwrap();
+        let header = |run: &str| {
+            format!(
+                r#"{{"type":"run","run":"{run}","command":["npm","test"],"endpoint":"http://127.0.0.1:4100","upstream":"u"}}"#
+            )
+        };
         let first = runs.join("20261115-000001-1.jsonl");
         fs::write(
             &first,
             format!(
-                "{}\n",
+                "{}\n{}\n",
+                header("first"),
                 line("a", "2026-11-15T00:00:01Z", serde_json::json!({}))
             ),
         )
         .unwrap();
-        fs::write(
-            run_info_path(&first),
-            r#"{"kind":"run","command":["npm","test"],"endpoint":"http://127.0.0.1:4100","upstream":"https://127.0.0.1:9298"}"#,
-        )
-        .unwrap();
-        assert!(
-            matches!(tailer.poll(), TailEvent::Replaced(rows) if rows[0].id.as_deref() == Some("a"))
-        );
+        assert!(matches!(tailer.poll(), TailEvent::Replaced(rows) if rows[0].id == "a"));
         let run = tailer.run().unwrap();
-        assert_eq!(run.command_line(), "npm test");
-        assert_eq!(RunInfo::address(&run.endpoint), Some("127.0.0.1:4100"));
-        assert_eq!(run.ended, None);
+        assert_eq!(run.header.run, "first");
+        assert!(!run.ended());
 
-        // The sidecar is re-read, so the window sees the run end.
-        fs::write(
-            run_info_path(&first),
-            r#"{"kind":"run","endpoint":"http://127.0.0.1:4100","upstream":"x","ended":"now","exit_code":3}"#,
-        )
-        .unwrap();
+        // The end line arrives like any other line.
+        write_append(&first, "{\"type\":\"end\",\"exit_code\":3}\n");
         assert!(matches!(tailer.poll(), TailEvent::Idle));
-        assert_eq!(tailer.run().unwrap().exit_code, Some(3));
+        assert_eq!(tailer.run().unwrap().exit_code(), Some(3));
 
         // A newer run takes over.
         let second = runs.join("20261115-000002-2.jsonl");
         fs::write(
             &second,
             format!(
-                "{}\n",
+                "{}\n{}\n",
+                header("second"),
                 line("b", "2026-11-15T00:00:02Z", serde_json::json!({}))
             ),
         )
         .unwrap();
-        assert!(
-            matches!(tailer.poll(), TailEvent::Replaced(rows) if rows[0].id.as_deref() == Some("b"))
-        );
+        assert!(matches!(tailer.poll(), TailEvent::Replaced(rows) if rows[0].id == "b"));
         assert_eq!(tailer.path(), Some(second.as_path()));
-        assert!(tailer.run().is_none(), "no sidecar yet");
+        assert_eq!(tailer.run().unwrap().header.run, "second");
+        assert_eq!(list_runs(&runs), vec![first.clone(), second.clone()]);
+
+        // Pinned to an older run, newer runs do not move the view.
+        let mut pinned = Tailer::follow(Source::Runs {
+            dir: runs.clone(),
+            pinned: Some(first.clone()),
+        });
+        assert!(matches!(pinned.poll(), TailEvent::Replaced(rows) if rows[0].id == "a"));
+        assert!(pinned.run().unwrap().ended());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_run_keeps_its_header_when_only_the_tail_is_read() {
+        let path = temp_trace("long");
+        let mut text = String::from(
+            r#"{"type":"run","run":"long","command":["make"],"endpoint":"http://127.0.0.1:1","upstream":"u"}"#,
+        );
+        text.push('\n');
+        let big = "x".repeat(5_000);
+        for index in 0..MAX_ROWS + 300 {
+            text.push_str(&line(
+                &format!("id-{index}"),
+                "2026-11-15T00:00:00Z",
+                serde_json::json!({"request": {"body": {"text": big, "bytes": 5000}}}),
+            ));
+            text.push('\n');
+        }
+        fs::write(&path, text).unwrap();
+        let mut tailer = Tailer::new(&path);
+        assert!(matches!(tailer.poll(), TailEvent::Replaced(rows) if rows.len() == MAX_ROWS));
+        assert_eq!(tailer.run().unwrap().header.run, "long");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -1639,7 +1790,7 @@ mod tests {
         let earlier =
             parse_line(&line("r", "2026-11-15T00:00:02Z", serde_json::json!({}))).unwrap();
         let rows = merge(&rows, vec![later, done, earlier]);
-        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_deref().unwrap()).collect();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(ids, ["p", "r", "q"], "one row per call, ordered by arrival");
         assert!(!rows[0].pending);
         assert!(rows[0].is_error());

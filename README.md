@@ -1,158 +1,200 @@
 # Lenslet
 
-**See what your code sends to local AWS, and why a call failed.**
+**Run your code against local AWS. See what it did, why calls failed, and what
+AWS access it needs.**
 
 ```console
-$ lenslet run -- npm test
-lenslet: http://127.0.0.1:43761 → https://127.0.0.1:9298 · trace ~/.lenslet/runs/20261115-054628-15569.jsonl
-...your tests run...
-lenslet: 8 calls · 1 error · 3 services (dynamodb, s3, sqs) · 341 ms
-  ✗ DYNAMODB GetItem  400  ResourceNotFoundException  Requested resource not found
+$ lenslet run --check -- npm test
+...your tests...
+lenslet: 15 calls · 2 errors · 6 services (dynamodb, iam, kms, lambda, s3, sqs) · 476 ms
+  ✗ S3 GetObject  404  NoSuchKey  The specified key does not exist.
       → The resource does not exist in the emulator. Was it created in this run, in the same region?
-lenslet: trace ~/.lenslet/runs/20261115-054628-15569.jsonl · open it with `lenslet ui`
+  access: 1 permission not in lenslet.lock
+    + dynamodb:DeleteItem              arn:aws:dynamodb:*:*:table/orders
+$ echo $?
+3
 ```
 
-Lenslet sits between an AWS SDK and
-[AWS Emulator](https://github.com/aws/aws-emulator). `lenslet run` starts a
-proxy, points your program at it, runs it, and prints every AWS call it made,
-with the error code, message and likely cause of each failure. The exit code
-is your program's. `lenslet ui` shows the same run, live, in a native window.
+Lenslet sits between your program and
+[AWS Emulator](https://github.com/aws/aws-emulator). AWS Emulator does not
+evaluate IAM, so code that works locally can still be denied on AWS. Lenslet
+records every call your program makes and works out the IAM action and
+resource each one needs. It keeps that list in `lenslet.lock`, a reviewable
+file you commit. When a change widens your AWS access, the diff shows up in
+the PR and `--check` fails CI.
 
-![Lenslet showing a live run](docs/lenslet.png)
+![A run in the Lenslet window](docs/lenslet.png)
 
 ## Quick start
 
 ```bash
-# 1. AWS Emulator, once
-EMULATOR_TELEMETRY=off aws-emulator --telemetry off --port 9298
+EMULATOR_TELEMETRY=off aws-emulator --telemetry off --port 9298   # once
 
-# 2. Your program, tests or script, through Lenslet
-lenslet run -- npm test          # or: pytest, go test ./..., aws s3 ls, ...
-
-# 3. Optional: the window (follows the newest run)
-lenslet ui
+lenslet run -- npm test             # see every call, and why failures failed
+lenslet run --update -- npm test    # write lenslet.lock; commit it
+lenslet run --check -- npm test     # in CI: exit 3 if access grew
+lenslet ui                          # the window
 ```
 
-That's all the setup. `lenslet run` sets, for the child process only:
+`lenslet run` sets `AWS_ENDPOINT_URL` for the child process, plus the
+emulator's credentials and config when you have not set your own. It unsets
+`AWS_PROFILE` and any `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN` from your environment, so real keys never reach the trace.
+The exit code is your program's. Use `127.0.0.1`, not `localhost`, if you set
+the endpoint yourself.
 
-| variable | value |
-| --- | --- |
-| `AWS_ENDPOINT_URL` | `http://127.0.0.1:<free port>` (plain HTTP on loopback: no certificate to trust) |
-| `AWS_SHARED_CREDENTIALS_FILE` | `~/.aws/emulator/9298/emulator_credentials`, if you have not set it |
-| `AWS_CONFIG_FILE` | `~/.aws/emulator/9298/config`, if you have not set it |
+## The three answers
 
-When it points at the emulator's files it also unsets `AWS_PROFILE`, since your
-real profile names do not exist there. `--no-env` sets only the endpoint. Current
-AWS SDKs and the AWS CLI read `AWS_ENDPOINT_URL`. Use the IP
-(`127.0.0.1`), not `localhost`: with `localhost`, S3 clients try
-virtual-hosted buckets (`bucket.localhost`).
+**What did it do?** Every call, live, with the service, operation, status,
+latency, raw headers and bodies (JSON and XML formatted). Calls slower than a
+second show as pending.
 
-### In CI or for an agent
+**Why did it fail?** The AWS error code and message, plus a one-line likely
+cause for common local failures: missing resource, unknown credentials,
+signature, region, not implemented, emulator down. A run also compares itself
+with the previous run of the same command: "1 new failure, 0 fixed".
 
-`lenslet run` needs no display. The summary goes to stderr. Add
-`--json summary.json` (or `--json -` for stdout) for a machine-readable copy:
+**What access does it need?** Each call maps to an IAM action and a resource
+ARN, with account and region set to `*`. Implied permissions are included:
+`kms:Decrypt` behind an SSE-KMS object, and `iam:PassRole` for a role handed to
+Lambda. Generated names (UUIDs, timestamps) become `*`, so the lock stays
+stable between runs.
+
+```text
+# lenslet.lock
+dynamodb:GetItem       arn:aws:dynamodb:*:*:table/orders
+iam:PassRole           arn:aws:iam::*:role/shop-lambda  # implied
+kms:Decrypt            arn:aws:kms:*:*:key/*  # implied
+s3:GetObject           arn:aws:s3:::shop-assets/*
+```
+
+`lenslet policy` turns the lock into an IAM policy document. This is
+**observed** access: what your tests exercised, mapped by rules. Review it
+before you attach it to a role.
+
+## The window
+
+`lenslet ui` follows the newest run. `[` and `]` step through earlier runs.
+
+- **Calls** (default): the stream and inspector. A failed call shows its error
+  in the row and a "Why it failed" panel. A call that needed access outside the
+  lock is marked `NEW ACCESS`.
+- **Access** (`a`): one row per permission, with call counts, `NEW` and
+  `implied` markers. Click a row to see the calls behind it.
+
+The header shows the run at a glance: command, exit code, `+N access`, and new
+failures. The footer shows whether the proxy and the emulator are actually up.
+
+![The access table](docs/access.png)
+
+## For agents and CI
+
+Every run ends with one JSON report. It is the same object in three places:
+the last line of the run file, `lenslet run --json PATH` (`-` for stdout), and
+`lenslet last --json`, which reads the newest run without re-running it.
 
 ```json
-{"calls": 8, "errors": 1, "unfinished": 0, "exit_code": 0,
- "failures": [{"service": "dynamodb", "operation": "GetItem", "status": 400,
-               "code": "ResourceNotFoundException",
-               "message": "Requested resource not found",
-               "hint": "The resource does not exist in the emulator. ..."}],
- "trace": "/home/me/.lenslet/runs/20261115-054628-15569.jsonl", ...}
+{
+  "exit_code": 0, "calls": 15, "errors": 2, "unfinished": 0,
+  "failures": [{"service": "s3", "operation": "GetObject", "status": 404,
+                "code": "NoSuchKey", "message": "…", "hint": "…"}],
+  "access": [{"action": "dynamodb:DeleteItem", "resource": "arn:aws:dynamodb:*:*:table/orders",
+              "calls": 1, "errors": 0, "new": true}],
+  "lock": "lenslet.lock",
+  "access_added": [{"action": "dynamodb:DeleteItem", "resource": "…"}],
+  "access_unused": [],
+  "regressions": {"previous_run": "20261115-095353-9629", "new_failures": [], "fixed": []},
+  "trace": "/home/me/.lenslet/runs/20261115-095354-9655.jsonl"
+}
 ```
 
-### A long-running proxy
+Exit codes:
 
-For an app server or a debugger session, keep a proxy up instead:
+| code | meaning |
+| --- | --- |
+| the command's | the command failed |
+| `3` | the command passed, but `--check` found access not in `lenslet.lock` |
+| `2` | Lenslet could not run (usage, emulator CA, …) |
+| `0` | otherwise |
 
-```bash
-lenslet proxy                    # http://127.0.0.1:9297, prints the env to export
+The full format is in [docs/trace.md](docs/trace.md).
+
+## Commands
+
+```text
+lenslet run [options] [--] COMMAND   run under Lenslet; report at the end
+lenslet run [options]                no command: a proxy on 127.0.0.1:9297 until Ctrl-C
+lenslet last [--json]                the newest run's report
+lenslet policy [--lock PATH]         an IAM policy from lenslet.lock
+lenslet ui                           the window (also: bare `lenslet`)
+
+run options: --check  --update  --json PATH  --quiet  --ui  --no-env
+             --listen PORT  --upstream ADDRESS  --emulator-ca PATH  --trace PATH
 ```
-
-The port also accepts TLS, so 1.x setups that use `https://127.0.0.1:9297` and
-trust `~/.lenslet/proxy-cert.pem` keep working.
-
-## What you see
-
-- **Every call, as it completes.** The service comes from the SigV4 scope (header
-  or presigned URL), so any emulator service shows up. Operations come from
-  `x-amz-target`, `x-id`, the Query `Action=`, and S3's REST shape (`GET /b/k` →
-  `GetObject`, `PUT /b?versioning` → `PutBucketVersioning`, …), so boto3 and the
-  AWS CLI get real names too.
-- **Why it failed.** The AWS error code and message from JSON, XML or Query
-  bodies, or the `x-amzn-ErrorType` header, plus a one-line likely cause for the
-  common local failures: missing resource, unknown credentials, signature,
-  region, not implemented, emulator down.
-- **Calls still running.** A call that takes longer than a second shows as
-  pending (long polls, large transfers, a stuck emulator).
-- **The raw exchange.** Headers and the first 64 KiB of text bodies, formatted
-  JSON and XML, copy as raw. Binary bodies keep size and SHA-256.
-- **Real status.** The window probes the run's proxy and emulator; it says when a
-  run ended and with what exit code.
-
-Lenslet records behavior; it does not claim the emulator matches AWS.
 
 ## Install
 
-Release archives: Linux x86_64 (`lenslet`, `lenslet-ui`) and macOS
-(`lenslet`, `Lenslet.app`, ad-hoc signed, not notarized).
+Release archives: Linux x86_64 (`lenslet`, `lenslet-ui`) and macOS arm64
+(`lenslet`, `Lenslet.app`, ad-hoc signed and not notarized). Put `lenslet` on
+your `PATH` and keep the window next to it. `lenslet run` needs no display or
+graphics libraries, so it works in CI, containers and over SSH.
 
 ```bash
 curl -fL -o lenslet.tar.gz \
-  https://github.com/hxddh/celagent/releases/download/lenslet-v2.0.0/lenslet-2.0.0-linux-x86_64.tar.gz
-tar xzf lenslet.tar.gz && cd lenslet-2.0.0-linux-x86_64
+  https://github.com/hxddh/celagent/releases/download/lenslet-v3.0.0/lenslet-3.0.0-linux-x86_64.tar.gz
+tar xzf lenslet.tar.gz && cd lenslet-3.0.0-linux-x86_64
 ./lenslet run -- aws s3 ls
 ```
-
-Put `lenslet` on your `PATH` and keep `lenslet-ui` (or `Lenslet.app`) next to
-it; `lenslet ui` looks there. `lenslet run` and `lenslet proxy` do not need the
-window or any graphics libraries. On macOS, if Gatekeeper complains:
-`xattr -dr com.apple.quarantine Lenslet.app lenslet`.
 
 ## Files
 
 | path | what |
 | --- | --- |
-| `~/.lenslet/runs/*.jsonl` | one trace per `run` / `proxy` session; the last 20 are kept |
-| `~/.lenslet/runs/*.run.json` | what the session was: command, endpoint, upstream, exit code |
-| `~/.lenslet/proxy-cert.pem`, `proxy-key.pem` | TLS identity for `https://` clients (generated) |
+| `./lenslet.lock` | the access your project's runs need; commit it |
+| `~/.lenslet/runs/*.jsonl` | one file per run: header, calls, report; the last 20 finished runs are kept |
 
-Traces are a **local development artifact**: raw headers and text bodies,
-including `Authorization`, written owner-only (`0600`). Do not commit them or
-attach them to public issues. Format: [docs/trace.md](docs/trace.md).
+Run files are a **local development artifact**. They hold raw headers and text
+bodies, including `Authorization`, and are written owner-only (`0600`). Do not
+commit them.
 
 ## Build from source
 
-Rust 1.88+ and, for the window, the GPUI Linux libraries (`libxkbcommon-dev`,
-`libxkbcommon-x11-dev`, `libwayland-dev`, `libx11-xcb-dev`, `libxcb1-dev`,
-`libvulkan-dev`, `libfontconfig1-dev`, `libfreetype-dev`, `pkg-config`,
-`cmake`, `clang`) and a Vulkan driver.
+Rust 1.88+. For the window you also need the GPUI Linux libraries
+(`libxkbcommon-dev`, `libxkbcommon-x11-dev`, `libwayland-dev`,
+`libx11-xcb-dev`, `libxcb1-dev`, `libvulkan-dev`, `libfontconfig1-dev`,
+`libfreetype-dev`, `pkg-config`, `cmake`, `clang`) and a Vulkan driver.
 
 ```bash
-cargo build --release -p lenslet          # CLI only: no graphics libraries needed
+cargo build --release -p lenslet          # CLI only: no graphics libraries
 cargo build --release -p lenslet-ui       # the window
 cargo test --workspace
 LENSLET_DEMO=1 ./target/release/lenslet-ui
 ```
 
 ```text
-crates/cli   lenslet: run / proxy / ui; proxy, error explanation, summaries
-crates/ui    lenslet-ui: the GPUI window
+crates/cli   lenslet: proxy, error and access derivation, lock, reports
+crates/ui    lenslet-ui: the GPUI window (reads run files; no IAM logic)
 vendor/xattr Linux build fix for gpui 0.2.2's xattr dependency
 ```
 
 ## Limits
 
-- HTTP/1.1 between SDK and proxy; loopback only.
-- Text capture is the first 64 KiB per body; binary bodies keep size and SHA-256.
-- The window shows the newest 500 calls of the newest run (or `LENSLET_TRACE`).
+- HTTP/1.1 between SDK and proxy; loopback only; plain HTTP only.
+- Text capture is the first 64 KiB per body; binary bodies keep size and
+  SHA-256.
+- Resources are read for S3, DynamoDB, SQS, SNS, Lambda, Secrets Manager, KMS,
+  STS, IAM, EventBridge and Step Functions; other services get `*`. Operations
+  that are only an HTTP method get no action.
+- Access is what your tests exercised. Code paths they never reach are not in
+  the lock.
 - Windows is not shipped.
 
 ## History
 
-This repository used to hold celagent, an agent runtime; its last release is
-[v4.1.0](https://github.com/hxddh/celagent/tree/v4.1.0). Lenslet 1.0 is at
-[lenslet-v1.0.0](https://github.com/hxddh/celagent/tree/lenslet-v1.0.0).
+Lenslet 2.0 is at
+[lenslet-v2.0.0](https://github.com/hxddh/celagent/tree/lenslet-v2.0.0).
+celagent, the agent runtime this repository used to hold, is at
+[v4.1.0](https://github.com/hxddh/celagent/tree/v4.1.0).
 
 ## License
 

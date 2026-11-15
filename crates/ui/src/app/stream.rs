@@ -4,6 +4,19 @@ use super::*;
 
 impl LensletApp {
     pub(super) fn render_stream(&mut self, op_width: f32, cx: &mut Context<Self>) -> Div {
+        if self.pane == Pane::Access && !self.rows.is_empty() {
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .bg(rgb(theme::PANEL))
+                .border_r_1()
+                .border_color(rgb(theme::BORDER))
+                .child(self.render_stream_head(cx))
+                .child(self.render_access(cx))
+                .child(self.render_stream_footer());
+        }
         let body: AnyElement = if self.view.is_empty() {
             if self.rows.is_empty() {
                 self.render_first_run(cx).into_any_element()
@@ -22,15 +35,31 @@ impl LensletApp {
             .bg(rgb(theme::PANEL))
             .border_r_1()
             .border_color(rgb(theme::BORDER))
-            .child(self.render_stream_head())
+            .child(self.render_stream_head(cx))
             .child(self.render_table_head(op_width))
             .child(body)
             .child(self.render_stream_footer())
     }
 
-    pub(super) fn render_stream_head(&self) -> Div {
+    pub(super) fn render_stream_head(&self, cx: &mut Context<Self>) -> Div {
         let filtered = !self.query.is_empty() || self.filter != Filter::All;
-        let counts = if filtered {
+        let access = self.access_rows();
+        let new_access = access.iter().filter(|entry| entry.new).count();
+        let counts = if self.pane == Pane::Access {
+            let mut text = format!(
+                "{} {}",
+                access.len(),
+                if access.len() == 1 {
+                    "PERMISSION"
+                } else {
+                    "PERMISSIONS"
+                }
+            );
+            if new_access > 0 {
+                text.push_str(&format!(" · {new_access} NEW"));
+            }
+            text
+        } else if filtered {
             format!(
                 "{} OF {} CALLS · {}",
                 self.counts.visible,
@@ -53,7 +82,19 @@ impl LensletApp {
             .px(px(theme::ROW_PAD_X))
             .border_b_1()
             .border_color(rgb(theme::BORDER_SUBTLE))
-            .child(micro_label("REQUEST STREAM"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(self.pane_tab(Pane::Calls, "CALLS", None, cx))
+                    .child(self.pane_tab(
+                        Pane::Access,
+                        "ACCESS",
+                        (new_access > 0).then(|| format!("+{new_access}")),
+                        cx,
+                    )),
+            )
             .child(
                 div()
                     .font_family(fonts::mono())
@@ -148,7 +189,9 @@ impl LensletApp {
             ),
         };
         let command = match self.run.as_ref() {
-            Some(run) if run.ended.is_none() && !run.endpoint.is_empty() => run.endpoint.clone(),
+            Some(run) if !run.ended() && !run.header.endpoint.is_empty() => {
+                run.header.endpoint.clone()
+            }
             _ => START_COMMAND.to_string(),
         };
 
@@ -235,7 +278,9 @@ impl LensletApp {
             Some(format!("\"{}\"", trace::clip_utf8(&self.query, 40)))
         };
         let mut description = String::from("Try a different search");
-        if let Filter::Service(id) = &self.filter {
+        if let Filter::Access(access) = &self.filter {
+            description = format!("No calls needed {} here", access.action);
+        } else if let Filter::Service(id) = &self.filter {
             description = format!("No calls for the {id} filter");
         } else if self.filter == Filter::Errors {
             description = "No error calls in the current trace".to_string();
@@ -300,7 +345,11 @@ impl LensletApp {
                 }
                 TraceHealth::Ok => (
                     self.proxy_light().dot,
-                    match self.run.as_ref().filter(|run| !run.command.is_empty()) {
+                    match self
+                        .run
+                        .as_ref()
+                        .filter(|run| !run.header.command.is_empty())
+                    {
                         Some(run) => format!(
                             "$ {} · {}",
                             trace::ellipsize(&run.command_line(), 48),
@@ -441,13 +490,21 @@ pub(super) fn trace_row(
                 .gap(px(3.0))
                 .child(
                     div()
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(theme::TEXT))
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .overflow_hidden()
-                        .child(operation_label(trace).to_string()),
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(theme::TEXT))
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .overflow_hidden()
+                                .child(operation_label(trace).to_string()),
+                        )
+                        .when(trace.new, |title| title.child(new_pill("NEW ACCESS"))),
                 )
                 .child(row_detail(trace, op_width)),
         )
@@ -570,4 +627,63 @@ fn row_detail(trace: &Trace, op_width: f32) -> Div {
             .overflow_hidden()
             .child(trace::display_path(trace).to_string()),
     )
+}
+
+impl LensletApp {
+    /// One segment of the CALLS / ACCESS switch (key: `a`).
+    fn pane_tab(
+        &self,
+        pane: Pane,
+        label: &'static str,
+        badge: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let active = self.pane == pane;
+        let mut tab = div()
+            .id(label)
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .h(px(22.0))
+            .px(px(8.0))
+            .rounded(px(5.0))
+            .bg(if active {
+                theme::h(theme::TEXT, 0.07)
+            } else {
+                theme::h(0x000000, 0.0)
+            })
+            .text_size(px(10.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(if active {
+                rgb(theme::TEXT)
+            } else {
+                rgb(theme::TEXT_MUTED)
+            })
+            .cursor_pointer()
+            .hover(|style| style.text_color(rgb(theme::TEXT_SOFT)))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_pane(pane, cx)))
+            .child(label);
+        if let Some(badge) = badge {
+            tab = tab.child(new_pill(badge));
+        }
+        tab
+    }
+}
+
+/// The small amber marker for access outside the lock file.
+pub(super) fn new_pill(text: impl Into<SharedString>) -> Div {
+    div()
+        .h(px(15.0))
+        .px(px(4.0))
+        .flex()
+        .items_center()
+        .rounded(px(3.0))
+        .border_1()
+        .border_color(theme::line(theme::AMBER, 0.4))
+        .bg(theme::h(theme::AMBER, 0.1))
+        .font_family(fonts::mono())
+        .text_size(px(9.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(theme::AMBER))
+        .child(text.into())
 }
