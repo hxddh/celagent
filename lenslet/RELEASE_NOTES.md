@@ -54,4 +54,4 @@ and CLI setup.
 - Real AWS Emulator 1.0.385 + Node AWS SDK through the TLS proxy:
   S3 CreateBucket/PutObject/GetObject, SQS CreateQueue/SendMessage, IAM
   ListUsers, CloudWatch PutMetricData — all 200.
-- Release build on Linux x86_64; headless GPUI render inspected.
+- Release build on Linux x86_64 and macOS arm64 (GitHub Actions, macos-latest); the Linux GPUI window was rendered and inspected headlessly.
