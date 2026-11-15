@@ -36,6 +36,8 @@ pub fn create(dir: &Path) -> Result<PathBuf> {
 }
 
 /// Keep the newest `keep` traces (by name, which sorts by start time).
+/// A session that is still running is never deleted, however old: a
+/// long-lived `lenslet proxy` must not lose its trace to newer runs.
 fn prune(dir: &Path, keep: usize) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -46,10 +48,39 @@ fn prune(dir: &Path, keep: usize) {
         .collect();
     traces.sort();
     let excess = traces.len().saturating_sub(keep);
-    for trace in traces.into_iter().take(excess) {
+    let finished = traces.into_iter().filter(|trace| !is_active(trace));
+    for trace in finished.take(excess) {
         let _ = fs::remove_file(info_path(&trace));
         let _ = fs::remove_file(trace);
     }
+}
+
+/// A session whose sidecar has not recorded an end and whose process lives.
+fn is_active(trace: &Path) -> bool {
+    let Some(info) = fs::read_to_string(info_path(trace))
+        .ok()
+        .and_then(|text| serde_json::from_str::<RunInfo>(&text).ok())
+    else {
+        return false;
+    };
+    info.ended.is_none() && process_alive(info.pid)
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // `kill -0` only checks that the process exists and is ours to signal.
+    pid != 0
+        && std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn process_alive(pid: u32) -> bool {
+    // No cheap liveness check: keep anything that has not recorded an end.
+    pid != 0
 }
 
 /// What a session was, next to its trace.
@@ -113,6 +144,15 @@ mod tests {
             fs::write(&trace, "").unwrap();
             write_info(&trace, &RunInfo::default()).unwrap();
         }
+        // The oldest session is a proxy that is still running (this process).
+        let live = dir.join("20261114-000000-1.jsonl");
+        fs::write(&live, "").unwrap();
+        let live_info = RunInfo {
+            kind: "proxy".into(),
+            pid: std::process::id(),
+            ..RunInfo::default()
+        };
+        write_info(&live, &live_info).unwrap();
         let next = create(&dir).unwrap();
         assert!(next.extension().is_some_and(|ext| ext == "jsonl"));
         let mut left: Vec<String> = fs::read_dir(&dir)
@@ -127,9 +167,11 @@ mod tests {
             .count();
         assert_eq!(traces, KEEP_RUNS - 1, "room is left for the new run");
         assert_eq!(infos, KEEP_RUNS - 1);
+        assert!(live.exists(), "a running session is never pruned");
+        assert_eq!(left[0], "20261114-000000-1.jsonl");
         assert!(
-            left[0].starts_with("20261115-000006"),
-            "oldest runs go first"
+            left[2].starts_with("20261115-000007"),
+            "oldest finished runs go first: {left:?}"
         );
 
         let info = RunInfo {

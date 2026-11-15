@@ -147,14 +147,21 @@ impl TraceSink {
         let line = match serde_json::to_string(trace) {
             Ok(line) => line,
             Err(error) => {
-                eprintln!("lenslet-proxy: cannot encode trace: {error}");
+                eprintln!("lenslet: cannot encode trace: {error}");
                 return;
             }
         };
+        // The summary lock also serializes writes, so this check and the
+        // write are atomic: a pending line can never land after the call's
+        // final line (which would make readers show a finished call as
+        // pending).
         let mut summary = self
             .summary
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if trace.pending && !summary.in_flight(&trace.id) {
+            return;
+        }
         summary.observe(trace);
         match open_trace(&self.path) {
             Ok(mut file) => {
@@ -162,11 +169,11 @@ impl TraceSink {
                 // followed by another writer's line.
                 let line = format!("{line}\n");
                 if let Err(error) = file.write_all(line.as_bytes()) {
-                    eprintln!("lenslet-proxy: cannot write trace: {error}");
+                    eprintln!("lenslet: cannot write trace: {error}");
                 }
             }
             Err(error) => eprintln!(
-                "lenslet-proxy: cannot open trace {}: {error}",
+                "lenslet: cannot open trace {}: {error}",
                 self.path.display()
             ),
         }
@@ -394,6 +401,44 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "trace is owner-only");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pending_line_never_follows_the_final_line() {
+        let dir = std::env::temp_dir().join(format!("lenslet-sink-{}", std::process::id()));
+        let path = dir.join("trace.jsonl");
+        let sink = TraceSink::new(path.clone()).unwrap();
+        let done = sample_trace();
+        let late_pending = Trace {
+            pending: true,
+            status: 0,
+            ..done.clone()
+        };
+
+        // The timer lost the race: the call finished first.
+        sink.start(&done.id);
+        sink.record(&done);
+        sink.record(&late_pending);
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "the late pending line is dropped");
+        assert_eq!(sink.summary().unfinished, 0);
+        assert_eq!(sink.summary().calls, 1);
+
+        // In the normal order both lines are kept.
+        let other = Trace {
+            id: "abc-2".to_string(),
+            ..done.clone()
+        };
+        sink.start(&other.id);
+        sink.record(&Trace {
+            pending: true,
+            ..other.clone()
+        });
+        assert_eq!(sink.summary().unfinished, 1);
+        sink.record(&other);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 3);
+        assert_eq!(sink.summary().unfinished, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -35,10 +35,14 @@ pub struct Failure {
 }
 
 impl Summary {
+    /// Whether a call has started and not yet been recorded as finished.
+    pub fn in_flight(&self, id: &str) -> bool {
+        self.pending.contains(id)
+    }
+
     pub fn observe(&mut self, trace: &Trace) {
         if trace.pending {
-            self.pending.insert(trace.id.clone());
-            self.unfinished = self.pending.len();
+            // A pending line only ever describes a call still in flight.
             return;
         }
         self.pending.remove(&trace.id);
@@ -185,6 +189,7 @@ mod tests {
         summary.start("a");
         summary.start("b");
         assert_eq!(summary.unfinished, 2);
+        assert!(summary.in_flight("a"));
         summary.observe(&trace("a", "sqs", 200, None));
         summary.observe(&trace(
             "b",
