@@ -296,10 +296,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
     let cwd = std::env::current_dir().context("read the current directory")?;
     let lock_path = lock.unwrap_or_else(|| lock::path_in(&cwd));
     // How the lock is named in reports: relative to the run's directory.
-    let lock_label = lock_path
-        .strip_prefix(&cwd)
-        .map(|relative| relative.display().to_string())
-        .unwrap_or_else(|_| lock_path.display().to_string());
+    let lock_label = relative_to(&lock_path, &cwd);
     let locked = lock::read(&lock_path)?;
     if check && locked.is_none() {
         bail!("--check needs {lock_label}; create it with `lenslet run --update -- <tests>`");
@@ -662,6 +659,26 @@ fn policy(args: Vec<String>) -> Result<i32> {
     Ok(0)
 }
 
+/// `path` relative to `dir` when it is inside it, also through symlinks
+/// (macOS temp dirs live under `/var`, which is `/private/var`).
+fn relative_to(path: &Path, dir: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(dir) {
+        return relative.display().to_string();
+    }
+    let canonical = |path: &Path| -> Option<PathBuf> {
+        // The file may not exist yet: resolve its directory instead.
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some(parent.join(path.file_name()?))
+    };
+    match (canonical(path), dir.canonicalize().ok()) {
+        (Some(path), Some(dir)) => match path.strip_prefix(&dir) {
+            Ok(relative) => relative.display().to_string(),
+            Err(_) => path.display().to_string(),
+        },
+        _ => path.display().to_string(),
+    }
+}
+
 fn exit_code(status: std::process::ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
@@ -864,6 +881,33 @@ mod tests {
             .status()
             .unwrap();
         assert_eq!(exit_code(status), 7);
+    }
+
+    #[test]
+    fn lock_labels_are_relative_even_through_symlinks() {
+        let base = std::env::temp_dir().join(format!("lenslet-rel-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("infra")).unwrap();
+        assert_eq!(
+            relative_to(&real.join("lenslet.lock"), &real),
+            "lenslet.lock"
+        );
+        #[cfg(unix)]
+        {
+            let link = base.join("link");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            // The lock is named through the link, the directory is the real path.
+            assert_eq!(
+                relative_to(&link.join("infra/aws.lock"), &real.canonicalize().unwrap()),
+                "infra/aws.lock"
+            );
+        }
+        assert_eq!(
+            relative_to(Path::new("/elsewhere/x.lock"), &real),
+            "/elsewhere/x.lock"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

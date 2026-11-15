@@ -107,7 +107,9 @@ runs:
         CHECK: ${{ inputs.check }}
         STRICT: ${{ inputs.strict }}
       run: |
-        set -uo pipefail
+        # GitHub runs this with `bash -e`: a failing lenslet must not end the
+        # step before the summary and outputs are written.
+        set +e -uo pipefail
         report="$RUNNER_TEMP/lenslet.json"
         markdown="$RUNNER_TEMP/lenslet.md"
         args=(run --upstream "$UPSTREAM" --json "$report" --markdown "$markdown")
@@ -139,19 +141,23 @@ runs:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
       run: |
-        set -uo pipefail
+        # Commenting is best effort (fork PRs get a read-only token).
+        set +e -uo pipefail
         markdown="$RUNNER_TEMP/lenslet.md"
         [ -f "$markdown" ] || exit 0
         marker="<!-- lenslet-report -->"
         body="$marker
         $(cat "$markdown")"
+        # Only a numeric id counts: on an API error gh prints the error body.
         existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" 2>/dev/null | head -n 1)
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" 2>/dev/null \
+          | grep -E '^[0-9]+$' | head -n 1)
         if [ -n "$existing" ]; then
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -f body="$body" > /dev/null
         else
           gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" > /dev/null
         fi || echo "::warning::Could not comment on the PR (forks get a read-only token). The report is in the job summary."
+        exit 0
 
     - name: Result
       shell: bash
