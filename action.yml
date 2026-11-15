@@ -42,8 +42,11 @@ outputs:
     description: lenslet's exit code (the command's own code when it failed, 3 when access changed).
     value: ${{ steps.run.outputs.exit-code }}
   report:
-    description: Path to the JSON report.
+    description: Path to the JSON report of this invocation.
     value: ${{ steps.run.outputs.report }}
+  markdown:
+    description: Path to the Markdown report of this invocation.
+    value: ${{ steps.run.outputs.markdown }}
 
 runs:
   using: composite
@@ -110,8 +113,11 @@ runs:
         # GitHub runs this with `bash -e`: a failing lenslet must not end the
         # step before the summary and outputs are written.
         set +e -uo pipefail
-        report="$RUNNER_TEMP/lenslet.json"
-        markdown="$RUNNER_TEMP/lenslet.md"
+        # Each invocation gets its own files: a run that fails before writing
+        # its report must not show a previous invocation's.
+        dir=$(mktemp -d "$RUNNER_TEMP/lenslet.XXXXXX")
+        report="$dir/report.json"
+        markdown="$dir/report.md"
         args=(run --upstream "$UPSTREAM" --json "$report" --markdown "$markdown")
         lock="${LOCK:-lenslet.lock}"
         args+=(--lock "$lock")
@@ -127,8 +133,10 @@ runs:
         code=$?
         [ -f "$markdown" ] && cat "$markdown" >> "$GITHUB_STEP_SUMMARY"
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
-        echo "report=$report" >> "$GITHUB_OUTPUT"
-        echo "LENSLET_EXIT=$code" >> "$GITHUB_ENV"
+        if [ -f "$report" ]; then
+          echo "report=$report" >> "$GITHUB_OUTPUT"
+          echo "markdown=$markdown" >> "$GITHUB_OUTPUT"
+        fi
         if [ "$code" = "3" ]; then
           echo "::error::AWS access changed: see the job summary. Accept it with \`lenslet run --update\` and commit $lock."
         fi
@@ -140,11 +148,12 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
+        MARKDOWN: ${{ steps.run.outputs.markdown }}
       run: |
         # Commenting is best effort (fork PRs get a read-only token).
         set +e -uo pipefail
-        markdown="$RUNNER_TEMP/lenslet.md"
-        [ -f "$markdown" ] || exit 0
+        markdown="$MARKDOWN"
+        [ -n "$markdown" ] && [ -f "$markdown" ] || exit 0
         marker="<!-- lenslet-report -->"
         body="$marker
         $(cat "$markdown")"
@@ -161,4 +170,6 @@ runs:
 
     - name: Result
       shell: bash
-      run: exit "${LENSLET_EXIT:-2}"
+      env:
+        CODE: ${{ steps.run.outputs.exit-code }}
+      run: exit "${CODE:-2}"

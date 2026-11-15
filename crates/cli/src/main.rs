@@ -521,6 +521,27 @@ jobs:
           emulator: ""
 "#;
 
+/// One shell word: left as is when it is plain, single-quoted otherwise, so
+/// `bash -c` in the action runs exactly the argv `init` ran.
+fn shell_quote(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A YAML single-quoted scalar.
 fn yaml_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
@@ -576,14 +597,14 @@ async fn init(args: Vec<String>) -> Result<i32> {
     } else {
         let text = WORKFLOW
             .replace("{version}", env!("CARGO_PKG_VERSION"))
-            .replace("{command}", &yaml_quote(&command.join(" ")))
+            .replace("{command}", &yaml_quote(&shell_join(&command)))
             .replace("{upstream}", &yaml_quote(&target.base));
         std::fs::create_dir_all(workflow.parent().unwrap_or(&cwd))
             .with_context(|| format!("create {}", workflow.display()))?;
         std::fs::write(&workflow, text).with_context(|| format!("write {}", workflow.display()))?;
     }
 
-    eprintln!("lenslet: 3/3 lenslet.lock from `{}`", command.join(" "));
+    eprintln!("lenslet: 3/3 lenslet.lock from `{}`", shell_join(&command));
     let mut run_args = vec!["--update".to_string(), "--upstream".to_string(), upstream];
     run_args.push("--".to_string());
     run_args.extend(command);
@@ -856,6 +877,28 @@ mod tests {
         assert_eq!(names(&env), ["AWS_ENDPOINT_URL"]);
         assert!(env.remove.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn init_keeps_argument_boundaries_for_bash() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(shell_join(&argv(&["npm", "test"])), "npm test");
+        assert_eq!(
+            shell_join(&argv(&["pytest", "-k", "not slow"])),
+            "pytest -k 'not slow'"
+        );
+        assert_eq!(
+            shell_join(&argv(&["python", "-c", "print('hi')"])),
+            r"python -c 'print('\''hi'\'')'"
+        );
+        assert_eq!(shell_join(&argv(&["echo", ""])), "echo ''");
+        // What bash does with it is the original argv.
+        let joined = shell_join(&argv(&["printf", "%s|", "a b", "it's", "$HOME"]));
+        let out = std::process::Command::new("bash")
+            .args(["-c", &joined])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "a b|it's|$HOME|");
     }
 
     #[test]
