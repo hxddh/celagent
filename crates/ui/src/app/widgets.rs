@@ -117,6 +117,7 @@ pub(super) fn mono_value(text: String) -> Div {
         .text_color(rgb(theme::TEXT_BODY))
         .whitespace_nowrap()
         .text_ellipsis()
+        .overflow_hidden()
         .child(text)
 }
 

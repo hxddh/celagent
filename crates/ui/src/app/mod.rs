@@ -84,6 +84,8 @@ impl InspectorTab {
 #[derive(Clone, Copy, Default)]
 struct Counts {
     total: usize,
+    reported_total: Option<usize>,
+    retries: usize,
     errors: usize,
     visible: usize,
     visible_errors: usize,
@@ -236,6 +238,14 @@ impl LensletApp {
         }
 
         self.counts.total = self.rows.len();
+        let report = self.run.as_ref().and_then(|run| run.report.as_ref());
+        self.counts.reported_total = report
+            .map(|r| r.calls)
+            .filter(|calls| *calls > self.rows.len());
+        self.counts.retries = report
+            .map(|r| r.retries)
+            .filter(|retries| *retries > 0)
+            .unwrap_or_else(|| self.rows.iter().filter(|row| row.is_retry()).count());
         self.counts.errors = self.rows.iter().filter(|row| row.is_error()).count();
         self.counts.services = self.facets.len();
 
@@ -362,6 +372,7 @@ impl LensletApp {
                 }
                 self.trace_path = path;
                 self.run = run;
+                self.refresh_view();
                 cx.notify();
             }
         }
@@ -676,31 +687,90 @@ impl LensletApp {
         cx.notify();
     }
 
-    /// The access table: the finished run's report, or live from the calls.
+    /// The access table: the finished run's report (including unused lock
+    /// entries and `# test` marks), or live from the calls.
     fn access_rows(&self) -> Vec<trace::AccessEntry> {
+        let test_marks = self
+            .run
+            .as_ref()
+            .and_then(|run| {
+                let lock = run.header.lock.as_deref()?;
+                Some(trace::read_test_marks(&run.header.cwd, lock))
+            })
+            .unwrap_or_default();
+
         if let Some(report) = self.run.as_ref().and_then(|run| run.report.as_ref()) {
-            return report.access.clone();
+            let mut rows = report.access.clone();
+            for entry in &mut rows {
+                let key = trace::Access {
+                    action: entry.action.clone(),
+                    resource: entry.resource.clone(),
+                };
+                entry.test = test_marks.contains(&key);
+            }
+            for unused in &report.access_unused {
+                rows.push(trace::AccessEntry {
+                    action: unused.action.clone(),
+                    resource: unused.resource.clone(),
+                    unused: true,
+                    test: test_marks.contains(unused),
+                    ..trace::AccessEntry::default()
+                });
+            }
+            rows.sort_by(|a, b| {
+                a.action
+                    .cmp(&b.action)
+                    .then_with(|| a.resource.cmp(&b.resource))
+            });
+            return rows;
         }
         let mut table: std::collections::BTreeMap<trace::Access, trace::AccessEntry> =
             std::collections::BTreeMap::new();
         for row in self.rows.iter().filter(|row| !row.pending) {
-            for (index, access) in row.access().enumerate() {
-                let own = index < row.access.len();
+            for (call_access, implied) in row.call_access() {
+                let key = call_access.key();
+                let is_new = row.is_access_new(call_access);
                 let entry = table
-                    .entry(access.clone())
+                    .entry(key.clone())
                     .or_insert_with(|| trace::AccessEntry {
-                        action: access.action.clone(),
-                        resource: access.resource.clone(),
-                        implied: !own,
+                        action: key.action.clone(),
+                        resource: key.resource.clone(),
+                        implied,
+                        test: test_marks.contains(&key),
                         ..trace::AccessEntry::default()
                     });
                 entry.calls += 1;
                 entry.errors += usize::from(row.is_error());
-                entry.implied &= !own;
-                entry.new |= row.new;
+                entry.implied &= implied;
+                entry.new |= is_new;
+                let via = format!("{} {}", row.service_name(), operation_label(row));
+                if entry.via.len() < 3 && !entry.via.contains(&via) {
+                    entry.via.push(via);
+                }
             }
         }
         table.into_values().collect()
+    }
+
+    pub(super) fn run_start_ms(&self) -> Option<i64> {
+        self.run
+            .as_ref()
+            .and_then(|run| trace::parse_rfc3339_ms(&run.header.started))
+            .or_else(|| self.rows.first().and_then(|row| row.at_ms()))
+    }
+
+    /// Count and combined wall time of all attempts sharing `trace`'s invocation id.
+    pub(super) fn invocation_stats(&self, trace: &Trace) -> Option<(usize, u64)> {
+        let id = trace.invocation_id.as_deref()?;
+        let mut count = 0usize;
+        let mut total_ms = 0u64;
+        for row in self.rows.iter().filter(|row| !row.pending) {
+            if row.invocation_id.as_deref() == Some(id) {
+                count += 1;
+                total_ms += row.ms;
+            }
+        }
+        (count > 1).then_some((count, total_ms))
     }
 
     // -- render -------------------------------------------------------------

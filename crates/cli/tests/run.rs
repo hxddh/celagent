@@ -456,3 +456,68 @@ fn usage_errors_exit_2() {
         assert_eq!(output.status.code(), Some(2), "{args:?}");
     }
 }
+
+#[test]
+fn init_detects_moto_and_run_tracks_retries() {
+    if !has_curl() {
+        eprintln!("skipping: curl is not installed");
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                }
+            }
+            let body = r#"{"__type":"com.amazonaws.sqs#InternalError","message":"boom"}"#;
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nserver: Werkzeug/3.1.0 Python/3.12.0\r\ncontent-type: application/x-amz-json-1.0\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let env = Env::new();
+    let upstream = format!("http://127.0.0.1:{port}");
+    let script = "for n in 1 2; do\n\
+        curl -s -o /dev/null -X POST \"$AWS_ENDPOINT_URL/\" \
+          -H 'x-amz-target: AmazonSQS.SendMessage' \
+          -H 'amz-sdk-invocation-id: inv-test-1' \
+          -H \"amz-sdk-request: attempt=$n; max=3\" \
+          -H 'content-type: application/x-amz-json-1.0' \
+          -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261118/us-east-1/sqs/aws4_request, Signature=x' \
+          -d '{\"QueueUrl\":\"http://127.0.0.1/000000000000/jobs\"}'\n\
+        done";
+    let summary = env.home.join("retry.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_lenslet"))
+        .args(["init", "--upstream", &upstream, "--", "sh", "-c", script])
+        .current_dir(&env.work)
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let workflow = std::fs::read_to_string(env.work.join(".github/workflows/lenslet.yml")).unwrap();
+    assert!(
+        workflow.contains(&format!("emulator: 'moto_server -p {port}'")),
+        "moto upstream should prefill emulator command:\n{workflow}"
+    );
+    let text = stderr(&output);
+    assert!(text.contains("2 calls (1 retry)"), "{text}");
+    assert!(text.contains("(attempt 2/3)"), "{text}");
+
+    // Also verify JSON report via `lenslet last --json`.
+    let last = env.lenslet(&["last", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&last.stdout).unwrap();
+    assert_eq!(report["retries"], 1);
+    assert_eq!(report["failures"][1]["attempt"], 2);
+    assert_eq!(report["failures"][1]["max_attempts"], 3);
+    let _ = summary;
+}

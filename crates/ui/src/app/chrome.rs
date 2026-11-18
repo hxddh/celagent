@@ -637,6 +637,14 @@ impl LensletApp {
         if added > 0 {
             line = line.child(badge(format!("+{added} access"), theme::AMBER));
         }
+        let unused = run
+            .report
+            .as_ref()
+            .map(|report| report.access_unused.len())
+            .unwrap_or(0);
+        if unused > 0 && run.exit_code() == Some(3) {
+            line = line.child(badge(format!("−{unused} unused"), theme::AMBER));
+        }
         if let Some(regressions) = run
             .report
             .as_ref()

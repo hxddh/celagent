@@ -51,7 +51,7 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   # install your test dependencies
-  - uses: hxddh/lenslet@lenslet-v4.0.0
+  - uses: hxddh/lenslet@lenslet-v4.1.0
     with:
       command: npm test
       emulator: moto_server -p 9298           # or however you start your emulator
@@ -189,8 +189,7 @@ run: --check  --strict  --update  --lock PATH  --json PATH  --markdown PATH
 It always removes `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_SESSION_TOKEN` and `AWS_PROFILE` from the environment it hands over, so
 real credentials never reach the emulator or the trace. `--no-env` sets only
-the endpoint. Use `127.0.0.1`, not `localhost`, if you set the endpoint
-yourself.
+the endpoint. Both `127.0.0.1` and `localhost` work on IPv4 and IPv6 loopback.
 
 ## Install
 
@@ -241,12 +240,15 @@ examples/      a project the action is tested against
 ## Limits
 
 - Between the SDK and the proxy: HTTP/1.1 only, loopback only.
-- Text capture keeps the first 64 KiB of each body.
-- Resources are read for S3, DynamoDB, SQS, SNS, Lambda, Secrets Manager, KMS,
-  STS, IAM, EventBridge and Step Functions. Other services get `*`.
+- Text capture keeps the first 64 KiB of each body (including `gzip` and
+  `deflate` payloads).
+- Resources are read for S3, DynamoDB, SQS, SNS, Lambda, SSM Parameter Store,
+  CloudWatch Logs, Kinesis, Bedrock, Secrets Manager, KMS, STS, IAM, EventBridge
+  and Step Functions. Other services get `*`. Calls with unrecognized operations
+  are reported as unmapped rather than guessed.
 - No Windows build. The macOS app is not notarized.
 
-Earlier versions: [lenslet-v3.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v3.0.0).
+Earlier versions: [lenslet-v4.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v4.0.0).
 This repository used to be `celagent`; that project is at
 [v4.1.0](https://github.com/hxddh/lenslet/tree/v4.1.0).
 

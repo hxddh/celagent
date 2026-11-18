@@ -16,7 +16,7 @@ use std::{
     collections::BTreeSet,
     convert::Infallible,
     fs,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -36,7 +36,10 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use rustls::RootCertStore;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 use crate::{
     access::Access,
@@ -119,13 +122,13 @@ fn resolve_operation(
 /// `Action=` from a captured form body, if the request is a query-protocol call.
 fn query_action(capture: &Mutex<Capture>, content: &Content) -> Option<String> {
     let capture = capture.lock().ok()?;
-    let prefix = capture.prefix();
+    let prefix = capture.decoded_prefix(content);
     let form = content.content_type.as_deref() == Some("application/x-www-form-urlencoded")
         || prefix.trim_ascii_start().starts_with(b"Action=");
     if !form {
         return None;
     }
-    wire::form_action(prefix)
+    wire::form_action(&prefix)
 }
 
 fn snapshot(capture: &Mutex<Capture>, content: &Content) -> Option<trace::BodyTrace> {
@@ -264,20 +267,56 @@ impl Upstream {
         matches!(self.host.as_str(), "127.0.0.1" | "localhost" | "::1")
     }
 
-    /// Whether something accepts TCP connections at the upstream address.
+    /// Whether something accepts TCP connections at the upstream address
+    /// (trying normal resolution first, so IPv6-only `localhost` works too).
     pub async fn reachable(&self) -> bool {
-        let host = if self.host == "localhost" {
-            "127.0.0.1"
-        } else {
-            self.host.as_str()
-        };
-        tokio::time::timeout(
+        let primary = tokio::time::timeout(
             Duration::from_millis(400),
-            TcpStream::connect((host, self.port)),
+            TcpStream::connect((self.host.as_str(), self.port)),
         )
         .await
-        .map(|connected| connected.is_ok())
-        .unwrap_or(false)
+        .is_ok_and(|connected| connected.is_ok());
+        if primary || self.host != "localhost" {
+            return primary;
+        }
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            TcpStream::connect(("127.0.0.1", self.port)),
+        )
+        .await
+        .is_ok_and(|connected| connected.is_ok())
+    }
+
+    /// Best-effort fingerprint of the running emulator for `lenslet init`.
+    pub async fn detect_emulator(&self) -> Option<String> {
+        if self.tls {
+            return Some(format!("aws-emulator --telemetry off --port {}", self.port));
+        }
+        let probe = async {
+            let mut stream = TcpStream::connect((self.host.as_str(), self.port))
+                .await
+                .ok()?;
+            stream
+                .write_all(
+                    b"GET /_localstack/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .ok()?;
+            let mut buf = vec![0u8; 2048];
+            let n = stream.read(&mut buf).await.ok()?;
+            Some(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase())
+        };
+        let reply = tokio::time::timeout(Duration::from_millis(300), probe)
+            .await
+            .ok()
+            .flatten()?;
+        if reply.contains("server: werkzeug") || reply.contains("moto") {
+            Some(format!("moto_server -p {}", self.port))
+        } else if reply.contains("localstack") || reply.contains("\"services\"") {
+            Some("localstack start -d".to_string())
+        } else {
+            None
+        }
     }
 }
 
@@ -350,7 +389,12 @@ where
         service,
         region,
         operation: advertised_operation,
+        invocation_id,
+        attempt,
+        max_attempts,
     } = wire::wire_info(req.headers(), &raw_path);
+    let retry_attempt = attempt.filter(|n| *n > 1);
+    let retry_max = max_attempts.filter(|_| retry_attempt.is_some());
     // A protocol-derived operation, or the method/path fallback until (and
     // unless) the request body supplies an AWS Query `Action=...`.
     let operation = advertised_operation.clone().unwrap_or_else(|| {
@@ -392,6 +436,9 @@ where
         ms: 0,
         authorization,
         region,
+        invocation_id,
+        attempt: retry_attempt,
+        max_attempts: retry_max,
         pending: false,
         error: None,
         problem: None,
@@ -519,10 +566,12 @@ pub struct Server {
     pub addr: SocketAddr,
     pub state: Arc<State>,
     task: tokio::task::JoinHandle<()>,
+    v6_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Server {
-    /// Validate everything, bind loopback, write the run header, and start
+    /// Validate everything, bind loopback (IPv4 + best-effort IPv6 so
+    /// `localhost` works on either stack), write the run header, and start
     /// serving in the background.
     pub async fn start(
         options: &Options,
@@ -546,6 +595,9 @@ impl Server {
             .await
             .with_context(|| format!("bind 127.0.0.1:{}", options.listen))?;
         let addr = listener.local_addr().context("read the bound address")?;
+        let v6_listener = TcpListener::bind((IpAddr::V6(Ipv6Addr::LOCALHOST), addr.port()))
+            .await
+            .ok();
         header.endpoint = format!("http://{addr}");
         header.upstream = options.upstream.base.clone();
         let trace = Arc::new(TraceSink::new(trace_path, &header, locked)?);
@@ -555,7 +607,13 @@ impl Server {
             trace,
         });
         let task = tokio::spawn(serve(listener, state.clone()));
-        Ok(Server { addr, state, task })
+        let v6_task = v6_listener.map(|v6| tokio::spawn(serve(v6, state.clone())));
+        Ok(Server {
+            addr,
+            state,
+            task,
+            v6_task,
+        })
     }
 
     /// The endpoint SDKs should use.
@@ -570,6 +628,9 @@ impl Server {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         self.task.abort();
+        if let Some(v6_task) = self.v6_task {
+            v6_task.abort();
+        }
     }
 }
 

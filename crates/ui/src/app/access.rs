@@ -5,20 +5,41 @@ use super::*;
 
 /// Widths of the access table's fixed columns.
 const COL_CALLS: f32 = 56.0;
-const COL_FLAGS: f32 = 92.0;
+const COL_FLAGS: f32 = 126.0;
 
 impl LensletApp {
     pub(super) fn render_access(&mut self, cx: &mut Context<Self>) -> Div {
         let rows = self.access_rows();
         let lock = self.run.as_ref().and_then(|run| run.header.lock.clone());
-        let note = match (&lock, rows.iter().filter(|row| row.new).count()) {
-            (None, _) => "No lenslet.lock in this run's directory. `lenslet run --update -- <tests>` writes one; then new access is flagged here and fails `--check`.".to_string(),
-            (Some(lock), 0) => format!("Everything this run used is in {lock}."),
-            (Some(lock), new) => format!(
+        let new_count = rows.iter().filter(|row| row.new).count();
+        let unused_count = rows.iter().filter(|row| row.unused).count();
+        let unmapped: usize = self
+            .run
+            .as_ref()
+            .and_then(|run| run.report.as_ref())
+            .map(|report| report.unmapped.values().sum())
+            .unwrap_or(0);
+        let mut note = match (&lock, new_count, unused_count) {
+            (None, _, _) => "No lenslet.lock in this run's directory. `lenslet run --update -- <tests>` writes one; then new access is flagged here and fails `--check`.".to_string(),
+            (Some(lock), 0, 0) => format!("Everything this run used is in {lock}."),
+            (Some(lock), new, 0) => format!(
                 "{new} {} not in {lock}: review them, then `lenslet run --update` to accept.",
                 if new == 1 { "permission is" } else { "permissions are" }
             ),
+            (Some(lock), 0, unused) => format!(
+                "Within {lock}, with {unused} locked {} not exercised by this run (`--strict` fails on unused access).",
+                if unused == 1 { "permission" } else { "permissions" }
+            ),
+            (Some(lock), new, unused) => format!(
+                "{new} not in {lock}, and {unused} in {lock} not exercised by this run: review changes, then `lenslet run --update`.",
+            ),
         };
+        if unmapped > 0 {
+            note.push_str(&format!(
+                " · {unmapped} {} had no recognizable operation.",
+                if unmapped == 1 { "call" } else { "calls" }
+            ));
+        }
         let header = div()
             .flex()
             .items_center()
@@ -103,6 +124,7 @@ fn access_row(
         .split_once(':')
         .unwrap_or(("", entry.action.as_str()));
     let color = theme::service_color(&trace::service_label(service));
+    let unused = entry.unused;
     let mut flags = div()
         .w(px(COL_FLAGS))
         .flex()
@@ -111,6 +133,18 @@ fn access_row(
         .gap(px(5.0));
     if entry.new {
         flags = flags.child(new_pill("NEW"));
+    }
+    if unused {
+        flags = flags.child(unused_pill("UNUSED"));
+    }
+    if entry.test {
+        flags = flags.child(
+            div()
+                .font_family(fonts::mono())
+                .text_size(px(10.0))
+                .text_color(rgb(theme::TEXT_FAINT))
+                .child("test"),
+        );
     }
     if entry.implied {
         flags = flags.child(
@@ -136,6 +170,8 @@ fn access_row(
         .border_color(rgb(theme::BORDER_SUBTLE))
         .bg(if entry.new {
             theme::h(theme::AMBER, 0.045)
+        } else if unused {
+            theme::h(theme::TEXT_FAINT, 0.05)
         } else {
             theme::h(theme::ROW, 1.0)
         })
@@ -143,7 +179,17 @@ fn access_row(
         .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
         .on_click(move |_, _, cx| {
             let access = access.clone();
-            this.update(cx, |app, cx| app.show_access(access, cx)).ok();
+            this.update(cx, |app, cx| {
+                if unused {
+                    app.show_toast(
+                        format!("{} was not exercised in this run", access.action),
+                        cx,
+                    );
+                } else {
+                    app.show_access(access, cx);
+                }
+            })
+            .ok();
         })
         .child(
             div()
@@ -169,7 +215,11 @@ fn access_row(
                         .child(
                             div()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT))
+                                .text_color(if unused {
+                                    rgb(theme::TEXT_DIM)
+                                } else {
+                                    rgb(theme::TEXT)
+                                })
                                 .child(action.to_string()),
                         ),
                 ),
@@ -180,7 +230,11 @@ fn access_row(
                 .min_w(px(0.0))
                 .font_family(fonts::mono())
                 .text_size(px(11.0))
-                .text_color(rgb(theme::TEXT_DIM))
+                .text_color(if unused {
+                    rgb(theme::TEXT_FAINT)
+                } else {
+                    rgb(theme::TEXT_DIM)
+                })
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .overflow_hidden()
@@ -193,8 +247,29 @@ fn access_row(
                 .text_right()
                 .font_family(fonts::mono())
                 .text_size(px(11.5))
-                .text_color(rgb(theme::TEXT_BODY))
+                .text_color(if unused {
+                    rgb(theme::TEXT_FAINT)
+                } else {
+                    rgb(theme::TEXT_BODY)
+                })
                 .child(entry.calls.to_string()),
         )
         .child(flags)
+}
+
+fn unused_pill(text: impl Into<SharedString>) -> Div {
+    div()
+        .h(px(15.0))
+        .px(px(4.0))
+        .flex()
+        .items_center()
+        .rounded(px(3.0))
+        .border_1()
+        .border_color(rgb(theme::BORDER_STRONG))
+        .bg(theme::h(theme::TEXT, 0.04))
+        .font_family(fonts::mono())
+        .text_size(px(9.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(theme::TEXT_DIM))
+        .child(text.into())
 }

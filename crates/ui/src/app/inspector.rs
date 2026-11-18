@@ -366,6 +366,17 @@ impl LensletApp {
                 "Method",
                 mono_value(trace.method.to_ascii_uppercase()),
             ));
+        if trace.is_retry() || self.invocation_stats(trace).is_some() {
+            let attempt = trace.attempt.unwrap_or(1);
+            let mut label = match trace.max_attempts {
+                Some(max) => format!("{attempt} of {max}"),
+                None => format!("attempt {attempt}"),
+            };
+            if let Some((count, total_ms)) = self.invocation_stats(trace) {
+                label.push_str(&format!(" · {count} tries ({})", format_latency(total_ms)));
+            }
+            call = call.child(meta_row("Retry", mono_value(label)));
+        }
 
         let mut routing = div().flex().flex_col();
         routing = routing
@@ -836,13 +847,12 @@ fn problem_panel(trace: &Trace) -> Option<Div> {
 
 /// The permissions this call needs: its own, and implied ones elsewhere.
 fn access_section(trace: &Trace) -> Option<Div> {
-    let entries: Vec<trace::Access> = trace.access().collect();
+    let entries: Vec<(&trace::CallAccess, bool)> = trace.call_access().collect();
     if entries.is_empty() {
         return None;
     }
     let mut list = div().flex().flex_col();
-    for (index, access) in entries.iter().enumerate() {
-        let implied = index >= trace.access.len();
+    for (access, implied) in entries {
         let mut name = div().flex().items_center().gap(px(6.0)).child(
             div()
                 .font_family(fonts::mono())
@@ -859,7 +869,7 @@ fn access_section(trace: &Trace) -> Option<Div> {
                     .child("implied"),
             );
         }
-        if trace.new && index == 0 {
+        if trace.is_access_new(access) {
             name = name.child(new_pill("NOT IN LOCK"));
         }
         list = list.child(

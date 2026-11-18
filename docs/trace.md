@@ -37,40 +37,46 @@ not compatible with earlier files.
 | `method`, `path`, `host` | as sent; `path` includes the query |
 | `service` | SigV4 scope service (header or presigned URL); `s3` for SigV2; else `aws` |
 | `region` | SigV4 scope region |
-| `operation` | from `x-amz-target`, `x-id`, the Query `Action=`, the S3 or Lambda REST shape, or the HTTP method |
+| `invocation_id` | SDK `amz-sdk-invocation-id`, shared across retries of one call |
+| `attempt`, `max_attempts` | retry attempt (`> 1`) and configured max from `amz-sdk-request` |
+| `operation` | from `x-amz-target`, `x-id`, the Query `Action=`, the S3/Lambda/Bedrock/API Gateway REST shape, or the HTTP method |
 | `status`, `ms` | HTTP status (`0` while pending) and full exchange time |
 | `authorization` | an Authorization header was present |
 | `pending` | `true` on a line for a call still running after 1 s |
 | `error` | proxy-side failure, e.g. the emulator was unreachable |
 | `problem` | `{code, message?, hint?}` for status ≥ 400 or a proxy failure |
-| `access` | `[{action, resource}]` this call needs: usually one; one per table for a batch; each item's action for a DynamoDB transaction; the source read for an S3 copy |
-| `implied` | `[{action, resource}]` needed elsewhere (SSE-KMS key, passed role) |
-| `new` | the call's access is not in the lock |
+| `access` | `[{action, resource, new?}]` this call needs: usually one; one per table/parameter for batches; each item's action for a DynamoDB transaction; the source read for an S3 copy |
+| `implied` | `[{action, resource, new?}]` needed elsewhere (SSE-KMS key, passed role) |
+| `new` | at least one permission on this call is not in the lock |
 | `request`, `response` | `{headers, content_type?, body?}` |
 
 `body` is `{text?, bytes, truncated, binary, sha256}`. Headers are raw and
 duplicate-preserving, with no redaction. `text` holds the first 64 KiB of a text
-body and is absent for binary or content-encoded bodies. `bytes` and `sha256`
-cover the whole body.
+body (`identity`, `gzip` or `deflate` decoded for reading; wire bytes are
+forwarded untouched) and is absent for binary or unknown encodings. `bytes` and
+`sha256` cover the whole wire body.
 
 ### Access derivation
 
 - **Action**: `{iam prefix}:{operation}`, plus exceptions. The SigV4 names
-  `monitoring` and `email` become `cloudwatch` and `ses`. S3 `ListObjectsV2`
-  becomes `s3:ListBucket`, `HeadObject` becomes `s3:GetObject`, multipart calls
-  become `s3:PutObject`, and Lambda `Invoke` becomes `lambda:InvokeFunction`.
+  `monitoring`, `email` and `bedrock-runtime` become `cloudwatch`, `ses` and
+  `bedrock`. S3 `ListObjectsV2` becomes `s3:ListBucket`, `HeadObject` becomes
+  `s3:GetObject`, multipart calls become `s3:PutObject`, Lambda `Invoke` becomes
+  `lambda:InvokeFunction`, and Bedrock `Converse` becomes `bedrock:InvokeModel`.
   `sts:GetCallerIdentity` needs nothing. `TransactWriteItems` and
   `TransactGetItems` are not IAM actions: each item contributes its own
   (`PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem`, `GetItem`).
   `CopyObject` and `UploadPartCopy` also need `s3:GetObject` on the source from
   `x-amz-copy-source`.
 - **Resource**: read from the request for S3, DynamoDB (tables and indexes;
-  one entry per table, since an IAM resource names one table), SQS, SNS, Lambda, Secrets Manager, KMS, STS, IAM,
-  EventBridge and Step Functions; otherwise `*`. Account and region are `*`.
-- **Normalization**: UUIDs, runs of six or more digits, and long hex segments
-  become `*`, so generated test names do not churn the lock.
+  one entry per table, since an IAM resource names one table), SQS, SNS, Lambda,
+  SSM Parameter Store, CloudWatch Logs, Kinesis, Bedrock, Secrets Manager, KMS,
+  STS, IAM, EventBridge and Step Functions; otherwise `*`. Account and region
+  are `*`, while `/` paths in secrets, parameters and IAM roles are preserved.
+- **Normalization**: UUIDs, runs of six or more digits, and hex segments of six
+  or more characters become `*`, so generated test names do not churn the lock.
 - A call whose operation is only an HTTP method gets no action. Lenslet does
-  not guess.
+  not guess, and reports unmapped call counts in `unmapped`.
 
 ## `end`
 
@@ -81,8 +87,8 @@ summaries.
 | field | meaning |
 | --- | --- |
 | `run`, `command`, `exit_code`, `ended`, `duration_ms` | the run; `exit_code` is the program's (`null` for a proxy session) |
-| `calls`, `errors`, `unfinished`, `services` | counts |
-| `failures` | `[{id, service, operation, status, code, message?, hint?}]` |
+| `calls`, `retries`, `errors`, `unfinished`, `services`, `unmapped` | counts (`retries` and `unmapped` omitted when empty) |
+| `failures` | `[{id, service, operation, status, code, message?, hint?, attempt?, max_attempts?}]` |
 | `access` | `[{action, resource, calls, errors, implied?, new?, via?}]`, sorted; `via` names the first calls that needed it, e.g. `DYNAMODB DeleteItem` |
 | `lock` | the lock file compared with, or `null` |
 | `access_added` | used by this run, not in the lock |

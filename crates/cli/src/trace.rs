@@ -21,7 +21,7 @@ use hyper::HeaderMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    access::{self, Access},
+    access::{self, Access, CallAccess},
     problem::Problem,
     summary::{Report, Summary},
 };
@@ -69,7 +69,7 @@ struct Tagged<'a, T: Serialize> {
     value: &'a T,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Trace {
     /// Unique per call within (and across) proxy runs.
     pub id: String,
@@ -88,6 +88,15 @@ pub struct Trace {
     /// SigV4 signing region, when the request was signed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// SDK invocation identifier (`amz-sdk-invocation-id`), constant across retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
+    /// Retry attempt number (`> 1`) from `amz-sdk-request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Maximum attempts configured for this SDK invocation, when retried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
     /// Written for a call that is still running after a second; the final
     /// line for the same `id` replaces it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -102,10 +111,10 @@ pub struct Trace {
     /// usually one; several for batches, transactions and copies; none when
     /// the operation is unknown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub access: Vec<Access>,
+    pub access: Vec<CallAccess>,
     /// Permissions the call implies elsewhere (SSE-KMS key, passed role).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub implied: Vec<Access>,
+    pub implied: Vec<CallAccess>,
     /// The access is not in the lock file: this run grew the footprint.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new: bool,
@@ -159,11 +168,15 @@ pub fn headers(headers: &HeaderMap) -> Vec<HeaderTrace> {
         .collect()
 }
 
-/// Append-only run file. Writes are serialized; the sink also keeps the
-/// in-memory [`Summary`] that becomes the `end` report.
+struct SinkState {
+    file: File,
+    summary: Summary,
+}
+
+/// Append-only run file. Writes are serialized through one open file handle;
+/// the sink also keeps the in-memory [`Summary`] that becomes the `end` report.
 pub struct TraceSink {
-    path: PathBuf,
-    summary: Mutex<Summary>,
+    state: Mutex<SinkState>,
     /// Access recorded in the lock file, when there is one.
     locked: Option<BTreeSet<Access>>,
 }
@@ -184,96 +197,108 @@ impl TraceSink {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create trace directory {}", parent.display()))?;
         }
-        open_trace(&path).with_context(|| format!("open trace file {}", path.display()))?;
+        let mut file =
+            open_trace(&path).with_context(|| format!("open trace file {}", path.display()))?;
         set_owner_only(&path)?;
-        let sink = TraceSink {
-            path,
-            summary: Mutex::new(Summary::default()),
+        write_record(&mut file, "run", header);
+        Ok(TraceSink {
+            state: Mutex::new(SinkState {
+                file,
+                summary: Summary::default(),
+            }),
             locked,
-        };
-        sink.write("run", header);
-        Ok(sink)
+        })
     }
 
     /// Append the `end` report. Nothing is written after it.
     pub fn end(&self, report: &Report) {
-        let _guard = self
-            .summary
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.write("end", report);
-    }
-
-    fn write<T: Serialize>(&self, kind: &'static str, value: &T) {
-        let line = match serde_json::to_string(&Tagged { kind, value }) {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("lenslet: cannot encode trace: {error}");
-                return;
-            }
-        };
-        match open_trace(&self.path) {
-            Ok(mut file) => {
-                // One write per line, so a reader never sees half a record
-                // followed by another writer's line.
-                if let Err(error) = file.write_all(format!("{line}\n").as_bytes()) {
-                    eprintln!("lenslet: cannot write trace: {error}");
-                }
-            }
-            Err(error) => eprintln!(
-                "lenslet: cannot open trace {}: {error}",
-                self.path.display()
-            ),
-        }
+        write_record(&mut state.file, "end", report);
     }
 
     /// Note a call that has started (for the in-flight count).
     pub fn start(&self, id: &str) {
-        self.summary
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .summary
             .start(id);
     }
 
     /// A copy of the calls seen so far.
     pub fn summary(&self) -> Summary {
-        self.summary
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .summary
             .clone()
     }
 
     /// Write one call. Never fails the caller: trace problems are logged to
     /// stderr and the proxy keeps forwarding.
     pub fn record(&self, mut trace: Trace) {
+        let locked = self.locked.as_ref();
         if !trace.pending && trace.access.is_empty() {
             let (own, implied) = access::derive(&trace);
-            trace.access = own;
-            trace.implied = implied;
+            trace.access = own
+                .into_iter()
+                .map(|entry| CallAccess::from_access(entry, locked))
+                .collect();
+            trace.implied = implied
+                .into_iter()
+                .map(|entry| CallAccess::from_access(entry, locked))
+                .collect();
+        } else if let Some(locked) = locked {
+            for entry in trace.access.iter_mut().chain(trace.implied.iter_mut()) {
+                entry.new = !locked.contains(&entry.key());
+            }
         }
-        if let Some(locked) = self.locked.as_ref() {
-            let new = trace_access(&trace).any(|access| !locked.contains(&access));
-            trace.new = new;
+        if locked.is_some() {
+            trace.new = trace
+                .access
+                .iter()
+                .chain(trace.implied.iter())
+                .any(|entry| entry.new);
         }
-        // The summary lock also serializes writes, so this check and the
-        // write are atomic: a pending line can never land after the call's
-        // final line (which would make readers show a finished call as
-        // pending).
-        let mut summary = self
-            .summary
+        // The sink lock serializes writes, so this check and the write are
+        // atomic: a pending line can never land after the call's final line.
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if trace.pending && !summary.in_flight(&trace.id) {
+        if trace.pending && !state.summary.in_flight(&trace.id) {
             return;
         }
-        summary.observe(&trace);
-        self.write("call", &trace);
+        state.summary.observe(&trace);
+        write_record(&mut state.file, "call", &trace);
+    }
+}
+
+fn write_record<T: Serialize>(file: &mut File, kind: &'static str, value: &T) {
+    let line = match serde_json::to_string(&Tagged { kind, value }) {
+        Ok(line) => line,
+        Err(error) => {
+            eprintln!("lenslet: cannot encode trace: {error}");
+            return;
+        }
+    };
+    // One write per line, so a reader never sees half a record followed by
+    // another writer's line.
+    if let Err(error) = file.write_all(format!("{line}\n").as_bytes()) {
+        eprintln!("lenslet: cannot write trace: {error}");
     }
 }
 
 /// Every permission one call accounts for: its own, then the implied ones.
 pub fn trace_access(trace: &Trace) -> impl Iterator<Item = Access> + '_ {
-    trace.access.iter().chain(trace.implied.iter()).cloned()
+    trace
+        .access
+        .iter()
+        .chain(trace.implied.iter())
+        .map(CallAccess::key)
 }
 
 fn open_trace(path: &Path) -> std::io::Result<File> {
@@ -344,6 +369,9 @@ mod tests {
             ms: 12,
             authorization: true,
             region: None,
+            invocation_id: None,
+            attempt: None,
+            max_attempts: None,
             pending: false,
             error: None,
             problem: None,
@@ -558,6 +586,33 @@ mod tests {
         sink.record(other);
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 4);
         assert_eq!(sink.summary().unfinished, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marks_only_the_unlocked_permission_as_new() {
+        let dir = std::env::temp_dir().join(format!("lenslet-new-attr-{}", std::process::id()));
+        let path = dir.join("trace.jsonl");
+        let locked: BTreeSet<Access> =
+            [Access::new("s3:PutObject", "arn:aws:s3:::bucket/*")].into();
+        let sink = TraceSink::new(path.clone(), &RunHeader::default(), Some(locked)).unwrap();
+        let mut trace = sample_trace();
+        trace.request.headers.push(HeaderTrace {
+            name: "x-amz-server-side-encryption".into(),
+            value: "aws:kms".into(),
+        });
+        sink.record(trace);
+        let text = fs::read_to_string(&path).unwrap();
+        let call: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(call["new"], true);
+        assert!(
+            call["access"][0].get("new").is_none(),
+            "locked permission stays unmarked: {call}"
+        );
+        assert_eq!(
+            call["implied"][0]["new"], true,
+            "only the implied kms permission is new: {call}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
