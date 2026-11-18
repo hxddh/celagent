@@ -1,15 +1,16 @@
 //! Selective desktop UI localization (`En` / `Zh`).
 //!
-//! Only desktop UI chrome, status guidance, buttons and empty-state explanations
-//! are localized in Chinese mode. Professional AWS, IAM and HTTP parameters and
-//! protocol terms (`Service`, `Operation`, `Method`, `Path`, `Status`, `Host`,
-//! `Region`, `Request ID`, `Trace ID`, `Content-Type`, `Headers`, `Body`,
-//! `Action`, `Resource`, `SigV4`, `Presigned URL`, `JSON`, `XML`, `Hex`,
-//! `SHA-256`, `curl`, `lenslet.lock`, CLI flags) intentionally stay in English.
+//! Only desktop UI chrome, settings descriptions, buttons and empty-state
+//! guidance are localized in Chinese mode. Professional AWS, IAM and HTTP
+//! parameters and protocol terms (`Service`, `Operation`, `Method`, `Path`,
+//! `Status`, `Host`, `Region`, `Request ID`, `Trace ID`, `Content-Type`,
+//! `Headers`, `Body`, `Action`, `Resource`, `SigV4`, `Presigned URL`, `JSON`,
+//! `XML`, `Hex`, `SHA-256`, `curl`, `lenslet.lock`, CLI flags) intentionally
+//! stay in canonical English.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::prefs::{Lang, ThemeMode};
+use crate::prefs::{AccentColor, Density, Lang, ThemeMode, TimeFormat};
 
 static ACTIVE_LANG: AtomicU8 = AtomicU8::new(0);
 
@@ -36,39 +37,49 @@ pub fn pick<'a>(en: &'a str, zh: &'a str) -> &'a str {
     if is_zh() { zh } else { en }
 }
 
-pub fn theme_button_label(mode: ThemeMode) -> &'static str {
+pub fn theme_label(mode: ThemeMode) -> &'static str {
     match (mode, lang()) {
-        (ThemeMode::System, Lang::En) => "Auto",
+        (ThemeMode::System, Lang::En) => "System",
         (ThemeMode::Light, Lang::En) => "Light",
         (ThemeMode::Dark, Lang::En) => "Dark",
-        (ThemeMode::System, Lang::Zh) => "自动",
+        (ThemeMode::System, Lang::Zh) => "跟随系统",
         (ThemeMode::Light, Lang::Zh) => "浅色",
         (ThemeMode::Dark, Lang::Zh) => "深色",
     }
 }
 
-pub fn theme_toast(mode: ThemeMode) -> String {
-    match (mode, lang()) {
-        (ThemeMode::System, Lang::En) => "theme: system".to_string(),
-        (ThemeMode::Light, Lang::En) => "theme: light".to_string(),
-        (ThemeMode::Dark, Lang::En) => "theme: dark".to_string(),
-        (ThemeMode::System, Lang::Zh) => "主题：跟随系统".to_string(),
-        (ThemeMode::Light, Lang::Zh) => "主题：浅色".to_string(),
-        (ThemeMode::Dark, Lang::Zh) => "主题：深色".to_string(),
+pub fn accent_label(accent: AccentColor) -> &'static str {
+    match (accent, lang()) {
+        (AccentColor::Sky, Lang::En) => "Sky",
+        (AccentColor::Indigo, Lang::En) => "Indigo",
+        (AccentColor::Violet, Lang::En) => "Violet",
+        (AccentColor::Emerald, Lang::En) => "Emerald",
+        (AccentColor::Amber, Lang::En) => "Amber",
+        (AccentColor::Rose, Lang::En) => "Rose",
+        (AccentColor::Sky, Lang::Zh) => "经典青蓝",
+        (AccentColor::Indigo, Lang::Zh) => "靛蓝",
+        (AccentColor::Violet, Lang::Zh) => "紫罗兰",
+        (AccentColor::Emerald, Lang::Zh) => "翠绿",
+        (AccentColor::Amber, Lang::Zh) => "琥珀橙",
+        (AccentColor::Rose, Lang::Zh) => "珊瑚红",
     }
 }
 
-pub fn lang_button_label() -> &'static str {
-    match lang() {
-        Lang::En => "中文",
-        Lang::Zh => "EN",
+pub fn density_label(density: Density) -> &'static str {
+    match (density, lang()) {
+        (Density::Comfortable, Lang::En) => "Comfortable",
+        (Density::Compact, Lang::En) => "Compact",
+        (Density::Comfortable, Lang::Zh) => "舒适",
+        (Density::Compact, Lang::Zh) => "紧凑",
     }
 }
 
-pub fn lang_toast() -> String {
-    match lang() {
-        Lang::En => "language: English".to_string(),
-        Lang::Zh => "界面语言：中文".to_string(),
+pub fn time_format_label(fmt: TimeFormat) -> &'static str {
+    match (fmt, lang()) {
+        (TimeFormat::Relative, Lang::En) => "Relative (+ms)",
+        (TimeFormat::Clock, Lang::En) => "Wall Clock",
+        (TimeFormat::Relative, Lang::Zh) => "相对起点 (+ms)",
+        (TimeFormat::Clock, Lang::Zh) => "本地时钟",
     }
 }
 
@@ -76,36 +87,6 @@ pub fn copied_toast(item: &str) -> String {
     if is_zh() {
         format!("已复制 {item}")
     } else {
-        format!("copied {item}")
-    }
-}
-
-pub fn call_count(count: usize) -> String {
-    if is_zh() {
-        format!("{count} 次调用")
-    } else if count == 1 {
-        "1 call".to_string()
-    } else {
-        format!("{count} calls")
-    }
-}
-
-pub fn error_count(count: usize) -> String {
-    if is_zh() {
-        format!("{count} 个错误")
-    } else if count == 1 {
-        "1 error".to_string()
-    } else {
-        format!("{count} errors")
-    }
-}
-
-pub fn service_count(count: usize) -> String {
-    if is_zh() {
-        format!("{count} 个服务")
-    } else if count == 1 {
-        "1 service".to_string()
-    } else {
-        format!("{count} services")
+        format!("Copied {item}")
     }
 }

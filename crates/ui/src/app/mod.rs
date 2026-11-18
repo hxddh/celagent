@@ -1,4 +1,6 @@
-//! Lenslet's single-window view: stream, inspector, live tail and keyboard flow.
+//! Lenslet 6.0 Workbench: 3-zone layout (global header, mode-linked sub-toolbar,
+//! draggable split workspace with Calls / Access / Diff views), dedicated
+//! Settings modal (`⌘,`), Run Switcher popover, and on-demand body hydration.
 
 use std::{
     path::{Path, PathBuf},
@@ -8,15 +10,17 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, Div, ElementId, FocusHandle, FontWeight, KeyDownEvent,
-    MouseButton, Render, ScrollStrategy, SharedString, Stateful, UniformListScrollHandle,
-    WeakEntity, Window, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba,
-    uniform_list,
+    AnyElement, ClipboardItem, Context, CursorStyle, Div, ElementId, FocusHandle, FontWeight,
+    KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, SharedString,
+    Stateful, UniformListScrollHandle, WeakEntity, Window, actions, div, linear_color_stop,
+    linear_gradient, prelude::*, px, rgb, rgba, uniform_list,
 };
 
 mod access;
 mod chrome;
+mod diff;
 mod inspector;
+mod settings;
 mod stream;
 mod widgets;
 
@@ -26,21 +30,24 @@ use self::{
 };
 use crate::{
     demo, fonts, glyph, i18n,
-    prefs::{self, UiPrefs},
+    prefs::{self, AccentColor, Density, Lang, ThemeMode, TimeFormat, UiPrefs},
     search::SearchInput,
     theme::{self, latency_color, status_color},
     trace::{
-        self, Body, Exchange, Filter, MAX_ROWS, RunInfo, ServiceFacet, Source, TailEvent, Tailer,
-        Trace, format_bytes, format_latency, full_time, headers_to_text, matches_search,
-        operation_label, search_tokens, service_facets, short_clock, status_is_success,
-        status_label, status_text,
+        self, AccessFilter, Body, CallFilter, Exchange, MAX_ROWS, RunInfo, ServiceFacet, Source,
+        StatusFilter, TailEvent, Tailer, Trace, format_bytes, format_latency, full_time,
+        headers_to_text, matches_search, operation_label, search_tokens, service_facets,
+        short_clock, status_is_success, status_label, status_text,
     },
 };
 
-/// What the empty window tells people to type.
+actions!(
+    lenslet,
+    [OpenSettings, ToggleInspector, ReloadTrace, QuitApp]
+);
+
 const START_COMMAND: &str = "lenslet run -- npm test";
 const POLL_INTERVAL: Duration = Duration::from_millis(420);
-/// Probe the proxy and emulator every few polls (~2 s).
 const PROBE_EVERY: u64 = 5;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const TOAST_MILLIS: u64 = 1_600;
@@ -53,35 +60,35 @@ enum TraceHealth {
     Error(String),
 }
 
-/// The left pane: every call, or the permissions those calls needed.
+/// Primary workspace mode in the center segmented switch.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Pane {
+pub(super) enum Pane {
     Calls,
     Access,
+    Diff,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum InspectorTab {
-    Overview,
-    Request,
-    Response,
+pub(super) enum InspectorTab {
+    Exchange,
+    Headers,
+    IamMeta,
 }
 
 impl InspectorTab {
     fn label(self) -> &'static str {
         match self {
-            InspectorTab::Overview => i18n::pick("Overview", "概览"),
-            // Professional HTTP exchange sides stay canonical.
-            InspectorTab::Request => "Request",
-            InspectorTab::Response => "Response",
+            InspectorTab::Exchange => i18n::pick("Exchange", "报文详情"),
+            InspectorTab::Headers => "Headers",
+            InspectorTab::IamMeta => i18n::pick("IAM & Meta", "IAM 与元数据"),
         }
     }
 
     fn index(self) -> &'static str {
         match self {
-            InspectorTab::Overview => "1",
-            InspectorTab::Request => "2",
-            InspectorTab::Response => "3",
+            InspectorTab::Exchange => "1",
+            InspectorTab::Headers => "2",
+            InspectorTab::IamMeta => "3",
         }
     }
 }
@@ -89,13 +96,11 @@ impl InspectorTab {
 #[derive(Clone, Copy, Default)]
 struct Counts {
     total: usize,
-    reported_total: Option<usize>,
     retries: usize,
     errors: usize,
     blocked: usize,
+    slow: usize,
     visible: usize,
-    visible_errors: usize,
-    services: usize,
 }
 
 pub struct LensletApp {
@@ -104,16 +109,27 @@ pub struct LensletApp {
     facets: Vec<ServiceFacet>,
     counts: Counts,
     selected: Option<usize>,
-    /// Set once the user picks a call; live appends then stop re-selecting.
+    /// Cached hydrated copy of the selected row when its body was offloaded to disk.
+    hydrated_cache: Option<(String, Arc<Trace>)>,
     selection_locked: bool,
-    filter: Filter,
+
+    call_filter: CallFilter,
+    access_filter: AccessFilter,
+    selected_access: Option<trace::Access>,
+    diff_base: Option<PathBuf>,
     query: String,
+
     tab: InspectorTab,
     pane: Pane,
     show_all_services: bool,
     raw_body: bool,
     expand_body: bool,
     prefs: UiPrefs,
+
+    settings_open: bool,
+    runs_popover_open: bool,
+    dragging_splitter: bool,
+    last_saved_viewport: (u32, u32),
 
     search: gpui::Entity<SearchInput>,
     search_focus: FocusHandle,
@@ -125,9 +141,7 @@ pub struct LensletApp {
     pending_replace: bool,
 
     source: Source,
-    /// The trace file being followed right now.
     trace_path: Option<PathBuf>,
-    /// The run being shown: its header, and its report once it ended.
     run: Option<RunInfo>,
     probe: Probe,
     tailer: Option<Tailer>,
@@ -144,6 +158,7 @@ impl LensletApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let prefs = prefs::load(&home());
         i18n::set_lang(prefs.lang);
+        theme::set_accent(prefs.accent);
 
         let source = trace_source();
         let demo = std::env::var_os("LENSLET_DEMO")
@@ -179,21 +194,30 @@ impl LensletApp {
             tailer = Some(tail);
         }
 
+        let raw_body = prefs.raw_body_default;
         let mut app = Self {
             rows: Rc::new(rows),
             view: Rc::new(Vec::new()),
             facets: Vec::new(),
             counts: Counts::default(),
             selected: if demo { Some(0) } else { None },
+            hydrated_cache: None,
             selection_locked: demo,
-            filter: Filter::All,
+            call_filter: CallFilter::default(),
+            access_filter: AccessFilter::default(),
+            selected_access: None,
+            diff_base: None,
             query: String::new(),
-            tab: InspectorTab::Overview,
+            tab: InspectorTab::Exchange,
             pane: Pane::Calls,
             show_all_services: false,
-            raw_body: false,
+            raw_body,
             expand_body: false,
             prefs,
+            settings_open: false,
+            runs_popover_open: false,
+            dragging_splitter: false,
+            last_saved_viewport: (0, 0),
             search,
             search_focus,
             root_focus,
@@ -237,9 +261,21 @@ impl LensletApp {
         app
     }
 
-    pub fn observe_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn observe_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.observe_window_appearance(window, |_, _, cx| {
             cx.notify();
+        })
+        .detach();
+        cx.observe_window_bounds(window, |this, window, _cx| {
+            let vp = window.viewport_size();
+            let w = vp.width.to_f64().round() as u32;
+            let h = vp.height.to_f64().round() as u32;
+            if (w, h) != this.last_saved_viewport && w >= 960 && h >= 640 {
+                this.last_saved_viewport = (w, h);
+                this.prefs.window_width = Some(w as f32);
+                this.prefs.window_height = Some(h as f32);
+                prefs::save(&home(), &this.prefs);
+            }
         })
         .detach();
     }
@@ -248,25 +284,103 @@ impl LensletApp {
         self.root_focus.clone()
     }
 
-    pub(super) fn cycle_theme(&mut self, cx: &mut Context<Self>) {
-        self.prefs.theme = self.prefs.theme.cycle();
+    // -- Settings & Preferences mutators -----------------------------------
+
+    pub(super) fn set_theme_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
+        self.prefs.theme = mode;
         prefs::save(&home(), &self.prefs);
-        self.show_toast(i18n::theme_toast(self.prefs.theme), cx);
+        cx.notify();
     }
 
-    pub(super) fn toggle_lang(&mut self, cx: &mut Context<Self>) {
-        self.prefs.lang = self.prefs.lang.toggle();
-        i18n::set_lang(self.prefs.lang);
+    pub(super) fn set_accent_color(&mut self, accent: AccentColor, cx: &mut Context<Self>) {
+        self.prefs.accent = accent;
+        theme::set_accent(accent);
         prefs::save(&home(), &self.prefs);
-        self.show_toast(i18n::lang_toast(), cx);
+        cx.notify();
+    }
+
+    pub(super) fn set_density(&mut self, density: Density, cx: &mut Context<Self>) {
+        self.prefs.density = density;
+        prefs::save(&home(), &self.prefs);
+        cx.notify();
+    }
+
+    pub(super) fn set_language(&mut self, lang: Lang, cx: &mut Context<Self>) {
+        self.prefs.lang = lang;
+        i18n::set_lang(lang);
+        prefs::save(&home(), &self.prefs);
+        cx.notify();
+    }
+
+    pub(super) fn set_time_format(&mut self, fmt: TimeFormat, cx: &mut Context<Self>) {
+        self.prefs.time_format = fmt;
+        prefs::save(&home(), &self.prefs);
+        cx.notify();
+    }
+
+    pub(super) fn set_raw_body_default(&mut self, raw: bool, cx: &mut Context<Self>) {
+        self.prefs.raw_body_default = raw;
+        self.raw_body = raw;
+        prefs::save(&home(), &self.prefs);
+        cx.notify();
+    }
+
+    pub(super) fn set_word_wrap(&mut self, wrap: bool, cx: &mut Context<Self>) {
+        self.prefs.word_wrap = wrap;
+        prefs::save(&home(), &self.prefs);
+        cx.notify();
+    }
+
+    pub(super) fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        self.prefs.inspector_open = !self.prefs.inspector_open;
+        prefs::save(&home(), &self.prefs);
+        cx.notify();
+    }
+
+    pub(super) fn runs_dir(&self) -> PathBuf {
+        match &self.source {
+            Source::Runs { dir, .. } => dir.clone(),
+            Source::File(p) => p
+                .parent()
+                .map_or_else(|| home().join(".lenslet/runs"), Path::to_path_buf),
+        }
+    }
+
+    pub(super) fn clear_historical_runs(&mut self, cx: &mut Context<Self>) {
+        let dir = self.runs_dir();
+        let removed = trace::clear_finished_runs(&dir, self.trace_path.as_deref());
+        let msg = if i18n::is_zh() {
+            format!("已清理 {removed} 个历史运行文件")
+        } else {
+            format!(
+                "Cleared {removed} finished {}",
+                if removed == 1 { "run" } else { "runs" }
+            )
+        };
+        self.show_toast(msg, cx);
+    }
+
+    // -- Hydrated Trace Selection ------------------------------------------
+
+    pub(super) fn selected_hydrated_trace(&mut self) -> Option<Arc<Trace>> {
+        let index = self.selected?;
+        let raw = self.rows.get(index)?;
+        let cache_key = format!("{}:{}:{}", raw.id, raw.pending, raw.status);
+        if let Some((cached_key, cached_trace)) = self.hydrated_cache.as_ref()
+            && cached_key == &cache_key
+        {
+            return Some(cached_trace.clone());
+        }
+        let hydrated = match raw.hydrated() {
+            std::borrow::Cow::Borrowed(_) => raw.clone(),
+            std::borrow::Cow::Owned(full) => Arc::new(full),
+        };
+        self.hydrated_cache = Some((cache_key, hydrated.clone()));
+        Some(hydrated)
     }
 
     pub(super) fn copy_selected_curl(&mut self, cx: &mut Context<Self>) {
-        let Some(trace) = self
-            .selected
-            .and_then(|index| self.rows.get(index))
-            .cloned()
-        else {
+        let Some(trace) = self.selected_hydrated_trace() else {
             return;
         };
         let endpoint = self
@@ -280,22 +394,19 @@ impl LensletApp {
         self.copy_text("curl", curl, cx);
     }
 
-    // -- data ---------------------------------------------------------------
+    // -- Data & Filtering --------------------------------------------------
 
     fn refresh_view(&mut self) {
         self.facets = service_facets(self.rows.iter().map(|row| row.as_ref()));
 
-        if let Filter::Service(id) = &self.filter
-            && !self.facets.iter().any(|facet| &facet.id == id)
+        if let Some(svc) = self.call_filter.service.as_deref()
+            && !self.facets.iter().any(|facet| facet.id == svc)
         {
-            self.filter = Filter::All;
+            self.call_filter.service = None;
         }
 
         self.counts.total = self.rows.len();
         let report = self.run.as_ref().and_then(|run| run.report.as_ref());
-        self.counts.reported_total = report
-            .map(|r| r.calls)
-            .filter(|calls| *calls > self.rows.len());
         self.counts.retries = report
             .map(|r| r.retries)
             .filter(|retries| *retries > 0)
@@ -304,29 +415,26 @@ impl LensletApp {
             .map(|r| r.blocked)
             .filter(|blocked| *blocked > 0)
             .unwrap_or_else(|| self.rows.iter().filter(|row| row.blocked).count());
-        if self.filter == Filter::Blocked && self.counts.blocked == 0 {
-            self.filter = Filter::All;
+        if self.call_filter.status == StatusFilter::Blocked && self.counts.blocked == 0 {
+            self.call_filter.status = StatusFilter::All;
         }
         self.counts.errors = self.rows.iter().filter(|row| row.is_error()).count();
-        self.counts.services = self.facets.len();
+        self.counts.slow = self
+            .rows
+            .iter()
+            .filter(|row| row.pending || row.ms >= 500)
+            .count();
 
         let tokens = search_tokens(&self.query);
         let mut view = Vec::new();
-        let mut visible_errors = 0;
         for (index, row) in self.rows.iter().enumerate() {
-            if self.filter.matches(row) && matches_search(row, &tokens) {
+            if self.call_filter.matches(row) && matches_search(row, &tokens) {
                 view.push(index);
-                if row.is_error() {
-                    visible_errors += 1;
-                }
             }
         }
         self.counts.visible = view.len();
-        self.counts.visible_errors = visible_errors;
         self.view = Rc::new(view);
 
-        // Live mode follows the newest call until the user deliberately picks
-        // one. After that, incoming calls must not move the inspector away.
         if !self.selection_locked {
             self.selected = self.view.last().copied();
         } else if let Some(selected) = self.selected
@@ -374,8 +482,7 @@ impl LensletApp {
             .map(|row| row.key());
         let base: &[Arc<Trace>] = if replace { &[] } else { &self.rows };
         self.rows = Rc::new(trace::merge(base, incoming));
-        // Rows can be replaced (pending → done), reordered or dropped, so the
-        // selection follows its call, not its index.
+        self.hydrated_cache = None;
         self.selected =
             selected_key.and_then(|key| self.rows.iter().position(|row| row.key() == key));
 
@@ -430,6 +537,7 @@ impl LensletApp {
             if path != self.trace_path || run != self.run {
                 if path != self.trace_path {
                     self.probe = Probe::default();
+                    self.diff_base = None;
                 }
                 self.trace_path = path;
                 self.run = run;
@@ -532,10 +640,10 @@ impl LensletApp {
         .detach();
     }
 
-    fn reload_now(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn reload_now(&mut self, cx: &mut Context<Self>) {
         if self.demo {
             self.show_toast(
-                i18n::pick("demo data is static", "演示数据为静态内容").to_string(),
+                i18n::pick("Demo data is static", "演示数据为静态内容").to_string(),
                 cx,
             );
             return;
@@ -547,20 +655,9 @@ impl LensletApp {
         self.tailer = Some(tailer);
         self.apply_tail(event, cx);
         self.show_toast(
-            i18n::pick("reloaded trace", "已重新加载 Trace").to_string(),
+            i18n::pick("Reloaded trace", "已重新加载 Trace").to_string(),
             cx,
         );
-    }
-
-    fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
-        self.filter = if self.filter == filter {
-            Filter::All
-        } else {
-            filter
-        };
-        self.refresh_view();
-        self.reveal_selected();
-        cx.notify();
     }
 
     fn set_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
@@ -574,11 +671,36 @@ impl LensletApp {
         self.selected = Some(index);
         self.selection_locked = true;
         self.expand_body = false;
+        self.raw_body = self.prefs.raw_body_default;
+        if !self.prefs.inspector_open {
+            self.prefs.inspector_open = true;
+        }
         window.focus(&self.root_focus);
         cx.notify();
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.pane == Pane::Access {
+            let rows = self.filtered_access_rows();
+            if rows.is_empty() {
+                return;
+            }
+            let current = self.selected_access.as_ref().and_then(|sel| {
+                rows.iter()
+                    .position(|r| r.action == sel.action && r.resource == sel.resource)
+            });
+            let next = match current {
+                Some(pos) => (pos as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
+                None => 0,
+            };
+            self.selected_access = Some(trace::Access {
+                action: rows[next].action.clone(),
+                resource: rows[next].resource.clone(),
+            });
+            cx.notify();
+            return;
+        }
+
         self.selection_locked = true;
         if self.view.is_empty() {
             self.selected = None;
@@ -602,6 +724,7 @@ impl LensletApp {
         };
         self.selected = Some(self.view[next]);
         self.expand_body = false;
+        self.raw_body = self.prefs.raw_body_default;
         self.scroll.scroll_to_item(next, ScrollStrategy::Center);
         cx.notify();
     }
@@ -612,7 +735,8 @@ impl LensletApp {
     }
 
     fn clear_search_and_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.filter = Filter::All;
+        self.call_filter = CallFilter::default();
+        self.access_filter = AccessFilter::default();
         self.search
             .update(cx, |search, cx| search.clear(window, cx));
         self.query.clear();
@@ -650,71 +774,98 @@ impl LensletApp {
         let keystroke = &event.keystroke;
         let search_focused = self.search_focus.is_focused(window);
 
-        if keystroke.modifiers.secondary() && keystroke.key == "k" {
-            self.focus_search(window, cx);
+        if keystroke.key == "escape" {
+            if self.settings_open {
+                self.settings_open = false;
+                cx.notify();
+                return;
+            }
+            if self.runs_popover_open {
+                self.runs_popover_open = false;
+                cx.notify();
+                return;
+            }
+        }
+
+        if keystroke.modifiers.secondary() {
+            match keystroke.key.as_str() {
+                "k" => {
+                    self.focus_search(window, cx);
+                    return;
+                }
+                "," => {
+                    self.settings_open = !self.settings_open;
+                    self.runs_popover_open = false;
+                    cx.notify();
+                    return;
+                }
+                "b" => {
+                    self.toggle_inspector(cx);
+                    return;
+                }
+                "r" => {
+                    self.reload_now(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.settings_open {
             return;
         }
 
         match keystroke.key.as_str() {
-            "up" => self.move_selection(-1, cx),
-            "down" => self.move_selection(1, cx),
+            "up" if !search_focused => self.move_selection(-1, cx),
+            "down" if !search_focused => self.move_selection(1, cx),
             "enter" if search_focused => {
                 window.focus(&self.root_focus);
                 cx.notify();
             }
             "space" if !search_focused => self.toggle_pause(cx),
-            "r" if !search_focused
-                && !keystroke.modifiers.secondary()
-                && !keystroke.modifiers.alt =>
-            {
-                self.reload_now(cx)
-            }
-            "t" if !search_focused && !keystroke.modifiers.modified() => self.cycle_theme(cx),
-            "l" if !search_focused && !keystroke.modifiers.modified() => self.toggle_lang(cx),
             "c" if !search_focused && !keystroke.modifiers.modified() => {
                 self.copy_selected_curl(cx)
-            }
-            "a" if !search_focused && !keystroke.modifiers.modified() => {
-                let next = if self.pane == Pane::Calls {
-                    Pane::Access
-                } else {
-                    Pane::Calls
-                };
-                self.set_pane(next, cx)
             }
             "[" if !search_focused => self.step_run(-1, cx),
             "]" if !search_focused => self.step_run(1, cx),
             "1" if !search_focused && !keystroke.modifiers.modified() => {
-                self.set_tab(InspectorTab::Overview, cx)
+                self.set_tab(InspectorTab::Exchange, cx)
             }
             "2" if !search_focused && !keystroke.modifiers.modified() => {
-                self.set_tab(InspectorTab::Request, cx)
+                self.set_tab(InspectorTab::Headers, cx)
             }
             "3" if !search_focused && !keystroke.modifiers.modified() => {
-                self.set_tab(InspectorTab::Response, cx)
+                self.set_tab(InspectorTab::IamMeta, cx)
             }
             _ => {}
         }
     }
 
-    fn set_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
+    pub(super) fn set_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
         if self.pane != pane {
             self.pane = pane;
+            let access_mode = pane == Pane::Access;
+            self.search
+                .update(cx, |s, cx| s.set_access_mode(access_mode, cx));
+            if access_mode && self.selected_access.is_none() {
+                self.selected_access = self.access_rows().first().map(|e| trace::Access {
+                    action: e.action.clone(),
+                    resource: e.resource.clone(),
+                });
+            }
             cx.notify();
         }
     }
 
-    /// From the access table: show the calls behind one permission.
-    fn show_access(&mut self, access: trace::Access, cx: &mut Context<Self>) {
-        self.filter = Filter::Access(access);
-        self.pane = Pane::Calls;
+    pub(super) fn filter_calls_by_access(&mut self, access: trace::Access, cx: &mut Context<Self>) {
+        self.call_filter.access = Some(access);
+        self.set_pane(Pane::Calls, cx);
         self.selection_locked = false;
         self.refresh_view();
         self.reveal_selected();
         cx.notify();
     }
 
-    /// The runs this window can step through, and where the current one is.
     fn run_position(&self) -> Option<(usize, usize)> {
         let Source::Runs { dir, .. } = &self.source else {
             return None;
@@ -725,8 +876,54 @@ impl LensletApp {
         Some((index + 1, runs.len()))
     }
 
-    /// `[` / `]`: the previous or next run. Stepping onto the newest run
-    /// follows new runs again.
+    pub(super) fn follow_latest_run(&mut self, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
+        let Source::Runs { dir, .. } = &self.source else {
+            return;
+        };
+        self.switch_source(
+            Source::Runs {
+                dir: dir.clone(),
+                pinned: None,
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn pin_run(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
+        let Source::Runs { dir, .. } = &self.source else {
+            return;
+        };
+        self.switch_source(
+            Source::Runs {
+                dir: dir.clone(),
+                pinned: Some(path),
+            },
+            cx,
+        );
+    }
+
+    fn switch_source(&mut self, next_source: Source, cx: &mut Context<Self>) {
+        self.source = next_source;
+        self.selected = None;
+        self.hydrated_cache = None;
+        self.selection_locked = false;
+        self.expand_body = false;
+        self.call_filter = CallFilter::default();
+        self.diff_base = None;
+        self.tailer_generation += 1;
+        let mut tailer = Tailer::follow(self.source.clone());
+        let event = tailer.poll();
+        self.tailer = Some(tailer);
+        self.apply_tail(event, cx);
+        cx.notify();
+    }
+
     fn step_run(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.demo {
             return;
@@ -749,21 +946,9 @@ impl LensletApp {
             return;
         }
         let pinned = (target + 1 < runs.len()).then(|| runs[target].clone());
-        self.source = Source::Runs { dir, pinned };
-        self.selected = None;
-        self.selection_locked = false;
-        self.expand_body = false;
-        self.filter = Filter::All;
-        self.tailer_generation += 1;
-        let mut tailer = Tailer::follow(self.source.clone());
-        let event = tailer.poll();
-        self.tailer = Some(tailer);
-        self.apply_tail(event, cx);
-        cx.notify();
+        self.switch_source(Source::Runs { dir, pinned }, cx);
     }
 
-    /// The access table: the finished run's report (including unused lock
-    /// entries and `# test` marks), or live from the calls.
     fn access_rows(&self) -> Vec<trace::AccessEntry> {
         let test_marks = self
             .run
@@ -834,7 +1019,6 @@ impl LensletApp {
             .or_else(|| self.rows.first().and_then(|row| row.at_ms()))
     }
 
-    /// Count and combined wall time of all attempts sharing `trace`'s invocation id.
     pub(super) fn invocation_stats(&self, trace: &Trace) -> Option<(usize, u64)> {
         let id = trace.invocation_id.as_deref()?;
         let mut count = 0usize;
@@ -847,8 +1031,6 @@ impl LensletApp {
         }
         (count > 1).then_some((count, total_ms))
     }
-
-    // -- render -------------------------------------------------------------
 
     fn copy_button(
         &self,
@@ -866,36 +1048,94 @@ impl LensletApp {
             }))
             .into_any_element()
     }
+
+    fn render_splitter(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = theme::p();
+        let dragging = self.dragging_splitter;
+        div()
+            .id("inspector-splitter")
+            .w(px(theme::SPLITTER_W))
+            .flex_shrink_0()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .bg(if dragging {
+                theme::h(t.accent, 0.45)
+            } else {
+                theme::h(t.border, 1.0)
+            })
+            .hover(move |s| s.bg(theme::h(t.accent, 0.35)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dragging_splitter = true;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+    }
 }
 
 impl Render for LensletApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         i18n::set_lang(self.prefs.lang);
         theme::set_appearance(theme::resolve(self.prefs.theme, window.appearance()));
+        theme::set_accent(self.prefs.accent);
         let t = theme::p();
 
         let viewport_width = window.viewport_size().width.to_f64() as f32;
         let compact = viewport_width < 1_180.0;
+        let show_inspector = self.prefs.inspector_open && self.pane != Pane::Diff;
+        let max_insp = (viewport_width - 420.0).clamp(320.0, 780.0);
+        let inspector_w = if show_inspector {
+            self.prefs.clamped_inspector_width().min(max_insp)
+        } else {
+            0.0
+        };
+        let splitter_w = if show_inspector {
+            theme::SPLITTER_W
+        } else {
+            0.0
+        };
+
         let fixed_columns = theme::COL_TIME
             + theme::COL_SERVICE
             + theme::COL_STATUS
             + theme::COL_LATENCY
             + theme::COL_AUTH;
         let op_width = (viewport_width
-            - theme::INSPECTOR_W
+            - inspector_w
+            - splitter_w
             - theme::ROW_PAD_X * 2.0
             - fixed_columns
             - theme::COL_GAP * 5.0
-            - 10.0)
+            - 8.0)
             .max(60.0);
+
         let header = self.render_header(cx);
-        let toolbar = self.render_toolbar(compact, cx);
-        let strip = self
-            .show_all_services
+        let subbar = self.render_subbar(compact, cx);
+        let strip = (self.pane == Pane::Calls && self.show_all_services)
             .then(|| self.render_service_strip(cx));
-        let stream = self.render_stream(op_width, cx);
-        let inspector = self.render_inspector(cx);
-        let footer = self.render_footer(compact);
+
+        let workspace: AnyElement = if self.pane == Pane::Diff {
+            self.render_diff(cx).into_any_element()
+        } else {
+            let stream = self.render_stream(op_width, cx);
+            let mut split = div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(stream);
+            if show_inspector {
+                let splitter = self.render_splitter(cx);
+                let inspector = self.render_inspector(inspector_w, cx);
+                split = split.child(splitter).child(inspector);
+            }
+            split.into_any_element()
+        };
+
+        let runs_popover = self.runs_popover_open.then(|| self.render_runs_popover(cx));
+        let settings_modal = self.settings_open.then(|| self.render_settings_modal(cx));
+        let toast = self.render_floating_toast();
 
         div()
             .id("lenslet")
@@ -907,6 +1147,17 @@ impl Render for LensletApp {
             .text_color(rgb(t.text))
             .font(fonts::sans_font())
             .track_focus(&self.root_focus)
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                this.settings_open = !this.settings_open;
+                this.runs_popover_open = false;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
+                this.toggle_inspector(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReloadTrace, _, cx| {
+                this.reload_now(cx);
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(
                 MouseButton::Left,
@@ -914,19 +1165,32 @@ impl Render for LensletApp {
                     window.focus(&this.root_focus);
                 }),
             )
-            .child(header)
-            .child(toolbar)
-            .children(strip)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .child(stream)
-                    .child(inspector),
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if this.dragging_splitter {
+                    let vw = window.viewport_size().width.to_f64() as f32;
+                    let x = event.position.x.to_f64() as f32;
+                    let max_w = (vw - 420.0).clamp(320.0, 780.0);
+                    this.prefs.inspector_width = (vw - x).clamp(320.0, max_w);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.dragging_splitter {
+                        this.dragging_splitter = false;
+                        prefs::save(&home(), &this.prefs);
+                        cx.notify();
+                    }
+                }),
             )
-            .child(footer)
+            .child(header)
+            .child(subbar)
+            .children(strip)
+            .child(workspace)
+            .children(runs_popover)
+            .children(settings_modal)
+            .children(toast)
     }
 }
 
@@ -936,30 +1200,13 @@ enum Side {
     Response,
 }
 
-impl Side {
-    fn noun(self) -> &'static str {
-        match self {
-            Side::Request => "request",
-            Side::Response => "response",
-        }
-    }
-
-    fn target_label(self) -> &'static str {
-        match self {
-            Side::Request => "TARGET",
-            Side::Response => "STATUS LINE",
-        }
-    }
-}
-
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_default()
 }
 
-/// `LENSLET_TRACE` pins one file; otherwise follow the newest run.
 fn trace_source() -> Source {
     match std::env::var_os("LENSLET_TRACE") {
         Some(path) => Source::File(PathBuf::from(path)),
@@ -973,8 +1220,6 @@ fn trace_source() -> Source {
     }
 }
 
-/// Whether the proxy and the emulator of the followed run answer on TCP.
-/// `None` means unknown (no run, or not probed yet).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Probe {
     proxy: Option<bool>,
@@ -1004,142 +1249,12 @@ fn tcp_answers(address: &str) -> bool {
     addresses.any(|address| TcpStream::connect_timeout(&address, PROBE_TIMEOUT).is_ok())
 }
 
-/// One status light: dot color, text, text color.
-pub(super) struct Light {
-    pub dot: gpui::Hsla,
-    pub text: String,
-    pub color: u32,
-}
-
-impl Light {
-    fn new(dot: u32, alpha: f32, text: String, color: u32) -> Self {
-        Light {
-            dot: theme::h(dot, alpha),
-            text,
-            color,
-        }
-    }
-}
-
 impl LensletApp {
-    /// The followed run's endpoint without the scheme, e.g. `127.0.0.1:43761`.
-    pub(super) fn endpoint_label(&self) -> String {
-        if self.demo {
-            return "127.0.0.1:9297".to_string();
-        }
-        self.run
-            .as_ref()
-            .and_then(|run| RunInfo::address(&run.header.endpoint))
-            .map(str::to_string)
-            .unwrap_or_else(|| i18n::pick("no run yet", "暂无运行").to_string())
-    }
-
-    /// The proxy light: live, gone, or the finished run's exit code.
-    pub(super) fn proxy_light(&self) -> Light {
-        let t = theme::p();
-        if self.demo {
-            return Light::new(
-                t.amber,
-                0.9,
-                i18n::pick("demo data", "演示数据").into(),
-                t.amber,
-            );
-        }
-        let Some(run) = self.run.as_ref() else {
-            return Light::new(
-                t.text_faint,
-                0.8,
-                i18n::pick(
-                    "no run · lenslet run -- <command>",
-                    "未运行 · lenslet run -- <command>",
-                )
-                .into(),
-                t.text_muted,
-            );
-        };
-        if run.ended() {
-            return match run.exit_code() {
-                Some(0) => Light::new(
-                    t.green,
-                    0.6,
-                    i18n::pick("run ended · exit 0", "运行结束 · exit 0").into(),
-                    t.text_muted,
-                ),
-                Some(code) => Light::new(
-                    t.red,
-                    0.9,
-                    if i18n::is_zh() {
-                        format!("运行结束 · exit {code}")
-                    } else {
-                        format!("run ended · exit {code}")
-                    },
-                    t.red,
-                ),
-                None => Light::new(
-                    t.text_faint,
-                    0.8,
-                    i18n::pick("proxy stopped", "代理已停止").into(),
-                    t.text_muted,
-                ),
-            };
-        }
-        let port = RunInfo::address(&run.header.endpoint)
-            .and_then(|address| address.rsplit(':').next())
-            .unwrap_or("?");
-        match self.probe.proxy {
-            Some(true) => Light::new(
-                t.green,
-                0.95,
-                format!("proxy :{port} {}", i18n::pick("live", "在线")),
-                t.text_muted,
-            ),
-            Some(false) => Light::new(
-                t.red,
-                0.95,
-                format!("proxy :{port} {}", i18n::pick("not answering", "无响应")),
-                t.red,
-            ),
-            None => Light::new(t.amber, 0.9, format!("proxy :{port}"), t.text_muted),
-        }
-    }
-
-    /// The emulator light, from a TCP probe of the run's upstream.
-    pub(super) fn emulator_light(&self) -> Option<Light> {
-        let t = theme::p();
-        if self.demo {
-            return Some(Light::new(
-                t.amber,
-                0.6,
-                "emulator :9298".into(),
-                t.text_muted,
-            ));
-        }
-        let run = self.run.as_ref()?;
-        let address = RunInfo::address(&run.header.upstream).unwrap_or("?");
-        let port = address.rsplit(':').next().unwrap_or(address);
-        Some(match self.probe.emulator {
-            Some(true) => Light::new(
-                t.green,
-                0.95,
-                format!("emulator :{port} {}", i18n::pick("up", "在线")),
-                t.text_muted,
-            ),
-            Some(false) => Light::new(
-                t.red,
-                0.95,
-                format!("emulator :{port} {}", i18n::pick("down", "离线")),
-                t.red,
-            ),
-            None => Light::new(t.text_faint, 0.8, format!("emulator :{port}"), t.text_muted),
-        })
-    }
-
     fn probe_targets(&self) -> ProbeTargets {
         let Some(run) = self.run.as_ref() else {
             return ProbeTargets::default();
         };
         ProbeTargets {
-            // An ended run has no proxy to ask.
             proxy: (!run.ended())
                 .then(|| RunInfo::address(&run.header.endpoint).map(str::to_string))
                 .flatten(),

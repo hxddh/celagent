@@ -1,14 +1,25 @@
-//! The inspector: one call's overview, request and response.
+//! Context-Aware Inspector (Option A Payload-First design):
+//! - In `Calls`: `Exchange` (default — root-cause diagnostic + Request Body + Response Body
+//!   on one scrollable page), `Headers` (structured key-value table with per-row Copy),
+//!   and `IAM & Meta` (permissions + non-duplicated wire metadata).
+//! - In `Access`: delegates to `render_access_inspector`.
 
 use super::*;
 
 impl LensletApp {
-    pub(super) fn render_inspector(&mut self, cx: &mut Context<Self>) -> Div {
+    pub(super) fn render_inspector(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
         let t = theme::p();
-        let trace = self
-            .selected
-            .and_then(|index| self.rows.get(index))
-            .cloned();
+        if self.pane == Pane::Access {
+            return div()
+                .flex()
+                .flex_col()
+                .w(px(width))
+                .flex_shrink_0()
+                .bg(rgb(t.panel_raised))
+                .child(self.render_access_inspector(cx));
+        }
+
+        let trace = self.selected_hydrated_trace();
         let body: AnyElement = if let Some(trace) = trace.as_ref() {
             self.render_inspector_body(trace, cx).into_any_element()
         } else {
@@ -18,7 +29,7 @@ impl LensletApp {
         div()
             .flex()
             .flex_col()
-            .w(px(theme::INSPECTOR_W))
+            .w(px(width))
             .flex_shrink_0()
             .bg(rgb(t.panel_raised))
             .child(if let Some(trace) = trace.as_ref() {
@@ -34,7 +45,7 @@ impl LensletApp {
         div()
             .flex()
             .items_center()
-            .h(px(theme::STREAM_HEAD_H))
+            .h(px(theme::TABLE_HEAD_H))
             .px(px(14.0))
             .border_b_1()
             .border_color(rgb(t.border_subtle))
@@ -63,16 +74,6 @@ impl LensletApp {
                     .child(trace::ellipsize(trace.service_name(), 14)),
             );
 
-        let title = div()
-            .mt(px(7.0))
-            .text_size(px(16.0))
-            .line_height(px(20.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(t.text))
-            .whitespace_nowrap()
-            .text_ellipsis()
-            .child(operation_label(trace).to_string());
-
         let endpoint = self
             .run
             .as_ref()
@@ -80,7 +81,39 @@ impl LensletApp {
             .filter(|e| !e.is_empty());
         let curl_cmd = trace::to_curl(trace, endpoint);
 
-        let path = div()
+        let mut top = div()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .child(service)
+            .child(
+                div()
+                    .text_size(px(14.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(t.text))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .child(operation_label(trace).to_string()),
+            );
+        if trace.blocked {
+            top = top.child(blocked_pill("BLOCKED"));
+        }
+        if let Some(retry) = trace.retry_badge() {
+            top = top.child(badge(retry, t.accent));
+        }
+        top = top.child(div().flex_1());
+        if let Some(curl_cmd) = curl_cmd {
+            top = top.child(
+                action_button("copy-curl", i18n::pick("Copy curl", "复制 curl")).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.copy_text("curl", curl_cmd.clone(), cx);
+                    }),
+                ),
+            );
+        }
+
+        let path_row = div()
             .flex()
             .items_center()
             .gap(px(6.0))
@@ -98,21 +131,14 @@ impl LensletApp {
                     .flex_1()
                     .min_w(px(0.0))
                     .font_family(fonts::mono())
-                    .text_size(px(12.0))
+                    .text_size(px(11.5))
                     .text_color(rgb(t.text_dim))
                     .whitespace_nowrap()
-                    .child(trace::ellipsize(trace::display_path(trace), 40)),
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .child(trace::display_path(trace).to_string()),
             )
-            .child(self.copy_button("copy-path", "path", Some(trace.path.clone()), cx))
-            .when_some(curl_cmd, |el, curl_cmd| {
-                el.child(
-                    action_button("copy-curl", i18n::pick("Copy curl", "复制 curl")).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.copy_text("curl", curl_cmd.clone(), cx);
-                        }),
-                    ),
-                )
-            });
+            .child(self.copy_button("copy-path", "path", Some(trace.path.clone()), cx));
 
         let (status_tint, status_value, status_words) = if trace.pending {
             (rgb(t.amber), "…".to_string(), "pending")
@@ -123,31 +149,31 @@ impl LensletApp {
                 status_text(trace.status),
             )
         };
-        let status = div()
-            .flex()
-            .items_center()
-            .gap(px(5.0))
-            .child(glyph::dot(status_tint, 4.5))
-            .child(
-                div()
-                    .font_family(fonts::mono())
-                    .text_size(px(11.0))
-                    .text_color(status_tint)
-                    .child(status_value),
-            )
-            .child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(rgb(t.text_faint))
-                    .child(status_words),
-            );
-
         let mut meta = div()
             .flex()
             .items_center()
             .gap(px(9.0))
-            .mt(px(6.0))
-            .child(status)
+            .mt(px(5.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(glyph::dot(status_tint, 4.5))
+                    .child(
+                        div()
+                            .font_family(fonts::mono())
+                            .text_size(px(11.0))
+                            .text_color(status_tint)
+                            .child(status_value),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(t.text_faint))
+                            .child(status_words),
+                    ),
+            )
             .child(
                 div()
                     .font_family(fonts::mono())
@@ -168,41 +194,29 @@ impl LensletApp {
                     .font_family(fonts::mono())
                     .text_size(px(10.5))
                     .text_color(rgb(t.text_faint))
-                    .child(full_time(&trace.at)),
+                    .child(short_clock(&trace.at)),
             )
-            .child(div().flex_1());
-        if trace.authorization || trace.presigned() {
-            meta = meta.child(glyph::auth_mark(true)).child(
+            .child(div().flex_1())
+            .child(glyph::auth_mark(trace.authorization || trace.presigned()))
+            .child(
                 div()
                     .text_size(px(10.0))
                     .text_color(rgb(t.text_muted))
                     .child(if trace.authorization {
-                        "sigv4"
+                        "SigV4"
+                    } else if trace.presigned() {
+                        "Presigned"
                     } else {
-                        "presigned"
+                        "Unsigned"
                     }),
             );
-        } else {
-            meta = meta.child(glyph::auth_mark(false)).child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(t.text_faint))
-                    .child("no auth"),
-            );
-        }
-
-        let mut top = div().flex().items_center().gap(px(8.0)).child(service);
-        if trace.blocked {
-            top = top.child(blocked_pill("BLOCKED"));
-        }
-        top = top.child(div().flex_1());
-        if let Some(id) = Some(trace.id.as_str()).filter(|id| !id.is_empty()) {
-            top = top.child(
+        if let Some(region) = trace.region.as_deref().filter(|r| !r.is_empty()) {
+            meta = meta.child(
                 div()
                     .font_family(fonts::mono())
                     .text_size(px(10.0))
                     .text_color(rgb(t.text_faint))
-                    .child(format!("#{}", trace::clip_utf8(id, 18))),
+                    .child(region.to_string()),
             );
         }
 
@@ -210,39 +224,56 @@ impl LensletApp {
             .flex()
             .flex_col()
             .px(px(14.0))
-            .pt(px(12.0))
-            .pb(px(8.0))
+            .pt(px(10.0))
             .child(top)
-            .child(title)
-            .child(path)
+            .child(path_row)
             .child(meta)
-            .child(self.render_tabs(cx))
+            .child(self.render_tabs(trace, cx))
     }
 
-    pub(super) fn render_tabs(&self, cx: &mut Context<Self>) -> Div {
+    pub(super) fn render_tabs(&self, trace: &Trace, cx: &mut Context<Self>) -> Div {
         let t = theme::p();
+        let req_h = trace.request.as_ref().map_or(0, |r| r.headers.len());
+        let res_h = trace.response.as_ref().map_or(0, |r| r.headers.len());
+        let iam_cnt = trace.access.len() + trace.implied.len();
+
+        let items = [
+            (
+                InspectorTab::Exchange,
+                InspectorTab::Exchange.label().to_string(),
+            ),
+            (
+                InspectorTab::Headers,
+                format!("{} ({})", InspectorTab::Headers.label(), req_h + res_h),
+            ),
+            (
+                InspectorTab::IamMeta,
+                if iam_cnt > 0 {
+                    format!("{} ({iam_cnt})", InspectorTab::IamMeta.label())
+                } else {
+                    InspectorTab::IamMeta.label().to_string()
+                },
+            ),
+        ];
+
         let mut tabs = Vec::new();
-        for tab in [
-            InspectorTab::Overview,
-            InspectorTab::Request,
-            InspectorTab::Response,
-        ] {
+        for (tab, label) in items {
             let active = self.tab == tab;
             tabs.push(
                 div()
                     .id(ElementId::Name(format!("tab-{}", tab.index()).into()))
-                    .h(px(36.0))
+                    .h(px(32.0))
                     .flex()
                     .items_center()
                     .border_b_2()
                     .border_color(if active {
                         rgb(t.accent)
                     } else {
-                        rgba(0x00000000)
+                        rgba(0x0000_0000)
                     })
-                    .text_size(px(12.0))
+                    .text_size(px(11.5))
                     .font_weight(if active {
-                        FontWeight::MEDIUM
+                        FontWeight::SEMIBOLD
                     } else {
                         FontWeight::NORMAL
                     })
@@ -254,15 +285,15 @@ impl LensletApp {
                     .cursor_pointer()
                     .hover(move |style| style.text_color(rgb(t.text_soft)))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
-                    .child(tab.label()),
+                    .child(label),
             );
         }
 
         div()
             .flex()
             .items_end()
-            .gap(px(18.0))
-            .mt(px(10.0))
+            .gap(px(16.0))
+            .mt(px(6.0))
             .border_b_1()
             .border_color(rgb(t.border_subtle))
             .children(tabs)
@@ -304,7 +335,7 @@ impl LensletApp {
                     .text_color(rgb(t.text_muted))
                     .text_center()
                     .child(i18n::pick(
-                        "Click a row, or use ↑ ↓ to move through the stream.",
+                        "Click a row, or use ↑ ↓ to step through the stream.",
                         "点击左侧列表行，或使用 ↑ ↓ 方向键浏览。",
                     )),
             )
@@ -316,13 +347,9 @@ impl LensletApp {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let content: AnyElement = match self.tab {
-            InspectorTab::Overview => self.render_overview(trace).into_any_element(),
-            InspectorTab::Request => self
-                .render_exchange(trace, Side::Request, cx)
-                .into_any_element(),
-            InspectorTab::Response => self
-                .render_exchange(trace, Side::Response, cx)
-                .into_any_element(),
+            InspectorTab::Exchange => self.render_exchange_combined(trace, cx).into_any_element(),
+            InspectorTab::Headers => self.render_headers_tab(trace, cx).into_any_element(),
+            InspectorTab::IamMeta => self.render_iam_meta_tab(trace, cx).into_any_element(),
         };
 
         div()
@@ -334,102 +361,204 @@ impl LensletApp {
             .child(div().p(px(14.0)).w_full().child(content))
     }
 
-    pub(super) fn render_overview(&self, trace: &Trace) -> Div {
+    /// Option A Default Tab (`Exchange`): Root-cause failure card (if any) +
+    /// Request Payload + Response Payload directly on one scrollable page.
+    fn render_exchange_combined(&self, trace: &Trace, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .children(problem_panel(trace))
+            .child(self.render_payload_section(trace.request.as_ref(), Side::Request, cx))
+            .child(self.render_payload_section(trace.response.as_ref(), Side::Response, cx))
+    }
+
+    fn render_payload_section(
+        &self,
+        exchange: Option<&Exchange>,
+        side: Side,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let title = match side {
+            Side::Request => "REQUEST BODY",
+            Side::Response => "RESPONSE BODY",
+        };
+        let code_id = match side {
+            Side::Request => "req-body",
+            Side::Response => "res-body",
+        };
+        let Some(exchange) = exchange else {
+            return section_with_action(
+                title,
+                None,
+                None,
+                empty_note(if matches!(side, Side::Response) {
+                    i18n::pick("Awaiting response…", "等待响应返回…")
+                } else {
+                    i18n::pick("Not captured", "未捕获")
+                }),
+            );
+        };
+
+        let body = exchange.body.as_ref();
+        let mut body_meta = Vec::new();
+        if let Some(body) = body {
+            body_meta.push(format_bytes(body.size()));
+            if let Some(ct) = exchange.content_type.as_deref() {
+                body_meta.push(body_kind(ct, body));
+            } else if !body.binary && !body.is_empty() {
+                body_meta.push("UTF-8".to_string());
+            }
+            if let Some(enc) = body.encoding.as_deref() {
+                body_meta.push(enc.to_string());
+            }
+            if body.truncated {
+                body_meta.push("truncated".to_string());
+            }
+        } else {
+            body_meta.push("0 B".to_string());
+        }
+
+        let actions = self.render_body_actions(body, &exchange.content_type, side, cx);
+        section_with_action(
+            title,
+            Some(body_meta.join(" · ")),
+            actions,
+            self.render_body(body, &exchange.content_type, code_id),
+        )
+    }
+
+    /// Structured Key-Value Headers table for Request & Response (no horizontal-scrolling blob).
+    fn render_headers_tab(&self, trace: &Trace, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(self.render_header_table(
+                "REQUEST HEADERS",
+                "copy-req-headers",
+                "req-hdr",
+                trace.request.as_ref().map(|r| r.headers.as_slice()),
+                cx,
+            ))
+            .child(self.render_header_table(
+                "RESPONSE HEADERS",
+                "copy-res-headers",
+                "res-hdr",
+                trace.response.as_ref().map(|r| r.headers.as_slice()),
+                cx,
+            ))
+    }
+
+    fn render_header_table(
+        &self,
+        title: &'static str,
+        copy_all_id: &'static str,
+        row_prefix: &'static str,
+        headers: Option<&[trace::Header]>,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let t = theme::p();
+        let headers = headers.unwrap_or(&[]);
+        if headers.is_empty() {
+            return section_with_action(
+                title,
+                Some("0".to_string()),
+                None,
+                empty_note(i18n::pick("No headers captured", "未捕获到 Headers")),
+            );
+        }
+
+        let all_text = headers_to_text(headers);
+        let copy_all = self.copy_button(copy_all_id, "headers", Some(all_text), cx);
+        let wrap = self.prefs.word_wrap;
+
+        let table = div()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(t.border))
+            .bg(rgb(t.code))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .children(headers.iter().enumerate().map(|(i, h)| {
+                let val_copy = h.value.clone();
+                let row = div()
+                    .id(ElementId::Name(format!("{row_prefix}-{i}").into()))
+                    .flex()
+                    .items_start()
+                    .gap(px(10.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .border_b_1()
+                    .border_color(rgb(t.border_subtle))
+                    .font_family(fonts::mono())
+                    .text_size(px(11.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(theme::h(t.text, 0.04)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.copy_text("header", val_copy.clone(), cx);
+                    }))
+                    .child(
+                        div()
+                            .w(px(142.0))
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(t.accent))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .overflow_hidden()
+                            .child(h.name.clone()),
+                    );
+                if wrap {
+                    row.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_color(rgb(t.text_body))
+                            .child(h.value.clone()),
+                    )
+                } else {
+                    row.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_color(rgb(t.text_body))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .overflow_hidden()
+                            .child(h.value.clone()),
+                    )
+                }
+            }));
+
+        section_with_action(
+            title,
+            Some(format!("{} entries · click row to copy", headers.len())),
+            Some(copy_all),
+            table,
+        )
+    }
+
+    /// Non-duplicated IAM & Wire Metadata tab (`3`).
+    fn render_iam_meta_tab(&self, trace: &Trace, cx: &mut Context<Self>) -> Div {
         let request_id = trace
             .response
             .as_ref()
-            .and_then(|response| {
-                response
-                    .header("x-amz-request-id")
-                    .or_else(|| response.header("x-amzn-requestid"))
+            .and_then(|res| {
+                res.header("x-amz-request-id")
+                    .or_else(|| res.header("x-amzn-requestid"))
             })
             .or_else(|| {
-                trace.request.as_ref().and_then(|request| {
-                    request
-                        .header("x-amz-request-id")
-                        .or_else(|| request.header("x-amzn-requestid"))
+                trace.request.as_ref().and_then(|req| {
+                    req.header("x-amz-request-id")
+                        .or_else(|| req.header("x-amzn-requestid"))
                 })
             });
 
-        let (status_tint, status_line) = if trace.pending {
-            (rgb(t.amber), "… pending".to_string())
-        } else {
-            (
-                status_color(trace.status),
-                format!(
-                    "{} {}",
-                    status_label(trace.status),
-                    status_text(trace.status)
-                ),
-            )
-        };
-        let mut call = div().flex().flex_col();
-        call = call
-            .child(meta_row(
-                "Status",
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(glyph::dot(status_tint, 4.5))
-                    .child(
-                        div()
-                            .font_family(fonts::mono())
-                            .text_size(px(11.5))
-                            .text_color(status_tint)
-                            .child(status_line),
-                    ),
-            ))
-            .child(meta_row(
-                "Duration",
-                mono_value(if trace.pending {
-                    i18n::pick("still running", "正在运行").to_string()
-                } else {
-                    format_latency(trace.ms)
-                }),
-            ))
+        let mut meta = div().flex().flex_col();
+        meta = meta
             .child(meta_row("Started", mono_value(full_time(&trace.at))))
-            .child(meta_row(
-                "Method",
-                mono_value(trace.method.to_ascii_uppercase()),
-            ));
-        if trace.is_retry() || self.invocation_stats(trace).is_some() {
-            let attempt = trace.attempt.unwrap_or(1);
-            let mut label = match trace.max_attempts {
-                Some(max) => format!("{attempt} of {max}"),
-                None => format!("attempt {attempt}"),
-            };
-            if let Some((count, total_ms)) = self.invocation_stats(trace) {
-                label.push_str(&format!(" · {count} tries ({})", format_latency(total_ms)));
-            }
-            call = call.child(meta_row("Retry", mono_value(label)));
-        }
-
-        let mut routing = div().flex().flex_col();
-        routing = routing
-            .child(meta_row(
-                "Service",
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(glyph::dot(theme::service_color(trace.service_name()), 4.5))
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(theme::service_color(trace.service_name()))
-                            .child(trace.service_name().to_string()),
-                    ),
-            ))
-            .child(meta_row(
-                "Operation",
-                mono_value(trace::ellipsize(operation_label(trace), 44)),
-            ))
-            .child(meta_row(
-                "Region",
-                mono_value(trace.region.clone().unwrap_or_else(|| "—".to_string())),
-            ))
             .child(meta_row(
                 "Host",
                 mono_value(if trace.host.is_empty() {
@@ -439,221 +568,111 @@ impl LensletApp {
                 }),
             ))
             .child(meta_row(
+                "Region",
+                mono_value(trace.region.clone().unwrap_or_else(|| "—".to_string())),
+            ))
+            .child(meta_row(
                 "Request ID",
                 mono_value(request_id.unwrap_or("—").to_string()),
-            ));
-        if let Some(id) = Some(trace.id.as_str()).filter(|id| !id.is_empty()) {
-            routing = routing.child(meta_row("Trace ID", mono_value(id.to_string())));
+            ))
+            .child(meta_row("Trace ID", mono_value(trace.id.clone())));
+
+        if let Some(inv) = trace.invocation_id.as_deref() {
+            meta = meta.child(meta_row("Invocation ID", mono_value(inv.to_string())));
         }
-
-        let auth = if trace.authorization {
-            "SigV4 authorization header"
-        } else if trace.presigned() {
-            "Presigned URL (query signature)"
-        } else {
-            "Unsigned"
-        };
-
-        let mut bodies = div().flex().flex_col();
-        bodies = bodies
-            .child(meta_row("Auth", text_value(auth.to_string(), t.text_soft)))
-            .child(meta_row(
-                "Request",
-                text_value(body_summary(trace.request.as_ref()), t.text_body),
-            ))
-            .child(meta_row(
-                "Response",
-                text_value(body_summary(trace.response.as_ref()), t.text_body),
-            ))
-            .child(meta_row(
-                "Content-Type",
-                mono_value(
-                    trace
-                        .response
-                        .as_ref()
-                        .and_then(|response| response.content_type.clone())
-                        .or_else(|| {
-                            trace
-                                .request
-                                .as_ref()
-                                .and_then(|request| request.content_type.clone())
-                        })
-                        .unwrap_or_else(|| "—".to_string()),
-                ),
-            ))
-            .child(meta_row(
-                "Path",
-                mono_value(trace::ellipsize(trace::display_path(trace), 44)),
-            ));
+        if trace.is_retry() || self.invocation_stats(trace).is_some() {
+            let attempt = trace.attempt.unwrap_or(1);
+            let mut label = match trace.max_attempts {
+                Some(max) => format!("{attempt} of {max}"),
+                None => format!("attempt {attempt}"),
+            };
+            if let Some((count, total_ms)) = self.invocation_stats(trace) {
+                label.push_str(&format!(" · {count} tries ({})", format_latency(total_ms)));
+            }
+            meta = meta.child(meta_row("SDK Retries", mono_value(label)));
+        }
+        if let Some(sha) = trace
+            .request
+            .as_ref()
+            .and_then(|r| r.body.as_ref())
+            .and_then(|b| b.sha256.as_deref())
+        {
+            meta = meta.child(meta_row("Req SHA-256", mono_value(sha.to_string())));
+        }
+        if let Some(sha) = trace
+            .response
+            .as_ref()
+            .and_then(|r| r.body.as_ref())
+            .and_then(|b| b.sha256.as_deref())
+        {
+            meta = meta.child(meta_row("Res SHA-256", mono_value(sha.to_string())));
+        }
 
         div()
             .flex()
             .flex_col()
             .gap(px(14.0))
-            .children(problem_panel(trace))
-            .children(access_section(trace))
-            .child(section(i18n::pick("CALL", "调用概览"), call))
-            .child(section(i18n::pick("ROUTING", "路由参数"), routing))
-            .child(section(i18n::pick("AUTH & BODIES", "认证与载荷"), bodies))
+            .children(self.access_section_interactive(trace, cx))
+            .child(section(i18n::pick("WIRE METADATA", "底层协议元数据"), meta))
     }
 
-    pub(super) fn render_exchange(&self, trace: &Trace, side: Side, cx: &mut Context<Self>) -> Div {
+    fn access_section_interactive(&self, trace: &Trace, cx: &mut Context<Self>) -> Option<Div> {
         let t = theme::p();
-        let exchange = match side {
-            Side::Request => trace.request.as_ref(),
-            Side::Response => trace.response.as_ref(),
-        };
-        let Some(exchange) = exchange else {
-            return div()
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .child(
+        let entries: Vec<(&trace::CallAccess, bool)> = trace.call_access().collect();
+        if entries.is_empty() {
+            return None;
+        }
+        let mut list = div().flex().flex_col();
+        for (idx, (access, implied)) in entries.into_iter().enumerate() {
+            let acc_key = access.key();
+            let mut name = div().flex().items_center().gap(px(6.0)).child(
+                div()
+                    .font_family(fonts::mono())
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(t.text))
+                    .child(access.action.clone()),
+            );
+            if implied {
+                name = name.child(
                     div()
-                        .text_size(px(12.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(t.text_soft))
-                        .child(if i18n::is_zh() {
-                            format!("尚未捕获 {}", side.noun())
-                        } else {
-                            format!("No {} captured", side.noun())
-                        }),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .line_height(px(16.0))
+                        .text_size(px(10.0))
                         .text_color(rgb(t.text_muted))
-                        .child(i18n::pick(
-                            "The trace entry for this call contains metadata only.",
-                            "当前调用记录仅包含元数据。",
-                        )),
+                        .child("implied"),
                 );
-        };
-
-        let target = match side {
-            Side::Request => format!(
-                "{} {}",
-                trace.method.to_ascii_uppercase(),
-                trace::display_path(trace)
-            ),
-            Side::Response => format!(
-                "HTTP {} {}",
-                status_label(trace.status),
-                status_text(trace.status)
-            ),
-        };
-
-        let headers_text = headers_to_text(&exchange.headers);
-        let headers_action = if exchange.headers.is_empty() {
-            None
-        } else {
-            Some(self.copy_button(
-                match side {
-                    Side::Request => "copy-req-headers",
-                    Side::Response => "copy-res-headers",
-                },
-                "headers",
-                Some(headers_text.clone()),
-                cx,
-            ))
-        };
-
-        let body = exchange.body.as_ref();
-        let body_actions = self.render_body_actions(body, &exchange.content_type, side, cx);
-
-        let mut header_meta = vec![format!(
-            "{} {}",
-            exchange.headers.len(),
-            if exchange.headers.len() == 1 {
-                "entry"
-            } else {
-                "entries"
             }
-        )];
-        if let Some(content_type) = exchange.content_type.as_deref() {
-            header_meta.push(content_type.to_string());
-        }
-
-        let mut body_meta = Vec::new();
-        if let Some(body) = body {
-            body_meta.push(format_bytes(body.size()));
-            if let Some(content_type) = exchange.content_type.as_deref() {
-                body_meta.push(body_kind(content_type, body));
-            } else if !body.binary {
-                body_meta.push("UTF-8".to_string());
-            }
-            if let Some(enc) = body.encoding.as_deref() {
-                body_meta.push(enc.to_string());
-            }
-            if body.truncated {
-                body_meta.push("truncated".to_string());
-            }
-        }
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(14.0))
-            .child(section_with_action(
-                side.target_label(),
-                None,
-                Some(self.copy_button(
-                    match side {
-                        Side::Request => "copy-req-target",
-                        Side::Response => "copy-res-target",
-                    },
-                    match side {
-                        Side::Request => "path",
-                        Side::Response => "status",
-                    },
-                    Some(match side {
-                        Side::Request => trace.path.clone(),
-                        Side::Response => target.clone(),
-                    }),
-                    cx,
-                )),
-                code_block(
-                    match side {
-                        Side::Request => "req-target",
-                        Side::Response => "res-target",
-                    },
-                    target.clone(),
-                    68.0,
-                ),
-            ))
-            .child(section_with_action(
-                "HEADERS",
-                Some(header_meta.join(" · ")),
-                headers_action,
-                if exchange.headers.is_empty() {
-                    empty_note(i18n::pick("No headers captured", "未捕获到 Headers"))
-                        .into_any_element()
+            if trace.is_access_new(access) {
+                if trace.blocked {
+                    name = name.child(blocked_pill("DENIED"));
                 } else {
-                    code_block(
-                        match side {
-                            Side::Request => "req-headers",
-                            Side::Response => "res-headers",
-                        },
-                        headers_text,
-                        210.0,
-                    )
-                    .into_any_element()
-                },
-            ))
-            .child(section_with_action(
-                "BODY",
-                Some(body_meta.join(" · ")),
-                body_actions,
-                self.render_body(
-                    body,
-                    &exchange.content_type,
-                    match side {
-                        Side::Request => "req-body",
-                        Side::Response => "res-body",
-                    },
-                ),
-            ))
+                    name = name.child(new_pill("NOT IN LOCK"));
+                }
+            }
+            list = list.child(
+                div()
+                    .id(ElementId::named_usize("call-iam-entry", idx))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .py(px(6.0))
+                    .px(px(6.0))
+                    .rounded(px(4.0))
+                    .border_b_1()
+                    .border_color(rgb(t.border_subtle))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(t.row_hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_access = Some(acc_key.clone());
+                        this.set_pane(Pane::Access, cx);
+                    }))
+                    .child(name)
+                    .child(mono_value(access.resource.clone())),
+            );
+        }
+        Some(section(
+            i18n::pick("IAM PERMISSIONS", "所需 IAM 权限"),
+            list,
+        ))
     }
 
     fn render_body_actions(
@@ -744,14 +763,14 @@ impl LensletApp {
     ) -> Div {
         let t = theme::p();
         let Some(body) = body else {
-            return empty_note(i18n::pick("No body captured", "未捕获到 Body"));
+            return empty_note(i18n::pick("Empty · 0 B", "无内容 · 0 B"));
         };
 
         if body.binary {
             let mut block = div().flex().flex_col().gap(px(6.0));
             if let Some(hex_str) = body.hex.as_deref().filter(|h| !h.is_empty()) {
                 let dump = trace::format_hex_dump(hex_str);
-                block = block.child(code_block(code_id, dump, 260.0));
+                block = block.child(code_block(code_id, dump, 240.0, false));
             } else {
                 block = block.child(empty_note(&format!(
                     "Binary body · {}",
@@ -783,7 +802,7 @@ impl LensletApp {
         };
 
         if text.is_empty() && body.size() == 0 {
-            return empty_note("Empty body · 0 B");
+            return empty_note(i18n::pick("Empty · 0 B", "无内容 · 0 B"));
         }
 
         let pretty = if self.raw_body {
@@ -798,31 +817,23 @@ impl LensletApp {
         } else {
             display
         };
-        let mut block = div().flex().flex_col().gap(px(6.0));
+        let mut block = div().flex().flex_col().gap(px(5.0));
         block = block.child(code_block(
             code_id,
             shown.to_string(),
-            if self.expand_body { 620.0 } else { 380.0 },
+            if self.expand_body { 560.0 } else { 290.0 },
+            self.prefs.word_wrap,
         ));
         let mut notes = Vec::new();
-        if pretty.is_some() {
-            notes.push(
-                i18n::pick(
-                    "Formatted for reading; Copy gives the raw unredacted body.",
-                    "已自动缩进便于阅读；点击“复制”或切换“原始”可查看未脱敏原始字节内容。",
-                )
-                .to_string(),
-            );
-        }
         if clipped {
             notes.push(if i18n::is_zh() {
                 format!(
-                    "预览截断在 {}；点击上方“展开全文”或“复制”可获取全部已捕获内容。",
+                    "预览截断在 {}；点击“展开全文”或“复制”获取完整内容。",
                     format_bytes(MAX_BODY_DISPLAY)
                 )
             } else {
                 format!(
-                    "Display capped at {}; click Full or Copy for everything captured.",
+                    "Display capped at {}; click Full or Copy for all.",
                     format_bytes(MAX_BODY_DISPLAY)
                 )
             });
@@ -830,13 +841,13 @@ impl LensletApp {
         if body.truncated {
             notes.push(if i18n::is_zh() {
                 format!(
-                    "代理按捕获上限保留了前 {}（总计 {}），可用 `--max-body unlimited` 全量捕获。",
+                    "代理按上限保留了前 {} / {}（可用 `--max-body unlimited` 全量捕获）。",
                     format_bytes(text.len()),
                     format_bytes(body.size())
                 )
             } else {
                 format!(
-                    "Truncated at proxy limit: captured {} of {} (`--max-body unlimited` keeps all).",
+                    "Proxy captured {} of {} (`--max-body unlimited` keeps all).",
                     format_bytes(text.len()),
                     format_bytes(body.size())
                 )
@@ -846,45 +857,6 @@ impl LensletApp {
             block = block.child(note_text(notes.join(" ")));
         }
         block
-    }
-}
-
-pub(super) fn body_summary(exchange: Option<&Exchange>) -> String {
-    let Some(exchange) = exchange else {
-        return i18n::pick("not captured", "未捕获").to_string();
-    };
-    let Some(body) = exchange.body.as_ref() else {
-        return i18n::pick("no body", "无 Body").to_string();
-    };
-    if body.binary {
-        let mut summary = format!("binary · {}", format_bytes(body.size()));
-        if body.hex.is_some() {
-            summary.push_str(" · hex");
-        }
-        if body.truncated {
-            summary.push_str(" · truncated");
-        }
-        return summary;
-    }
-    if body.is_empty() {
-        return "empty · 0 B".to_string();
-    }
-    match body.text.as_deref() {
-        Some(text) if !text.is_empty() || body.encoding.is_some() => {
-            let mut summary = format!(
-                "{} · {}",
-                body_kind(exchange.content_type.as_deref().unwrap_or(""), body),
-                format_bytes(body.size())
-            );
-            if let Some(enc) = body.encoding.as_deref() {
-                summary.push_str(&format!(" · {enc}"));
-            }
-            if body.truncated {
-                summary.push_str(" · truncated");
-            }
-            summary
-        }
-        _ => format!("text unavailable · {}", format_bytes(body.size())),
     }
 }
 
@@ -906,14 +878,13 @@ pub(super) fn body_kind(content_type: &str, body: &Body) -> String {
     }
 }
 
-/// The answer to "why did this fail?", above everything else.
 fn problem_panel(trace: &Trace) -> Option<Div> {
     let t = theme::p();
     let problem = trace.problem.as_ref()?;
     let heading = if trace.blocked {
         i18n::pick("BLOCKED BY LENSLET", "已被 LENSLET 实时拦截")
     } else {
-        i18n::pick("WHY IT FAILED", "失败原因")
+        i18n::pick("WHY IT FAILED", "失败根因诊断")
     };
     let mut panel = div()
         .flex()
@@ -950,8 +921,8 @@ fn problem_panel(trace: &Trace) -> Option<Div> {
     if let Some(message) = problem.message.as_deref().filter(|m| !m.is_empty()) {
         panel = panel.child(
             div()
-                .text_size(px(12.5))
-                .line_height(px(17.0))
+                .text_size(px(12.0))
+                .line_height(px(16.5))
                 .text_color(rgb(t.text_soft))
                 .child(message.to_string()),
         );
@@ -973,8 +944,8 @@ fn problem_panel(trace: &Trace) -> Option<Div> {
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .text_size(px(12.0))
-                        .line_height(px(17.0))
+                        .text_size(px(11.5))
+                        .line_height(px(16.5))
                         .text_color(rgb(t.text_body))
                         .child(hint.to_string()),
                 ),
@@ -984,51 +955,4 @@ fn problem_panel(trace: &Trace) -> Option<Div> {
         panel = panel.child(note_text(error.to_string()));
     }
     Some(panel)
-}
-
-/// The permissions this call needs: its own, and implied ones elsewhere.
-fn access_section(trace: &Trace) -> Option<Div> {
-    let t = theme::p();
-    let entries: Vec<(&trace::CallAccess, bool)> = trace.call_access().collect();
-    if entries.is_empty() {
-        return None;
-    }
-    let mut list = div().flex().flex_col();
-    for (access, implied) in entries {
-        let mut name = div().flex().items_center().gap(px(6.0)).child(
-            div()
-                .font_family(fonts::mono())
-                .text_size(px(11.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(t.text))
-                .child(access.action.clone()),
-        );
-        if implied {
-            name = name.child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(t.text_muted))
-                    .child("implied"),
-            );
-        }
-        if trace.is_access_new(access) {
-            if trace.blocked {
-                name = name.child(blocked_pill("DENIED"));
-            } else {
-                name = name.child(new_pill("NOT IN LOCK"));
-            }
-        }
-        list = list.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .py(px(6.0))
-                .border_b_1()
-                .border_color(rgb(t.border_subtle))
-                .child(name)
-                .child(mono_value(access.resource.clone())),
-        );
-    }
-    Some(section(i18n::pick("ACCESS", "IAM 权限"), list))
 }

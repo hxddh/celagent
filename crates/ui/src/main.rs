@@ -1,4 +1,4 @@
-//! Lenslet: a single-window live lens over the Lenslet proxy trace.
+//! Lenslet: a precision workbench over the Lenslet proxy trace.
 
 mod app;
 mod demo;
@@ -11,15 +11,49 @@ mod theme;
 mod trace;
 
 use gpui::{
-    App, Application, Bounds, WindowBackgroundAppearance, WindowBounds, WindowOptions, prelude::*,
-    px, size,
+    App, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, prelude::*, px, size,
 };
+
+use crate::app::{OpenSettings, QuitApp, ReloadTrace, ToggleInspector};
 
 fn main() {
     Application::new().run(|cx: &mut App| {
         fonts::install(cx);
 
-        let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
+        cx.bind_keys([
+            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
+            KeyBinding::new("cmd-b", ToggleInspector, None),
+            KeyBinding::new("ctrl-b", ToggleInspector, None),
+            KeyBinding::new("cmd-r", ReloadTrace, None),
+            KeyBinding::new("ctrl-r", ReloadTrace, None),
+            KeyBinding::new("cmd-q", QuitApp, None),
+        ]);
+        cx.on_action(|_: &QuitApp, cx| cx.quit());
+        cx.set_menus(vec![
+            Menu {
+                name: "Lenslet".into(),
+                items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Lenslet", QuitApp),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Toggle Inspector", ToggleInspector),
+                    MenuItem::action("Reload Trace", ReloadTrace),
+                ],
+            },
+        ]);
+
+        let saved = prefs::load(&app::home());
+        let width = saved.window_width.unwrap_or(1320.0).clamp(960.0, 3840.0);
+        let height = saved.window_height.unwrap_or(820.0).clamp(640.0, 2400.0);
+        let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+
         let window = cx
             .open_window(
                 WindowOptions {
@@ -39,7 +73,7 @@ fn main() {
 
         window
             .update(cx, |view, window, cx| {
-                view.observe_appearance(window, cx);
+                view.observe_window(window, cx);
                 window.focus(&view.root_focus());
                 cx.activate(true);
             })

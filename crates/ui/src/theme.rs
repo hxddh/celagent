@@ -1,10 +1,11 @@
-//! Design tokens for Lenslet: precision-instrument dark and light surfaces.
+//! Design tokens for Lenslet: precision-instrument dark and light surfaces
+//! with 6 contrast-calibrated accent palettes.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use gpui::{Hsla, Rgba, WindowAppearance, rgb};
 
-use crate::prefs::ThemeMode;
+use crate::prefs::{AccentColor, Density, ThemeMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appearance {
@@ -13,6 +14,7 @@ pub enum Appearance {
 }
 
 static ACTIVE_APPEARANCE: AtomicU8 = AtomicU8::new(0);
+static ACTIVE_ACCENT: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_appearance(appearance: Appearance) {
     let val = match appearance {
@@ -29,6 +31,29 @@ pub fn appearance() -> Appearance {
     }
 }
 
+pub fn set_accent(accent: AccentColor) {
+    let val = match accent {
+        AccentColor::Sky => 0,
+        AccentColor::Indigo => 1,
+        AccentColor::Violet => 2,
+        AccentColor::Emerald => 3,
+        AccentColor::Amber => 4,
+        AccentColor::Rose => 5,
+    };
+    ACTIVE_ACCENT.store(val, Ordering::Relaxed);
+}
+
+pub fn accent() -> AccentColor {
+    match ACTIVE_ACCENT.load(Ordering::Relaxed) {
+        1 => AccentColor::Indigo,
+        2 => AccentColor::Violet,
+        3 => AccentColor::Emerald,
+        4 => AccentColor::Amber,
+        5 => AccentColor::Rose,
+        _ => AccentColor::Sky,
+    }
+}
+
 pub fn resolve(mode: ThemeMode, window: WindowAppearance) -> Appearance {
     match mode {
         ThemeMode::Dark => Appearance::Dark,
@@ -38,6 +63,30 @@ pub fn resolve(mode: ThemeMode, window: WindowAppearance) -> Appearance {
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Appearance::Dark,
         },
     }
+}
+
+/// `(accent_hex, row_selected_hex, row_selected_hover_hex, mark_bg_hex)` for `(mode, accent)`.
+pub const fn accent_tokens(mode: Appearance, accent: AccentColor) -> (u32, u32, u32, u32) {
+    match (mode, accent) {
+        (Appearance::Dark, AccentColor::Sky) => (0x7DD3FC, 0x152230, 0x192838, 0x131C27),
+        (Appearance::Dark, AccentColor::Indigo) => (0xA5B4FC, 0x181C32, 0x1D223C, 0x15182A),
+        (Appearance::Dark, AccentColor::Violet) => (0xC4B5FD, 0x1E1932, 0x241E3C, 0x1A162B),
+        (Appearance::Dark, AccentColor::Emerald) => (0x6EE7B7, 0x122622, 0x162E29, 0x11201D),
+        (Appearance::Dark, AccentColor::Amber) => (0xFCD34D, 0x262013, 0x2F2717, 0x201B11),
+        (Appearance::Dark, AccentColor::Rose) => (0xFDA4AF, 0x281720, 0x311C27, 0x22141B),
+
+        (Appearance::Light, AccentColor::Sky) => (0x0369A1, 0xE6F2FE, 0xDAEBFB, 0xE2EEF9),
+        (Appearance::Light, AccentColor::Indigo) => (0x4338CA, 0xEAEAFE, 0xE0E0FC, 0xE6E7FB),
+        (Appearance::Light, AccentColor::Violet) => (0x6D28D9, 0xF0E9FE, 0xE7DDFD, 0xECE5FB),
+        (Appearance::Light, AccentColor::Emerald) => (0x047857, 0xE4F7F0, 0xD6F1E7, 0xE0F3EC),
+        (Appearance::Light, AccentColor::Amber) => (0xB45309, 0xFEF1DF, 0xFDE8CC, 0xFAECDA),
+        (Appearance::Light, AccentColor::Rose) => (0xBE123C, 0xFEE8EE, 0xFCDCE5, 0xFAE4EA),
+    }
+}
+
+/// Swatch preview color for the Settings modal.
+pub fn accent_swatch(accent: AccentColor) -> u32 {
+    accent_tokens(appearance(), accent).0
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,7 +101,6 @@ pub struct Palette {
     pub code: u32,
     pub input: u32,
     pub input_focused: u32,
-    pub footer: u32,
 
     pub row: u32,
     pub row_hover: u32,
@@ -92,13 +140,12 @@ pub const DARK: Palette = Palette {
     code: 0x090C11,
     input: 0x0B0F15,
     input_focused: 0x0A0E14,
-    footer: 0x080A0E,
 
     row: 0x0E1117,
     row_hover: 0x131A24,
-    row_selected: 0x16212C,
-    row_selected_hover: 0x18242F,
-    mark_bg: 0x141B25,
+    row_selected: 0x152230,
+    row_selected_hover: 0x192838,
+    mark_bg: 0x131C27,
 
     border: 0x1E2632,
     border_subtle: 0x171E28,
@@ -124,21 +171,20 @@ pub const DARK: Palette = Palette {
 pub const LIGHT: Palette = Palette {
     canvas: 0xF5F7FA,
     header: 0xEEF2F6,
-    toolbar: 0xF3F6FA,
+    toolbar: 0xF4F7FA,
     strip: 0xECF0F5,
     table_head: 0xF0F4F8,
     panel: 0xFFFFFF,
     panel_raised: 0xFAFBFD,
     code: 0xF3F6FA,
-    input: 0xF6F8FB,
+    input: 0xFFFFFF,
     input_focused: 0xFFFFFF,
-    footer: 0xEAEFF5,
 
     row: 0xFFFFFF,
     row_hover: 0xF1F5FA,
-    row_selected: 0xE3F0FF,
-    row_selected_hover: 0xD8EAFF,
-    mark_bg: 0xE2ECF7,
+    row_selected: 0xE6F2FE,
+    row_selected_hover: 0xDAEBFB,
+    mark_bg: 0xE2EEF9,
 
     border: 0xD2DCE7,
     border_subtle: 0xE3EAF2,
@@ -151,7 +197,7 @@ pub const LIGHT: Palette = Palette {
     text_muted: 0x5B6B82,
     text_faint: 0x75859B,
 
-    accent: 0x0284C7,
+    accent: 0x0369A1,
     green: 0x047857,
     amber: 0xB45309,
     red: 0xDC2626,
@@ -161,31 +207,42 @@ pub const LIGHT: Palette = Palette {
     blue: 0x1D4ED8,
 };
 
-/// Active palette for the current render pass.
-pub fn p() -> &'static Palette {
-    match appearance() {
-        Appearance::Dark => &DARK,
-        Appearance::Light => &LIGHT,
+/// Active palette for the current render pass, incorporating the active accent.
+pub fn p() -> Palette {
+    let mode = appearance();
+    let mut base = match mode {
+        Appearance::Dark => DARK,
+        Appearance::Light => LIGHT,
+    };
+    let (acc, sel, sel_hover, mark) = accent_tokens(mode, accent());
+    base.accent = acc;
+    base.row_selected = sel;
+    base.row_selected_hover = sel_hover;
+    base.mark_bg = mark;
+    base
+}
+
+// Workbench 3-zone layout rhythm.
+pub const HEADER_H: f32 = 44.0;
+pub const SUBBAR_H: f32 = 38.0;
+pub const TABLE_HEAD_H: f32 = 28.0;
+pub const SPLITTER_W: f32 = 5.0;
+
+pub fn row_height(density: Density) -> f32 {
+    match density {
+        Density::Comfortable => 54.0,
+        Density::Compact => 40.0,
     }
 }
 
-// Layout rhythm.
-pub const HEADER_H: f32 = 46.0;
-pub const TOOLBAR_H: f32 = 50.0;
-pub const STREAM_HEAD_H: f32 = 34.0;
-pub const TABLE_HEAD_H: f32 = 30.0;
-pub const ROW_H: f32 = 60.0;
-pub const INSPECTOR_W: f32 = 448.0;
-pub const FOOTER_H: f32 = 30.0;
-
 // Stream columns.
 pub const ROW_PAD_X: f32 = 14.0;
-pub const COL_TIME: f32 = 92.0;
+pub const COL_TIME: f32 = 88.0;
 pub const COL_SERVICE: f32 = 88.0;
 pub const COL_STATUS: f32 = 52.0;
 pub const COL_LATENCY: f32 = 66.0;
-pub const COL_AUTH: f32 = 34.0;
-pub const COL_GAP: f32 = 11.0;
+pub const COL_AUTH: f32 = 30.0;
+pub const COL_GAP: f32 = 10.0;
 
 pub fn h(hex: u32, alpha: f32) -> Hsla {
     let mut color: Hsla = rgb(hex).into();
@@ -317,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn light_palette_maintains_wcag_aa_contrast() {
+    fn light_and_dark_accent_palettes_maintain_wcag_aa_contrast() {
         for token in [
             LIGHT.text,
             LIGHT.text_soft,
@@ -334,6 +391,21 @@ mod tests {
             assert!(
                 ratio >= 4.5,
                 "token #{token:06x} has insufficient contrast {ratio:.2} on white"
+            );
+        }
+
+        for accent in AccentColor::ALL {
+            let (dark_acc, _, _, _) = accent_tokens(Appearance::Dark, accent);
+            let dark_ratio = contrast(dark_acc, DARK.panel);
+            assert!(
+                dark_ratio >= 4.5,
+                "{accent:?} dark accent #{dark_acc:06x} contrast {dark_ratio:.2} < 4.5"
+            );
+            let (light_acc, _, _, _) = accent_tokens(Appearance::Light, accent);
+            let light_ratio = contrast(light_acc, LIGHT.panel);
+            assert!(
+                light_ratio >= 4.5,
+                "{accent:?} light accent #{light_acc:06x} contrast {light_ratio:.2} < 4.5"
             );
         }
     }

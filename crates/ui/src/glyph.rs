@@ -91,8 +91,119 @@ pub fn search_icon(color: Hsla) -> impl IntoElement {
         .child(
             canvas(
                 |_, _, _| (),
-                move |_, _, window, _| {
-                    paint_line(window, (6.6, 6.6), (10.0, 10.0), 1.1, color);
+                move |bounds, _, window, _| {
+                    let ox = bounds.left().to_f64() as f32;
+                    let oy = bounds.top().to_f64() as f32;
+                    paint_line(
+                        window,
+                        (ox + 6.4, oy + 6.4),
+                        (ox + 10.0, oy + 10.0),
+                        1.2,
+                        color,
+                    );
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+}
+
+/// Settings gear icon: precision ring with 6 radial teeth.
+pub fn gear_icon(color: Hsla) -> impl IntoElement {
+    div()
+        .relative()
+        .flex_shrink_0()
+        .w(px(13.0))
+        .h(px(13.0))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let cx = bounds.left().to_f64() as f32 + 6.5;
+                    let cy = bounds.top().to_f64() as f32 + 6.5;
+                    for i in 0..6 {
+                        let a = i as f32 * PI / 3.0;
+                        paint_line(
+                            window,
+                            (cx + 3.6 * a.cos(), cy + 3.6 * a.sin()),
+                            (cx + 5.8 * a.cos(), cy + 5.8 * a.sin()),
+                            1.4,
+                            color,
+                        );
+                    }
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(3.0))
+                .top(px(3.0))
+                .w(px(7.0))
+                .h(px(7.0))
+                .rounded_full()
+                .border_1()
+                .border_color(color),
+        )
+}
+
+/// Split-sidebar icon (`⌘B` toggle inspector).
+pub fn sidebar_icon(color: Hsla, active: bool) -> impl IntoElement {
+    let fill = if active {
+        Hsla { a: 0.25, ..color }
+    } else {
+        Hsla { a: 0.0, ..color }
+    };
+    div()
+        .relative()
+        .flex_shrink_0()
+        .w(px(13.0))
+        .h(px(11.0))
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(color)
+        .child(
+            div()
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0()
+                .w(px(4.5))
+                .border_l_1()
+                .border_color(color)
+                .bg(fill),
+        )
+}
+
+/// Chevron down (`▾`) drawn cleanly without font fallback variance.
+pub fn chevron_down(color: Hsla) -> impl IntoElement {
+    div()
+        .relative()
+        .flex_shrink_0()
+        .w(px(8.0))
+        .h(px(6.0))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let ox = bounds.left().to_f64() as f32;
+                    let oy = bounds.top().to_f64() as f32;
+                    paint_line(
+                        window,
+                        (ox + 1.0, oy + 1.5),
+                        (ox + 4.0, oy + 4.6),
+                        1.25,
+                        color,
+                    );
+                    paint_line(
+                        window,
+                        (ox + 4.0, oy + 4.6),
+                        (ox + 7.0, oy + 1.5),
+                        1.25,
+                        color,
+                    );
                 },
             )
             .absolute()

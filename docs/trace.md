@@ -73,11 +73,14 @@ forwarded untouched). Binary payloads record `hex` (first 512 bytes) alongside
   (`PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem`, `GetItem`).
   `CopyObject` and `UploadPartCopy` also need `s3:GetObject` on the source from
   `x-amz-copy-source`.
-- **Resource**: read from the request for S3, DynamoDB (tables and indexes;
-  one entry per table, since an IAM resource names one table), SQS, SNS, Lambda,
-  SSM Parameter Store, CloudWatch Logs, Kinesis, Bedrock, Secrets Manager, KMS,
-  STS, IAM, EventBridge and Step Functions; otherwise `*`. Account and region
-  are `*`, while `/` paths in secrets, parameters and IAM roles are preserved.
+- **Resource**: read from the request for S3, DynamoDB (tables, indexes, and
+  Streams `StreamArn`; one entry per table, since an IAM resource names one
+  table), SQS, SNS, Lambda, SSM Parameter Store, CloudWatch Logs, Kinesis,
+  Bedrock, Secrets Manager, KMS, STS, IAM, EventBridge (including per-entry
+  `PutEvents` `EventBusName`, defaulting omitted entries to `default`), and Step
+  Functions (`stateMachineArn`, `CreateStateMachine` `name`, and `executionArn`);
+  otherwise `*`. Account and region are `*`, while `/` paths in secrets,
+  parameters and IAM roles are preserved.
 - **Normalization**: UUIDs, runs of six or more digits, and hex segments of six
   or more characters become `*`, so generated test names do not churn the lock.
 - A call whose operation is only an HTTP method gets no action. Lenslet does

@@ -53,7 +53,7 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   # install your test dependencies
-  - uses: hxddh/lenslet@lenslet-v5.0.0
+  - uses: hxddh/lenslet@lenslet-v6.0.0
     with:
       command: npm test
       emulator: moto_server -p 9298           # or however you start your emulator
@@ -77,7 +77,7 @@ Until a `lenslet.lock` exists, it only reports.
 | `emulator` | | a command that starts the emulator in the background |
 | `working-directory` | `.` | where to run and find the lock |
 | `lock` | `lenslet.lock` | lock path, relative to `working-directory` |
-| `policy` | | IAM policy JSON path to check/enforce instead of `lenslet.lock` |
+| `policy` | | IAM policy JSON path to check/enforce instead of `lenslet.lock` (supports `Allow`, `Deny`, `NotAction`, `NotResource`, and wire-level IAM `Condition` blocks) |
 | `check` | `true` | fail when access grows (exit 3) |
 | `strict` | `false` | also fail when the lock lists access the run did not use |
 | `enforce` | `false` | actively deny calls outside the lock/policy with AWS `AccessDenied` |
@@ -140,15 +140,30 @@ rewrites the lock and keeps the marks. It only writes when the command passed.
 
 ## The window
 
-`lenslet ui` (or `Lenslet.app`) shows the newest run live. It has two views:
+`lenslet ui` (or `Lenslet.app`) opens a three-zone workbench that tails the
+newest run live (up to 5,000 calls per run, with payloads > 8 KiB offloaded to
+disk offsets and hydrated on demand):
 
-- **Calls**: every call, with errors and `BLOCKED` markers in the row, `Copy curl` (`c`), formatted/raw wire toggle, and binary Hex + ASCII preview in the inspector.
-- **Access** (`a`): one row per permission. Click a row to see the calls
-  behind it.
+- **Calls** (`1`): combinable status (`All` / `Errors` / `Blocked` / `New IAM` /
+  `Pending`) and service filters, plus a resizable (`⌘B` collapsible) inspector
+  whose default **Exchange** view shows the root-cause failure/blocked card,
+  Request Body, and Response Body together without tab switching, alongside
+  structured **Headers** and **IAM & Meta** tabs and one-key `Copy curl` (`c`).
+- **Access** (`2` / `a`): searchable permission table (`All` / `New` /
+  `Implied` / `Unused` / `# test`) paired with a **Permission Inspector**
+  showing the IAM Statement JSON, `lenslet.lock` line, one-click `Export Policy`,
+  and every call that exercised that permission.
+- **Diff** (`3` / `d`): visual run-to-run comparison against any recorded base
+  run—highlighting new and fixed failures, IAM permission additions/removals,
+  and per-service call deltas.
 
-`[` and `]` step through earlier runs. `t` switches between System, Light and
-Dark themes; `l` toggles Chinese / English UI labels (keeping AWS, IAM and HTTP
-technical terms canonical). Preferences are stored in `~/.lenslet/ui.json`.
+Use the header **Run Switcher** (or `[` and `]`) to pin any historical run or
+follow the live stream. Open **Settings** (`⌘,` or the `⚙` button) to configure
+System / Light / Dark appearance, 6 WCAG-calibrated accent colors (`Sky`,
+`Indigo`, `Violet`, `Emerald`, `Amber`, `Rose`), Comfortable / Compact row
+density, English / Chinese UI labels (keeping AWS, IAM, and HTTP technical terms
+canonical), relative `+ms` vs wall-clock timestamps, payload formatting/wrap
+defaults, and local run storage cleanup (`~/.lenslet/ui.json`).
 
 ![A run in the Lenslet window](docs/lenslet.png)
 
@@ -178,6 +193,9 @@ lenslet init [--upstream ADDRESS] -- COMMAND   first run: lock + CI workflow
 lenslet run [options] [--] COMMAND             run under Lenslet; report at the end
 lenslet run [options]                          no command: a proxy on 127.0.0.1:9297
 lenslet last [--json]                          the newest run's report
+lenslet runs [--json] [--limit N]              list recorded runs newest-first
+lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]
+                                               compare two runs (default: previous vs newest)
 lenslet policy [--lock PATH]                   an IAM policy from the lock (without `# test` lines)
 lenslet ui                                     the window
 
@@ -253,13 +271,21 @@ examples/      a project the action is tested against
   `--max-body unlimited` to change), unframing `aws-chunked` streams and
   decompressing `gzip` and `deflate` for inspection while forwarding wire bytes
   untouched and unredacted.
-- Resources are read for S3, DynamoDB, SQS, SNS, Lambda, SSM Parameter Store,
-  CloudWatch Logs, Kinesis, Bedrock, Secrets Manager, KMS, STS, IAM, EventBridge
-  and Step Functions. Other services get `*`. Calls with unrecognized operations
-  are reported as unmapped rather than guessed.
+- Resources are read for S3, DynamoDB (tables, indexes, and Streams), SQS, SNS,
+  Lambda, SSM Parameter Store, CloudWatch Logs, Kinesis, Bedrock, Secrets
+  Manager, KMS, STS, IAM, EventBridge (including per-entry `PutEvents` bus
+  names), and Step Functions (`stateMachine` and `execution` ARNs). Other
+  services get `*`. Calls with unrecognized operations are reported as unmapped
+  rather than guessed.
+- `--policy` evaluates wire-observable IAM `Condition` keys (`aws:RequestedRegion`,
+  `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:versionid`, `s3:x-amz-*`)
+  across `String*`, `Arn*`, `Numeric*`, `Bool`, `Null`, `ForAnyValue:`,
+  `ForAllValues:`, and `...IfExists`, and fails closed on policy variables
+  (`${...}`) or cloud-only runtime context keys (such as `aws:PrincipalOrgID`).
 - No Windows build. The macOS app is not notarized.
 
-Earlier versions: [lenslet-v4.1.0](https://github.com/hxddh/lenslet/tree/lenslet-v4.1.0).
+Earlier versions: [lenslet-v5.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v5.0.0),
+[lenslet-v4.1.0](https://github.com/hxddh/lenslet/tree/lenslet-v4.1.0).
 This repository used to be `celagent`; that project is at
 [v4.1.0](https://github.com/hxddh/lenslet/tree/v4.1.0).
 

@@ -605,4 +605,17 @@ fn enforce_and_policy_gate_live_calls_end_to_end() {
         "{}",
         stderr(&check_out)
     );
+
+    // `lenslet runs --json` lists recorded runs newest-first, and `lenslet diff --json`
+    // compares the two most recent finished runs.
+    let runs_out = env.lenslet(&["runs", "--json"]);
+    assert_eq!(runs_out.status.code(), Some(0), "{}", stderr(&runs_out));
+    let runs_json: serde_json::Value = serde_json::from_slice(&runs_out.stdout).unwrap();
+    assert!(runs_json.as_array().unwrap().len() >= 3, "{runs_json}");
+
+    let diff_out = env.lenslet(&["diff", "--json"]);
+    assert_eq!(diff_out.status.code(), Some(0), "{}", stderr(&diff_out));
+    let diff_json: serde_json::Value = serde_json::from_slice(&diff_out.stdout).unwrap();
+    assert!(diff_json["base_run"].is_string());
+    assert!(diff_json["target_run"].is_string());
 }
