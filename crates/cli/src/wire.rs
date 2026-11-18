@@ -158,10 +158,12 @@ fn bedrock_operation(method: &str, path: &str) -> Option<String> {
     let bare = path.split('?').next().unwrap_or(path);
     let segments: Vec<&str> = bare.split('/').filter(|s| !s.is_empty()).collect();
     let operation = match (method, segments.as_slice()) {
-        ("POST", ["model", _, "invoke"]) => "InvokeModel",
-        ("POST", ["model", _, "invoke-with-response-stream"]) => "InvokeModelWithResponseStream",
-        ("POST", ["model", _, "converse"]) => "Converse",
-        ("POST", ["model", _, "converse-stream"]) => "ConverseStream",
+        ("POST", ["model", mid @ .., "invoke"]) if !mid.is_empty() => "InvokeModel",
+        ("POST", ["model", mid @ .., "invoke-with-response-stream"]) if !mid.is_empty() => {
+            "InvokeModelWithResponseStream"
+        }
+        ("POST", ["model", mid @ .., "converse"]) if !mid.is_empty() => "Converse",
+        ("POST", ["model", mid @ .., "converse-stream"]) if !mid.is_empty() => "ConverseStream",
         ("GET", ["foundation-models"]) => "ListFoundationModels",
         ("GET", ["foundation-models", _]) => "GetFoundationModel",
         ("GET", ["inference-profiles"]) => "ListInferenceProfiles",
@@ -175,7 +177,7 @@ fn appconfig_operation(method: &str, path: &str) -> Option<String> {
     let bare = path.split('?').next().unwrap_or(path);
     let segments: Vec<&str> = bare.split('/').filter(|s| !s.is_empty()).collect();
     let operation = match (method, segments.as_slice()) {
-        ("POST", ["configuration"]) => "StartConfigurationSession",
+        ("POST", ["configurationsessions"]) => "StartConfigurationSession",
         ("GET", ["configuration"]) => "GetLatestConfiguration",
         _ => return None,
     };
@@ -612,8 +614,17 @@ mod tests {
             "Invoke"
         );
         assert_eq!(
-            fallback_operation("appconfigdata", "POST", "/configuration", &none),
+            fallback_operation("appconfigdata", "POST", "/configurationsessions", &none),
             "StartConfigurationSession"
+        );
+        assert_eq!(
+            fallback_operation(
+                "appconfigdata",
+                "GET",
+                "/configuration?configuration_token=tok",
+                &none
+            ),
+            "GetLatestConfiguration"
         );
     }
 }

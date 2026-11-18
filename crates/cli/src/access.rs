@@ -503,13 +503,11 @@ fn resource(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String
         "logs" => body
             .field("logGroupName")
             .map(|group| {
-                arn(
-                    "logs",
-                    &format!(
-                        "log-group:{}:*",
-                        normalize_path(group.trim_start_matches('/'))
-                    ),
-                )
+                let raw = group
+                    .split_once(":log-group:")
+                    .map_or(group.as_str(), |(_, rest)| rest)
+                    .trim_end_matches(":*");
+                arn("logs", &format!("log-group:{}:*", normalize_path(raw)))
             })
             .unwrap_or_else(|| "*".to_string()),
         "kinesis" => body
@@ -597,25 +595,64 @@ fn iam_entity(kind: &str, value: &str) -> String {
 
 fn bedrock_model(path: &str) -> Option<String> {
     let bare = path.split('?').next().unwrap_or(path);
-    let mut segments = bare.split('/').filter(|s| !s.is_empty());
-    match segments.next()? {
-        "model" | "foundation-models" => {
-            let id = segments.next()?;
-            let decoded = wire::query_param(&format!("?v={id}"), "v").unwrap_or_default();
-            (!decoded.is_empty()).then_some(decoded)
-        }
-        _ => None,
-    }
+    let segments: Vec<&str> = bare.split('/').filter(|s| !s.is_empty()).collect();
+    let raw = match segments.as_slice() {
+        [
+            "model",
+            mid @ ..,
+            "invoke" | "invoke-with-response-stream" | "converse" | "converse-stream",
+        ] if !mid.is_empty() => mid.join("/"),
+        ["foundation-models" | "inference-profiles", id] => (*id).to_string(),
+        _ => return None,
+    };
+    let decoded = wire::query_param(&format!("?v={raw}"), "v").unwrap_or_default();
+    (!decoded.is_empty()).then_some(decoded)
 }
 
 fn bedrock_resource(model: &str) -> String {
-    if let Some((_, rest)) = model.split_once(":foundation-model/") {
-        arn("bedrock", &format!("foundation-model/{rest}"))
-    } else if let Some((_, rest)) = model.split_once(":inference-profile/") {
-        arn("bedrock", &format!("inference-profile/{rest}"))
-    } else {
-        arn("bedrock", &format!("foundation-model/{model}"))
+    if model.starts_with("arn:") {
+        let Some(rest) = model.splitn(6, ':').nth(5).filter(|s| !s.is_empty()) else {
+            return "*".to_string();
+        };
+        if let Some((kind, id)) = rest.split_once('/') {
+            return match kind {
+                "foundation-model" => arn("bedrock", rest),
+                "inference-profile" if is_system_inference_profile(id) => arn("bedrock", rest),
+                _ => arn("bedrock", &format!("{kind}/{}", normalize_path(id))),
+            };
+        }
+        return arn("bedrock", rest);
     }
+    if is_system_inference_profile(model) {
+        arn("bedrock", &format!("inference-profile/{model}"))
+    } else if is_foundation_model_id(model) {
+        arn("bedrock", &format!("foundation-model/{model}"))
+    } else {
+        "*".to_string()
+    }
+}
+
+fn is_system_inference_profile(id: &str) -> bool {
+    let Some((geo, rest)) = id.split_once('.') else {
+        return false;
+    };
+    matches!(
+        geo,
+        "us" | "eu" | "apac" | "global" | "us-gov" | "ca" | "jp" | "au"
+    ) && is_foundation_model_id(rest)
+}
+
+fn is_foundation_model_id(id: &str) -> bool {
+    let Some((provider, model)) = id.split_once('.') else {
+        return false;
+    };
+    !provider.is_empty()
+        && !model.is_empty()
+        && !id.contains('/')
+        && provider
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && provider.bytes().any(|b| b.is_ascii_alphabetic())
 }
 
 fn kms_key(key: &str) -> String {
@@ -1113,8 +1150,19 @@ mod tests {
             )),
             (
                 "logs:PutLogEvents".into(),
-                "arn:aws:logs:*:*:log-group:aws/lambda/checkout:*".into()
+                "arn:aws:logs:*:*:log-group:/aws/lambda/checkout:*".into()
             )
+        );
+        assert_eq!(
+            access(&call(
+                "logs",
+                "PutLogEvents",
+                "POST",
+                "/",
+                Some(r#"{"logGroupName":"custom/checkout"}"#)
+            ))
+            .1,
+            "arn:aws:logs:*:*:log-group:custom/checkout:*"
         );
         assert_eq!(
             access(&call(
@@ -1142,6 +1190,39 @@ mod tests {
                 "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
                     .into()
             )
+        );
+        assert_eq!(
+            access(&call(
+                "bedrock-runtime",
+                "InvokeModel",
+                "POST",
+                "/model/us.anthropic.claude-3-5-sonnet-20241022-v2%3A0/invoke",
+                Some("{}")
+            ))
+            .1,
+            "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        );
+        assert_eq!(
+            access(&call(
+                "bedrock-runtime",
+                "InvokeModel",
+                "POST",
+                "/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aprovisioned-model%2Fmy-throughput/invoke",
+                Some("{}")
+            ))
+            .1,
+            "arn:aws:bedrock:*:*:provisioned-model/my-throughput"
+        );
+        assert_eq!(
+            access(&call(
+                "bedrock-runtime",
+                "InvokeModel",
+                "POST",
+                "/model/opaque-throughput-id/invoke",
+                Some("{}")
+            ))
+            .1,
+            "*"
         );
     }
 
