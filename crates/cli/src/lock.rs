@@ -176,6 +176,20 @@ enum BaseOp {
     Null,
 }
 
+impl BaseOp {
+    fn is_negated(self) -> bool {
+        matches!(
+            self,
+            BaseOp::StringNotEquals
+                | BaseOp::StringNotEqualsIgnoreCase
+                | BaseOp::StringNotLike
+                | BaseOp::ArnNotEquals
+                | BaseOp::ArnNotLike
+                | BaseOp::NumericNotEquals
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ConditionClause {
     quantifier: SetQuantifier,
@@ -604,7 +618,8 @@ impl ConditionClause {
         if actuals.is_empty() {
             return match self.quantifier {
                 SetQuantifier::ForAllValues => true,
-                SetQuantifier::ForAnyValue | SetQuantifier::Single => self.if_exists,
+                SetQuantifier::ForAnyValue => self.if_exists,
+                SetQuantifier::Single => self.if_exists || self.op.is_negated(),
             };
         }
         match self.quantifier {
@@ -986,6 +1001,59 @@ mod tests {
             !copy_deny
                 .allows_in_context(&put_access, Some(&RequestContext::from_trace(&copy_trace))),
             "percent-encoded x-amz-copy-source must still trigger Deny"
+        );
+
+        // Unqualified negated operators (`StringNotEquals`, `StringNotLike`, ...)
+        // evaluate to `true` when the context key is absent, matching AWS IAM so a
+        // Deny guardrail cannot be bypassed by omitting the header.
+        let sse_deny_guardrail = Gate::from_policy_str(
+            r#"{
+                "Statement": [
+                    { "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::assets/*" },
+                    {
+                        "Effect": "Deny",
+                        "Action": "s3:PutObject",
+                        "Resource": "arn:aws:s3:::assets/*",
+                        "Condition": {
+                            "StringNotEquals": { "s3:x-amz-server-side-encryption": "aws:kms" }
+                        }
+                    }
+                ]
+            }"#,
+            "sse-guardrail.json",
+        )
+        .unwrap();
+        let mut omitted_sse = base_put.clone();
+        omitted_sse.request.headers.clear();
+        assert!(
+            !sse_deny_guardrail
+                .allows_in_context(&put_access, Some(&RequestContext::from_trace(&omitted_sse))),
+            "omitting x-amz-server-side-encryption must trigger StringNotEquals Deny"
+        );
+        let mut wrong_sse = omitted_sse.clone();
+        wrong_sse.request.headers.push(crate::trace::HeaderTrace {
+            name: "x-amz-server-side-encryption".into(),
+            value: "AES256".into(),
+        });
+        assert!(
+            !sse_deny_guardrail
+                .allows_in_context(&put_access, Some(&RequestContext::from_trace(&wrong_sse))),
+            "non-matching x-amz-server-side-encryption must trigger StringNotEquals Deny"
+        );
+        let mut matching_sse = omitted_sse;
+        matching_sse
+            .request
+            .headers
+            .push(crate::trace::HeaderTrace {
+                name: "x-amz-server-side-encryption".into(),
+                value: "aws:kms".into(),
+            });
+        assert!(
+            sse_deny_guardrail.allows_in_context(
+                &put_access,
+                Some(&RequestContext::from_trace(&matching_sse))
+            ),
+            "matching aws:kms header satisfies guardrail"
         );
 
         let principal_scoped = r#"{

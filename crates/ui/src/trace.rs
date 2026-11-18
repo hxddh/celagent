@@ -1778,6 +1778,30 @@ pub fn list_run_summaries(dir: &Path) -> Vec<RunSummary> {
         .collect()
 }
 
+/// Finished candidate baselines for `current_path`, ordered with earlier runs
+/// first (nearest predecessor at index 0) followed by newer finished runs, plus
+/// the nearest earlier baseline path (`prev`) if one exists.
+pub fn ordered_baselines(
+    dir: &Path,
+    current_path: Option<&Path>,
+) -> (Vec<RunSummary>, Option<PathBuf>) {
+    let mut earlier = Vec::new();
+    let mut newer = Vec::new();
+    for summary in list_run_summaries(dir) {
+        if summary.report.is_none() || Some(summary.path.as_path()) == current_path {
+            continue;
+        }
+        if current_path.is_none_or(|cur| summary.path.as_path() < cur) {
+            earlier.push(summary);
+        } else {
+            newer.push(summary);
+        }
+    }
+    let prev_path = earlier.first().map(|s| s.path.clone());
+    earlier.extend(newer);
+    (earlier, prev_path)
+}
+
 /// `(file_count, total_bytes)` for `~/.lenslet/runs`.
 pub fn storage_stats(dir: &Path) -> (usize, u64) {
     let files = list_runs(dir);
@@ -3130,6 +3154,29 @@ mod tests {
         assert_eq!(diff.new_failures[0].service, "kms");
         assert_eq!(diff.fixed_failures.len(), 1);
         assert_eq!(diff.fixed_failures[0].service, "dynamodb");
+
+        // Historical baseline ordering: for finished runs A < B < C, viewing B
+        // defaults `prev` to A (earlier) while keeping C available afterwards,
+        // and viewing oldest A yields `prev == None` so Diff never reverses C → A.
+        let newer_path = runs_dir.join("20261118T100800Z-250.jsonl");
+        fs::write(
+            &newer_path,
+            concat!(
+                "{\"type\":\"run\",\"run\":\"newer-run\",\"started\":\"2026-11-18T10:08:00Z\",\"command\":[\"pytest\"]}\n",
+                "{\"type\":\"end\",\"run\":\"newer-run\",\"calls\":0,\"errors\":0,\"blocked\":0,\"duration_ms\":5,\"exit_code\":0}\n"
+            ),
+        )
+        .unwrap();
+        let (bases_for_b, prev_for_b) = ordered_baselines(&runs_dir, Some(&target_path));
+        assert_eq!(prev_for_b.as_deref(), Some(base_path.as_path()));
+        assert_eq!(bases_for_b.len(), 2);
+        assert_eq!(bases_for_b[0].path, base_path);
+        assert_eq!(bases_for_b[1].path, newer_path);
+
+        let (bases_for_a, prev_for_a) = ordered_baselines(&runs_dir, Some(&base_path));
+        assert!(prev_for_a.is_none());
+        assert_eq!(bases_for_a.len(), 2);
+        fs::remove_file(&newer_path).unwrap();
 
         // Storage stats & clear_finished_runs preserves current + live runs and removes finished base_path.
         let (count_before, bytes_before) = storage_stats(&runs_dir);

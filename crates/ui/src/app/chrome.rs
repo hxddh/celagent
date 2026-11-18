@@ -554,7 +554,7 @@ impl LensletApp {
 
     fn render_diff_subbar(&self, cx: &mut Context<Self>) -> Div {
         let t = theme::p();
-        let baselines = self.finished_baselines();
+        let (baselines, prev_path) = self.finished_baselines_with_prev();
         let mut row = div()
             .flex()
             .items_center()
@@ -575,11 +575,13 @@ impl LensletApp {
             let active_base = self
                 .diff_base
                 .as_deref()
-                .unwrap_or_else(|| baselines[0].path.as_path());
+                .filter(|pinned| baselines.iter().any(|s| s.path.as_path() == *pinned))
+                .or(prev_path.as_deref());
             for (i, base) in baselines.iter().take(5).enumerate() {
-                let is_active = base.path.as_path() == active_base;
+                let is_active = active_base == Some(base.path.as_path());
                 let path_clone = base.path.clone();
-                let label = if i == 0 {
+                let is_prev = prev_path.as_deref() == Some(base.path.as_path());
+                let label = if is_prev {
                     format!("{} ({})", base.id, i18n::pick("prev", "上一次"))
                 } else {
                     base.id.clone()

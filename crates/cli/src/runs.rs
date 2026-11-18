@@ -74,13 +74,29 @@ pub fn list(dir: &Path) -> Vec<PathBuf> {
     runs
 }
 
-/// Resolve a run specifier (path, exact run ID, or unique ID prefix) against `dir`.
+/// Resolve a run specifier (path, `latest`/`prev` alias, exact run ID, or unique ID prefix) against `dir`.
 pub fn resolve(dir: &Path, spec: &str) -> Result<PathBuf> {
     let candidate = Path::new(spec);
     if candidate.is_file() {
         return Ok(candidate.to_path_buf());
     }
     let all = list(dir);
+    if spec.eq_ignore_ascii_case("latest") {
+        if let Some(finished_latest) = all.iter().rev().find(|p| report(p).is_some()) {
+            return Ok(finished_latest.clone());
+        }
+        if let Some(any_latest) = all.last() {
+            return Ok(any_latest.clone());
+        }
+        anyhow::bail!("no runs yet; try `lenslet run -- <command>`");
+    }
+    if spec.eq_ignore_ascii_case("prev") || spec.eq_ignore_ascii_case("previous") {
+        let finished: Vec<&PathBuf> = all.iter().filter(|p| report(p).is_some()).collect();
+        if finished.len() < 2 {
+            anyhow::bail!("need at least 2 finished runs for `{spec}`; try `lenslet runs`");
+        }
+        return Ok(finished[finished.len() - 2].clone());
+    }
     if let Some(exact) = all.iter().find(|p| run_id(p) == spec) {
         return Ok(exact.clone());
     }

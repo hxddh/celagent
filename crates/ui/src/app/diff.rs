@@ -6,27 +6,26 @@ use super::*;
 impl LensletApp {
     pub(super) fn compute_active_diff(&self) -> Option<trace::UiRunDiff> {
         let current = self.run.as_ref()?;
-        let summaries = self.finished_baselines();
+        let (summaries, prev_path) = self.finished_baselines_with_prev();
         let base = match self.diff_base.as_deref() {
-            Some(pinned) => summaries
-                .iter()
-                .find(|s| s.path == pinned)
-                .or_else(|| summaries.first())?,
-            None => summaries.first()?,
+            Some(pinned) => summaries.iter().find(|s| s.path == pinned).or_else(|| {
+                let prev = prev_path.as_deref()?;
+                summaries.iter().find(|s| s.path == prev)
+            })?,
+            None => {
+                let prev = prev_path.as_deref()?;
+                summaries.iter().find(|s| s.path == prev)?
+            }
         };
         let access = self.access_rows();
         trace::UiRunDiff::from_summaries(base, current, &self.rows, &access)
     }
 
-    pub(super) fn finished_baselines(&self) -> Vec<trace::RunSummary> {
+    pub(super) fn finished_baselines_with_prev(&self) -> (Vec<trace::RunSummary>, Option<PathBuf>) {
         let Source::Runs { dir, .. } = &self.source else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
-        let current_path = self.trace_path.as_deref();
-        trace::list_run_summaries(dir)
-            .into_iter()
-            .filter(|s| s.report.is_some() && Some(s.path.as_path()) != current_path)
-            .collect()
+        trace::ordered_baselines(dir, self.trace_path.as_deref())
     }
 
     pub(super) fn render_diff(&self, cx: &mut Context<Self>) -> Stateful<Div> {

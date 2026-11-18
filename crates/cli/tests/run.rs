@@ -618,4 +618,17 @@ fn enforce_and_policy_gate_live_calls_end_to_end() {
     let diff_json: serde_json::Value = serde_json::from_slice(&diff_out.stdout).unwrap();
     assert!(diff_json["base_run"].is_string());
     assert!(diff_json["target_run"].is_string());
+
+    // Explicit `prev` and `latest` aliases resolve to the same two runs.
+    let alias_diff_out = env.lenslet(&["diff", "prev", "latest", "--json"]);
+    assert_eq!(
+        alias_diff_out.status.code(),
+        Some(0),
+        "{}",
+        stderr(&alias_diff_out)
+    );
+    let alias_diff_json: serde_json::Value =
+        serde_json::from_slice(&alias_diff_out.stdout).unwrap();
+    assert_eq!(alias_diff_json["base_run"], diff_json["base_run"]);
+    assert_eq!(alias_diff_json["target_run"], diff_json["target_run"]);
 }
