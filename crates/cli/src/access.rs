@@ -1193,10 +1193,15 @@ fn s3_resources(mode: Mode, operation: &str, trace: &Trace) -> Vec<String> {
                     .as_ref()
                     .and_then(|b| b.text.as_deref())
                     .unwrap_or("");
-                xml_elements(xml, "Key")
-                    .into_iter()
-                    .map(|key| format!("arn:aws:s3:::{bucket}/{key}"))
-                    .collect()
+                match parse_s3_delete_keys(xml) {
+                    Ok(keys) => keys
+                        .into_iter()
+                        .map(|key| format!("arn:aws:s3:::{bucket}/{key}"))
+                        .collect(),
+                    // Returning empty causes `derive_inner` to emit `UNVERIFIED_RESOURCE`,
+                    // failing closed on malformed XML, DTD/entity declarations, or unknown refs.
+                    Err(()) => Vec::new(),
+                }
             }
         };
     }
@@ -1210,28 +1215,235 @@ fn s3_resources(mode: Mode, operation: &str, trace: &Trace) -> Vec<String> {
     }
 }
 
-fn xml_elements(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start_tag) = rest.find(&open) {
-        let after = &rest[start_tag + open.len()..];
-        let Some(end_tag) = after.find(&close) else {
-            break;
-        };
-        let decoded = after[..end_tag]
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&");
-        if !decoded.is_empty() {
-            out.push(decoded);
-        }
-        rest = &after[end_tag + close.len()..];
+/// Strictly parse `<Delete><Object><Key>...</Key></Object>...</Delete>` payloads,
+/// resolving all XML 1.0 named entities, decimal (`&#47;`) and hex (`&#x2f;`)
+/// character references, and `<![CDATA[...]]>` sections while failing closed
+/// (`Err(())`) on DTD/`<!ENTITY` declarations, unknown entities, or malformed markup.
+fn parse_s3_delete_keys(raw_xml: &str) -> Result<Vec<String>, ()> {
+    let xml = raw_xml.strip_prefix('\u{FEFF}').unwrap_or(raw_xml);
+    let mut pos = 0usize;
+    let mut stack: Vec<&str> = Vec::new();
+    let mut saw_root = false;
+    let mut in_key: Option<String> = None;
+    let mut keys: Vec<String> = Vec::new();
+
+    fn local_name(tag: &str) -> &str {
+        tag.rsplit_once(':').map_or(tag, |(_, local)| local)
     }
-    out
+
+    fn valid_xml_name(name: &str) -> bool {
+        !name.is_empty()
+            && !name.starts_with(['-', '.', ':'])
+            && !name.ends_with(':')
+            && name
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    }
+
+    while pos < xml.len() {
+        let rest = &xml[pos..];
+        if let Some(after) = rest.strip_prefix("<!--") {
+            let end = after.find("-->").ok_or(())?;
+            let body = &after[..end];
+            if body.contains("--") || body.ends_with('-') {
+                return Err(());
+            }
+            pos += 4 + end + 3;
+        } else if let Some(after) = rest.strip_prefix("<![CDATA[") {
+            if stack.is_empty() {
+                return Err(());
+            }
+            let end = after.find("]]>").ok_or(())?;
+            if let Some(buf) = in_key.as_mut() {
+                buf.push_str(&after[..end]);
+            }
+            pos += 9 + end + 3;
+        } else if let Some(after) = rest.strip_prefix("<?") {
+            let end = after.find("?>").ok_or(())?;
+            pos += 2 + end + 2;
+        } else if rest.starts_with("<!") {
+            // Reject DOCTYPE / ENTITY / ATTLIST declarations fail-closed.
+            return Err(());
+        } else if let Some(after) = rest.strip_prefix("</") {
+            let end = after.find('>').ok_or(())?;
+            let inner = &after[..end];
+            let raw_name = inner.trim_end_matches([' ', '\t', '\r', '\n']);
+            if !valid_xml_name(raw_name) {
+                return Err(());
+            }
+            let expected = stack.pop().ok_or(())?;
+            if expected != raw_name {
+                return Err(());
+            }
+            if local_name(raw_name) == "Key" {
+                let val = in_key.take().ok_or(())?;
+                if val.is_empty() {
+                    return Err(());
+                }
+                keys.push(val);
+            }
+            pos += 2 + end + 1;
+        } else if let Some(after) = rest.strip_prefix('<') {
+            if in_key.is_some() {
+                return Err(());
+            }
+            let end = find_tag_end(after)?;
+            let inner = &after[..end];
+            let (tag_body, self_closing) = match inner.strip_suffix('/') {
+                Some(stripped) => (stripped, true),
+                None => (inner, false),
+            };
+            let name_end = tag_body
+                .find([' ', '\t', '\r', '\n'])
+                .unwrap_or(tag_body.len());
+            let raw_name = &tag_body[..name_end];
+            if !valid_xml_name(raw_name) {
+                return Err(());
+            }
+            validate_attributes(&tag_body[name_end..])?;
+            if stack.is_empty() {
+                if saw_root || local_name(raw_name) != "Delete" {
+                    return Err(());
+                }
+                saw_root = true;
+            }
+            if local_name(raw_name) == "Key" {
+                let under_object = stack.last().is_some_and(|p| local_name(p) == "Object");
+                if !under_object || self_closing {
+                    return Err(());
+                }
+                in_key = Some(String::new());
+            }
+            if !self_closing {
+                stack.push(raw_name);
+            }
+            pos += 1 + end + 1;
+        } else {
+            let next_lt = rest.find('<').unwrap_or(rest.len());
+            let chunk = &rest[..next_lt];
+            if chunk.contains("]]>") {
+                return Err(());
+            }
+            if stack.is_empty() {
+                if !chunk.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
+                    return Err(());
+                }
+            } else {
+                let decoded = decode_xml_text(chunk)?;
+                if let Some(buf) = in_key.as_mut() {
+                    buf.push_str(&decoded);
+                }
+            }
+            pos += next_lt;
+        }
+    }
+
+    if !saw_root || !stack.is_empty() || in_key.is_some() || keys.is_empty() {
+        return Err(());
+    }
+    Ok(keys)
+}
+
+fn find_tag_end(s: &str) -> Result<usize, ()> {
+    let mut quote: Option<char> = None;
+    for (idx, ch) in s.char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) if ch == '<' => return Err(()),
+            Some(_) => {}
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '<' => return Err(()),
+                '>' => return Ok(idx),
+                _ => {}
+            },
+        }
+    }
+    Err(())
+}
+
+fn validate_attributes(mut attrs: &str) -> Result<(), ()> {
+    loop {
+        attrs = attrs.trim_start_matches([' ', '\t', '\r', '\n']);
+        if attrs.is_empty() {
+            return Ok(());
+        }
+        let eq = attrs.find('=').ok_or(())?;
+        let name = attrs[..eq].trim_end_matches([' ', '\t', '\r', '\n']);
+        if name.is_empty() {
+            return Err(());
+        }
+        let after_eq = attrs[eq + 1..].trim_start_matches([' ', '\t', '\r', '\n']);
+        let q = after_eq
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\''))
+            .ok_or(())?;
+        let rest = &after_eq[q.len_utf8()..];
+        let close = rest.find(q).ok_or(())?;
+        let val = &rest[..close];
+        if val.contains('<') {
+            return Err(());
+        }
+        let _ = decode_xml_text(val)?;
+        attrs = &rest[close + q.len_utf8()..];
+    }
+}
+
+fn decode_xml_text(s: &str) -> Result<String, ()> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let semi = after.find(';').ok_or(())?;
+        let entity = &after[..semi];
+        let ch = match entity {
+            "lt" => '<',
+            "gt" => '>',
+            "amp" => '&',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => {
+                if let Some(hex) = entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                {
+                    if hex.is_empty()
+                        || hex.len() > 6
+                        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        return Err(());
+                    }
+                    let code = u32::from_str_radix(hex, 16).map_err(|_| ())?;
+                    valid_xml_char(code)?
+                } else if let Some(dec) = entity.strip_prefix('#') {
+                    if dec.is_empty() || dec.len() > 7 || !dec.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(());
+                    }
+                    let code = dec.parse::<u32>().map_err(|_| ())?;
+                    valid_xml_char(code)?
+                } else {
+                    return Err(());
+                }
+            }
+        };
+        out.push(ch);
+        rest = &after[semi + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn valid_xml_char(code: u32) -> Result<char, ()> {
+    let allowed = matches!(
+        code,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    );
+    if !allowed {
+        return Err(());
+    }
+    char::from_u32(code).ok_or(())
 }
 
 /// Permissions a call needs on resources it does not name in its target.
@@ -1868,19 +2080,47 @@ mod tests {
             "POST",
             "/bucket?delete",
             Some(
-                r#"<Delete><Object><Key>public/a.txt</Key></Object><Object><Key>/private//secret.txt</Key></Object></Delete>"#,
+                r#"<?xml version="1.0" encoding="UTF-8"?><!-- <Key>ignored</Key> --><Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>public/a.txt</Key></Object><Object><Key>private&#47;dec&#x2f;hex</Key></Object><Object><Key><![CDATA[private/cdata<&>.txt]]></Key></Object><Object><Key>/private//secret.txt</Key></Object></Delete>"#,
             ),
         );
         assert_eq!(
             derive_for_gate(&del, true).0,
             vec![
                 Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/public/a.txt"),
+                Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/private/dec/hex"),
+                Access::new(
+                    "s3:DeleteObject",
+                    "arn:aws:s3:::bucket/private/cdata<&>.txt"
+                ),
                 Access::new(
                     "s3:DeleteObject",
                     "arn:aws:s3:::bucket//private//secret.txt"
                 ),
             ]
         );
+
+        // DTD / ENTITY declarations, unknown entities, and malformed XML fail closed.
+        for bad_xml in [
+            r#"<!DOCTYPE Delete [<!ENTITY p "private">]><Delete><Object><Key>&p;/file</Key></Object></Delete>"#,
+            r#"<Delete><Object><Key>&unknown;/file</Key></Object></Delete>"#,
+            r#"<Delete><Object><Key>unclosed</Object></Delete>"#,
+        ] {
+            let bad = call(
+                "s3",
+                "DeleteObjects",
+                "POST",
+                "/bucket?delete",
+                Some(bad_xml),
+            );
+            assert_eq!(
+                derive_for_gate(&bad, true).0,
+                vec![Access::new(
+                    "s3:DeleteObject",
+                    crate::lock::UNVERIFIED_RESOURCE
+                )],
+                "bad XML must fail closed: {bad_xml}"
+            );
+        }
 
         let mut truncated = call(
             "dynamodb",

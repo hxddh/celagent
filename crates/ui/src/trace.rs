@@ -1277,13 +1277,51 @@ pub fn to_curl(trace: &Trace, endpoint: Option<&str>) -> String {
         posix_single_quote(&url),
     ];
     if let Some(req) = trace.request.as_ref() {
+        let decoded_wire = req
+            .body
+            .as_ref()
+            .is_some_and(|body| body.encoding.is_some() || (body.bytes > 0 && body.text.is_none()));
+        let compressed_wire = req
+            .body
+            .as_ref()
+            .and_then(|body| body.encoding.as_deref())
+            .is_some_and(|enc| {
+                let low = enc.to_ascii_lowercase();
+                low.contains("gzip") || low.contains("deflate")
+            });
         for header in &req.headers {
-            // Skip hop-by-hop Content-Length / Transfer-Encoding so curl sets
-            // the exact length for `--data-raw` when decoded from chunked/gzip.
-            if matches!(
-                header.name.to_ascii_lowercase().as_str(),
-                "content-length" | "transfer-encoding"
-            ) {
+            let low = header.name.to_ascii_lowercase();
+            // Skip hop-by-hop framing headers, and when replaying a decoded
+            // (`gzip` / `deflate` / `aws-chunked`) plaintext payload, strip
+            // wire-encoding & trailing-checksum headers that no longer match
+            // the decoded `--data-raw` bytes.
+            if matches!(low.as_str(), "content-length" | "transfer-encoding") {
+                continue;
+            }
+            if decoded_wire
+                && (matches!(
+                    low.as_str(),
+                    "content-encoding"
+                        | "x-amz-decoded-content-length"
+                        | "x-amz-trailer"
+                        | "x-amz-sdk-checksum-algorithm"
+                ) || low.starts_with("x-amz-checksum-")
+                    || (compressed_wire && low == "content-md5"))
+            {
+                continue;
+            }
+            if low == "x-amz-content-sha256"
+                && (decoded_wire
+                    || header
+                        .value
+                        .trim()
+                        .to_ascii_uppercase()
+                        .starts_with("STREAMING-"))
+            {
+                parts.push(format!(
+                    "-H {}",
+                    posix_single_quote(&format!("{}: UNSIGNED-PAYLOAD", header.name))
+                ));
                 continue;
             }
             parts.push(format!(
@@ -2316,5 +2354,56 @@ mod tests {
         let dump = format_hex_dump("89504e470d0a1a0a");
         assert!(dump.starts_with("0000  89 50 4e 47 0d 0a 1a 0a"), "{dump}");
         assert!(dump.ends_with("|.PNG....|"), "{dump}");
+
+        // Decoded gzip / aws-chunked requests strip wire framing headers so
+        // `--data-raw` replays cleanly against the emulator.
+        let encoded_call = parse_line(
+            &serde_json::to_string(&serde_json::json!({
+                "type": "call",
+                "id": "c2",
+                "at": "2026-11-18T00:00:01Z",
+                "method": "PUT",
+                "path": "/bucket/key.json?x-id=PutObject",
+                "host": "127.0.0.1:9297",
+                "service": "s3",
+                "operation": "PutObject",
+                "status": 200,
+                "ms": 3,
+                "request": {
+                    "headers": [
+                        {"name": "content-encoding", "value": "aws-chunked,gzip"},
+                        {"name": "x-amz-decoded-content-length", "value": "16"},
+                        {"name": "x-amz-trailer", "value": "x-amz-checksum-crc32"},
+                        {"name": "x-amz-content-sha256", "value": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"},
+                        {"name": "content-type", "value": "application/json"}
+                    ],
+                    "content_type": "application/json",
+                    "body": {
+                        "text": "{\"order\":\"#42\"}",
+                        "encoding": "aws-chunked,gzip",
+                        "bytes": 98,
+                        "truncated": false,
+                        "binary": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let encoded_curl = to_curl(&encoded_call, Some("http://127.0.0.1:9297"));
+        assert!(!encoded_curl.contains("content-encoding"), "{encoded_curl}");
+        assert!(
+            !encoded_curl.contains("x-amz-decoded-content-length"),
+            "{encoded_curl}"
+        );
+        assert!(!encoded_curl.contains("x-amz-trailer"), "{encoded_curl}");
+        assert!(
+            encoded_curl.contains("x-amz-content-sha256: UNSIGNED-PAYLOAD"),
+            "{encoded_curl}"
+        );
+        assert!(
+            encoded_curl.contains("--data-raw '{\"order\":\"#42\"}'"),
+            "{encoded_curl}"
+        );
     }
 }
