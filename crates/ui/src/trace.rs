@@ -102,6 +102,26 @@ pub struct Access {
     pub resource: String,
 }
 
+/// One permission on a `call` trace line, with its own `new` flag.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct CallAccess {
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub resource: String,
+    #[serde(default)]
+    pub new: bool,
+}
+
+impl CallAccess {
+    pub fn key(&self) -> Access {
+        Access {
+            action: self.action.clone(),
+            resource: self.resource.clone(),
+        }
+    }
+}
+
 /// The first line of a run file.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct RunHeader {
@@ -109,6 +129,8 @@ pub struct RunHeader {
     pub run: String,
     #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub cwd: String,
     #[serde(default)]
     pub endpoint: String,
     #[serde(default)]
@@ -133,9 +155,17 @@ pub struct AccessEntry {
     pub errors: usize,
     #[serde(default)]
     pub implied: bool,
+    #[serde(default)]
+    pub via: Vec<String>,
     /// Not in the lock file.
     #[serde(default)]
     pub new: bool,
+    /// In the lock file, not exercised by this run.
+    #[serde(skip)]
+    pub unused: bool,
+    /// Marked `# test` in the lock file.
+    #[serde(skip)]
+    pub test: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -166,11 +196,19 @@ pub struct Report {
     #[serde(default)]
     pub ended: String,
     #[serde(default)]
+    pub calls: usize,
+    #[serde(default)]
+    pub retries: usize,
+    #[serde(default)]
     pub access: Vec<AccessEntry>,
     #[serde(default)]
     pub lock: Option<String>,
     #[serde(default)]
     pub access_added: Vec<Access>,
+    #[serde(default)]
+    pub access_unused: Vec<Access>,
+    #[serde(default)]
+    pub unmapped: std::collections::BTreeMap<String, usize>,
     #[serde(default)]
     pub regressions: Option<Regressions>,
 }
@@ -245,6 +283,12 @@ pub struct Trace {
     pub authorization: bool,
     #[serde(default)]
     pub region: Option<String>,
+    #[serde(default)]
+    pub invocation_id: Option<String>,
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
     /// Still running when written; a later line with the same id replaces it.
     #[serde(default)]
     pub pending: bool,
@@ -256,10 +300,10 @@ pub struct Trace {
     /// The IAM permissions this call needs (several for batches,
     /// transactions and copies).
     #[serde(default)]
-    pub access: Vec<Access>,
+    pub access: Vec<CallAccess>,
     /// Permissions the call implies elsewhere (SSE-KMS key, passed role).
     #[serde(default)]
-    pub implied: Vec<Access>,
+    pub implied: Vec<CallAccess>,
     /// The call used access that is not in the lock file.
     #[serde(default)]
     pub new: bool,
@@ -273,14 +317,51 @@ pub struct Trace {
     service_name: String,
     #[serde(skip)]
     haystack: String,
+    #[serde(skip)]
+    at_ms: Option<i64>,
 }
 
 impl Trace {
     fn finalize(mut self) -> Self {
+        if let Some(request) = self.request.as_ref() {
+            if self.invocation_id.is_none() {
+                self.invocation_id = request
+                    .header("amz-sdk-invocation-id")
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+            }
+            if self.attempt.is_none()
+                && let Some(raw) = request.header("amz-sdk-request")
+            {
+                let (attempt, max) = parse_sdk_request(raw);
+                if attempt.is_some_and(|n| n > 1) {
+                    self.attempt = attempt;
+                    self.max_attempts = max;
+                }
+            }
+        }
+        self.at_ms = parse_rfc3339_ms(&self.at);
         self.service_key = service_id(&self.service);
         self.service_name = service_label(&self.service);
         self.haystack = self.build_haystack();
         self
+    }
+
+    pub fn at_ms(&self) -> Option<i64> {
+        self.at_ms
+    }
+
+    pub fn is_retry(&self) -> bool {
+        self.attempt.is_some_and(|attempt| attempt > 1)
+    }
+
+    pub fn retry_badge(&self) -> Option<String> {
+        let attempt = self.attempt.filter(|n| *n > 1)?;
+        Some(match self.max_attempts {
+            Some(max) => format!("RETRY {attempt}/{max}"),
+            None => format!("RETRY {attempt}"),
+        })
     }
 
     /// Normalized service identity (e.g. `dynamodb`), used by dynamic filters.
@@ -320,6 +401,16 @@ impl Trace {
         if let Some(region) = self.region.as_deref() {
             haystack.push_str(region);
             haystack.push('\n');
+        }
+        if let Some(invocation_id) = self.invocation_id.as_deref() {
+            haystack.push_str(invocation_id);
+            haystack.push('\n');
+        }
+        if self.is_retry() {
+            haystack.push_str("retry retried\n");
+        }
+        if self.new {
+            haystack.push_str("new\n");
         }
         haystack.push_str(&self.id);
         haystack.push('\n');
@@ -373,7 +464,24 @@ impl Trace {
 
     /// Every permission this call accounts for: its own, then implied ones.
     pub fn access(&self) -> impl Iterator<Item = Access> + '_ {
-        self.access.iter().chain(self.implied.iter()).cloned()
+        self.access
+            .iter()
+            .chain(self.implied.iter())
+            .map(CallAccess::key)
+    }
+
+    /// Every permission on this call paired with whether it is implied.
+    pub fn call_access(&self) -> impl Iterator<Item = (&CallAccess, bool)> + '_ {
+        self.access
+            .iter()
+            .map(|entry| (entry, false))
+            .chain(self.implied.iter().map(|entry| (entry, true)))
+    }
+
+    /// Whether a specific permission on this call is marked new (falling back
+    /// to `self.new` for single-permission calls from older trace files).
+    pub fn is_access_new(&self, entry: &CallAccess) -> bool {
+        entry.new || (self.new && self.access.len() + self.implied.len() == 1)
     }
 
     pub fn uses(&self, access: &Access) -> bool {
@@ -1111,6 +1219,123 @@ pub fn headers_to_text(headers: &[Header]) -> String {
     out
 }
 
+/// Parse `attempt=2; max=3` from `amz-sdk-request`.
+pub fn parse_sdk_request(value: &str) -> (Option<u32>, Option<u32>) {
+    let mut attempt = None;
+    let mut max = None;
+    for part in value.split(';') {
+        let Some((key, raw)) = part.trim().split_once('=') else {
+            continue;
+        };
+        let parsed = raw.trim().parse::<u32>().ok().filter(|n| *n > 0);
+        match key.trim() {
+            "attempt" => attempt = parsed,
+            "max" => max = parsed,
+            _ => {}
+        }
+    }
+    (attempt, max)
+}
+
+/// Parse an RFC3339 timestamp into epoch milliseconds, for relative waterfall
+/// offsets and idle-gap detection.
+pub fn parse_rfc3339_ms(at: &str) -> Option<i64> {
+    let (date, rest) = at.trim().split_once(['T', ' '])?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let rest = rest.strip_suffix('Z').unwrap_or(rest);
+    let (clock, tz_minutes) = if let Some((c, off)) = rest.rsplit_once('+') {
+        (c, parse_tz_offset(off)?)
+    } else if let Some((c, off)) = rest.rsplit_once('-') {
+        (c, -parse_tz_offset(off)?)
+    } else {
+        (rest, 0)
+    };
+    let mut t = clock.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let minute: i64 = t.next()?.parse().ok()?;
+    let sec_part = t.next()?;
+    let (sec_str, frac_str) = sec_part.split_once('.').unwrap_or((sec_part, ""));
+    let second: i64 = sec_str.parse().ok()?;
+    let mut millis: i64 = 0;
+    for (index, byte) in frac_str.bytes().take(3).enumerate() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        let scale = match index {
+            0 => 100,
+            1 => 10,
+            _ => 1,
+        };
+        millis += i64::from(byte - b'0') * scale;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let total_seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - tz_minutes * 60;
+    Some(total_seconds * 1_000 + millis)
+}
+
+fn parse_tz_offset(offset: &str) -> Option<i64> {
+    let (h, m) = offset.split_once(':').unwrap_or((offset, "0"));
+    let hours: i64 = h.parse().ok()?;
+    let mins: i64 = m.parse().ok()?;
+    Some(hours * 60 + mins)
+}
+
+/// `+142 ms` or `+1.8 s` relative to the start of the run.
+pub fn format_offset(delta_ms: i64) -> String {
+    let ms = delta_ms.max(0) as u64;
+    if ms == 0 {
+        "+0 ms".to_string()
+    } else {
+        format!("+{}", format_latency(ms))
+    }
+}
+
+/// Read `# test` marks from a lock file on disk, when reachable.
+pub fn read_test_marks(cwd: &str, lock: &str) -> std::collections::BTreeSet<Access> {
+    let lock_path = Path::new(lock);
+    let resolved = if lock_path.is_absolute() || cwd.is_empty() {
+        lock_path.to_path_buf()
+    } else {
+        Path::new(cwd).join(lock_path)
+    };
+    let Ok(text) = fs::read_to_string(resolved) else {
+        return std::collections::BTreeSet::new();
+    };
+    let mut out = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let Some((entry, comment)) = line.split_once('#') else {
+            continue;
+        };
+        if !comment
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == "test")
+        {
+            continue;
+        }
+        let mut fields = entry.split_whitespace();
+        let Some(action) = fields.next() else {
+            continue;
+        };
+        out.insert(Access {
+            action: action.to_string(),
+            resource: fields.next().unwrap_or("*").to_string(),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1343,7 @@ mod tests {
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[allow(clippy::too_many_arguments)]
     fn sample(
         at: &str,
         method: &str,
@@ -1869,5 +2095,51 @@ mod tests {
         assert!(legacy.presigned());
         let plain = parse_line(&line("p", "2026-11-15T00:00:01Z", serde_json::json!({}))).unwrap();
         assert!(!plain.presigned());
+    }
+
+    #[test]
+    fn parses_timestamps_retries_per_permission_new_and_test_marks() {
+        let start = parse_rfc3339_ms("2026-11-15T09:48:42.242Z").unwrap();
+        let later = parse_rfc3339_ms("2026-11-15T09:48:42.616763588+00:00").unwrap();
+        assert_eq!(later - start, 374);
+        assert_eq!(format_offset(later - start), "+374 ms");
+
+        let retried = parse_line(&line(
+            "r1",
+            "2026-11-15T09:48:43.000Z",
+            serde_json::json!({
+                "new": true,
+                "access": [{"action": "s3:PutObject", "resource": "arn:aws:s3:::b/*"}],
+                "implied": [{"action": "kms:GenerateDataKey", "resource": "arn:aws:kms:*:*:key/*", "new": true}],
+                "request": {
+                    "headers": [
+                        {"name": "amz-sdk-invocation-id", "value": "inv-42"},
+                        {"name": "amz-sdk-request", "value": "attempt=3; max=4"}
+                    ]
+                }
+            }),
+        ))
+        .unwrap();
+        assert!(retried.is_retry());
+        assert_eq!(retried.retry_badge().as_deref(), Some("RETRY 3/4"));
+        assert!(matches_search(&retried, &search_tokens("retry")));
+        assert!(matches_search(&retried, &search_tokens("inv-42")));
+        assert!(!retried.is_access_new(&retried.access[0]));
+        assert!(retried.is_access_new(&retried.implied[0]));
+
+        let lock_file = temp_trace("lock");
+        fs::write(
+            &lock_file,
+            "dynamodb:CreateTable  arn:aws:dynamodb:*:*:table/orders  # test\n\
+             dynamodb:PutItem      arn:aws:dynamodb:*:*:table/orders\n",
+        )
+        .unwrap();
+        let marks = read_test_marks("", lock_file.to_str().unwrap());
+        assert_eq!(marks.len(), 1);
+        assert!(marks.contains(&Access {
+            action: "dynamodb:CreateTable".into(),
+            resource: "arn:aws:dynamodb:*:*:table/orders".into(),
+        }));
+        let _ = fs::remove_file(&lock_file);
     }
 }

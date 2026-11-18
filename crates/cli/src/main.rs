@@ -380,9 +380,11 @@ async fn run(args: Vec<String>) -> Result<i32> {
         ended: runs::now(),
         duration_ms: started.elapsed().as_millis() as u64,
         calls: summary.calls,
+        retries: summary.retries,
         errors: summary.errors,
         unfinished: summary.unfinished,
         services: summary.services.clone(),
+        unmapped: summary.unmapped.clone(),
         failures: summary.failures.clone(),
         lock: locked.is_some().then(|| lock_label.clone()),
         trace: trace_path.display().to_string(),
@@ -518,7 +520,7 @@ jobs:
           # A command that starts your local AWS emulator inside this job, for
           # example `aws-emulator --telemetry off --port 9298` once AWS Emulator
           # is installed (see its docs), or `moto_server -p 9298`.
-          emulator: ""
+          emulator: {emulator}
 "#;
 
 /// One shell word: left as is when it is plain, single-quoted otherwise, so
@@ -545,6 +547,22 @@ fn shell_join(argv: &[String]) -> String {
 /// A YAML single-quoted scalar.
 fn yaml_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
+}
+
+fn render_workflow(
+    version: &str,
+    command: &[String],
+    upstream: &str,
+    emulator: Option<&str>,
+) -> String {
+    let emulator_yaml = emulator
+        .map(yaml_quote)
+        .unwrap_or_else(|| "\"\"".to_string());
+    WORKFLOW
+        .replace("{version}", version)
+        .replace("{command}", &yaml_quote(&shell_join(command)))
+        .replace("{upstream}", &yaml_quote(upstream))
+        .replace("{emulator}", &emulator_yaml)
 }
 
 /// `lenslet init [--upstream ADDRESS] [--force] -- COMMAND`: from nothing to
@@ -589,16 +607,23 @@ async fn init(args: Vec<String>) -> Result<i32> {
         );
     }
 
+    let detected_emulator = target.detect_emulator().await;
+    if let Some(emulator) = detected_emulator.as_deref() {
+        eprintln!("lenslet:   detected `{emulator}`");
+    }
+
     let cwd = std::env::current_dir().context("read the current directory")?;
     let workflow = cwd.join(".github/workflows/lenslet.yml");
     eprintln!("lenslet: 2/3 workflow {}", workflow.display());
     if workflow.exists() && !force {
         eprintln!("lenslet:   exists, left alone (use --force to replace it)");
     } else {
-        let text = WORKFLOW
-            .replace("{version}", env!("CARGO_PKG_VERSION"))
-            .replace("{command}", &yaml_quote(&shell_join(&command)))
-            .replace("{upstream}", &yaml_quote(&target.base));
+        let text = render_workflow(
+            env!("CARGO_PKG_VERSION"),
+            &command,
+            &target.base,
+            detected_emulator.as_deref(),
+        );
         std::fs::create_dir_all(workflow.parent().unwrap_or(&cwd))
             .with_context(|| format!("create {}", workflow.display()))?;
         std::fs::write(&workflow, text).with_context(|| format!("write {}", workflow.display()))?;
@@ -610,10 +635,15 @@ async fn init(args: Vec<String>) -> Result<i32> {
     run_args.extend(command);
     let code = Box::pin(run(run_args)).await?;
     if code == 0 {
+        let emulator_note = if detected_emulator.is_some() {
+            "and make sure the workflow installs your emulator and test dependencies."
+        } else {
+            "and set `emulator:` in the workflow to start your emulator in CI."
+        };
         eprintln!(
             "\nlenslet: done. Review lenslet.lock (mark fixture-only lines `# test`), then\n  \
              git add lenslet.lock .github/workflows/lenslet.yml\n\
-             and set `emulator:` in the workflow to start your emulator in CI."
+             {emulator_note}"
         );
     }
     Ok(code)
@@ -908,12 +938,15 @@ mod tests {
             yaml_quote("pytest -k 'not slow'"),
             "'pytest -k ''not slow'''"
         );
-        let text = WORKFLOW
-            .replace("{version}", "4.0.0")
-            .replace("{command}", &yaml_quote("npm test"))
-            .replace("{upstream}", &yaml_quote("https://127.0.0.1:9298"));
-        assert!(text.contains("uses: hxddh/lenslet@lenslet-v4.0.0"));
+        let text = render_workflow(
+            "4.1.0",
+            &strings(&["npm", "test"]),
+            "https://127.0.0.1:9298",
+            Some("aws-emulator --telemetry off --port 9298"),
+        );
+        assert!(text.contains("uses: hxddh/lenslet@lenslet-v4.1.0"));
         assert!(text.contains("command: 'npm test'"));
+        assert!(text.contains("emulator: 'aws-emulator --telemetry off --port 9298'"));
         assert!(!text.contains('{'), "every placeholder is filled");
     }
 

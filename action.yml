@@ -138,6 +138,23 @@ runs:
           echo "markdown=$markdown" >> "$GITHUB_OUTPUT"
         fi
         if [ "$code" = "3" ]; then
+          if command -v jq >/dev/null 2>&1 && [ -f "$report" ]; then
+            while IFS=$'\t' read -r action resource; do
+              [ -n "$action" ] || continue
+              echo "::error file=$lock,title=New AWS permission::+ $action on $resource (accept with \`lenslet run --update\`)"
+            done < <(jq -r '.access_added[]? | [.action, .resource] | @tsv' "$report")
+            if [ "$STRICT" = "true" ] && [ -f "$lock" ]; then
+              while IFS=$'\t' read -r action resource; do
+                [ -n "$action" ] || continue
+                line=$(awk -v a="$action" -v r="$resource" '$1 == a && $2 == r { print NR; exit }' "$lock")
+                if [ -n "$line" ]; then
+                  echo "::error file=$lock,line=$line,title=Unused AWS permission::- $action on $resource was not exercised by this run"
+                else
+                  echo "::error file=$lock,title=Unused AWS permission::- $action on $resource was not exercised by this run"
+                fi
+              done < <(jq -r '.access_unused[]? | [.action, .resource] | @tsv' "$report")
+            fi
+          fi
           echo "::error::AWS access changed: see the job summary. Accept it with \`lenslet run --update\` and commit $lock."
         fi
         exit 0

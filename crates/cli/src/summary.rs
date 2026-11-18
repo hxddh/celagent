@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    access::Access,
+    access::{self, Access},
     trace::{Trace, trace_access},
 };
 
@@ -16,19 +16,30 @@ use crate::{
 const LISTED_FAILURES: usize = 10;
 /// Access changes listed in the human summary.
 const LISTED_ACCESS: usize = 20;
+/// Inline new-permission rows in PR Markdown before folding into `<details>`.
+const MARKDOWN_INLINE_ADDED: usize = 30;
+/// Hard ceiling on PR Markdown permission rows so comments stay under 64 KiB.
+const MARKDOWN_MAX_ROWS: usize = 120;
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Summary {
     pub calls: usize,
+    pub retries: usize,
     pub errors: usize,
     pub unfinished: usize,
     pub services: BTreeMap<String, usize>,
+    pub unmapped: BTreeMap<String, usize>,
     pub failures: Vec<Failure>,
     pub access: BTreeMap<Access, AccessUse>,
     pending: HashSet<String>,
+    invocations: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Failure {
     pub id: String,
     pub service: String,
@@ -39,6 +50,10 @@ pub struct Failure {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,7 +90,18 @@ impl Summary {
         self.pending.remove(&trace.id);
         self.unfinished = self.pending.len();
         self.calls += 1;
+        let seen_invocation = trace
+            .invocation_id
+            .as_ref()
+            .is_some_and(|id| !self.invocations.insert(id.clone()));
+        let retried = trace.attempt.is_some_and(|attempt| attempt > 1) || seen_invocation;
+        if retried {
+            self.retries += 1;
+        }
         *self.services.entry(trace.service.clone()).or_default() += 1;
+        if access::is_unmapped(trace) {
+            *self.unmapped.entry(trace.service.clone()).or_default() += 1;
+        }
         let failed = trace.problem.is_some();
         for (index, access) in trace_access(trace).enumerate() {
             let entry = self.access.entry(access).or_default();
@@ -104,6 +130,8 @@ impl Summary {
                 code: problem.code.clone(),
                 message: problem.message.clone(),
                 hint: problem.hint.clone(),
+                attempt: trace.attempt.filter(|attempt| *attempt > 1),
+                max_attempts: trace.max_attempts.filter(|_| retried),
             });
         }
     }
@@ -152,9 +180,13 @@ pub struct Report {
     pub ended: String,
     pub duration_ms: u64,
     pub calls: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: usize,
     pub errors: usize,
     pub unfinished: usize,
     pub services: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unmapped: BTreeMap<String, usize>,
     pub failures: Vec<Failure>,
     pub access: Vec<AccessEntry>,
     /// Compared with this lock file; `null` when there is none.
@@ -232,16 +264,18 @@ impl Report {
                 names.join(", ")
             )
         };
+        let retries = retries_label(self.retries);
         out.push_str(&format!(
-            "lenslet: {} · {}{} · {}\n",
+            "lenslet: {}{retries} · {}{} · {}\n",
             plural(self.calls, "call"),
             plural(self.errors, "error"),
             services,
             seconds(self.duration_ms),
         ));
         for failure in self.failures.iter().take(LISTED_FAILURES) {
+            let attempt = attempt_label(failure.attempt, failure.max_attempts);
             out.push_str(&format!(
-                "  ✗ {} {}  {}  {}",
+                "  ✗ {} {}  {}  {}{attempt}",
                 failure.service.to_ascii_uppercase(),
                 failure.operation,
                 failure.status,
@@ -323,6 +357,22 @@ impl Report {
                     access.action, access.resource
                 ));
             }
+            if self.access_unused.len() > LISTED_ACCESS {
+                out.push_str(&format!(
+                    "    … and {} more\n",
+                    self.access_unused.len() - LISTED_ACCESS
+                ));
+            }
+        }
+        if !self.unmapped.is_empty() {
+            let total: usize = self.unmapped.values().sum();
+            let names: Vec<&str> = self.unmapped.keys().map(String::as_str).collect();
+            out.push_str(&format!(
+                "  note: {} ({}) had no recognizable operation and {} not in the access list\n",
+                plural(total, "call"),
+                names.join(", "),
+                if total == 1 { "is" } else { "are" }
+            ));
         }
         if self.unfinished > 0 {
             out.push_str(&format!(
@@ -359,8 +409,9 @@ impl Report {
         };
         out.push_str(&format!("### Lenslet · {command} {exit}\n\n"));
         out.push_str(&format!(
-            "{} · {} · {}\n\n",
+            "{}{} · {} · {}\n\n",
             plural(self.calls, "AWS call"),
+            retries_label(self.retries),
             plural(self.errors, "error"),
             plural(self.services.len(), "service")
         ));
@@ -385,7 +436,7 @@ impl Report {
                     plural(self.access_added.len(), "permission")
                 ));
                 out.push_str("| | Permission | Resource | Needed by |\n|---|---|---|---|\n");
-                for access in &self.access_added {
+                for access in self.access_added.iter().take(MARKDOWN_INLINE_ADDED) {
                     out.push_str(&format!(
                         "| + | `{}` | `{}` | {} |\n",
                         access.action,
@@ -394,6 +445,29 @@ impl Report {
                     ));
                 }
                 out.push('\n');
+                if self.access_added.len() > MARKDOWN_INLINE_ADDED {
+                    let extra = &self.access_added[MARKDOWN_INLINE_ADDED..];
+                    let shown = extra.len().min(MARKDOWN_MAX_ROWS - MARKDOWN_INLINE_ADDED);
+                    out.push_str(&format!(
+                        "<details><summary>… and {} more new permissions</summary>\n\n| | Permission | Resource | Needed by |\n|---|---|---|---|\n",
+                        extra.len()
+                    ));
+                    for access in extra.iter().take(shown) {
+                        out.push_str(&format!(
+                            "| + | `{}` | `{}` | {} |\n",
+                            access.action,
+                            access.resource,
+                            via(access)
+                        ));
+                    }
+                    if extra.len() > shown {
+                        out.push_str(&format!(
+                            "\n_… and {} more in the JSON report._\n",
+                            extra.len() - shown
+                        ));
+                    }
+                    out.push_str("\n</details>\n\n");
+                }
             }
             Some(lock) => out.push_str(&format!(
                 "AWS access is within `{lock}` ({} used).\n\n",
@@ -412,13 +486,33 @@ impl Report {
                 plural(self.access_unused.len(), "permission")
             ));
             out.push_str("| | Permission | Resource |\n|---|---|---|\n");
-            for access in &self.access_unused {
+            for access in self.access_unused.iter().take(MARKDOWN_MAX_ROWS) {
                 out.push_str(&format!(
                     "| − | `{}` | `{}` |\n",
                     access.action, access.resource
                 ));
             }
+            if self.access_unused.len() > MARKDOWN_MAX_ROWS {
+                out.push_str(&format!(
+                    "\n_… and {} more in `{lock}`._\n",
+                    self.access_unused.len() - MARKDOWN_MAX_ROWS
+                ));
+            }
             out.push_str("\n</details>\n\n");
+        }
+        if !self.unmapped.is_empty() {
+            let total: usize = self.unmapped.values().sum();
+            let names: Vec<String> = self
+                .unmapped
+                .keys()
+                .map(|service| format!("`{service}`"))
+                .collect();
+            out.push_str(&format!(
+                "> **Note:** {} ({}) had no recognizable AWS operation and {} not included in `lenslet.lock`.\n\n",
+                plural(total, "call"),
+                names.join(", "),
+                if total == 1 { "is" } else { "are" }
+            ));
         }
         if !self.failures.is_empty() {
             let new: BTreeSet<FailureKind> = self
@@ -437,8 +531,9 @@ impl Report {
                     code: failure.code.clone(),
                 };
                 let marker = if new.contains(&kind) { " **new**" } else { "" };
+                let attempt = attempt_label(failure.attempt, failure.max_attempts);
                 out.push_str(&format!(
-                    "| {} {}{marker} | {} | `{}` {} | {} |\n",
+                    "| {} {}{marker}{attempt} | {} | `{}` {} | {} |\n",
                     failure.service.to_ascii_uppercase(),
                     failure.operation,
                     failure.status,
@@ -465,6 +560,22 @@ fn plural(count: usize, noun: &str) -> String {
     }
 }
 
+fn retries_label(retries: usize) -> String {
+    match retries {
+        0 => String::new(),
+        1 => " (1 retry)".to_string(),
+        n => format!(" ({n} retries)"),
+    }
+}
+
+fn attempt_label(attempt: Option<u32>, max: Option<u32>) -> String {
+    match (attempt.filter(|n| *n > 1), max) {
+        (Some(attempt), Some(max)) => format!(" (attempt {attempt}/{max})"),
+        (Some(attempt), None) => format!(" (attempt {attempt})"),
+        _ => String::new(),
+    }
+}
+
 fn seconds(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms} ms")
@@ -487,7 +598,7 @@ fn one_line(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{problem, trace::Message};
+    use crate::{access::CallAccess, problem, trace::Message};
 
     fn trace(id: &str, service: &str, status: u16, body: Option<&str>) -> Trace {
         Trace {
@@ -502,12 +613,16 @@ mod tests {
             ms: 3,
             authorization: true,
             region: None,
+            invocation_id: None,
+            attempt: None,
+            max_attempts: None,
             pending: false,
             error: None,
             problem: problem::from_response(status, &[], body),
-            access: vec![Access {
+            access: vec![CallAccess {
                 action: format!("{service}:SendMessage"),
                 resource: format!("arn:aws:{service}:*:*:jobs"),
+                new: false,
             }],
             implied: Vec::new(),
             new: false,
@@ -527,9 +642,11 @@ mod tests {
         Report {
             run: "r2".into(),
             calls: summary.calls,
+            retries: summary.retries,
             errors: summary.errors,
             unfinished: summary.unfinished,
             services: summary.services.clone(),
+            unmapped: summary.unmapped.clone(),
             failures: summary.failures.clone(),
             duration_ms: 1500,
             ..Report::default()
@@ -596,8 +713,7 @@ mod tests {
             operation: "SendMessage".into(),
             status: 400,
             code: code.into(),
-            message: None,
-            hint: None,
+            ..Failure::default()
         };
         let previous = Report {
             run: "r1".into(),
@@ -681,5 +797,38 @@ mod tests {
         let text = report.render("t");
         assert!(text.contains("unused: 1 permission in lenslet.lock not exercised by this run"));
         assert!(text.contains("- sqs:DeleteMessage"));
+    }
+
+    #[test]
+    fn surfaces_sdk_retries_and_unmapped_calls() {
+        let mut summary = Summary::default();
+        let mut first = trace("a1", "sqs", 500, Some(r#"{"__type":"InternalError"}"#));
+        first.invocation_id = Some("inv-1".into());
+        let mut retry = trace("a2", "sqs", 500, Some(r#"{"__type":"InternalError"}"#));
+        retry.invocation_id = Some("inv-1".into());
+        retry.attempt = Some(2);
+        retry.max_attempts = Some(3);
+        let mut unmapped = trace("u1", "custom-svc", 200, None);
+        unmapped.operation = "POST".into();
+        unmapped.access.clear();
+
+        summary.observe(&first);
+        summary.observe(&retry);
+        summary.observe(&unmapped);
+        assert_eq!(summary.retries, 1);
+        assert_eq!(summary.unmapped.get("custom-svc"), Some(&1));
+
+        let report = report(&summary);
+        let text = report.render("t");
+        assert!(text.contains("3 calls (1 retry)"), "{text}");
+        assert!(text.contains("InternalError (attempt 2/3)"), "{text}");
+        assert!(
+            text.contains("note: 1 call (custom-svc) had no recognizable operation"),
+            "{text}"
+        );
+        let md = report.markdown();
+        assert!(md.contains("3 AWS calls (1 retry)"), "{md}");
+        assert!(md.contains("(attempt 2/3)"), "{md}");
+        assert!(md.contains("`custom-svc`"), "{md}");
     }
 }

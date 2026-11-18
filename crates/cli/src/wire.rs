@@ -23,9 +23,16 @@ pub struct Wire {
     pub region: Option<String>,
     /// Operation advertised by `x-amz-target` or `x-id`, if any.
     pub operation: Option<String>,
+    /// SDK invocation identifier (`amz-sdk-invocation-id`), constant across retries.
+    pub invocation_id: Option<String>,
+    /// SDK attempt number (`amz-sdk-request: attempt=N; max=M`), 1-based.
+    pub attempt: Option<u32>,
+    /// Maximum attempts configured for this SDK invocation, when sent.
+    pub max_attempts: Option<u32>,
 }
 
-/// Read the service and the advertised operation from request headers and path.
+/// Read the service, advertised operation and SDK retry metadata from request
+/// headers and path.
 ///
 /// The credential scope comes from the `Authorization` header, or from the
 /// `X-Amz-Credential` query parameter of a presigned URL.
@@ -47,11 +54,43 @@ pub fn wire_info(headers: &HeaderMap, path: &str) -> Wire {
         || (query_param(path, "AWSAccessKeyId").is_some()
             && query_param(path, "Signature").is_some());
     let service = service.or(sigv2.then_some("s3"));
+    let invocation_id = headers
+        .get("amz-sdk-invocation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && id.len() <= 128)
+        .map(str::to_string);
+    let (attempt, max_attempts) = headers
+        .get("amz-sdk-request")
+        .and_then(|value| value.to_str().ok())
+        .map(parse_sdk_request)
+        .unwrap_or((None, None));
     Wire {
         service: service.unwrap_or("aws").to_string(),
         region: region.map(str::to_string),
         operation: operation(headers, path),
+        invocation_id,
+        attempt,
+        max_attempts,
     }
+}
+
+/// Parse `attempt=2; max=3` from `amz-sdk-request`.
+pub fn parse_sdk_request(value: &str) -> (Option<u32>, Option<u32>) {
+    let mut attempt = None;
+    let mut max = None;
+    for part in value.split(';') {
+        let Some((key, raw)) = part.trim().split_once('=') else {
+            continue;
+        };
+        let parsed = raw.trim().parse::<u32>().ok().filter(|n| *n > 0);
+        match key.trim() {
+            "attempt" => attempt = parsed,
+            "max" => max = parsed,
+            _ => {}
+        }
+    }
+    (attempt, max)
 }
 
 fn operation(headers: &HeaderMap, path: &str) -> Option<String> {
@@ -99,16 +138,50 @@ fn percent_decode(value: &str) -> String {
 
 /// Last resort when the protocol advertises no operation at all.
 ///
-/// S3's REST API names its operations by shape (method, bucket/key, query
-/// subresource), and some SDKs (boto3, the AWS CLI) do not send `x-id`, so S3
-/// gets its shape rules. Everything else keeps the HTTP method.
+/// S3, Lambda, Bedrock and API Gateway REST APIs name operations by HTTP method
+/// and path shape, and some SDKs do not send `x-id`, so those services get
+/// shape rules. Everything else keeps the HTTP method.
 pub fn fallback_operation(service: &str, method: &str, path: &str, headers: &HeaderMap) -> String {
     let shaped = match service {
         "s3" => s3_operation(method, path, headers),
         "lambda" => lambda_operation(method, path),
+        "bedrock" | "bedrock-runtime" => bedrock_operation(method, path),
+        "execute-api" => Some("Invoke".to_string()),
+        "appconfig" | "appconfigdata" => appconfig_operation(method, path),
         _ => None,
     };
     shaped.unwrap_or_else(|| method.to_string())
+}
+
+/// Bedrock and Bedrock Runtime REST APIs: `/model/{id}/invoke`, `/foundation-models`, etc.
+fn bedrock_operation(method: &str, path: &str) -> Option<String> {
+    let bare = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = bare.split('/').filter(|s| !s.is_empty()).collect();
+    let operation = match (method, segments.as_slice()) {
+        ("POST", ["model", mid @ .., "invoke"]) if !mid.is_empty() => "InvokeModel",
+        ("POST", ["model", mid @ .., "invoke-with-response-stream"]) if !mid.is_empty() => {
+            "InvokeModelWithResponseStream"
+        }
+        ("POST", ["model", mid @ .., "converse"]) if !mid.is_empty() => "Converse",
+        ("POST", ["model", mid @ .., "converse-stream"]) if !mid.is_empty() => "ConverseStream",
+        ("GET", ["foundation-models"]) => "ListFoundationModels",
+        ("GET", ["foundation-models", _]) => "GetFoundationModel",
+        ("GET", ["inference-profiles"]) => "ListInferenceProfiles",
+        ("GET", ["inference-profiles", _]) => "GetInferenceProfile",
+        _ => return None,
+    };
+    Some(operation.to_string())
+}
+
+fn appconfig_operation(method: &str, path: &str) -> Option<String> {
+    let bare = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = bare.split('/').filter(|s| !s.is_empty()).collect();
+    let operation = match (method, segments.as_slice()) {
+        ("POST", ["configurationsessions"]) => "StartConfigurationSession",
+        ("GET", ["configuration"]) => "GetLatestConfiguration",
+        _ => return None,
+    };
+    Some(operation.to_string())
 }
 
 /// Lambda's REST API: `/2015-03-31/functions/{name}/...`.
@@ -127,10 +200,23 @@ fn lambda_operation(method: &str, path: &str) -> Option<String> {
         ("GET", ["functions", _, "configuration"]) => "GetFunctionConfiguration",
         ("PUT", ["functions", _, "configuration"]) => "UpdateFunctionConfiguration",
         ("POST", ["functions", _, "versions"]) => "PublishVersion",
+        ("GET", ["functions", _, "versions"]) => "ListVersionsByFunction",
         ("POST", ["functions", _, "aliases"]) => "CreateAlias",
+        ("GET", ["functions", _, "aliases"]) => "ListAliases",
+        ("GET", ["functions", _, "aliases", _]) => "GetAlias",
         ("POST", ["functions", _, "policy"]) => "AddPermission",
+        ("GET", ["functions", _, "policy"]) => "GetPolicy",
+        ("DELETE", ["functions", _, "policy", _]) => "RemovePermission",
+        ("POST", ["functions", _, "url"]) => "CreateFunctionUrlConfig",
+        ("GET", ["functions", _, "url"]) => "GetFunctionUrlConfig",
         ("POST", ["event-source-mappings"]) => "CreateEventSourceMapping",
         ("GET", ["event-source-mappings"]) => "ListEventSourceMappings",
+        ("GET", ["event-source-mappings", _]) => "GetEventSourceMapping",
+        ("PUT", ["event-source-mappings", _]) => "UpdateEventSourceMapping",
+        ("DELETE", ["event-source-mappings", _]) => "DeleteEventSourceMapping",
+        ("GET", ["tags", ..]) => "ListTags",
+        ("POST", ["tags", ..]) => "TagResource",
+        ("DELETE", ["tags", ..]) => "UntagResource",
         _ => return None,
     };
     Some(operation.to_string())
@@ -477,5 +563,68 @@ mod tests {
         let wire = wire_info(&HeaderMap::new(), "/");
         assert_eq!(wire.service, "aws");
         assert_eq!(wire.operation, None);
+        assert_eq!(wire.invocation_id, None);
+        assert_eq!(wire.attempt, None);
+    }
+
+    #[test]
+    fn parses_sdk_invocation_and_retry_headers() {
+        let mut map = headers(&scope("sqs"), None);
+        map.insert(
+            "amz-sdk-invocation-id",
+            HeaderValue::from_static("9ab7d414-3ade-40c4-a305-c1dc7137bbfa"),
+        );
+        map.insert(
+            "amz-sdk-request",
+            HeaderValue::from_static("attempt=2; max=4; ttl=20261118T000000Z"),
+        );
+        let wire = wire_info(&map, "/");
+        assert_eq!(
+            wire.invocation_id.as_deref(),
+            Some("9ab7d414-3ade-40c4-a305-c1dc7137bbfa")
+        );
+        assert_eq!(wire.attempt, Some(2));
+        assert_eq!(wire.max_attempts, Some(4));
+        assert_eq!(parse_sdk_request("attempt=0; max=nope"), (None, None));
+    }
+
+    #[test]
+    fn names_bedrock_and_api_gateway_rest_operations() {
+        let none = HeaderMap::new();
+        assert_eq!(
+            fallback_operation(
+                "bedrock-runtime",
+                "POST",
+                "/model/anthropic.claude-3-haiku/invoke",
+                &none
+            ),
+            "InvokeModel"
+        );
+        assert_eq!(
+            fallback_operation(
+                "bedrock-runtime",
+                "POST",
+                "/model/anthropic.claude-3-haiku/converse-stream",
+                &none
+            ),
+            "ConverseStream"
+        );
+        assert_eq!(
+            fallback_operation("execute-api", "GET", "/prod/orders", &none),
+            "Invoke"
+        );
+        assert_eq!(
+            fallback_operation("appconfigdata", "POST", "/configurationsessions", &none),
+            "StartConfigurationSession"
+        );
+        assert_eq!(
+            fallback_operation(
+                "appconfigdata",
+                "GET",
+                "/configuration?configuration_token=tok",
+                &none
+            ),
+            "GetLatestConfiguration"
+        );
     }
 }

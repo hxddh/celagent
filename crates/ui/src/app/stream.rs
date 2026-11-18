@@ -44,12 +44,13 @@ impl LensletApp {
     pub(super) fn render_stream_head(&self, cx: &mut Context<Self>) -> Div {
         let filtered = !self.query.is_empty() || self.filter != Filter::All;
         let access = self.access_rows();
+        let used_access = access.iter().filter(|entry| !entry.unused).count();
         let new_access = access.iter().filter(|entry| entry.new).count();
+        let unused_access = access.iter().filter(|entry| entry.unused).count();
         let counts = if self.pane == Pane::Access {
             let mut text = format!(
-                "{} {}",
-                access.len(),
-                if access.len() == 1 {
+                "{used_access} {}",
+                if used_access == 1 {
                     "PERMISSION"
                 } else {
                     "PERMISSIONS"
@@ -57,6 +58,9 @@ impl LensletApp {
             );
             if new_access > 0 {
                 text.push_str(&format!(" · {new_access} NEW"));
+            }
+            if unused_access > 0 {
+                text.push_str(&format!(" · {unused_access} UNUSED"));
             }
             text
         } else if filtered {
@@ -66,12 +70,31 @@ impl LensletApp {
                 self.counts.total,
                 error_count(self.counts.visible_errors)
             )
-        } else {
+        } else if let Some(reported) = self.counts.reported_total {
             format!(
+                "LATEST {} OF {} CALLS · {}",
+                self.counts.total,
+                reported,
+                error_count(self.counts.errors)
+            )
+        } else {
+            let mut text = format!(
                 "{} · {}",
                 call_count(self.counts.total),
                 error_count(self.counts.errors)
-            )
+            );
+            if self.counts.retries > 0 {
+                text.push_str(&format!(
+                    " · {} {}",
+                    self.counts.retries,
+                    if self.counts.retries == 1 {
+                        "retry"
+                    } else {
+                        "retries"
+                    }
+                ));
+            }
+            text
         };
 
         div()
@@ -136,13 +159,26 @@ impl LensletApp {
         let rows = self.rows.clone();
         let view = self.view.clone();
         let selected = self.selected;
+        let run_start_ms = self.run_start_ms();
         let this = cx.entity().downgrade();
         let list = uniform_list("trace-rows", view.len(), move |range, _window, _cx| {
             range
                 .map(|position| {
                     let raw = view[position];
                     let row = rows[raw].clone();
-                    trace_row(&row, raw, selected == Some(raw), op_width, this.clone())
+                    let prev_end_ms = raw.checked_sub(1).and_then(|prev| {
+                        rows.get(prev)
+                            .and_then(|r| r.at_ms().map(|at| at + r.ms as i64))
+                    });
+                    trace_row(
+                        &row,
+                        raw,
+                        selected == Some(raw),
+                        op_width,
+                        run_start_ms,
+                        prev_end_ms,
+                        this.clone(),
+                    )
                 })
                 .collect()
         })
@@ -279,7 +315,14 @@ impl LensletApp {
         };
         let mut description = String::from("Try a different search");
         if let Filter::Access(access) = &self.filter {
-            description = format!("No calls needed {} here", access.action);
+            description = if self.counts.reported_total.is_some() {
+                format!(
+                    "Earlier calls that needed {} fell outside the latest {}-call window",
+                    access.action, self.counts.total
+                )
+            } else {
+                format!("No calls needed {} here", access.action)
+            };
         } else if let Filter::Service(id) = &self.filter {
             description = format!("No calls for the {id} filter");
         } else if self.filter == Filter::Errors {
@@ -411,14 +454,31 @@ impl LensletApp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn trace_row(
     trace: &Trace,
     raw_index: usize,
     selected: bool,
     op_width: f32,
+    run_start_ms: Option<i64>,
+    prev_end_ms: Option<i64>,
     this: WeakEntity<LensletApp>,
 ) -> Stateful<Div> {
     let service_color = theme::service_color(trace.service_name());
+    let idle_gap_ms = match (trace.at_ms(), prev_end_ms) {
+        (Some(at), Some(prev_end)) if at - prev_end >= 500 => Some((at - prev_end) as u64),
+        _ => None,
+    };
+    let time_sub = if let Some(gap) = idle_gap_ms {
+        Some((format!("Δ {}", format_latency(gap)), rgb(theme::AMBER)))
+    } else {
+        match (trace.at_ms(), run_start_ms) {
+            (Some(at), Some(start)) => {
+                Some((trace::format_offset(at - start), rgb(theme::TEXT_FAINT)))
+            }
+            _ => None,
+        }
+    };
     let row = div()
         .id(ElementId::named_usize("trace-row", raw_index))
         .relative()
@@ -457,10 +517,19 @@ pub(super) fn trace_row(
             div()
                 .w(px(theme::COL_TIME))
                 .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
                 .font_family(fonts::mono())
-                .text_size(px(12.0))
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(short_clock(&trace.at)),
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(short_clock(&trace.at)),
+                )
+                .when_some(time_sub, |col, (label, color)| {
+                    col.child(div().text_size(px(10.0)).text_color(color).child(label))
+                }),
         )
         .child(
             div()
@@ -504,6 +573,9 @@ pub(super) fn trace_row(
                                 .overflow_hidden()
                                 .child(operation_label(trace).to_string()),
                         )
+                        .when_some(trace.retry_badge(), |title, badge| {
+                            title.child(retry_pill(badge))
+                        })
                         .when(trace.new, |title| title.child(new_pill("NEW ACCESS"))),
                 )
                 .child(row_detail(trace, op_width)),
@@ -685,5 +757,22 @@ pub(super) fn new_pill(text: impl Into<SharedString>) -> Div {
         .text_size(px(9.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(theme::AMBER))
+        .child(text.into())
+}
+
+fn retry_pill(text: impl Into<SharedString>) -> Div {
+    div()
+        .h(px(15.0))
+        .px(px(4.0))
+        .flex()
+        .items_center()
+        .rounded(px(3.0))
+        .border_1()
+        .border_color(theme::line(theme::ACCENT, 0.38))
+        .bg(theme::h(theme::ACCENT, 0.09))
+        .font_family(fonts::mono())
+        .text_size(px(9.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(theme::ACCENT))
         .child(text.into())
 }

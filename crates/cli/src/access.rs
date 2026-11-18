@@ -21,12 +21,62 @@ pub struct Access {
 }
 
 impl Access {
-    fn new(action: impl Into<String>, resource: impl Into<String>) -> Self {
+    pub fn new(action: impl Into<String>, resource: impl Into<String>) -> Self {
         Access {
             action: action.into(),
             resource: resource.into(),
         }
     }
+}
+
+/// One permission recorded on a `call` trace line, carrying whether that
+/// specific permission is outside the lock file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallAccess {
+    pub action: String,
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool,
+}
+
+impl CallAccess {
+    pub fn from_access(
+        access: Access,
+        locked: Option<&std::collections::BTreeSet<Access>>,
+    ) -> Self {
+        let new = locked.is_some_and(|locked| !locked.contains(&access));
+        CallAccess {
+            action: access.action,
+            resource: access.resource,
+            new,
+        }
+    }
+
+    pub fn key(&self) -> Access {
+        Access {
+            action: self.action.clone(),
+            resource: self.resource.clone(),
+        }
+    }
+}
+
+impl From<Access> for CallAccess {
+    fn from(access: Access) -> Self {
+        CallAccess {
+            action: access.action,
+            resource: access.resource,
+            new: false,
+        }
+    }
+}
+
+/// Whether a finished call had no recognizable IAM mapping (excluding calls
+/// like `sts:GetCallerIdentity` that genuinely need no permission).
+pub fn is_unmapped(trace: &Trace) -> bool {
+    !trace.pending
+        && trace.access.is_empty()
+        && trace.implied.is_empty()
+        && !(trace.service == "sts" && trace.operation == "GetCallerIdentity")
 }
 
 /// The access one call needs, and the permissions it implies on other
@@ -124,7 +174,10 @@ fn copy_source(trace: &Trace) -> Option<String> {
 fn iam_prefix(service: &str) -> &str {
     match service {
         "monitoring" => "cloudwatch",
-        "email" => "ses",
+        "email" | "sesv2" => "ses",
+        "bedrock-runtime" => "bedrock",
+        "streams.dynamodb" | "dynamodbstreams" => "dynamodb",
+        "appconfigdata" => "appconfig",
         "logs" => "logs",
         "execute-api" => "execute-api",
         "s3-object-lambda" => "s3-object-lambda",
@@ -157,6 +210,8 @@ fn action_name(prefix: &str, operation: &str) -> Option<String> {
         ("s3", "DeleteObjectTagging") => "DeleteObjectTagging",
         ("lambda", "Invoke" | "InvokeAsync" | "InvokeWithResponseStream") => "InvokeFunction",
         ("lambda", "GetFunction") => "GetFunction",
+        ("bedrock", "Converse") => "InvokeModel",
+        ("bedrock", "ConverseStream") => "InvokeModelWithResponseStream",
         _ => operation,
     };
     Some(format!("{prefix}:{mapped}"))
@@ -213,6 +268,25 @@ impl Body {
         }
     }
 
+    /// A top-level array of strings (JSON), e.g. SSM `Names`.
+    fn string_list(&self, name: &str) -> Vec<String> {
+        let Body::Json(value) = self else {
+            return Vec::new();
+        };
+        let Some(items) = value.get(name).and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = items
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Every DynamoDB table named anywhere in the body (batch and transact
     /// calls name several).
     fn tables(&self) -> Vec<String> {
@@ -258,7 +332,7 @@ pub fn normalize(name: &str) -> String {
         let digits = part.bytes().all(|b| b.is_ascii_digit());
         (part.len() >= 8 && hex)
             || (part.len() >= 6 && digits)
-            || (part.len() >= 4
+            || (part.len() >= 6
                 && hex
                 && part.bytes().any(|b| b.is_ascii_digit())
                 && part.bytes().any(|b| b.is_ascii_alphabetic()))
@@ -290,6 +364,12 @@ pub fn normalize(name: &str) -> String {
         }
         out = collapsed;
     }
+}
+
+/// Normalize each `/`-delimited segment while preserving path hierarchy
+/// (`db/password`, `service-role/lambda-exec`, `app/prod/db-url`).
+fn normalize_path(path: &str) -> String {
+    path.split('/').map(normalize).collect::<Vec<_>>().join("/")
 }
 
 /// Replace every `8-4-4-4-12` hex UUID with `*`.
@@ -340,8 +420,14 @@ fn last_segment(value: &str) -> &str {
 }
 
 /// The resources an action applies to: usually one; one per table for a
-/// DynamoDB batch, since an IAM resource names exactly one table.
+/// DynamoDB batch, and one per parameter for SSM `GetParameters`/`DeleteParameters`.
 fn resources(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<String> {
+    if prefix == "ssm" {
+        let names = body.string_list("Names");
+        if !names.is_empty() {
+            return names.iter().map(|name| ssm_parameter(name)).collect();
+        }
+    }
     if prefix != "dynamodb" {
         return vec![resource(prefix, operation, trace, body)];
     }
@@ -394,12 +480,45 @@ fn resource(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String
             .field("SecretId")
             .or_else(|| body.field("Name"))
             .map(|secret| {
-                let name = secret
-                    .strip_prefix("arn:")
-                    .map(|_| last_segment(&secret).to_string())
-                    .unwrap_or(secret);
-                arn("secretsmanager", &format!("secret:{}-*", normalize(&name)))
+                arn(
+                    "secretsmanager",
+                    &format!("secret:{}-*", secret_name(&secret)),
+                )
             })
+            .unwrap_or_else(|| "*".to_string()),
+        "ssm" => body
+            .field("Name")
+            .map(|name| ssm_parameter(&name))
+            .or_else(|| {
+                body.field("Path").map(|path| {
+                    let clean = path.trim_matches('/');
+                    if clean.is_empty() {
+                        arn("ssm", "parameter/*")
+                    } else {
+                        arn("ssm", &format!("parameter/{}/*", normalize_path(clean)))
+                    }
+                })
+            })
+            .unwrap_or_else(|| "*".to_string()),
+        "logs" => body
+            .field("logGroupName")
+            .map(|group| {
+                let raw = group
+                    .split_once(":log-group:")
+                    .map_or(group.as_str(), |(_, rest)| rest)
+                    .trim_end_matches(":*");
+                arn("logs", &format!("log-group:{}:*", normalize_path(raw)))
+            })
+            .unwrap_or_else(|| "*".to_string()),
+        "kinesis" => body
+            .field("StreamARN")
+            .and_then(|stream| stream.split(":stream/").nth(1).map(str::to_string))
+            .or_else(|| body.field("StreamName"))
+            .map(|stream| arn("kinesis", &format!("stream/{}", normalize_path(&stream))))
+            .unwrap_or_else(|| "*".to_string()),
+        "bedrock" => bedrock_model(&trace.path)
+            .or_else(|| body.field("modelId"))
+            .map(|model| bedrock_resource(&model))
             .unwrap_or_else(|| "*".to_string()),
         "kms" => body
             .field("KeyId")
@@ -407,15 +526,12 @@ fn resource(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String
             .unwrap_or_else(|| "*".to_string()),
         "sts" => body
             .field("RoleArn")
-            .map(|role| format!("arn:aws:iam::*:role/{}", normalize(last_segment(&role))))
+            .map(|role| iam_entity("role", &role))
             .unwrap_or_else(|| "*".to_string()),
         "iam" => body
             .field("RoleName")
-            .map(|role| format!("arn:aws:iam::*:role/{}", normalize(&role)))
-            .or_else(|| {
-                body.field("UserName")
-                    .map(|user| format!("arn:aws:iam::*:user/{}", normalize(&user)))
-            })
+            .map(|role| iam_entity("role", &role))
+            .or_else(|| body.field("UserName").map(|user| iam_entity("user", &user)))
             .unwrap_or_else(|| "*".to_string()),
         "events" => body
             .field("EventBusName")
@@ -439,11 +555,115 @@ fn resource(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String
     }
 }
 
-fn kms_key(key: &str) -> String {
-    if key.starts_with("alias/") {
-        arn("kms", &normalize(key))
+/// Preserve hierarchical secret names (`db/password`) whether given by name or
+/// by full ARN (`arn:aws:secretsmanager:...:secret:db/password-AbCdEf`).
+fn secret_name(secret: &str) -> String {
+    if let Some((_, rest)) = secret.split_once(":secret:") {
+        let base = match rest.rsplit_once('-') {
+            Some((prefix, suffix))
+                if !prefix.is_empty()
+                    && suffix.len() == 6
+                    && suffix.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+            {
+                prefix
+            }
+            _ => rest,
+        };
+        normalize_path(base)
     } else {
-        arn("kms", &format!("key/{}", normalize(last_segment(key))))
+        normalize_path(secret.trim_start_matches('/'))
+    }
+}
+
+fn ssm_parameter(name: &str) -> String {
+    let raw = name
+        .split_once(":parameter/")
+        .map_or(name, |(_, rest)| rest)
+        .trim_start_matches('/');
+    arn("ssm", &format!("parameter/{}", normalize_path(raw)))
+}
+
+/// Preserve IAM role/user paths (`service-role/my-role`) from names or ARNs.
+fn iam_entity(kind: &str, value: &str) -> String {
+    let needle = format!(":{kind}/");
+    let raw = value
+        .split_once(&needle)
+        .map_or(value, |(_, rest)| rest)
+        .trim_start_matches('/');
+    format!("arn:aws:iam::*:{kind}/{}", normalize_path(raw))
+}
+
+fn bedrock_model(path: &str) -> Option<String> {
+    let bare = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = bare.split('/').filter(|s| !s.is_empty()).collect();
+    let raw = match segments.as_slice() {
+        [
+            "model",
+            mid @ ..,
+            "invoke" | "invoke-with-response-stream" | "converse" | "converse-stream",
+        ] if !mid.is_empty() => mid.join("/"),
+        ["foundation-models" | "inference-profiles", id] => (*id).to_string(),
+        _ => return None,
+    };
+    let decoded = wire::query_param(&format!("?v={raw}"), "v").unwrap_or_default();
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+fn bedrock_resource(model: &str) -> String {
+    if model.starts_with("arn:") {
+        let Some(rest) = model.splitn(6, ':').nth(5).filter(|s| !s.is_empty()) else {
+            return "*".to_string();
+        };
+        if let Some((kind, id)) = rest.split_once('/') {
+            return match kind {
+                "foundation-model" => arn("bedrock", rest),
+                "inference-profile" if is_system_inference_profile(id) => arn("bedrock", rest),
+                _ => arn("bedrock", &format!("{kind}/{}", normalize_path(id))),
+            };
+        }
+        return arn("bedrock", rest);
+    }
+    if is_system_inference_profile(model) {
+        arn("bedrock", &format!("inference-profile/{model}"))
+    } else if is_foundation_model_id(model) {
+        arn("bedrock", &format!("foundation-model/{model}"))
+    } else {
+        "*".to_string()
+    }
+}
+
+fn is_system_inference_profile(id: &str) -> bool {
+    let Some((geo, rest)) = id.split_once('.') else {
+        return false;
+    };
+    matches!(
+        geo,
+        "us" | "eu" | "apac" | "global" | "us-gov" | "ca" | "jp" | "au"
+    ) && is_foundation_model_id(rest)
+}
+
+fn is_foundation_model_id(id: &str) -> bool {
+    let Some((provider, model)) = id.split_once('.') else {
+        return false;
+    };
+    !provider.is_empty()
+        && !model.is_empty()
+        && !id.contains('/')
+        && provider
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && provider.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+fn kms_key(key: &str) -> String {
+    let raw = key
+        .split_once(":alias/")
+        .map(|(_, alias)| format!("alias/{alias}"))
+        .unwrap_or_else(|| key.to_string());
+    if raw.starts_with("alias/") {
+        arn("kms", &normalize_path(&raw))
+    } else {
+        arn("kms", &format!("key/{}", normalize(last_segment(&raw))))
     }
 }
 
@@ -530,6 +750,26 @@ fn implied(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<Acc
                 out.push(Access::new(action, key));
             }
         }
+    } else if let Some(key) = body
+        .field("KmsKeyId")
+        .or_else(|| body.field("KMSMasterKeyId"))
+        .or_else(|| body.field("KmsMasterKeyId"))
+        .or_else(|| body.field("KeyId").filter(|_| prefix == "ssm"))
+    {
+        let kms_action = match (prefix, operation) {
+            ("secretsmanager", "GetSecretValue") => Some("kms:Decrypt"),
+            ("secretsmanager", "CreateSecret" | "PutSecretValue" | "UpdateSecret") => {
+                Some("kms:GenerateDataKey")
+            }
+            ("ssm", "PutParameter") => Some("kms:GenerateDataKey"),
+            ("sns", "Publish" | "PublishBatch") | ("sqs", "SendMessage" | "SendMessageBatch") => {
+                Some("kms:GenerateDataKey")
+            }
+            _ => None,
+        };
+        if let Some(action) = kms_action {
+            out.push(Access::new(action, kms_key(&key)));
+        }
     }
     // Passing a role to a service needs iam:PassRole on that role.
     let passed_role = match (prefix, operation) {
@@ -538,13 +778,11 @@ fn implied(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<Acc
         ("ecs", "RegisterTaskDefinition") => body
             .field("taskRoleArn")
             .or_else(|| body.field("executionRoleArn")),
+        ("events", "PutRule" | "PutTargets") => body.field("RoleArn"),
         _ => None,
     };
     if let Some(role) = passed_role {
-        out.push(Access::new(
-            "iam:PassRole",
-            format!("arn:aws:iam::*:role/{}", normalize(last_segment(&role))),
-        ));
+        out.push(Access::new("iam:PassRole", iam_entity("role", &role)));
     }
     out
 }
@@ -567,6 +805,9 @@ mod tests {
             ms: 1,
             authorization: true,
             region: Some("us-east-1".into()),
+            invocation_id: None,
+            attempt: None,
+            max_attempts: None,
             pending: false,
             error: None,
             problem: None,
@@ -848,6 +1089,140 @@ mod tests {
         assert_eq!(
             normalize("key-2d1f0b7c-1838-4281-9a3e-000000000001-x"),
             "key-*-x"
+        );
+        // Short 4-5 char identifiers stay intact rather than collapsing to `*`.
+        assert_eq!(normalize("app-f100"), "app-f100");
+        assert_eq!(normalize("node-ab12"), "node-ab12");
+    }
+
+    #[test]
+    fn preserves_paths_in_secrets_roles_ssm_logs_kinesis_and_bedrock() {
+        assert_eq!(
+            access(&call(
+                "secretsmanager",
+                "GetSecretValue",
+                "POST",
+                "/",
+                Some(
+                    r#"{"SecretId":"arn:aws:secretsmanager:us-east-1:123456789012:secret:db/password-AbCd12"}"#
+                )
+            ))
+            .1,
+            "arn:aws:secretsmanager:*:*:secret:db/password-*"
+        );
+        assert_eq!(
+            access(&call(
+                "sts",
+                "AssumeRole",
+                "POST",
+                "/",
+                Some("Action=AssumeRole&RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fservice-role%2Fworker")
+            ))
+            .1,
+            "arn:aws:iam::*:role/service-role/worker"
+        );
+        assert_eq!(
+            all(&call(
+                "ssm",
+                "GetParameters",
+                "POST",
+                "/",
+                Some(r#"{"Names":["/shop/prod/db-url","/shop/prod/api-key"]}"#)
+            )),
+            vec![
+                (
+                    "ssm:GetParameters".into(),
+                    "arn:aws:ssm:*:*:parameter/shop/prod/api-key".into()
+                ),
+                (
+                    "ssm:GetParameters".into(),
+                    "arn:aws:ssm:*:*:parameter/shop/prod/db-url".into()
+                ),
+            ]
+        );
+        assert_eq!(
+            access(&call(
+                "logs",
+                "PutLogEvents",
+                "POST",
+                "/",
+                Some(r#"{"logGroupName":"/aws/lambda/checkout"}"#)
+            )),
+            (
+                "logs:PutLogEvents".into(),
+                "arn:aws:logs:*:*:log-group:/aws/lambda/checkout:*".into()
+            )
+        );
+        assert_eq!(
+            access(&call(
+                "logs",
+                "PutLogEvents",
+                "POST",
+                "/",
+                Some(r#"{"logGroupName":"custom/checkout"}"#)
+            ))
+            .1,
+            "arn:aws:logs:*:*:log-group:custom/checkout:*"
+        );
+        assert_eq!(
+            access(&call(
+                "kinesis",
+                "PutRecord",
+                "POST",
+                "/",
+                Some(r#"{"StreamName":"orders-events"}"#)
+            )),
+            (
+                "kinesis:PutRecord".into(),
+                "arn:aws:kinesis:*:*:stream/orders-events".into()
+            )
+        );
+        assert_eq!(
+            access(&call(
+                "bedrock-runtime",
+                "Converse",
+                "POST",
+                "/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse",
+                Some("{}")
+            )),
+            (
+                "bedrock:InvokeModel".into(),
+                "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+                    .into()
+            )
+        );
+        assert_eq!(
+            access(&call(
+                "bedrock-runtime",
+                "InvokeModel",
+                "POST",
+                "/model/us.anthropic.claude-3-5-sonnet-20241022-v2%3A0/invoke",
+                Some("{}")
+            ))
+            .1,
+            "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        );
+        assert_eq!(
+            access(&call(
+                "bedrock-runtime",
+                "InvokeModel",
+                "POST",
+                "/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aprovisioned-model%2Fmy-throughput/invoke",
+                Some("{}")
+            ))
+            .1,
+            "arn:aws:bedrock:*:*:provisioned-model/my-throughput"
+        );
+        assert_eq!(
+            access(&call(
+                "bedrock-runtime",
+                "InvokeModel",
+                "POST",
+                "/model/opaque-throughput-id/invoke",
+                Some("{}")
+            ))
+            .1,
+            "*"
         );
     }
 

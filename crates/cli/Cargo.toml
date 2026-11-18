@@ -8,6 +8,7 @@ license.workspace = true
 anyhow = "1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "logging", "native-tokio"] }

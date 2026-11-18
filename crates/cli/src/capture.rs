@@ -7,12 +7,15 @@
 //! [`MAX_CAPTURE_BYTES`] per request and per response.
 
 use std::{
+    borrow::Cow,
+    io::Read,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use hyper::{
     HeaderMap,
     body::{Body, Frame, SizeHint},
@@ -24,6 +27,15 @@ use crate::trace::BodyTrace;
 /// Maximum number of body bytes kept for the trace (64 KiB).
 pub const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 
+/// Content encodings Lenslet can decode on the captured prefix while forwarding
+/// the compressed wire bytes untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    Identity,
+    Gzip,
+    Deflate,
+}
+
 /// The classified `content-type` of a message.
 #[derive(Clone, Debug)]
 pub struct Content {
@@ -31,13 +43,16 @@ pub struct Content {
     pub content_type: Option<String>,
     /// Whether the body is captured as text (JSON, XML, form, or text types).
     pub text: bool,
+    /// Supported content encoding for text decoding, when present.
+    pub encoding: Option<Encoding>,
 }
 
 /// Classify a message's body from its headers.
 ///
-/// Classification is deliberately content-type driven (no sniffing): anything
-/// that is not a known text type, or that carries a `content-encoding`, is
-/// recorded as binary metadata only.
+/// Classification is deliberately content-type driven (no sniffing): known text
+/// types with identity, `gzip` or `deflate` encoding are decoded into bounded
+/// text for error/access inspection; unknown encodings or binary media types
+/// are recorded as metadata only.
 pub fn content(headers: &HeaderMap) -> Content {
     let media = headers
         .get("content-type")
@@ -45,15 +60,22 @@ pub fn content(headers: &HeaderMap) -> Content {
         .and_then(|value| value.split(';').next())
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
-    let encoded = headers
+    let encoding = match headers
         .get("content-encoding")
         .and_then(|value| value.to_str().ok())
-        .map(|value| !value.trim().eq_ignore_ascii_case("identity"))
-        .unwrap_or(false);
-    let text = media.as_deref().map(is_text).unwrap_or(false) && !encoded;
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("identity") => Some(Encoding::Identity),
+        Some("gzip" | "x-gzip") => Some(Encoding::Gzip),
+        Some("deflate") => Some(Encoding::Deflate),
+        Some(_) => None,
+    };
+    let text = media.as_deref().map(is_text).unwrap_or(false) && encoding.is_some();
     Content {
         content_type: media,
         text,
+        encoding,
     }
 }
 
@@ -103,34 +125,103 @@ impl Capture {
         }
     }
 
-    /// The retained prefix of the body (at most [`MAX_CAPTURE_BYTES`]).
-    pub fn prefix(&self) -> &[u8] {
-        &self.prefix
+    /// The retained prefix of the body (at most [`MAX_CAPTURE_BYTES`]), decoded
+    /// when a supported content encoding was used.
+    pub fn decoded_prefix(&self, content: &Content) -> Cow<'_, [u8]> {
+        match content.encoding {
+            Some(Encoding::Identity) | None => Cow::Borrowed(&self.prefix),
+            Some(encoding) => decode_compressed(&self.prefix, encoding)
+                .map(|(bytes, _)| Cow::Owned(bytes))
+                .unwrap_or(Cow::Borrowed(&[])),
+        }
     }
 
     /// Build the trace body, or `None` when no bytes were captured.
     ///
-    /// `sha256` always covers every byte seen (not just the retained prefix), so
-    /// a large or binary body still has a useful integrity value. `truncated`
-    /// marks a text capture that holds only a prefix of the body that flowed
-    /// through; binary bodies are never truncated because no bytes are kept.
+    /// `sha256` always covers every wire byte seen (not just the retained
+    /// prefix), so a large, compressed or binary body still has an exact wire
+    /// integrity value. `truncated` marks a text capture that holds only a
+    /// prefix of the body; binary bodies are never truncated because no bytes
+    /// are kept.
     pub fn body(&self, content: &Content) -> Option<BodyTrace> {
         if self.bytes == 0 {
             return None;
         }
-        let binary = !content.text;
+        let wire_truncated = self.keep_bytes && self.bytes > self.prefix.len() as u64;
+        let decoded = if content.text && self.keep_bytes {
+            match content.encoding {
+                Some(Encoding::Identity) => Some((
+                    String::from_utf8_lossy(&self.prefix).into_owned(),
+                    wire_truncated,
+                )),
+                Some(encoding) => {
+                    decode_compressed(&self.prefix, encoding).map(|(bytes, capped)| {
+                        (
+                            String::from_utf8_lossy(&bytes).into_owned(),
+                            wire_truncated || capped,
+                        )
+                    })
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let (text, truncated, binary) = match decoded {
+            Some((text, truncated)) => (Some(text), truncated, false),
+            None => (None, false, true),
+        };
         Some(BodyTrace {
-            text: if binary {
-                None
-            } else {
-                Some(String::from_utf8_lossy(&self.prefix).into_owned())
-            },
+            text,
             bytes: self.bytes,
-            truncated: self.keep_bytes && self.bytes > self.prefix.len() as u64,
+            truncated,
             binary,
             sha256: hex(&self.hasher.clone().finalize()),
         })
     }
+}
+
+/// Decompress up to [`MAX_CAPTURE_BYTES`] of a `gzip` or `deflate` stream.
+/// Partial streams still yield whatever prefix decoded before EOF; unreadable
+/// data returns `None` so the caller falls back to binary metadata.
+fn decode_compressed(prefix: &[u8], encoding: Encoding) -> Option<(Vec<u8>, bool)> {
+    if prefix.is_empty() {
+        return Some((Vec::new(), false));
+    }
+    let read_bounded = |mut reader: Box<dyn Read + '_>| -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while out.len() <= MAX_CAPTURE_BYTES {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let keep = n.min((MAX_CAPTURE_BYTES + 1).saturating_sub(out.len()));
+                    out.extend_from_slice(&chunk[..keep]);
+                }
+            }
+        }
+        out
+    };
+    let mut out = match encoding {
+        Encoding::Identity => prefix.to_vec(),
+        Encoding::Gzip => read_bounded(Box::new(GzDecoder::new(prefix))),
+        Encoding::Deflate => {
+            let zlib = read_bounded(Box::new(ZlibDecoder::new(prefix)));
+            if !zlib.is_empty() {
+                zlib
+            } else {
+                read_bounded(Box::new(DeflateDecoder::new(prefix)))
+            }
+        }
+    };
+    if out.is_empty() {
+        return None;
+    }
+    let capped = out.len() > MAX_CAPTURE_BYTES;
+    if capped {
+        out.truncate(MAX_CAPTURE_BYTES);
+    }
+    Some((out, capped))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -264,16 +355,73 @@ mod tests {
         let binary = content(&headers(&[("content-type", "application/octet-stream")]));
         assert!(!binary.text);
 
-        // Compressed bodies are not text, whatever the media type says.
+        // Gzip and deflate text bodies are decoded for inspection; unknown encodings stay binary.
         let gzip = content(&headers(&[
             ("content-type", "application/json"),
             ("content-encoding", "gzip"),
         ]));
-        assert!(!gzip.text);
+        assert!(gzip.text);
+        assert_eq!(gzip.encoding, Some(Encoding::Gzip));
+
+        let br = content(&headers(&[
+            ("content-type", "application/json"),
+            ("content-encoding", "br"),
+        ]));
+        assert!(!br.text);
+        assert_eq!(br.encoding, None);
 
         let missing = content(&HeaderMap::new());
         assert!(!missing.text);
         assert!(missing.content_type.is_none());
+    }
+
+    #[test]
+    fn decodes_gzip_and_deflate_text_within_capture_bounds() {
+        use flate2::{Compression, write::GzEncoder, write::ZlibEncoder};
+        use std::io::Write as _;
+
+        let json = br#"{"TableName":"orders","__type":"ResourceNotFoundException"}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(json).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let gzip = content(&headers(&[
+            ("content-type", "application/json"),
+            ("content-encoding", "gzip"),
+        ]));
+        let mut capture = Capture::new(true);
+        capture.feed(&compressed);
+        let body = capture.body(&gzip).unwrap();
+        assert!(!body.binary);
+        assert!(!body.truncated);
+        assert_eq!(body.bytes as usize, compressed.len());
+        assert_eq!(body.sha256, hex(&Sha256::digest(&compressed)));
+        assert_eq!(
+            body.text.as_deref(),
+            Some(std::str::from_utf8(json).unwrap())
+        );
+
+        // Large compressed payloads are capped at MAX_CAPTURE_BYTES when decoded.
+        let huge = vec![b'z'; MAX_CAPTURE_BYTES * 4];
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::fast());
+        zlib.write_all(&huge).unwrap();
+        let deflated = zlib.finish().unwrap();
+        let deflate = content(&headers(&[
+            ("content-type", "text/plain"),
+            ("content-encoding", "deflate"),
+        ]));
+        let mut big_capture = Capture::new(true);
+        big_capture.feed(&deflated);
+        let big_body = big_capture.body(&deflate).unwrap();
+        assert!(big_body.truncated);
+        assert_eq!(big_body.text.as_ref().unwrap().len(), MAX_CAPTURE_BYTES);
+
+        // Corrupt gzip falls back to metadata rather than empty text.
+        let mut bad = Capture::new(true);
+        bad.feed(b"not-gzip");
+        let bad_body = bad.body(&gzip).unwrap();
+        assert!(bad_body.binary);
+        assert!(bad_body.text.is_none());
     }
 
     #[test]
