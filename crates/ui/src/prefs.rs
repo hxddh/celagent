@@ -1,7 +1,7 @@
 //! Persistent window preferences in `~/.lenslet/ui.json`.
 //!
-//! Kept strictly in the user's home directory so appearance and language
-//! choices never touch project repositories or require configuration files.
+//! Kept strictly in the user's home directory so appearance, accent color,
+//! layout, formatting, and language choices never touch project repositories.
 
 use std::{
     fs,
@@ -20,13 +20,46 @@ pub enum ThemeMode {
 }
 
 impl ThemeMode {
-    pub fn cycle(self) -> Self {
-        match self {
-            ThemeMode::System => ThemeMode::Light,
-            ThemeMode::Light => ThemeMode::Dark,
-            ThemeMode::Dark => ThemeMode::System,
-        }
-    }
+    pub const ALL: [ThemeMode; 3] = [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark];
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccentColor {
+    #[default]
+    Sky,
+    Indigo,
+    Violet,
+    Emerald,
+    Amber,
+    Rose,
+}
+
+impl AccentColor {
+    pub const ALL: [AccentColor; 6] = [
+        AccentColor::Sky,
+        AccentColor::Indigo,
+        AccentColor::Violet,
+        AccentColor::Emerald,
+        AccentColor::Amber,
+        AccentColor::Rose,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Density {
+    #[default]
+    Comfortable,
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeFormat {
+    #[default]
+    Relative,
+    Clock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,21 +75,62 @@ impl Default for Lang {
     }
 }
 
-impl Lang {
-    pub fn toggle(self) -> Self {
-        match self {
-            Lang::En => Lang::Zh,
-            Lang::Zh => Lang::En,
-        }
-    }
+fn default_true() -> bool {
+    true
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+fn default_inspector_width() -> f32 {
+    476.0
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiPrefs {
     #[serde(default)]
     pub theme: ThemeMode,
     #[serde(default)]
+    pub accent: AccentColor,
+    #[serde(default)]
+    pub density: Density,
+    #[serde(default)]
+    pub time_format: TimeFormat,
+    #[serde(default)]
     pub lang: Lang,
+    #[serde(default)]
+    pub raw_body_default: bool,
+    #[serde(default = "default_true")]
+    pub word_wrap: bool,
+    #[serde(default = "default_inspector_width")]
+    pub inspector_width: f32,
+    #[serde(default = "default_true")]
+    pub inspector_open: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_height: Option<f32>,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        UiPrefs {
+            theme: ThemeMode::default(),
+            accent: AccentColor::default(),
+            density: Density::default(),
+            time_format: TimeFormat::default(),
+            lang: Lang::default(),
+            raw_body_default: false,
+            word_wrap: true,
+            inspector_width: default_inspector_width(),
+            inspector_open: true,
+            window_width: None,
+            window_height: None,
+        }
+    }
+}
+
+impl UiPrefs {
+    pub fn clamped_inspector_width(&self) -> f32 {
+        self.inspector_width.clamp(320.0, 780.0)
+    }
 }
 
 pub fn path(home: &Path) -> PathBuf {
@@ -68,6 +142,7 @@ pub fn load(home: &Path) -> UiPrefs {
         .ok()
         .and_then(|text| serde_json::from_str::<UiPrefs>(&text).ok())
         .unwrap_or_default();
+    prefs.inspector_width = prefs.clamped_inspector_width();
     if let Some(forced) = env_lang() {
         prefs.lang = forced;
     }
@@ -138,21 +213,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cycles_theme_and_round_trips_preferences() {
-        assert_eq!(ThemeMode::System.cycle(), ThemeMode::Light);
-        assert_eq!(ThemeMode::Light.cycle(), ThemeMode::Dark);
-        assert_eq!(ThemeMode::Dark.cycle(), ThemeMode::System);
-        assert_eq!(Lang::En.toggle(), Lang::Zh);
-
+    fn round_trips_workbench_preferences_and_clamps_inspector_width() {
         let dir = std::env::temp_dir().join(format!("lenslet-ui-prefs-{}", std::process::id()));
         let prefs = UiPrefs {
             theme: ThemeMode::Light,
+            accent: AccentColor::Indigo,
+            density: Density::Compact,
+            time_format: TimeFormat::Clock,
             lang: Lang::Zh,
+            raw_body_default: true,
+            word_wrap: false,
+            inspector_width: 520.0,
+            inspector_open: false,
+            window_width: Some(1440.0),
+            window_height: Some(900.0),
         };
         save(&dir, &prefs);
         let text = fs::read_to_string(path(&dir)).unwrap();
         let parsed: UiPrefs = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed, prefs);
+
+        let mut out_of_range = parsed;
+        out_of_range.inspector_width = 120.0;
+        assert_eq!(out_of_range.clamped_inspector_width(), 320.0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

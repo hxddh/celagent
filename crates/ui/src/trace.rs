@@ -15,7 +15,10 @@ use std::{
 
 use serde::Deserialize;
 
-pub const MAX_ROWS: usize = 500;
+pub const MAX_ROWS: usize = 5_000;
+/// Bodies larger than this in a tailed file are offloaded from the in-memory
+/// stream row and hydrated on demand via byte offset when inspected.
+const INLINE_BODY_LIMIT: usize = 8 * 1024;
 /// A reload reads backwards in blocks of this size until it has `MAX_ROWS`
 /// lines, so traces with large bodies still show a full stream.
 const TAIL_BLOCK_BYTES: u64 = 1 << 20;
@@ -25,7 +28,7 @@ const MAX_TAIL_BYTES: u64 = 256 << 20;
 /// to two 1 MiB bodies plus headers, even fully JSON-escaped.
 const MAX_CARRY_BYTES: usize = 16 << 20;
 /// Body text contributed to the search index (per request/response).
-const SEARCH_BODY_BYTES: usize = 32 * 1024;
+const SEARCH_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Header {
@@ -178,7 +181,7 @@ pub struct AccessEntry {
     pub test: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 pub struct FailureKind {
     #[serde(default)]
     pub service: String,
@@ -208,15 +211,27 @@ pub struct Regressions {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct Report {
     #[serde(default)]
+    pub run: String,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub ended: String,
     #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
     pub calls: usize,
+    #[serde(default)]
+    pub errors: usize,
     #[serde(default)]
     pub retries: usize,
     #[serde(default)]
     pub blocked: usize,
+    #[serde(default)]
+    pub services: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub failures: Vec<FailureKind>,
     #[serde(default)]
     pub access: Vec<AccessEntry>,
     #[serde(default)]
@@ -259,15 +274,6 @@ impl RunInfo {
     pub fn exit_code(&self) -> Option<i32> {
         self.report.as_ref().and_then(|report| report.exit_code)
     }
-
-    /// `run` for a command, `proxy` for a bare proxy session.
-    pub fn kind(&self) -> &'static str {
-        if self.header.command.is_empty() {
-            "proxy"
-        } else {
-            "run"
-        }
-    }
 }
 
 /// One line of a run file.
@@ -277,6 +283,13 @@ enum Record {
     Run(RunHeader),
     Call(Box<Trace>),
     End(Box<Report>),
+}
+
+#[derive(Clone, Debug)]
+pub struct LineRef {
+    pub path: Arc<PathBuf>,
+    pub offset: u64,
+    pub len: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -342,9 +355,60 @@ pub struct Trace {
     haystack: String,
     #[serde(skip)]
     at_ms: Option<i64>,
+    #[serde(skip)]
+    line_ref: Option<LineRef>,
+    #[serde(skip)]
+    dehydrated: bool,
 }
 
 impl Trace {
+    fn dehydrate(&mut self, lref: LineRef) {
+        let mut shed = false;
+        for ex in [self.request.as_mut(), self.response.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(body) = ex.body.as_mut()
+                && body
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.len() > INLINE_BODY_LIMIT)
+            {
+                body.text = None;
+                shed = true;
+            }
+        }
+        if shed {
+            self.line_ref = Some(lref);
+            self.dehydrated = true;
+        }
+    }
+
+    /// Return a `Trace` with full request/response bodies loaded from disk when
+    /// large bodies were offloaded during stream indexing.
+    pub fn hydrated(&self) -> Cow<'_, Trace> {
+        if !self.dehydrated {
+            return Cow::Borrowed(self);
+        }
+        let Some(lref) = self.line_ref.as_ref() else {
+            return Cow::Borrowed(self);
+        };
+        let Ok(mut file) = File::open(&*lref.path) else {
+            return Cow::Borrowed(self);
+        };
+        if file.seek(SeekFrom::Start(lref.offset)).is_err() {
+            return Cow::Borrowed(self);
+        }
+        let mut buf = vec![0u8; lref.len];
+        if file.read_exact(&mut buf).is_err() {
+            return Cow::Borrowed(self);
+        }
+        let line = String::from_utf8_lossy(&buf);
+        match parse_record(&line) {
+            Some(Record::Call(full)) => Cow::Owned(*full),
+            _ => Cow::Borrowed(self),
+        }
+    }
     fn finalize(mut self) -> Self {
         if let Some(request) = self.request.as_ref() {
             if self.invocation_id.is_none() {
@@ -561,13 +625,37 @@ struct Parsed {
 }
 
 fn parse_records(text: &str) -> Parsed {
+    parse_records_at(text.as_bytes(), 0, None)
+}
+
+fn parse_records_at(bytes: &[u8], base_offset: u64, source: Option<&Arc<PathBuf>>) -> Parsed {
     let mut parsed = Parsed::default();
-    for line in text.lines() {
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let rel_end = bytes[pos..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .unwrap_or(bytes.len() - pos);
+        let slice = &bytes[pos..pos + rel_end];
+        let line_offset = base_offset + pos as u64;
+        let line_len = slice.len();
+        pos += rel_end + 1;
+
+        let line = String::from_utf8_lossy(slice);
         if line.trim().is_empty() {
             continue;
         }
-        match parse_record(line) {
-            Some(Record::Call(trace)) => parsed.calls.push(*trace),
+        match parse_record(&line) {
+            Some(Record::Call(mut trace)) => {
+                if let Some(arc_path) = source {
+                    trace.dehydrate(LineRef {
+                        path: arc_path.clone(),
+                        offset: line_offset,
+                        len: line_len,
+                    });
+                }
+                parsed.calls.push(*trace);
+            }
             Some(Record::Run(header)) => parsed.header = Some(header),
             Some(Record::End(report)) => parsed.report = Some(*report),
             None => parsed.bad += 1,
@@ -802,11 +890,15 @@ impl Tailer {
 
         // Drop a leading partial line, and keep an unterminated tail for later.
         let mut body: &[u8] = &bytes;
+        let mut body_offset = start;
         if start > 0 {
-            body = match body.iter().position(|byte| *byte == b'\n') {
-                Some(ix) => &body[ix + 1..],
-                None => &[],
-            };
+            match body.iter().position(|byte| *byte == b'\n') {
+                Some(ix) => {
+                    body = &body[ix + 1..];
+                    body_offset += (ix + 1) as u64;
+                }
+                None => body = &[],
+            }
         }
         let complete = match body.iter().rposition(|byte| *byte == b'\n') {
             Some(ix) => {
@@ -818,7 +910,8 @@ impl Tailer {
                 &[][..]
             }
         };
-        let parsed = parse_records(&String::from_utf8_lossy(complete));
+        let arc_path = Arc::new(path.to_path_buf());
+        let parsed = parse_records_at(complete, body_offset, Some(&arc_path));
         self.skipped = parsed.bad;
         // A long run's header is far before the tail that was read.
         self.header = parsed.header.or_else(|| read_header(path));
@@ -842,6 +935,8 @@ impl Tailer {
             return TailEvent::Idle;
         }
 
+        let carry_before = self.carry.len() as u64;
+        let base_offset = self.offset.saturating_sub(carry_before);
         self.offset += bytes.len() as u64;
         self.carry.extend_from_slice(&bytes);
 
@@ -853,7 +948,8 @@ impl Tailer {
             return TailEvent::Idle;
         };
         let complete: Vec<u8> = self.carry.drain(..=newline).collect();
-        let parsed = parse_records(&String::from_utf8_lossy(&complete));
+        let arc_path = Arc::new(path.to_path_buf());
+        let parsed = parse_records_at(&complete, base_offset, Some(&arc_path));
         self.skipped += parsed.bad;
         if parsed.header.is_some() {
             self.header = parsed.header;
@@ -1013,6 +1109,103 @@ pub fn service_facets<'a>(rows: impl IntoIterator<Item = &'a Trace>) -> Vec<Serv
     facets
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StatusFilter {
+    #[default]
+    All,
+    Errors,
+    Blocked,
+    Retries,
+    Slow,
+}
+
+/// Combinable call-stream filter: status facet AND service facet AND optional IAM permission.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallFilter {
+    pub status: StatusFilter,
+    pub service: Option<String>,
+    pub access: Option<Access>,
+}
+
+impl CallFilter {
+    pub fn is_active(&self) -> bool {
+        self.status != StatusFilter::All || self.service.is_some() || self.access.is_some()
+    }
+
+    pub fn matches(&self, trace: &Trace) -> bool {
+        let status_ok = match self.status {
+            StatusFilter::All => true,
+            StatusFilter::Errors => trace.is_error(),
+            StatusFilter::Blocked => trace.blocked,
+            StatusFilter::Retries => trace.is_retry(),
+            StatusFilter::Slow => trace.pending || trace.ms >= 500,
+        };
+        if !status_ok {
+            return false;
+        }
+        if let Some(svc) = self.service.as_deref()
+            && trace.service_key() != svc
+        {
+            return false;
+        }
+        if let Some(access) = self.access.as_ref()
+            && !trace.uses(access)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccessFilter {
+    #[default]
+    All,
+    New,
+    Implied,
+    Unused,
+    Test,
+}
+
+impl AccessFilter {
+    pub fn matches(self, entry: &AccessEntry) -> bool {
+        match self {
+            AccessFilter::All => true,
+            AccessFilter::New => entry.new,
+            AccessFilter::Implied => entry.implied,
+            AccessFilter::Unused => entry.unused,
+            AccessFilter::Test => entry.test,
+        }
+    }
+}
+
+impl AccessEntry {
+    pub fn matches_search(&self, tokens: &[String]) -> bool {
+        if tokens.is_empty() {
+            return true;
+        }
+        let mut hay = format!("{} {}", self.action, self.resource).to_lowercase();
+        for v in &self.via {
+            hay.push(' ');
+            hay.push_str(&v.to_lowercase());
+        }
+        if self.new {
+            hay.push_str(" new denied");
+        }
+        if self.implied {
+            hay.push_str(" implied");
+        }
+        if self.unused {
+            hay.push_str(" unused");
+        }
+        if self.test {
+            hay.push_str(" test");
+        }
+        tokens.iter().all(|tok| hay.contains(tok.as_str()))
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Filter {
     All,
@@ -1023,6 +1216,7 @@ pub enum Filter {
     Access(Access),
 }
 
+#[cfg(test)]
 impl Filter {
     pub fn matches(&self, trace: &Trace) -> bool {
         match self {
@@ -1507,6 +1701,335 @@ pub fn read_test_marks(cwd: &str, lock: &str) -> std::collections::BTreeSet<Acce
     out
 }
 
+/// Summary of one recorded run file for the Run Switcher popover and Diff view.
+#[derive(Clone, Debug)]
+pub struct RunSummary {
+    pub path: PathBuf,
+    pub id: String,
+    pub header: RunHeader,
+    pub report: Option<Report>,
+}
+
+impl RunSummary {
+    pub fn label(&self) -> String {
+        if self.header.command.is_empty() {
+            "proxy session".to_string()
+        } else {
+            format!("$ {}", self.header.command.join(" "))
+        }
+    }
+}
+
+fn read_last_report(path: &Path) -> Option<Report> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let mut start = len;
+    let mut tail: Vec<u8> = Vec::new();
+    while start > 0 && len - start < (16 << 20) {
+        let block = (64 * 1024u64).min(start);
+        start -= block;
+        let mut chunk = vec![0u8; block as usize];
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut chunk).ok()?;
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        let body = tail.strip_suffix(b"\n").unwrap_or(&tail);
+        if body.contains(&b'\n') {
+            break;
+        }
+    }
+    let body = tail.strip_suffix(b"\n").unwrap_or(&tail);
+    let line = match body.iter().rposition(|b| *b == b'\n') {
+        Some(ix) => &body[ix + 1..],
+        None if start == 0 => body,
+        None => return None,
+    };
+    match parse_record(&String::from_utf8_lossy(line))? {
+        Record::End(report) => Some(*report),
+        _ => None,
+    }
+}
+
+/// Read header + final `end` report of a run file without reading its call stream.
+pub fn load_run_summary(path: &Path) -> Option<RunSummary> {
+    let header = read_header(path)?;
+    let report = read_last_report(path);
+    let id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| header.run.clone());
+    Some(RunSummary {
+        path: path.to_path_buf(),
+        id,
+        header,
+        report,
+    })
+}
+
+/// All recorded runs in `dir`, newest first.
+pub fn list_run_summaries(dir: &Path) -> Vec<RunSummary> {
+    list_runs(dir)
+        .into_iter()
+        .rev()
+        .filter_map(|p| load_run_summary(&p))
+        .collect()
+}
+
+/// Finished candidate baselines for `current_path`, ordered with earlier runs
+/// first (nearest predecessor at index 0) followed by newer finished runs, plus
+/// the nearest earlier baseline path (`prev`) if one exists.
+pub fn ordered_baselines(
+    dir: &Path,
+    current_path: Option<&Path>,
+) -> (Vec<RunSummary>, Option<PathBuf>) {
+    let mut earlier = Vec::new();
+    let mut newer = Vec::new();
+    for summary in list_run_summaries(dir) {
+        if summary.report.is_none() || Some(summary.path.as_path()) == current_path {
+            continue;
+        }
+        if current_path.is_none_or(|cur| summary.path.as_path() < cur) {
+            earlier.push(summary);
+        } else {
+            newer.push(summary);
+        }
+    }
+    let prev_path = earlier.first().map(|s| s.path.clone());
+    earlier.extend(newer);
+    (earlier, prev_path)
+}
+
+/// `(file_count, total_bytes)` for `~/.lenslet/runs`.
+pub fn storage_stats(dir: &Path) -> (usize, u64) {
+    let files = list_runs(dir);
+    let count = files.len();
+    let bytes = files
+        .iter()
+        .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    (count, bytes)
+}
+
+/// Delete finished run files in `dir` (preserving `keep_path` and any still-running file).
+pub fn clear_finished_runs(dir: &Path, keep_path: Option<&Path>) -> usize {
+    let mut removed = 0usize;
+    for path in list_runs(dir) {
+        if keep_path.is_some_and(|keep| keep == path.as_path()) {
+            continue;
+        }
+        if read_last_report(&path).is_some() && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Build an IAM policy JSON document from exercised non-`# test` permissions.
+pub fn export_policy_json(rows: &[AccessEntry]) -> String {
+    let mut by_resource: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for entry in rows {
+        if entry.unused || entry.test {
+            continue;
+        }
+        by_resource
+            .entry(entry.resource.clone())
+            .or_default()
+            .push(entry.action.clone());
+    }
+    let statements: Vec<serde_json::Value> = by_resource
+        .into_iter()
+        .map(|(resource, mut actions)| {
+            actions.sort();
+            actions.dedup();
+            let action = match actions.as_slice() {
+                [only] => serde_json::Value::String(only.clone()),
+                many => serde_json::json!(many),
+            };
+            serde_json::json!({
+                "Effect": "Allow",
+                "Action": action,
+                "Resource": resource,
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": statements,
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Single IAM Statement JSON snippet for one `AccessEntry`.
+pub fn statement_json(entry: &AccessEntry) -> String {
+    let stmt = serde_json::json!({
+        "Effect": "Allow",
+        "Action": entry.action,
+        "Resource": entry.resource,
+    });
+    serde_json::to_string_pretty(&stmt).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Run-to-run diff model for the desktop `Diff` view.
+#[derive(Clone, Debug, Default)]
+pub struct UiRunDiff {
+    pub base_id: String,
+    pub base_cmd: String,
+    pub target_id: String,
+    pub target_cmd: String,
+    pub base_calls: usize,
+    pub target_calls: usize,
+    pub base_errors: usize,
+    pub target_errors: usize,
+    pub base_duration_ms: u64,
+    pub target_duration_ms: u64,
+    pub new_failures: Vec<FailureKind>,
+    pub fixed_failures: Vec<FailureKind>,
+    pub access_added: Vec<Access>,
+    pub access_removed: Vec<Access>,
+    pub service_deltas: Vec<(String, usize, usize)>,
+}
+
+impl UiRunDiff {
+    pub fn from_summaries(
+        base: &RunSummary,
+        target_run: &RunInfo,
+        target_rows: &[Arc<Trace>],
+        target_access: &[AccessEntry],
+    ) -> Option<Self> {
+        let base_rep = base.report.as_ref()?;
+
+        let target_calls = target_run
+            .report
+            .as_ref()
+            .map_or(target_rows.len(), |r| r.calls);
+        let target_errors = target_run.report.as_ref().map_or_else(
+            || target_rows.iter().filter(|r| r.is_error()).count(),
+            |r| r.errors,
+        );
+        let target_duration_ms = target_run.report.as_ref().map_or_else(
+            || match (
+                target_rows.first().and_then(|r| r.at_ms()),
+                target_rows
+                    .last()
+                    .and_then(|r| r.at_ms().map(|at| at + r.ms as i64)),
+            ) {
+                (Some(s), Some(e)) if e >= s => (e - s) as u64,
+                _ => 0,
+            },
+            |r| r.duration_ms,
+        );
+
+        let base_access: std::collections::BTreeSet<Access> = base_rep
+            .access
+            .iter()
+            .filter(|e| !e.unused)
+            .map(|e| Access {
+                action: e.action.clone(),
+                resource: e.resource.clone(),
+            })
+            .collect();
+        let now_access: std::collections::BTreeSet<Access> = target_access
+            .iter()
+            .filter(|e| !e.unused)
+            .map(|e| Access {
+                action: e.action.clone(),
+                resource: e.resource.clone(),
+            })
+            .collect();
+
+        let (new_failures, fixed_failures) = if let Some(reg) = target_run
+            .report
+            .as_ref()
+            .and_then(|r| r.regressions.as_ref())
+            .filter(|reg| reg.previous_run == base.id || reg.previous_run == base.header.run)
+        {
+            (reg.new_failures.clone(), reg.fixed.clone())
+        } else {
+            let base_f: std::collections::BTreeSet<FailureKind> =
+                base_rep.failures.iter().cloned().collect();
+            let now_f: std::collections::BTreeSet<FailureKind> = if let Some(rep) = target_run
+                .report
+                .as_ref()
+                .filter(|r| !r.failures.is_empty() || r.errors == 0)
+            {
+                rep.failures.iter().cloned().collect()
+            } else {
+                target_rows
+                    .iter()
+                    .filter_map(|row| {
+                        let p = row.problem.as_ref()?;
+                        Some(FailureKind {
+                            service: row.service.clone(),
+                            operation: row.operation.clone(),
+                            code: p.code.clone(),
+                        })
+                    })
+                    .collect()
+            };
+            (
+                now_f.difference(&base_f).cloned().collect(),
+                base_f.difference(&now_f).cloned().collect(),
+            )
+        };
+
+        let mut target_services: std::collections::BTreeMap<String, usize> = if let Some(rep) =
+            target_run
+                .report
+                .as_ref()
+                .filter(|r| !r.services.is_empty())
+        {
+            rep.services.clone()
+        } else {
+            let mut map = std::collections::BTreeMap::new();
+            for row in target_rows {
+                *map.entry(row.service_key().to_string()).or_default() += 1;
+            }
+            map
+        };
+        let mut all_svcs: std::collections::BTreeSet<String> =
+            base_rep.services.keys().cloned().collect();
+        all_svcs.extend(target_services.keys().cloned());
+        let mut service_deltas = Vec::new();
+        for svc in all_svcs {
+            let b = base_rep.services.get(&svc).copied().unwrap_or(0);
+            let t = target_services.remove(&svc).unwrap_or(0);
+            if b != t || b > 0 {
+                service_deltas.push((svc, b, t));
+            }
+        }
+
+        Some(UiRunDiff {
+            base_id: if base.header.run.is_empty() {
+                base.id.clone()
+            } else {
+                base.header.run.clone()
+            },
+            base_cmd: base.label(),
+            target_id: target_run.header.run.clone(),
+            target_cmd: if target_run.header.command.is_empty() {
+                "proxy session".to_string()
+            } else {
+                format!("$ {}", target_run.command_line())
+            },
+            base_calls: base_rep.calls,
+            target_calls,
+            base_errors: base_rep.errors,
+            target_errors,
+            base_duration_ms: base_rep.duration_ms,
+            target_duration_ms,
+            new_failures,
+            fixed_failures,
+            access_added: now_access.difference(&base_access).cloned().collect(),
+            access_removed: base_access.difference(&now_access).cloned().collect(),
+            service_deltas,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,7 +2164,6 @@ mod tests {
 
         let run = parse_run(&text);
         assert_eq!(run.command_line(), "npm test");
-        assert_eq!(run.kind(), "run");
         assert_eq!(
             RunInfo::address(&run.header.endpoint),
             Some("127.0.0.1:4100")
@@ -2051,15 +2573,20 @@ mod tests {
     }
 
     #[test]
-    fn reload_fills_the_stream_even_with_large_bodies() {
+    fn reload_fills_the_stream_even_with_large_bodies_and_hydrates_on_demand() {
         let path = temp_trace("large");
-        let big = "x".repeat(5_000);
+        let big = "x".repeat(10_000);
         let mut text = String::new();
         for index in 0..MAX_ROWS + 20 {
             text.push_str(&line(
                 &format!("id-{index}"),
-                &format!("2026-11-15T00:{:02}:{:02}Z", index / 60, index % 60),
-                serde_json::json!({"request": {"body": {"text": big, "bytes": 5000}}}),
+                &format!(
+                    "2026-11-15T{:02}:{:02}:{:02}Z",
+                    index / 3600,
+                    (index / 60) % 60,
+                    index % 60
+                ),
+                serde_json::json!({"request": {"body": {"text": big, "bytes": 10_000}}}),
             ));
             text.push('\n');
         }
@@ -2069,7 +2596,34 @@ mod tests {
         match tailer.poll() {
             TailEvent::Replaced(rows) => {
                 assert_eq!(rows.len(), MAX_ROWS);
-                assert_eq!(rows.last().unwrap().id, "id-519");
+                let last = rows.last().unwrap();
+                assert_eq!(last.id, format!("id-{}", MAX_ROWS + 19));
+                assert!(
+                    last.request
+                        .as_ref()
+                        .unwrap()
+                        .body
+                        .as_ref()
+                        .unwrap()
+                        .text
+                        .is_none(),
+                    "large bodies are offloaded from stream RAM"
+                );
+                let hydrated = last.hydrated();
+                assert_eq!(
+                    hydrated
+                        .request
+                        .as_ref()
+                        .unwrap()
+                        .body
+                        .as_ref()
+                        .unwrap()
+                        .text
+                        .as_deref()
+                        .map(str::len),
+                    Some(10_000),
+                    "selected row hydrates full body on demand"
+                );
             }
             other => panic!("expected replace, got {other:?}"),
         }
@@ -2437,5 +2991,203 @@ mod tests {
             .unwrap()
             .truncated = true;
         assert!(to_curl(&truncated_call, None).is_none());
+    }
+
+    #[test]
+    fn combinable_filters_offloading_policy_export_and_run_diff_work() {
+        let dir = temp_trace("v6-workbench").with_extension("");
+        let _ = fs::remove_dir_all(&dir);
+        let runs_dir = dir.join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        let big_payload = "x".repeat(INLINE_BODY_LIMIT + 2048);
+        let base_path = runs_dir.join("20261118T100000Z-100.jsonl");
+        fs::write(
+            &base_path,
+            concat!(
+                "{\"type\":\"run\",\"run\":\"base-run\",\"started\":\"2026-11-18T10:00:00Z\",\"command\":[\"pytest\"]}\n",
+                "{\"type\":\"call\",\"id\":\"b1\",\"at\":\"2026-11-18T10:00:01Z\",\"method\":\"PUT\",\"path\":\"/b/k\",\"host\":\"localhost:4566\",\"service\":\"s3\",\"operation\":\"PutObject\",\"status\":200,\"ms\":12,\"access\":[{\"action\":\"s3:PutObject\",\"resource\":\"arn:aws:s3:::b/k\"}]}\n",
+                "{\"type\":\"call\",\"id\":\"b2\",\"at\":\"2026-11-18T10:00:02Z\",\"method\":\"POST\",\"path\":\"/\",\"host\":\"localhost:4566\",\"service\":\"dynamodb\",\"operation\":\"GetItem\",\"status\":400,\"ms\":8,\"problem\":{\"code\":\"ResourceNotFoundException\",\"message\":\"missing\"},\"access\":[{\"action\":\"dynamodb:GetItem\",\"resource\":\"arn:aws:dynamodb:us-east-1:000000000000:table/orders\"}]}\n",
+                "{\"type\":\"end\",\"run\":\"base-run\",\"calls\":2,\"errors\":1,\"blocked\":0,\"duration_ms\":20,\"exit_code\":1,\"services\":{\"s3\":1,\"dynamodb\":1},\"failures\":[{\"service\":\"dynamodb\",\"operation\":\"GetItem\",\"code\":\"ResourceNotFoundException\"}],\"access\":[{\"action\":\"s3:PutObject\",\"resource\":\"arn:aws:s3:::b/k\",\"calls\":1},{\"action\":\"dynamodb:GetItem\",\"resource\":\"arn:aws:dynamodb:us-east-1:000000000000:table/orders\",\"calls\":1}]}\n"
+            ),
+        )
+        .unwrap();
+
+        let target_path = runs_dir.join("20261118T100500Z-200.jsonl");
+        let large_call = serde_json::to_string(&serde_json::json!({
+            "type": "call",
+            "id": "t1",
+            "at": "2026-11-18T10:05:01Z",
+            "method": "PUT",
+            "path": "/b/big.json",
+            "host": "localhost:4566",
+            "service": "s3",
+            "operation": "PutObject",
+            "status": 200,
+            "ms": 25,
+            "access": [{"action": "s3:PutObject", "resource": "arn:aws:s3:::b/big.json"}],
+            "request": {
+                "content_type": "application/json",
+                "body": {
+                    "text": big_payload,
+                    "bytes": big_payload.len(),
+                    "truncated": false,
+                    "binary": false
+                }
+            }
+        }))
+        .unwrap();
+        let blocked_call = serde_json::to_string(&serde_json::json!({
+            "type": "call",
+            "id": "t2",
+            "at": "2026-11-18T10:05:02Z",
+            "method": "POST",
+            "path": "/",
+            "host": "localhost:4566",
+            "service": "kms",
+            "operation": "Decrypt",
+            "status": 403,
+            "ms": 4,
+            "blocked": true,
+            "problem": {"code": "AccessDeniedException", "message": "blocked"},
+            "access": [{"action": "kms:Decrypt", "resource": "arn:aws:kms:us-east-1:000000000000:key/k1"}]
+        }))
+        .unwrap();
+        let end_line = serde_json::to_string(&serde_json::json!({
+            "type": "end",
+            "run": "target-run",
+            "calls": 2,
+            "errors": 1,
+            "blocked": 1,
+            "duration_ms": 29,
+            "exit_code": 1,
+            "services": {"s3": 1, "kms": 1},
+            "failures": [{"service": "kms", "operation": "Decrypt", "code": "AccessDeniedException"}],
+            "access": [
+                {"action": "s3:PutObject", "resource": "arn:aws:s3:::b/big.json", "calls": 1, "new": true},
+                {"action": "kms:Decrypt", "resource": "arn:aws:kms:us-east-1:000000000000:key/k1", "calls": 1, "new": true}
+            ],
+            "access_unused": [
+                {"action": "sqs:SendMessage", "resource": "arn:aws:sqs:us-east-1:000000000000:jobs"}
+            ]
+        }))
+        .unwrap();
+        fs::write(
+            &target_path,
+            format!(
+                "{{\"type\":\"run\",\"run\":\"target-run\",\"started\":\"2026-11-18T10:05:00Z\",\"command\":[\"pytest\",\"-k\",\"kms\"]}}\n{large_call}\n{blocked_call}\n{end_line}\n"
+            ),
+        )
+        .unwrap();
+
+        let live_path = runs_dir.join("20261118T101000Z-300.jsonl");
+        fs::write(
+            &live_path,
+            "{\"type\":\"run\",\"run\":\"live-run\",\"started\":\"2026-11-18T10:10:00Z\",\"command\":[\"python\",\"app.py\"]}\n",
+        )
+        .unwrap();
+
+        let mut tailer = Tailer::new(&target_path);
+        let rows: Vec<Arc<Trace>> = match tailer.poll() {
+            TailEvent::Replaced(rows) => rows.into_iter().map(Arc::new).collect(),
+            other => panic!("expected Replaced, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 2);
+
+        // Large payload (> INLINE_BODY_LIMIT) is offloaded in stream memory and hydrated on demand.
+        let stream_t1 = &rows[0];
+        assert!(
+            stream_t1
+                .request
+                .as_ref()
+                .unwrap()
+                .body
+                .as_ref()
+                .unwrap()
+                .text
+                .is_none()
+        );
+        let hydrated_t1 = stream_t1.hydrated();
+        assert_eq!(
+            hydrated_t1
+                .request
+                .as_ref()
+                .unwrap()
+                .body
+                .as_ref()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some(big_payload.as_str())
+        );
+
+        // Combinable CallFilter: Blocked + service = kms matches only t2.
+        let filter = CallFilter {
+            status: StatusFilter::Blocked,
+            service: Some("kms".into()),
+            access: None,
+        };
+        assert!(!filter.matches(&rows[0]));
+        assert!(filter.matches(&rows[1]));
+
+        // AccessFilter + search + IAM statement/policy export.
+        let run_info = tailer.run().unwrap();
+        let report = run_info.report.as_ref().unwrap();
+        assert!(AccessFilter::New.matches(&report.access[0]));
+        assert!(!AccessFilter::Unused.matches(&report.access[0]));
+        assert!(report.access[1].matches_search(&search_tokens("kms")));
+        let policy_doc: serde_json::Value =
+            serde_json::from_str(&export_policy_json(&report.access)).unwrap();
+        assert_eq!(policy_doc["Version"], "2012-10-17");
+        assert_eq!(policy_doc["Statement"].as_array().unwrap().len(), 2);
+        let single_stmt: serde_json::Value =
+            serde_json::from_str(&statement_json(&report.access[1])).unwrap();
+        assert_eq!(single_stmt["Action"], "kms:Decrypt");
+
+        // Run-to-Run Diff between base and target.
+        let base_summary = load_run_summary(&base_path).unwrap();
+        let diff =
+            UiRunDiff::from_summaries(&base_summary, &run_info, &rows, &report.access).unwrap();
+        assert_eq!(diff.base_id, "base-run");
+        assert_eq!(diff.target_id, "target-run");
+        assert_eq!(diff.new_failures.len(), 1);
+        assert_eq!(diff.new_failures[0].service, "kms");
+        assert_eq!(diff.fixed_failures.len(), 1);
+        assert_eq!(diff.fixed_failures[0].service, "dynamodb");
+
+        // Historical baseline ordering: for finished runs A < B < C, viewing B
+        // defaults `prev` to A (earlier) while keeping C available afterwards,
+        // and viewing oldest A yields `prev == None` so Diff never reverses C → A.
+        let newer_path = runs_dir.join("20261118T100800Z-250.jsonl");
+        fs::write(
+            &newer_path,
+            concat!(
+                "{\"type\":\"run\",\"run\":\"newer-run\",\"started\":\"2026-11-18T10:08:00Z\",\"command\":[\"pytest\"]}\n",
+                "{\"type\":\"end\",\"run\":\"newer-run\",\"calls\":0,\"errors\":0,\"blocked\":0,\"duration_ms\":5,\"exit_code\":0}\n"
+            ),
+        )
+        .unwrap();
+        let (bases_for_b, prev_for_b) = ordered_baselines(&runs_dir, Some(&target_path));
+        assert_eq!(prev_for_b.as_deref(), Some(base_path.as_path()));
+        assert_eq!(bases_for_b.len(), 2);
+        assert_eq!(bases_for_b[0].path, base_path);
+        assert_eq!(bases_for_b[1].path, newer_path);
+
+        let (bases_for_a, prev_for_a) = ordered_baselines(&runs_dir, Some(&base_path));
+        assert!(prev_for_a.is_none());
+        assert_eq!(bases_for_a.len(), 2);
+        fs::remove_file(&newer_path).unwrap();
+
+        // Storage stats & clear_finished_runs preserves current + live runs and removes finished base_path.
+        let (count_before, bytes_before) = storage_stats(&runs_dir);
+        assert_eq!(count_before, 3);
+        assert!(bytes_before > 0);
+        let removed = clear_finished_runs(&runs_dir, Some(&target_path));
+        assert_eq!(removed, 1);
+        assert!(!base_path.exists());
+        assert!(target_path.exists());
+        assert!(live_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

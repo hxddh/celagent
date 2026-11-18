@@ -1,23 +1,22 @@
-//! The request stream: table, rows, empty states.
+//! The request stream: table header, virtualized rows, and empty states.
 
 use super::*;
+use crate::prefs::{Density, TimeFormat};
 
 impl LensletApp {
     pub(super) fn render_stream(&mut self, op_width: f32, cx: &mut Context<Self>) -> Div {
         let t = theme::p();
-        if self.pane == Pane::Access && !self.rows.is_empty() {
+        // Note: `Pane::Access` works even when `rows.is_empty()` (e.g. showing UNUSED lock entries).
+        if self.pane == Pane::Access {
             return div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_w(px(0.0))
                 .bg(rgb(t.panel))
-                .border_r_1()
-                .border_color(rgb(t.border))
-                .child(self.render_stream_head(cx))
-                .child(self.render_access(cx))
-                .child(self.render_stream_footer());
+                .child(self.render_access(cx));
         }
+
         let body: AnyElement = if self.view.is_empty() {
             if self.rows.is_empty() {
                 self.render_first_run(cx).into_any_element()
@@ -34,128 +33,19 @@ impl LensletApp {
             .flex_1()
             .min_w(px(0.0))
             .bg(rgb(t.panel))
-            .border_r_1()
-            .border_color(rgb(t.border))
-            .child(self.render_stream_head(cx))
             .child(self.render_table_head(op_width))
             .child(body)
-            .child(self.render_stream_footer())
-    }
-
-    pub(super) fn render_stream_head(&self, cx: &mut Context<Self>) -> Div {
-        let t = theme::p();
-        let filtered = !self.query.is_empty() || self.filter != Filter::All;
-        let access = self.access_rows();
-        let used_access = access.iter().filter(|entry| !entry.unused).count();
-        let new_access = access.iter().filter(|entry| entry.new).count();
-        let unused_access = access.iter().filter(|entry| entry.unused).count();
-        let counts = if self.pane == Pane::Access {
-            let mut text = if i18n::is_zh() {
-                format!("{used_access} 项权限")
-            } else {
-                format!(
-                    "{used_access} {}",
-                    if used_access == 1 {
-                        "PERMISSION"
-                    } else {
-                        "PERMISSIONS"
-                    }
-                )
-            };
-            if new_access > 0 {
-                text.push_str(&format!(" · {new_access} NEW"));
-            }
-            if unused_access > 0 {
-                text.push_str(&format!(" · {unused_access} UNUSED"));
-            }
-            text
-        } else if filtered {
-            if i18n::is_zh() {
-                format!(
-                    "显示 {} / {} · {}",
-                    self.counts.visible,
-                    self.counts.total,
-                    i18n::error_count(self.counts.visible_errors)
-                )
-            } else {
-                format!(
-                    "{} OF {} CALLS · {}",
-                    self.counts.visible,
-                    self.counts.total,
-                    i18n::error_count(self.counts.visible_errors)
-                )
-            }
-        } else if let Some(reported) = self.counts.reported_total {
-            if i18n::is_zh() {
-                format!(
-                    "最近 {} / {} 次 · {}",
-                    self.counts.total,
-                    reported,
-                    i18n::error_count(self.counts.errors)
-                )
-            } else {
-                format!(
-                    "LATEST {} OF {} CALLS · {}",
-                    self.counts.total,
-                    reported,
-                    i18n::error_count(self.counts.errors)
-                )
-            }
-        } else {
-            let mut text = format!(
-                "{} · {}",
-                i18n::call_count(self.counts.total),
-                i18n::error_count(self.counts.errors)
-            );
-            if self.counts.retries > 0 {
-                text.push_str(&format!(
-                    " · {} {}",
-                    self.counts.retries,
-                    if self.counts.retries == 1 {
-                        "retry"
-                    } else {
-                        "retries"
-                    }
-                ));
-            }
-            if self.counts.blocked > 0 {
-                text.push_str(&format!(" · {} blocked", self.counts.blocked));
-            }
-            text
-        };
-
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .h(px(theme::STREAM_HEAD_H))
-            .px(px(theme::ROW_PAD_X))
-            .border_b_1()
-            .border_color(rgb(t.border_subtle))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .child(self.pane_tab(Pane::Calls, i18n::pick("CALLS", "请求流"), None, cx))
-                    .child(self.pane_tab(
-                        Pane::Access,
-                        i18n::pick("ACCESS", "IAM 权限"),
-                        (new_access > 0).then(|| format!("+{new_access}")),
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .font_family(fonts::mono())
-                    .text_size(px(10.0))
-                    .text_color(rgb(t.text_faint))
-                    .child(counts),
-            )
     }
 
     pub(super) fn render_table_head(&self, op_width: f32) -> Div {
         let t = theme::p();
+        let filtered = !self.query.is_empty() || self.call_filter.is_active();
+        let count_hint = if filtered {
+            format!("{}/{}", self.counts.visible, self.counts.total)
+        } else {
+            String::new()
+        };
+
         div()
             .flex()
             .items_center()
@@ -167,7 +57,23 @@ impl LensletApp {
             .border_color(rgb(t.border_subtle))
             .child(table_label(i18n::pick("TIME", "时间"), theme::COL_TIME))
             .child(table_label("SERVICE", theme::COL_SERVICE))
-            .child(div().w(px(op_width)).child(micro_label("OPERATION / PATH")))
+            .child(
+                div()
+                    .w(px(op_width))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(micro_label("OPERATION / PATH"))
+                    .when(!count_hint.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .font_family(fonts::mono())
+                                .text_size(px(9.5))
+                                .text_color(rgb(t.accent))
+                                .child(count_hint),
+                        )
+                    }),
+            )
             .child(table_label("STATUS", theme::COL_STATUS))
             .child(
                 div()
@@ -189,6 +95,8 @@ impl LensletApp {
         let view = self.view.clone();
         let selected = self.selected;
         let run_start_ms = self.run_start_ms();
+        let density = self.prefs.density;
+        let time_format = self.prefs.time_format;
         let this = cx.entity().downgrade();
         let list = uniform_list("trace-rows", view.len(), move |range, _window, _cx| {
             range
@@ -206,6 +114,8 @@ impl LensletApp {
                         op_width,
                         run_start_ms,
                         prev_end_ms,
+                        density,
+                        time_format,
                         this.clone(),
                     )
                 })
@@ -216,8 +126,6 @@ impl LensletApp {
         .min_h(px(0.0))
         .track_scroll(self.scroll.clone());
 
-        // A short fade makes the partially visible last row read as a
-        // scroll edge rather than a clipped row.
         div()
             .relative()
             .flex()
@@ -232,11 +140,11 @@ impl LensletApp {
                     .bottom_0()
                     .left_0()
                     .right_0()
-                    .h(px(16.0))
+                    .h(px(14.0))
                     .bg(linear_gradient(
                         0.0,
                         linear_color_stop(theme::h(t.panel, 0.0), 0.0),
-                        linear_color_stop(theme::h(t.panel, 0.94), 1.0),
+                        linear_color_stop(theme::h(t.panel, 0.92), 1.0),
                     )),
             )
     }
@@ -247,8 +155,8 @@ impl LensletApp {
             TraceHealth::Missing => (
                 i18n::pick("Run your code through Lenslet", "通过 Lenslet 运行你的程序"),
                 i18n::pick(
-                    "Start AWS Emulator, then run your program, tests or script with the command below. Every AWS call it makes appears here, with the reason when one fails.",
-                    "先启动本地 AWS Emulator，再用下方命令运行程序、测试或脚本。每条 AWS 调用都会实时显示在这里，并在失败时给出原因。",
+                    "Start your local AWS emulator, then run your program, tests, or script with the command below. Every AWS call appears here live.",
+                    "先启动本地 AWS 模拟器，再用下方命令运行程序、测试或脚本。每条 AWS 调用都会实时显示在这里，并在失败或越权时给出根因。",
                 ),
             ),
             TraceHealth::Error(error) => (
@@ -258,8 +166,8 @@ impl LensletApp {
             TraceHealth::Ok => (
                 i18n::pick("No calls captured yet", "尚未捕获到请求"),
                 i18n::pick(
-                    "The run is live, but nothing has called AWS through it. SDKs that honor AWS_ENDPOINT_URL are routed automatically; others need the endpoint set by hand.",
-                    "当前会话已连接，但尚未收到 AWS 调用。支持 AWS_ENDPOINT_URL 的 SDK 会自动路由至此。",
+                    "The session is connected, waiting for AWS SDK traffic routed via AWS_ENDPOINT_URL.",
+                    "当前会话已就绪，正在等待通过 AWS_ENDPOINT_URL 路由的 AWS SDK 调用。",
                 ),
             ),
         };
@@ -275,7 +183,7 @@ impl LensletApp {
             .items_center()
             .gap(px(8.0))
             .h(px(30.0))
-            .px(px(9.0))
+            .px(px(10.0))
             .rounded(px(6.0))
             .border_1()
             .border_color(rgb(t.border))
@@ -324,82 +232,26 @@ impl LensletApp {
                             .child(description.to_string()),
                     )
                     .child(div().h(px(2.0)))
-                    .child(endpoint)
-                    .child(
-                        div()
-                            .font_family(fonts::mono())
-                            .text_size(px(10.0))
-                            .text_color(rgb(t.text_faint))
-                            .child(format!(
-                                "{} {}",
-                                i18n::pick("watching", "监听"),
-                                display_trace_path(self.trace_path.as_deref())
-                            )),
-                    )
-                    .when(self.demo, |this| {
-                        this.child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(rgb(t.amber))
-                                .child("Demo data · LENSLET_DEMO=1"),
-                        )
-                    }),
+                    .child(endpoint),
             )
     }
 
     pub(super) fn render_no_matches(&mut self, cx: &mut Context<Self>) -> Div {
         let t = theme::p();
-        let query = if self.query.is_empty() {
-            None
+        let description = if !self.query.is_empty() {
+            let q = trace::clip_utf8(&self.query, 40);
+            if i18n::is_zh() {
+                format!("没有匹配 \"{q}\" 的请求。")
+            } else {
+                format!("Nothing matches \"{q}\".")
+            }
         } else {
-            Some(format!("\"{}\"", trace::clip_utf8(&self.query, 40)))
+            i18n::pick(
+                "No calls match the active filter combination.",
+                "当前筛选组合下没有匹配的请求。",
+            )
+            .to_string()
         };
-        let mut description =
-            i18n::pick("Try a different search", "请尝试其他搜索关键词").to_string();
-        if let Filter::Access(access) = &self.filter {
-            description = if self.counts.reported_total.is_some() {
-                if i18n::is_zh() {
-                    format!(
-                        "使用 {} 的早期请求已超出最近 {} 条窗口",
-                        access.action, self.counts.total
-                    )
-                } else {
-                    format!(
-                        "Earlier calls that needed {} fell outside the latest {}-call window",
-                        access.action, self.counts.total
-                    )
-                }
-            } else if i18n::is_zh() {
-                format!("当前没有请求使用 {}", access.action)
-            } else {
-                format!("No calls needed {} here", access.action)
-            };
-        } else if let Filter::Service(id) = &self.filter {
-            description = if i18n::is_zh() {
-                format!("当前没有 {id} 的请求")
-            } else {
-                format!("No calls for the {id} filter")
-            };
-        } else if self.filter == Filter::Errors {
-            description = i18n::pick(
-                "No error calls in the current trace",
-                "当前 Trace 中没有错误请求",
-            )
-            .to_string();
-        } else if self.filter == Filter::Blocked {
-            description = i18n::pick(
-                "No blocked calls in the current trace",
-                "当前 Trace 中没有被拦截的请求",
-            )
-            .to_string();
-        }
-        if let Some(query) = query {
-            description = if i18n::is_zh() {
-                format!("没有匹配 {query} 的结果。")
-            } else {
-                format!("Nothing matches {query}.")
-            };
-        }
 
         div()
             .flex_1()
@@ -434,105 +286,6 @@ impl LensletApp {
                 ),
             )
     }
-
-    pub(super) fn render_stream_footer(&self) -> Div {
-        let t = theme::p();
-        let (dot, text) = if self.demo && !self.paused {
-            (
-                theme::h(t.amber, 0.9),
-                i18n::pick("demo data · static", "演示数据 · 静态").to_string(),
-            )
-        } else if self.paused {
-            (
-                theme::h(t.amber, 0.95),
-                if self.buffered.is_empty() {
-                    i18n::pick("paused", "已暂停").to_string()
-                } else if i18n::is_zh() {
-                    format!("已暂停 · 缓存 {}", self.buffered.len())
-                } else {
-                    format!("paused · {} buffered", self.buffered.len())
-                },
-            )
-        } else {
-            match &self.health {
-                TraceHealth::Missing => (
-                    theme::h(t.amber, 0.9),
-                    if i18n::is_zh() {
-                        format!("等待运行记录 {}", display_trace_path(None))
-                    } else {
-                        format!("waiting for a run in {}", display_trace_path(None))
-                    },
-                ),
-                TraceHealth::Error(error) => {
-                    (theme::h(t.red, 0.9), format!("trace error · {error}"))
-                }
-                TraceHealth::Ok => (
-                    self.proxy_light().dot,
-                    match self
-                        .run
-                        .as_ref()
-                        .filter(|run| !run.header.command.is_empty())
-                    {
-                        Some(run) => format!(
-                            "$ {} · {}",
-                            trace::ellipsize(&run.command_line(), 48),
-                            display_trace_path(self.trace_path.as_deref())
-                        ),
-                        None => format!(
-                            "{} {}",
-                            i18n::pick("watching", "监听"),
-                            display_trace_path(self.trace_path.as_deref())
-                        ),
-                    },
-                ),
-            }
-        };
-
-        let mut left = div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .flex_1()
-            .min_w(px(0.0))
-            .child(glyph::dot(dot, 4.5))
-            .child(
-                div()
-                    .font_family(fonts::mono())
-                    .text_size(px(10.0))
-                    .text_color(rgb(t.text_muted))
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(text),
-            );
-        if self.skipped > 0 {
-            left = left.child(
-                div()
-                    .font_family(fonts::mono())
-                    .text_size(px(10.0))
-                    .text_color(rgb(t.amber))
-                    .child(format!(
-                        "· {} {}",
-                        self.skipped,
-                        if self.skipped == 1 {
-                            "bad line"
-                        } else {
-                            "bad lines"
-                        }
-                    )),
-            );
-        }
-
-        div()
-            .flex()
-            .items_center()
-            .gap(px(10.0))
-            .h(px(32.0))
-            .px(px(theme::ROW_PAD_X))
-            .border_t_1()
-            .border_color(rgb(t.border_subtle))
-            .bg(rgb(t.strip))
-            .child(left)
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,29 +296,44 @@ pub(super) fn trace_row(
     op_width: f32,
     run_start_ms: Option<i64>,
     prev_end_ms: Option<i64>,
+    density: Density,
+    time_format: TimeFormat,
     this: WeakEntity<LensletApp>,
 ) -> Stateful<Div> {
     let t = theme::p();
+    let compact_row = density == Density::Compact;
     let service_color = theme::service_color(trace.service_name());
     let idle_gap_ms = match (trace.at_ms(), prev_end_ms) {
         (Some(at), Some(prev_end)) if at - prev_end >= 500 => Some((at - prev_end) as u64),
         _ => None,
     };
-    let time_sub = if let Some(gap) = idle_gap_ms {
-        Some((format!("Δ {}", format_latency(gap)), rgb(t.amber)))
-    } else {
-        match (trace.at_ms(), run_start_ms) {
-            (Some(at), Some(start)) => Some((trace::format_offset(at - start), rgb(t.text_faint))),
-            _ => None,
-        }
+    let rel_str = match (trace.at_ms(), run_start_ms) {
+        (Some(at), Some(start)) => trace::format_offset(at - start),
+        _ => short_clock(&trace.at),
     };
+    let clock_str = short_clock(&trace.at);
+    let (primary_time, secondary_time) = match time_format {
+        TimeFormat::Relative => (
+            rel_str,
+            idle_gap_ms
+                .map(|g| (format!("Δ {}", format_latency(g)), rgb(t.amber)))
+                .or(Some((clock_str, rgb(t.text_faint)))),
+        ),
+        TimeFormat::Clock => (
+            clock_str,
+            idle_gap_ms
+                .map(|g| (format!("Δ {}", format_latency(g)), rgb(t.amber)))
+                .or(Some((rel_str, rgb(t.text_faint)))),
+        ),
+    };
+
     let row = div()
         .id(ElementId::named_usize("trace-row", raw_index))
         .relative()
         .flex()
         .w_full()
         .items_center()
-        .h(px(theme::ROW_H))
+        .h(px(theme::row_height(density)))
         .px(px(theme::ROW_PAD_X))
         .gap(px(theme::COL_GAP))
         .border_b_1()
@@ -586,13 +354,13 @@ pub(super) fn trace_row(
                 .left_0()
                 .top_0()
                 .bottom_0()
-                .w(px(2.0))
+                .w(px(2.5))
                 .bg(if selected {
                     rgb(t.accent)
                 } else if trace.blocked {
                     rgb(t.red)
                 } else {
-                    rgba(0x00000000)
+                    rgba(0x0000_0000)
                 }),
         )
         .child(
@@ -601,16 +369,18 @@ pub(super) fn trace_row(
                 .flex_shrink_0()
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(1.5))
                 .font_family(fonts::mono())
                 .child(
                     div()
-                        .text_size(px(12.0))
-                        .text_color(rgb(t.text_muted))
-                        .child(short_clock(&trace.at)),
+                        .text_size(px(11.5))
+                        .text_color(rgb(t.text_dim))
+                        .child(primary_time),
                 )
-                .when_some(time_sub, |col, (label, color)| {
-                    col.child(div().text_size(px(10.0)).text_color(color).child(label))
+                .when(!compact_row, |col| {
+                    col.when_some(secondary_time, |c, (label, color)| {
+                        c.child(div().text_size(px(9.5)).text_color(color).child(label))
+                    })
                 }),
         )
         .child(
@@ -638,16 +408,16 @@ pub(super) fn trace_row(
                 .flex_shrink_0()
                 .flex()
                 .flex_col()
-                .gap(px(3.0))
+                .gap(px(2.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(7.0))
+                        .gap(px(6.0))
                         .min_w(px(0.0))
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(12.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(t.text))
                                 .whitespace_nowrap()
@@ -661,9 +431,23 @@ pub(super) fn trace_row(
                         })
                         .when(trace.new && !trace.blocked, |title| {
                             title.child(new_pill("NEW ACCESS"))
+                        })
+                        .when(compact_row, |title| {
+                            title.child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .font_family(fonts::mono())
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(t.text_muted))
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .overflow_hidden()
+                                    .child(trace::display_path(trace).to_string()),
+                            )
                         }),
                 )
-                .child(row_detail(trace, op_width)),
+                .when(!compact_row, |col| col.child(row_detail(trace, op_width))),
         )
         .child(
             div()
@@ -683,7 +467,7 @@ pub(super) fn trace_row(
                 .child(
                     div()
                         .font_family(fonts::mono())
-                        .text_size(px(12.0))
+                        .text_size(px(11.5))
                         .text_color(if trace.pending {
                             rgb(t.amber)
                         } else if trace.is_error() {
@@ -704,7 +488,7 @@ pub(super) fn trace_row(
                 .flex_shrink_0()
                 .text_right()
                 .font_family(fonts::mono())
-                .text_size(px(12.0))
+                .text_size(px(11.5))
                 .text_color(if trace.pending {
                     rgb(t.amber)
                 } else {
@@ -732,8 +516,6 @@ pub(super) fn trace_row(
     }
 }
 
-/// The row's second line: the AWS error when the call failed, otherwise the
-/// method and path.
 fn row_detail(trace: &Trace, op_width: f32) -> Div {
     let t = theme::p();
     let line = div().flex().items_center().gap(px(6.0)).min_w(px(0.0));
@@ -744,16 +526,16 @@ fn row_detail(trace: &Trace, op_width: f32) -> Div {
                 div()
                     .flex_shrink_0()
                     .font_family(fonts::mono())
-                    .text_size(px(12.0))
+                    .text_size(px(11.5))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(status_color(trace.status.max(400)))
-                    .child(trace::ellipsize(&problem.code, 40)),
+                    .child(trace::ellipsize(&problem.code, 38)),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
-                    .text_size(px(12.5))
+                    .text_size(px(12.0))
                     .text_color(rgb(t.text_dim))
                     .whitespace_nowrap()
                     .text_ellipsis()
@@ -774,10 +556,10 @@ fn row_detail(trace: &Trace, op_width: f32) -> Div {
     )
     .child(
         div()
-            .w(px((op_width - 32.0).max(24.0)))
+            .w(px((op_width - 34.0).max(24.0)))
             .flex_shrink_0()
             .font_family(fonts::mono())
-            .text_size(px(12.0))
+            .text_size(px(11.5))
             .text_color(rgb(t.text_muted))
             .min_w(px(0.0))
             .whitespace_nowrap()
@@ -787,53 +569,6 @@ fn row_detail(trace: &Trace, op_width: f32) -> Div {
     )
 }
 
-impl LensletApp {
-    /// One segment of the CALLS / ACCESS switch (key: `a`).
-    fn pane_tab(
-        &self,
-        pane: Pane,
-        label: &'static str,
-        badge: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let t = theme::p();
-        let active = self.pane == pane;
-        let id = match pane {
-            Pane::Calls => "pane-calls",
-            Pane::Access => "pane-access",
-        };
-        let mut tab = div()
-            .id(id)
-            .flex()
-            .items_center()
-            .gap(px(5.0))
-            .h(px(22.0))
-            .px(px(8.0))
-            .rounded(px(5.0))
-            .bg(if active {
-                theme::h(t.text, 0.07)
-            } else {
-                theme::h(0x000000, 0.0)
-            })
-            .text_size(px(10.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(if active {
-                rgb(t.text)
-            } else {
-                rgb(t.text_muted)
-            })
-            .cursor_pointer()
-            .hover(move |style| style.text_color(rgb(t.text_soft)))
-            .on_click(cx.listener(move |this, _, _, cx| this.set_pane(pane, cx)))
-            .child(label);
-        if let Some(badge) = badge {
-            tab = tab.child(new_pill(badge));
-        }
-        tab
-    }
-}
-
-/// The small amber marker for access outside the lock file.
 pub(super) fn new_pill(text: impl Into<SharedString>) -> Div {
     let t = theme::p();
     div()
@@ -844,7 +579,7 @@ pub(super) fn new_pill(text: impl Into<SharedString>) -> Div {
         .rounded(px(3.0))
         .border_1()
         .border_color(theme::line(t.amber, 0.4))
-        .bg(theme::h(t.amber, 0.1))
+        .bg(theme::h(t.amber, 0.10))
         .font_family(fonts::mono())
         .text_size(px(9.0))
         .font_weight(FontWeight::SEMIBOLD)

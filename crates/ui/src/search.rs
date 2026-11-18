@@ -25,6 +25,7 @@ pub struct SearchInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    access_mode: bool,
 }
 
 impl SearchInput {
@@ -39,6 +40,14 @@ impl SearchInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            access_mode: false,
+        }
+    }
+
+    pub fn set_access_mode(&mut self, access_mode: bool, cx: &mut Context<Self>) {
+        if self.access_mode != access_mode {
+            self.access_mode = access_mode;
+            cx.notify();
         }
     }
 
@@ -663,12 +672,22 @@ impl Render for SearchInput {
         let focused = self.focus.is_focused(window);
         let compact = window.viewport_size().width < px(1_180.0);
         let has_query = !self.content.is_empty();
-        let placeholder: SharedString = if compact {
+        let placeholder: SharedString = if self.access_mode {
+            if compact {
+                i18n::pick("Filter Action, ARN…", "筛选 Action、ARN…").into()
+            } else {
+                i18n::pick(
+                    "Filter IAM Action, Resource ARN, caller…",
+                    "筛选 IAM Action、Resource ARN 或调用方…",
+                )
+                .into()
+            }
+        } else if compact {
             i18n::pick("Search calls, paths…", "搜索请求、Path…").into()
         } else {
             i18n::pick(
-                "Search calls, operations, paths…",
-                "搜索请求、Operation、Path…",
+                "Search calls, Operation, Path, Body…",
+                "搜索请求、Operation、Path、Body…",
             )
             .into()
         };
@@ -711,7 +730,7 @@ impl Render for SearchInput {
 
         div()
             .w_full()
-            .h(px(30.0))
+            .h(px(27.0))
             .flex()
             .items_center()
             .gap(px(7.0))
@@ -728,7 +747,7 @@ impl Render for SearchInput {
             } else {
                 rgb(t.input)
             })
-            .text_size(px(13.0))
+            .text_size(px(12.0))
             .line_height(px(16.0))
             .font_family(fonts::sans())
             .text_color(rgb(t.text_soft))

@@ -74,6 +74,52 @@ pub fn list(dir: &Path) -> Vec<PathBuf> {
     runs
 }
 
+/// Resolve a run specifier (path, `latest`/`prev` alias, exact run ID, or unique ID prefix) against `dir`.
+pub fn resolve(dir: &Path, spec: &str) -> Result<PathBuf> {
+    let candidate = Path::new(spec);
+    if candidate.is_file() {
+        return Ok(candidate.to_path_buf());
+    }
+    let all = list(dir);
+    if spec.eq_ignore_ascii_case("latest") {
+        if let Some(finished_latest) = all.iter().rev().find(|p| report(p).is_some()) {
+            return Ok(finished_latest.clone());
+        }
+        if let Some(any_latest) = all.last() {
+            return Ok(any_latest.clone());
+        }
+        anyhow::bail!("no runs yet; try `lenslet run -- <command>`");
+    }
+    if spec.eq_ignore_ascii_case("prev") || spec.eq_ignore_ascii_case("previous") {
+        let finished: Vec<&PathBuf> = all.iter().filter(|p| report(p).is_some()).collect();
+        if finished.len() < 2 {
+            anyhow::bail!("need at least 2 finished runs for `{spec}`; try `lenslet runs`");
+        }
+        return Ok(finished[finished.len() - 2].clone());
+    }
+    if let Some(exact) = all.iter().find(|p| run_id(p) == spec) {
+        return Ok(exact.clone());
+    }
+    let matches: Vec<PathBuf> = all
+        .into_iter()
+        .filter(|p| {
+            let id = run_id(p);
+            id.starts_with(spec) || id.contains(spec)
+        })
+        .collect();
+    match matches.as_slice() {
+        [single] => Ok(single.clone()),
+        [] => anyhow::bail!("no run matching `{spec}`; try `lenslet runs`"),
+        many => {
+            let names: Vec<String> = many.iter().rev().take(5).map(|p| run_id(p)).collect();
+            anyhow::bail!(
+                "ambiguous run `{spec}` (matches {}); specify more characters",
+                names.join(", ")
+            )
+        }
+    }
+}
+
 fn prune(dir: &Path, keep: usize) {
     let runs = list(dir);
     let excess = runs.len().saturating_sub(keep);

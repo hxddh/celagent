@@ -698,6 +698,191 @@ fn one_line(text: &str, max: usize) -> String {
     }
 }
 
+/// Structured comparison between two finished runs (`lenslet diff`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunDiff {
+    pub base_run: String,
+    pub target_run: String,
+    pub base_command: Vec<String>,
+    pub target_command: Vec<String>,
+    pub base_exit_code: Option<i32>,
+    pub target_exit_code: Option<i32>,
+    pub base_calls: usize,
+    pub target_calls: usize,
+    pub base_errors: usize,
+    pub target_errors: usize,
+    pub base_blocked: usize,
+    pub target_blocked: usize,
+    pub base_duration_ms: u64,
+    pub target_duration_ms: u64,
+    pub new_failures: Vec<FailureKind>,
+    pub fixed_failures: Vec<FailureKind>,
+    pub access_added: Vec<Access>,
+    pub access_removed: Vec<Access>,
+    pub service_deltas: BTreeMap<String, isize>,
+}
+
+impl RunDiff {
+    pub fn compute(base: &Report, target: &Report) -> Self {
+        let base_f = base.failure_kinds();
+        let target_f = target.failure_kinds();
+        let base_a = base.access_set();
+        let target_a = target.access_set();
+
+        let mut services: BTreeSet<&String> = base.services.keys().collect();
+        services.extend(target.services.keys());
+        let mut service_deltas = BTreeMap::new();
+        for svc in services {
+            let b = base.services.get(svc).copied().unwrap_or(0) as isize;
+            let t = target.services.get(svc).copied().unwrap_or(0) as isize;
+            if t - b != 0 {
+                service_deltas.insert(svc.clone(), t - b);
+            }
+        }
+
+        RunDiff {
+            base_run: base.run.clone(),
+            target_run: target.run.clone(),
+            base_command: base.command.clone(),
+            target_command: target.command.clone(),
+            base_exit_code: base.exit_code,
+            target_exit_code: target.exit_code,
+            base_calls: base.calls,
+            target_calls: target.calls,
+            base_errors: base.errors,
+            target_errors: target.errors,
+            base_blocked: base.blocked,
+            target_blocked: target.blocked,
+            base_duration_ms: base.duration_ms,
+            target_duration_ms: target.duration_ms,
+            new_failures: target_f.difference(&base_f).cloned().collect(),
+            fixed_failures: base_f.difference(&target_f).cloned().collect(),
+            access_added: target_a.difference(&base_a).cloned().collect(),
+            access_removed: base_a.difference(&target_a).cloned().collect(),
+            service_deltas,
+        }
+    }
+
+    pub fn is_identical(&self) -> bool {
+        self.new_failures.is_empty()
+            && self.fixed_failures.is_empty()
+            && self.access_added.is_empty()
+            && self.access_removed.is_empty()
+            && self.base_calls == self.target_calls
+            && self.base_errors == self.target_errors
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        let call_delta = self.target_calls as isize - self.base_calls as isize;
+        let dur_delta = self.target_duration_ms as i64 - self.base_duration_ms as i64;
+        out.push_str(&format!(
+            "lenslet diff: {} → {}\n",
+            self.base_run, self.target_run
+        ));
+        out.push_str(&format!(
+            "  calls: {} → {} ({:+}) · errors: {} → {} · duration: {} → {} ({:+} ms)\n",
+            self.base_calls,
+            self.target_calls,
+            call_delta,
+            self.base_errors,
+            self.target_errors,
+            seconds(self.base_duration_ms),
+            seconds(self.target_duration_ms),
+            dur_delta,
+        ));
+        if !self.new_failures.is_empty() {
+            out.push_str(&format!("  new failures ({}):\n", self.new_failures.len()));
+            for f in &self.new_failures {
+                out.push_str(&format!(
+                    "    ✗ {} {}  {}\n",
+                    f.service.to_ascii_uppercase(),
+                    f.operation,
+                    f.code
+                ));
+            }
+        }
+        if !self.fixed_failures.is_empty() {
+            out.push_str(&format!("  fixed ({}):\n", self.fixed_failures.len()));
+            for f in &self.fixed_failures {
+                out.push_str(&format!(
+                    "    ✓ {} {}  {}\n",
+                    f.service.to_ascii_uppercase(),
+                    f.operation,
+                    f.code
+                ));
+            }
+        }
+        if !self.access_added.is_empty() {
+            out.push_str(&format!("  access added ({}):\n", self.access_added.len()));
+            for a in &self.access_added {
+                out.push_str(&format!("    + {:<32} {}\n", a.action, a.resource));
+            }
+        }
+        if !self.access_removed.is_empty() {
+            out.push_str(&format!(
+                "  access not exercised ({}):\n",
+                self.access_removed.len()
+            ));
+            for a in &self.access_removed {
+                out.push_str(&format!("    - {:<32} {}\n", a.action, a.resource));
+            }
+        }
+        if self.is_identical() {
+            out.push_str("  no changes in calls, failures, or IAM access.\n");
+        }
+        out
+    }
+
+    pub fn markdown(&self) -> String {
+        let mut out = format!(
+            "### Lenslet Diff: `{}` → `{}`\n\n",
+            self.base_run, self.target_run
+        );
+        out.push_str(&format!(
+            "- **Calls**: {} → {} ({:+})\n- **Errors**: {} → {}\n- **Duration**: {} → {}\n\n",
+            self.base_calls,
+            self.target_calls,
+            self.target_calls as isize - self.base_calls as isize,
+            self.base_errors,
+            self.target_errors,
+            seconds(self.base_duration_ms),
+            seconds(self.target_duration_ms),
+        ));
+        if !self.new_failures.is_empty() {
+            out.push_str("**New Failures**\n\n| Service | Operation | Error |\n|---|---|---|\n");
+            for f in &self.new_failures {
+                out.push_str(&format!(
+                    "| `{}` | `{}` | `{}` |\n",
+                    f.service, f.operation, f.code
+                ));
+            }
+            out.push('\n');
+        }
+        if !self.fixed_failures.is_empty() {
+            out.push_str("**Fixed**\n\n| Service | Operation | Error |\n|---|---|---|\n");
+            for f in &self.fixed_failures {
+                out.push_str(&format!(
+                    "| `{}` | `{}` | `{}` |\n",
+                    f.service, f.operation, f.code
+                ));
+            }
+            out.push('\n');
+        }
+        if !self.access_added.is_empty() || !self.access_removed.is_empty() {
+            out.push_str("**IAM Access Changes**\n\n| | Action | Resource |\n|---|---|---|\n");
+            for a in &self.access_added {
+                out.push_str(&format!("| + | `{}` | `{}` |\n", a.action, a.resource));
+            }
+            for a in &self.access_removed {
+                out.push_str(&format!("| − | `{}` | `{}` |\n", a.action, a.resource));
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

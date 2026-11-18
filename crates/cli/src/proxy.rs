@@ -829,10 +829,11 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 
 /// Return the first derived permission on `trace` that `gate` does not allow.
 fn first_denied(trace: &Trace, gate: &Gate) -> Option<Access> {
+    let req_ctx = crate::lock::RequestContext::from_trace(trace);
     let (own, implied) = access::derive_for_gate(trace, gate.is_policy());
     own.into_iter()
         .chain(implied)
-        .find(|entry| !gate.allows(entry))
+        .find(|entry| !gate.allows_in_context(entry, Some(&req_ctx)))
 }
 
 /// Record a blocked call in the trace and return a protocol-accurate AWS

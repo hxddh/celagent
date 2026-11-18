@@ -477,6 +477,33 @@ impl Body {
         out
     }
 
+    /// Every EventBridge target bus named in `Entries[].EventBusName` (defaulting
+    /// omitted entry buses to `"default"`, matching EventBridge `PutEvents` semantics).
+    fn event_buses(&self) -> Vec<String> {
+        let Body::Json(value) = self else {
+            return Vec::new();
+        };
+        let Some(entries) = value.get("Entries").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = entries
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|entry| {
+                entry
+                    .get("EventBusName")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("default")
+                    .to_string()
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Every DynamoDB table named anywhere in the body (batch and transact
     /// calls name several).
     fn tables(&self) -> Vec<String> {
@@ -774,12 +801,24 @@ fn resources(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Bo
                 .collect();
         }
     }
+    if prefix == "events" && operation == "PutEvents" {
+        let buses = body.event_buses();
+        if !buses.is_empty() {
+            return buses
+                .into_iter()
+                .map(|bus| event_bus_arn(mode, trace, &bus))
+                .collect();
+        }
+    }
     if prefix != "dynamodb" {
         return vec![resource(mode, prefix, operation, trace, body)];
     }
     let tables = body.tables();
     match tables.as_slice() {
-        [] => vec!["*".to_string()],
+        [] => match body.field("StreamArn") {
+            Some(stream) => vec![dynamodb_stream_arn(mode, trace, &stream)],
+            None => vec!["*".to_string()],
+        },
         [one] => vec![match body.field("IndexName") {
             Some(index) => arn_for(
                 mode,
@@ -956,36 +995,96 @@ fn resource(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Bod
             .unwrap_or_else(|| "*".to_string()),
         "events" => body
             .field("EventBusName")
-            .map(|bus| {
-                if mode == Mode::Concrete && bus.starts_with("arn:") {
-                    bus
-                } else {
-                    arn_for(
-                        mode,
-                        trace,
-                        "events",
-                        &format!("event-bus/{}", norm(mode, last_segment(&bus))),
-                    )
-                }
+            .or_else(|| {
+                (operation == "CreateEventBus")
+                    .then(|| body.field("Name"))
+                    .flatten()
             })
+            .map(|bus| event_bus_arn(mode, trace, &bus))
             .unwrap_or_else(|| "*".to_string()),
         "states" => body
-            .field("stateMachineArn")
-            .map(|machine| {
-                if mode == Mode::Concrete && machine.starts_with("arn:") {
-                    machine
-                } else {
-                    arn_for(
-                        mode,
-                        trace,
-                        "states",
-                        &format!("stateMachine:{}", norm(mode, last_segment(&machine))),
-                    )
-                }
+            .field("executionArn")
+            .map(|exec| states_execution_arn(mode, trace, &exec))
+            .or_else(|| {
+                body.field("stateMachineArn").map(|machine| {
+                    if mode == Mode::Concrete && machine.starts_with("arn:") {
+                        machine
+                    } else {
+                        arn_for(
+                            mode,
+                            trace,
+                            "states",
+                            &format!("stateMachine:{}", norm(mode, last_segment(&machine))),
+                        )
+                    }
+                })
+            })
+            .or_else(|| {
+                (operation == "CreateStateMachine")
+                    .then(|| body.field("name"))
+                    .flatten()
+                    .map(|name| {
+                        arn_for(
+                            mode,
+                            trace,
+                            "states",
+                            &format!("stateMachine:{}", norm(mode, &name)),
+                        )
+                    })
             })
             .unwrap_or_else(|| "*".to_string()),
         _ => "*".to_string(),
     }
+}
+
+fn event_bus_arn(mode: Mode, trace: &Trace, bus: &str) -> String {
+    if mode == Mode::Concrete && bus.starts_with("arn:") {
+        bus.to_string()
+    } else {
+        arn_for(
+            mode,
+            trace,
+            "events",
+            &format!("event-bus/{}", norm(mode, last_segment(bus))),
+        )
+    }
+}
+
+fn states_execution_arn(mode: Mode, trace: &Trace, exec: &str) -> String {
+    if mode == Mode::Concrete && exec.starts_with("arn:") {
+        return exec.to_string();
+    }
+    if let Some((_, rest)) = exec.split_once(":execution:") {
+        let machine = rest.split(':').next().unwrap_or(rest);
+        return arn_for(
+            mode,
+            trace,
+            "states",
+            &format!("execution:{}:*", norm(mode, machine)),
+        );
+    }
+    arn_for(
+        mode,
+        trace,
+        "states",
+        &format!("execution:{}:*", norm(mode, last_segment(exec))),
+    )
+}
+
+fn dynamodb_stream_arn(mode: Mode, trace: &Trace, stream: &str) -> String {
+    if mode == Mode::Concrete && stream.starts_with("arn:") {
+        return stream.to_string();
+    }
+    if let Some((_, rest)) = stream.split_once(":table/") {
+        let table = rest.split('/').next().unwrap_or(rest);
+        return arn_for(
+            mode,
+            trace,
+            "dynamodb",
+            &format!("table/{}/stream/*", norm(mode, table)),
+        );
+    }
+    "*".to_string()
 }
 
 /// Preserve hierarchical secret names (`db/password`) whether given by name or
@@ -2153,6 +2252,58 @@ mod tests {
                 crate::lock::UNVERIFIED_RESOURCE
             )),
             "truncated body-dependent call emits fail-closed sentinel"
+        );
+
+        // EventBridge PutEvents extracts every target bus under Entries[], defaulting omitted entries to `default`.
+        let put_events = call(
+            "events",
+            "PutEvents",
+            "POST",
+            "/",
+            Some(
+                r#"{"Entries":[{"Source":"app","DetailType":"OrderCreated"},{"EventBusName":"audit-bus","Source":"app"}]}"#,
+            ),
+        );
+        assert_eq!(
+            derive(&put_events).0,
+            vec![
+                Access::new("events:PutEvents", "arn:aws:events:*:*:event-bus/audit-bus"),
+                Access::new("events:PutEvents", "arn:aws:events:*:*:event-bus/default"),
+            ]
+        );
+
+        // Step Functions execution-scoped calls and DynamoDB Streams ARNs map cleanly.
+        let desc_exec = call(
+            "states",
+            "DescribeExecution",
+            "POST",
+            "/",
+            Some(
+                r#"{"executionArn":"arn:aws:states:us-east-1:123456789012:execution:checkout-flow:run-12345678"}"#,
+            ),
+        );
+        assert_eq!(
+            derive(&desc_exec).0,
+            vec![Access::new(
+                "states:DescribeExecution",
+                "arn:aws:states:*:*:execution:checkout-flow:*"
+            )]
+        );
+        let stream_call = call(
+            "streams.dynamodb",
+            "DescribeStream",
+            "POST",
+            "/",
+            Some(
+                r#"{"StreamArn":"arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2026-11-18T00:00:00.000"}"#,
+            ),
+        );
+        assert_eq!(
+            derive(&stream_call).0,
+            vec![Access::new(
+                "dynamodb:DescribeStream",
+                "arn:aws:dynamodb:*:*:table/orders/stream/*"
+            )]
         );
     }
 }

@@ -54,6 +54,10 @@ Usage:
       .github/workflows/lenslet.yml so pull requests show their AWS access.
   lenslet last [--json]
       The report of the newest run.
+  lenslet runs [--json] [--limit N]
+      List recorded runs in ~/.lenslet/runs (newest first).
+  lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]
+      Compare two runs (defaults to the previous finished run vs the latest).
   lenslet policy [--lock PATH]
       An IAM policy document granting exactly what lenslet.lock lists.
   lenslet ui
@@ -112,6 +116,8 @@ fn main() -> ExitCode {
         "run" => runtime().and_then(|runtime| runtime.block_on(run(args))),
         "init" => runtime().and_then(|runtime| runtime.block_on(init(args))),
         "last" => last(args),
+        "runs" => runs_cmd(args),
+        "diff" => diff_cmd(args),
         "policy" => policy(args),
         "ui" => open_ui(None).map(|()| 0),
         "-V" | "--version" | "version" => {
@@ -748,6 +754,155 @@ fn policy(args: Vec<String>) -> Result<i32> {
         locked.access.len() - locked.test.len(),
         locked.test.len()
     );
+    Ok(0)
+}
+
+#[derive(serde::Serialize)]
+struct RunListEntry {
+    run: String,
+    started: String,
+    command: Vec<String>,
+    running: bool,
+    exit_code: Option<i32>,
+    calls: Option<usize>,
+    errors: Option<usize>,
+    blocked: Option<usize>,
+    duration_ms: Option<u64>,
+    trace: String,
+}
+
+/// `lenslet runs [--json] [--limit N]`: list recorded runs newest-first.
+fn runs_cmd(args: Vec<String>) -> Result<i32> {
+    let mut json = false;
+    let mut limit: usize = 20;
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--limit" => {
+                let raw = it.next().context("--limit requires a number")?;
+                limit = raw
+                    .parse::<usize>()
+                    .with_context(|| format!("--limit expects a positive integer, got `{raw}`"))?;
+            }
+            _ => bail!("usage: lenslet runs [--json] [--limit N]"),
+        }
+    }
+    let home = home();
+    let all = runs::list(&runs::dir(&home));
+    if all.is_empty() {
+        if json {
+            println!("[]");
+            return Ok(0);
+        }
+        bail!("no runs yet; try `lenslet run -- <command>`");
+    }
+    let mut entries = Vec::new();
+    for path in all.into_iter().rev().take(limit) {
+        let id = runs::run_id(&path);
+        let hdr = runs::header(&path);
+        let rep = runs::report(&path);
+        let running = rep.is_none() && runs::is_active(&path);
+        entries.push(RunListEntry {
+            run: id,
+            started: hdr.as_ref().map(|h| h.started.clone()).unwrap_or_default(),
+            command: hdr.map(|h| h.command).unwrap_or_default(),
+            running,
+            exit_code: rep.as_ref().and_then(|r| r.exit_code),
+            calls: rep.as_ref().map(|r| r.calls),
+            errors: rep.as_ref().map(|r| r.errors),
+            blocked: rep.as_ref().map(|r| r.blocked),
+            duration_ms: rep.as_ref().map(|r| r.duration_ms),
+            trace: tilde(&path, &home),
+        });
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(0);
+    }
+    for e in &entries {
+        let status = if e.running {
+            "running".to_string()
+        } else {
+            match e.exit_code {
+                Some(code) => format!("exit {code}"),
+                None => "stopped".to_string(),
+            }
+        };
+        let stats = match (e.calls, e.errors, e.duration_ms) {
+            (Some(c), Some(err), Some(ms)) => format!("{c} calls · {err} errors · {ms} ms"),
+            _ => "in progress".to_string(),
+        };
+        let cmd = if e.command.is_empty() {
+            "(proxy)".to_string()
+        } else {
+            format!("$ {}", e.command.join(" "))
+        };
+        println!("{:<24}  {:<9}  {:<32}  {}", e.run, status, stats, cmd);
+    }
+    Ok(0)
+}
+
+/// `lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]`: compare two runs.
+fn diff_cmd(args: Vec<String>) -> Result<i32> {
+    let mut json = false;
+    let mut markdown: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--markdown" => markdown = Some(it.next().context("--markdown requires a path")?),
+            flag if flag.starts_with('-') => {
+                bail!("usage: lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]")
+            }
+            other => positional.push(other.to_string()),
+        }
+    }
+    if positional.len() > 2 {
+        bail!("usage: lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]");
+    }
+    let home = home();
+    let dir = runs::dir(&home);
+    let (base_path, target_path) = match positional.as_slice() {
+        [base, target] => (runs::resolve(&dir, base)?, runs::resolve(&dir, target)?),
+        [base] => {
+            let latest = runs::list(&dir)
+                .into_iter()
+                .rev()
+                .find(|p| runs::report(p).is_some())
+                .context("no finished runs yet")?;
+            (runs::resolve(&dir, base)?, latest)
+        }
+        [] => {
+            let finished: Vec<PathBuf> = runs::list(&dir)
+                .into_iter()
+                .filter(|p| runs::report(p).is_some())
+                .collect();
+            if finished.len() < 2 {
+                bail!("need at least 2 finished runs to diff; try `lenslet runs`");
+            }
+            (
+                finished[finished.len() - 2].clone(),
+                finished[finished.len() - 1].clone(),
+            )
+        }
+        _ => unreachable!(),
+    };
+    let base_report = runs::report(&base_path)
+        .with_context(|| format!("run {} has not finished yet", runs::run_id(&base_path)))?;
+    let target_report = runs::report(&target_path)
+        .with_context(|| format!("run {} has not finished yet", runs::run_id(&target_path)))?;
+
+    let diff = summary::RunDiff::compute(&base_report, &target_report);
+    if let Some(md_path) = markdown.as_deref() {
+        write_text(&diff.markdown(), md_path)?;
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+    } else {
+        print!("{}", diff.render());
+    }
     Ok(0)
 }
 

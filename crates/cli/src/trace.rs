@@ -294,14 +294,15 @@ impl TraceSink {
                         trace.implied.iter().map(CallAccess::key).collect(),
                     )
                 };
+                let req_ctx = crate::lock::RequestContext::from_trace(source);
                 let (c_own, c_implied) = access::derive_for_gate(source, true);
                 let own_denied: Vec<Access> = c_own
                     .into_iter()
-                    .filter(|entry| !gate.allows(entry))
+                    .filter(|entry| !gate.allows_in_context(entry, Some(&req_ctx)))
                     .collect();
                 let imp_denied: Vec<Access> = c_implied
                     .into_iter()
-                    .filter(|entry| !gate.allows(entry))
+                    .filter(|entry| !gate.allows_in_context(entry, Some(&req_ctx)))
                     .collect();
                 let matches_denied = |fp: &Access, denied: &[Access]| -> bool {
                     denied.iter().any(|d| {

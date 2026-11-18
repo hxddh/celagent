@@ -144,6 +144,151 @@ struct Statement {
     not_actions: Vec<String>,
     resources: Vec<String>,
     not_resources: Vec<String>,
+    conditions: Vec<ConditionClause>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetQuantifier {
+    Single,
+    ForAnyValue,
+    ForAllValues,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaseOp {
+    StringEquals,
+    StringNotEquals,
+    StringEqualsIgnoreCase,
+    StringNotEqualsIgnoreCase,
+    StringLike,
+    StringNotLike,
+    ArnEquals,
+    ArnNotEquals,
+    ArnLike,
+    ArnNotLike,
+    NumericEquals,
+    NumericNotEquals,
+    NumericLessThan,
+    NumericLessThanEquals,
+    NumericGreaterThan,
+    NumericGreaterThanEquals,
+    Bool,
+    Null,
+}
+
+impl BaseOp {
+    fn is_negated(self) -> bool {
+        matches!(
+            self,
+            BaseOp::StringNotEquals
+                | BaseOp::StringNotEqualsIgnoreCase
+                | BaseOp::StringNotLike
+                | BaseOp::ArnNotEquals
+                | BaseOp::ArnNotLike
+                | BaseOp::NumericNotEquals
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConditionClause {
+    quantifier: SetQuantifier,
+    op: BaseOp,
+    if_exists: bool,
+    key: String,
+    values: Vec<String>,
+}
+
+/// Request-level IAM context keys unambiguously observable on the local wire.
+#[derive(Clone, Debug, Default)]
+pub struct RequestContext {
+    values: BTreeMap<String, Vec<String>>,
+}
+
+const SUPPORTED_CONDITION_KEYS: &[&str] = &[
+    "aws:requestedregion",
+    "s3:prefix",
+    "s3:delimiter",
+    "s3:max-keys",
+    "s3:versionid",
+    "s3:x-amz-acl",
+    "s3:x-amz-copy-source",
+    "s3:x-amz-metadata-directive",
+    "s3:x-amz-server-side-encryption",
+    "s3:x-amz-server-side-encryption-aws-kms-key-id",
+    "s3:x-amz-storage-class",
+    "s3:x-amz-tagging-directive",
+];
+
+impl RequestContext {
+    pub fn from_trace(trace: &crate::trace::Trace) -> Self {
+        let mut values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if let Some(region) = trace.region.as_deref().filter(|r| !r.is_empty()) {
+            values.insert("aws:requestedregion".into(), vec![region.to_string()]);
+        }
+
+        if trace.service == "s3" {
+            let list_bucket = matches!(
+                trace.operation.as_str(),
+                "ListObjects" | "ListObjectsV2" | "ListObjectVersions" | "ListMultipartUploads"
+            );
+            match crate::wire::query_param(&trace.path, "prefix") {
+                Some(prefix) => {
+                    values.insert("s3:prefix".into(), vec![prefix]);
+                }
+                None if list_bucket => {
+                    // S3 populates `s3:prefix` with `""` on ListBucket calls when omitted.
+                    values.insert("s3:prefix".into(), vec![String::new()]);
+                }
+                None => {}
+            }
+            match crate::wire::query_param(&trace.path, "delimiter") {
+                Some(delim) => {
+                    values.insert("s3:delimiter".into(), vec![delim]);
+                }
+                None if list_bucket => {
+                    values.insert("s3:delimiter".into(), vec![String::new()]);
+                }
+                None => {}
+            }
+            if let Some(max_keys) = crate::wire::query_param(&trace.path, "max-keys") {
+                values.insert("s3:max-keys".into(), vec![max_keys]);
+            }
+            if let Some(vid) = crate::wire::query_param(&trace.path, "versionId") {
+                values.insert("s3:versionid".into(), vec![vid]);
+            }
+            for header in &trace.request.headers {
+                let low = header.name.to_ascii_lowercase();
+                if matches!(
+                    low.as_str(),
+                    "x-amz-acl"
+                        | "x-amz-copy-source"
+                        | "x-amz-metadata-directive"
+                        | "x-amz-server-side-encryption"
+                        | "x-amz-server-side-encryption-aws-kms-key-id"
+                        | "x-amz-storage-class"
+                        | "x-amz-tagging-directive"
+                ) {
+                    let trimmed = header.value.trim();
+                    let val = if low == "x-amz-copy-source" {
+                        let raw_path = trimmed.split('?').next().unwrap_or(trimmed);
+                        crate::wire::percent_decode_path(raw_path)
+                    } else {
+                        trimmed.to_string()
+                    };
+                    values.entry(format!("s3:{low}")).or_default().push(val);
+                }
+            }
+        }
+
+        RequestContext { values }
+    }
+
+    pub fn get(&self, key: &str) -> &[String] {
+        self.values
+            .get(&key.to_ascii_lowercase())
+            .map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Sentinel resource emitted when a request body needed for permission
@@ -181,14 +326,10 @@ impl Gate {
             let Some(obj) = item.as_object() else {
                 anyhow::bail!("each IAM Statement must be a JSON object");
             };
-            if obj
-                .get("Condition")
-                .is_some_and(|c| !c.is_null() && c.as_object().is_none_or(|m| !m.is_empty()))
-            {
-                anyhow::bail!(
-                    "IAM Statement contains `Condition`, which Lenslet cannot evaluate locally; remove `Condition` or use `lenslet.lock`"
-                );
-            }
+            let conditions = match obj.get("Condition") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(cond_val) => parse_conditions(cond_val)?,
+            };
             if obj.get("NotPrincipal").is_some()
                 || obj
                     .get("Principal")
@@ -206,20 +347,34 @@ impl Gate {
             } else {
                 anyhow::bail!("IAM Statement Effect must be `Allow` or `Deny`, got `{effect}`");
             };
-            let list = |key: &str| -> Vec<String> {
+            let list = |key: &str| -> Result<Vec<String>> {
                 match obj.get(key) {
-                    Some(serde_json::Value::String(s)) => vec![s.clone()],
+                    None => Ok(Vec::new()),
+                    Some(serde_json::Value::String(s)) => Ok(vec![s.clone()]),
                     Some(serde_json::Value::Array(arr)) => arr
                         .iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .map(|v| {
+                            v.as_str().map(str::to_string).ok_or_else(|| {
+                                anyhow::anyhow!("IAM Statement `{key}` entries must be strings")
+                            })
+                        })
                         .collect(),
-                    _ => Vec::new(),
+                    _ => {
+                        anyhow::bail!("IAM Statement `{key}` must be a string or array of strings")
+                    }
                 }
             };
-            let actions = list("Action");
-            let not_actions = list("NotAction");
-            let resources = list("Resource");
-            let not_resources = list("NotResource");
+            let actions = list("Action")?;
+            let not_actions = list("NotAction")?;
+            let resources = list("Resource")?;
+            let not_resources = list("NotResource")?;
+            for res in resources.iter().chain(not_resources.iter()) {
+                if res.contains("${") {
+                    anyhow::bail!(
+                        "IAM policy variables (`${{...}}`) in Resource `{res}` cannot be evaluated locally"
+                    );
+                }
+            }
             if actions.is_empty() && not_actions.is_empty() {
                 anyhow::bail!("IAM Statement must specify `Action` or `NotAction`");
             }
@@ -232,6 +387,7 @@ impl Gate {
                 not_actions,
                 resources,
                 not_resources,
+                conditions,
             });
         }
         Ok(Gate {
@@ -247,8 +403,13 @@ impl Gate {
         }
     }
 
-    /// Whether `access` is permitted by this lock or IAM policy.
+    /// Whether `access` is permitted by this lock or IAM policy without request context.
     pub fn allows(&self, access: &Access) -> bool {
+        self.allows_in_context(access, None)
+    }
+
+    /// Whether `access` is permitted under optional wire `ctx`.
+    pub fn allows_in_context(&self, access: &Access, ctx: Option<&RequestContext>) -> bool {
         if access.resource == UNVERIFIED_RESOURCE {
             return false;
         }
@@ -263,7 +424,7 @@ impl Gate {
             GateKind::Policy(statements) => {
                 let mut allowed = false;
                 for stmt in statements {
-                    if !stmt.matches(access) {
+                    if !stmt.matches(access, ctx) {
                         continue;
                     }
                     if !stmt.allow {
@@ -278,7 +439,7 @@ impl Gate {
 }
 
 impl Statement {
-    fn matches(&self, access: &Access) -> bool {
+    fn matches(&self, access: &Access, ctx: Option<&RequestContext>) -> bool {
         let action_ok = if !self.actions.is_empty() {
             self.actions
                 .iter()
@@ -294,7 +455,7 @@ impl Statement {
         if !action_ok {
             return false;
         }
-        if !self.resources.is_empty() {
+        let resource_ok = if !self.resources.is_empty() {
             self.resources
                 .iter()
                 .any(|p| iam_arn_matches(p, &access.resource))
@@ -305,7 +466,226 @@ impl Statement {
                 .any(|p| iam_arn_matches(p, &access.resource))
         } else {
             false
+        };
+        if !resource_ok {
+            return false;
         }
+        if self.conditions.is_empty() {
+            return true;
+        }
+        let Some(ctx) = ctx else {
+            // Fail closed when no request context is supplied: conditional Allow
+            // does not grant, conditional Deny still triggers.
+            return !self.allow;
+        };
+        self.conditions.iter().all(|clause| clause.evaluate(ctx))
+    }
+}
+
+fn parse_conditions(value: &serde_json::Value) -> Result<Vec<ConditionClause>> {
+    let Some(ops_map) = value.as_object() else {
+        anyhow::bail!("IAM Statement `Condition` must be a JSON object");
+    };
+    let mut clauses = Vec::new();
+    for (raw_op, keys_val) in ops_map {
+        let (quantifier, op, if_exists) = parse_condition_operator(raw_op)?;
+        let Some(keys_map) = keys_val.as_object() else {
+            anyhow::bail!("IAM Condition operator `{raw_op}` must map to a JSON object of keys");
+        };
+        for (raw_key, expected_val) in keys_map {
+            let key = raw_key.trim().to_ascii_lowercase();
+            if !SUPPORTED_CONDITION_KEYS.contains(&key.as_str()) {
+                anyhow::bail!(
+                    "IAM Condition key `{raw_key}` cannot be evaluated locally; supported wire keys: {}",
+                    SUPPORTED_CONDITION_KEYS.join(", ")
+                );
+            }
+            let values = parse_condition_values(raw_op, raw_key, op, expected_val)?;
+            clauses.push(ConditionClause {
+                quantifier,
+                op,
+                if_exists,
+                key,
+                values,
+            });
+        }
+    }
+    Ok(clauses)
+}
+
+fn parse_condition_operator(raw: &str) -> Result<(SetQuantifier, BaseOp, bool)> {
+    let (quantifier, rest) = if let Some(r) = raw.strip_prefix("ForAnyValue:") {
+        (SetQuantifier::ForAnyValue, r)
+    } else if let Some(r) = raw.strip_prefix("ForAllValues:") {
+        (SetQuantifier::ForAllValues, r)
+    } else {
+        (SetQuantifier::Single, raw)
+    };
+    let (base, if_exists) = match rest.strip_suffix("IfExists") {
+        Some(stripped) if stripped != "Null" => (stripped, true),
+        _ => (rest, false),
+    };
+    let op = match base {
+        "StringEquals" => BaseOp::StringEquals,
+        "StringNotEquals" => BaseOp::StringNotEquals,
+        "StringEqualsIgnoreCase" => BaseOp::StringEqualsIgnoreCase,
+        "StringNotEqualsIgnoreCase" => BaseOp::StringNotEqualsIgnoreCase,
+        "StringLike" => BaseOp::StringLike,
+        "StringNotLike" => BaseOp::StringNotLike,
+        "ArnEquals" | "ARNEquals" => BaseOp::ArnEquals,
+        "ArnNotEquals" | "ARNNotEquals" => BaseOp::ArnNotEquals,
+        "ArnLike" | "ARNLike" => BaseOp::ArnLike,
+        "ArnNotLike" | "ARNNotLike" => BaseOp::ArnNotLike,
+        "NumericEquals" => BaseOp::NumericEquals,
+        "NumericNotEquals" => BaseOp::NumericNotEquals,
+        "NumericLessThan" => BaseOp::NumericLessThan,
+        "NumericLessThanEquals" => BaseOp::NumericLessThanEquals,
+        "NumericGreaterThan" => BaseOp::NumericGreaterThan,
+        "NumericGreaterThanEquals" => BaseOp::NumericGreaterThanEquals,
+        "Bool" => BaseOp::Bool,
+        "Null" if quantifier == SetQuantifier::Single => BaseOp::Null,
+        _ => {
+            anyhow::bail!("IAM Condition operator `{raw}` is not supported locally")
+        }
+    };
+    Ok((quantifier, op, if_exists))
+}
+
+fn parse_condition_values(
+    raw_op: &str,
+    raw_key: &str,
+    op: BaseOp,
+    val: &serde_json::Value,
+) -> Result<Vec<String>> {
+    let items: Vec<&serde_json::Value> = match val {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        single => vec![single],
+    };
+    if items.is_empty() {
+        anyhow::bail!("IAM Condition `{raw_op}` on `{raw_key}` must specify at least one value");
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let s = match item {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => anyhow::bail!(
+                "IAM Condition `{raw_op}` on `{raw_key}` expects string, boolean, or numeric values"
+            ),
+        };
+        if s.contains("${") {
+            anyhow::bail!(
+                "IAM policy variables (`${{...}}`) in Condition `{raw_op}` on `{raw_key}` cannot be evaluated locally"
+            );
+        }
+        if matches!(op, BaseOp::Bool | BaseOp::Null)
+            && !matches!(s.to_ascii_lowercase().as_str(), "true" | "false")
+        {
+            anyhow::bail!(
+                "IAM Condition `{raw_op}` on `{raw_key}` expects `true` or `false`, got `{s}`"
+            );
+        }
+        if matches!(
+            op,
+            BaseOp::NumericEquals
+                | BaseOp::NumericNotEquals
+                | BaseOp::NumericLessThan
+                | BaseOp::NumericLessThanEquals
+                | BaseOp::NumericGreaterThan
+                | BaseOp::NumericGreaterThanEquals
+        ) && s.parse::<f64>().map_or(true, |n| !n.is_finite())
+        {
+            anyhow::bail!(
+                "IAM Condition `{raw_op}` on `{raw_key}` expects finite numbers, got `{s}`"
+            );
+        }
+        out.push(s);
+    }
+    Ok(out)
+}
+
+impl ConditionClause {
+    fn evaluate(&self, ctx: &RequestContext) -> bool {
+        let actuals = ctx.get(&self.key);
+        if self.op == BaseOp::Null {
+            let is_null = actuals.is_empty();
+            return self
+                .values
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case("true") == is_null);
+        }
+        if actuals.is_empty() {
+            return match self.quantifier {
+                SetQuantifier::ForAllValues => true,
+                SetQuantifier::ForAnyValue => self.if_exists,
+                SetQuantifier::Single => self.if_exists || self.op.is_negated(),
+            };
+        }
+        match self.quantifier {
+            SetQuantifier::ForAnyValue => actuals.iter().any(|a| self.matches_one(a)),
+            SetQuantifier::ForAllValues | SetQuantifier::Single => {
+                actuals.iter().all(|a| self.matches_one(a))
+            }
+        }
+    }
+
+    fn matches_one(&self, actual: &str) -> bool {
+        match self.op {
+            BaseOp::StringEquals => self.values.iter().any(|p| actual == p),
+            BaseOp::StringNotEquals => self.values.iter().all(|p| actual != p),
+            BaseOp::StringEqualsIgnoreCase => {
+                self.values.iter().any(|p| actual.eq_ignore_ascii_case(p))
+            }
+            BaseOp::StringNotEqualsIgnoreCase => {
+                self.values.iter().all(|p| !actual.eq_ignore_ascii_case(p))
+            }
+            BaseOp::StringLike => self.values.iter().any(|p| glob_match(p, actual)),
+            BaseOp::StringNotLike => self.values.iter().all(|p| !glob_match(p, actual)),
+            BaseOp::ArnEquals => self.values.iter().any(|p| actual == p),
+            BaseOp::ArnNotEquals => self.values.iter().all(|p| actual != p),
+            BaseOp::ArnLike => self.values.iter().any(|p| iam_arn_matches(p, actual)),
+            BaseOp::ArnNotLike => self.values.iter().all(|p| !iam_arn_matches(p, actual)),
+            BaseOp::Bool => {
+                let Some(act_bool) = parse_bool_str(actual) else {
+                    return false;
+                };
+                self.values
+                    .iter()
+                    .any(|p| parse_bool_str(p) == Some(act_bool))
+            }
+            BaseOp::NumericEquals => self.num_any(actual, |a, b| a == b),
+            BaseOp::NumericNotEquals => {
+                let Ok(a) = actual.parse::<f64>() else {
+                    return false;
+                };
+                self.values
+                    .iter()
+                    .all(|p| p.parse::<f64>().is_ok_and(|b| a != b))
+            }
+            BaseOp::NumericLessThan => self.num_any(actual, |a, b| a < b),
+            BaseOp::NumericLessThanEquals => self.num_any(actual, |a, b| a <= b),
+            BaseOp::NumericGreaterThan => self.num_any(actual, |a, b| a > b),
+            BaseOp::NumericGreaterThanEquals => self.num_any(actual, |a, b| a >= b),
+            BaseOp::Null => unreachable!(),
+        }
+    }
+
+    fn num_any(&self, actual: &str, cmp: impl Fn(f64, f64) -> bool) -> bool {
+        let Ok(a) = actual.parse::<f64>() else {
+            return false;
+        };
+        self.values
+            .iter()
+            .any(|p| p.parse::<f64>().is_ok_and(|b| cmp(a, b)))
+    }
+}
+
+fn parse_bool_str(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -488,23 +868,193 @@ mod tests {
     }
 
     #[test]
-    fn policy_gate_rejects_conditions_and_restricted_principals() {
+    fn policy_gate_evaluates_wire_conditions_and_rejects_unsupported_clauses() {
         let conditional = r#"{
             "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "s3:PutObject",
+                    "Resource": "arn:aws:s3:::assets/*",
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:RequestedRegion": "us-east-1",
+                            "s3:x-amz-server-side-encryption": "aws:kms"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": "s3:ListBucket",
+                    "Resource": "arn:aws:s3:::assets",
+                    "Condition": {
+                        "StringLike": { "s3:prefix": ["public/*"] },
+                        "NumericLessThanEqualsIfExists": { "s3:max-keys": 100 }
+                    }
+                }
+            ]
+        }"#;
+        let gate = Gate::from_policy_str(conditional, "cond.json").unwrap();
+
+        let mut base_put = crate::trace::Trace {
+            id: "1".into(),
+            at: "t".into(),
+            method: "PUT".into(),
+            path: "/assets/doc.txt?x-id=PutObject".into(),
+            host: "127.0.0.1:9297".into(),
+            service: "s3".into(),
+            operation: "PutObject".into(),
+            status: 200,
+            ms: 1,
+            authorization: true,
+            region: Some("us-east-1".into()),
+            invocation_id: None,
+            attempt: None,
+            max_attempts: None,
+            pending: false,
+            error: None,
+            problem: None,
+            access: Vec::new(),
+            implied: Vec::new(),
+            new: false,
+            blocked: false,
+            request: crate::trace::Message::default(),
+            response: crate::trace::Message::default(),
+        };
+        let put_access = access("s3:PutObject", "arn:aws:s3:::assets/doc.txt");
+        // Missing SSE-KMS header → denied.
+        let unencrypted_ctx = RequestContext::from_trace(&base_put);
+        assert!(!gate.allows_in_context(&put_access, Some(&unencrypted_ctx)));
+
+        // Present SSE-KMS header in matching region → allowed.
+        base_put.request.headers.push(crate::trace::HeaderTrace {
+            name: "x-amz-server-side-encryption".into(),
+            value: "aws:kms".into(),
+        });
+        let encrypted_ctx = RequestContext::from_trace(&base_put);
+        assert!(gate.allows_in_context(&put_access, Some(&encrypted_ctx)));
+
+        // Wrong region → denied.
+        base_put.region = Some("eu-west-1".into());
+        let wrong_region_ctx = RequestContext::from_trace(&base_put);
+        assert!(!gate.allows_in_context(&put_access, Some(&wrong_region_ctx)));
+
+        // ListBucket with matching prefix and omitted max-keys (`IfExists`) → allowed;
+        // ListBucket without prefix → s3:prefix is "" → denied.
+        let mut list = base_put.clone();
+        list.region = Some("us-east-1".into());
+        list.operation = "ListObjectsV2".into();
+        list.path = "/assets?list-type=2&prefix=public%2Fdocs".into();
+        let list_access = access("s3:ListBucket", "arn:aws:s3:::assets");
+        assert!(gate.allows_in_context(&list_access, Some(&RequestContext::from_trace(&list))));
+        list.path = "/assets?list-type=2".into();
+        assert!(!gate.allows_in_context(&list_access, Some(&RequestContext::from_trace(&list))));
+
+        // Cloud-only runtime condition keys and unsupported operators still fail closed.
+        let cloud_cond = r#"{
             "Statement": [{
                 "Effect": "Allow",
-                "Action": "s3:PutObject",
-                "Resource": "arn:aws:s3:::assets/*",
-                "Condition": {
-                    "StringEquals": { "s3:x-amz-server-side-encryption": "aws:kms" }
-                }
+                "Action": "s3:GetObject",
+                "Resource": "*",
+                "Condition": { "StringEquals": { "aws:PrincipalOrgID": "o-123456" } }
             }]
         }"#;
-        let Err(err) = Gate::from_policy_str(conditional, "cond.json") else {
-            panic!("Condition must be rejected");
+        let Err(err) = Gate::from_policy_str(cloud_cond, "org.json") else {
+            panic!("Cloud-only condition key must be rejected");
         };
-        let err = err.to_string();
-        assert!(err.contains("Condition"), "{err}");
+        assert!(err.to_string().contains("aws:PrincipalOrgID"), "{err}");
+
+        // IAM policy variables (`${...}`) fail closed rather than matching literally.
+        let var_policy = r#"{
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::assets",
+                "Condition": { "StringLike": { "s3:prefix": ["home/${aws:username}/*"] } }
+            }]
+        }"#;
+        assert!(Gate::from_policy_str(var_policy, "var.json").is_err());
+
+        // `s3:x-amz-copy-source` decodes percent-encoding and strips `?versionId=...`
+        // so encoded segments cannot evade a Deny condition.
+        let copy_deny = Gate::from_policy_str(
+            r#"{
+                "Statement": [
+                    { "Effect": "Allow", "Action": "s3:*", "Resource": "*" },
+                    {
+                        "Effect": "Deny",
+                        "Action": "s3:PutObject",
+                        "Resource": "*",
+                        "Condition": { "StringLike": { "s3:x-amz-copy-source": ["*secret*"] } }
+                    }
+                ]
+            }"#,
+            "copy.json",
+        )
+        .unwrap();
+        let mut copy_trace = base_put.clone();
+        copy_trace.request.headers.push(crate::trace::HeaderTrace {
+            name: "x-amz-copy-source".into(),
+            value: "/vault/%73%65%63%72%65%74.txt?versionId=99".into(),
+        });
+        assert!(
+            !copy_deny
+                .allows_in_context(&put_access, Some(&RequestContext::from_trace(&copy_trace))),
+            "percent-encoded x-amz-copy-source must still trigger Deny"
+        );
+
+        // Unqualified negated operators (`StringNotEquals`, `StringNotLike`, ...)
+        // evaluate to `true` when the context key is absent, matching AWS IAM so a
+        // Deny guardrail cannot be bypassed by omitting the header.
+        let sse_deny_guardrail = Gate::from_policy_str(
+            r#"{
+                "Statement": [
+                    { "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::assets/*" },
+                    {
+                        "Effect": "Deny",
+                        "Action": "s3:PutObject",
+                        "Resource": "arn:aws:s3:::assets/*",
+                        "Condition": {
+                            "StringNotEquals": { "s3:x-amz-server-side-encryption": "aws:kms" }
+                        }
+                    }
+                ]
+            }"#,
+            "sse-guardrail.json",
+        )
+        .unwrap();
+        let mut omitted_sse = base_put.clone();
+        omitted_sse.request.headers.clear();
+        assert!(
+            !sse_deny_guardrail
+                .allows_in_context(&put_access, Some(&RequestContext::from_trace(&omitted_sse))),
+            "omitting x-amz-server-side-encryption must trigger StringNotEquals Deny"
+        );
+        let mut wrong_sse = omitted_sse.clone();
+        wrong_sse.request.headers.push(crate::trace::HeaderTrace {
+            name: "x-amz-server-side-encryption".into(),
+            value: "AES256".into(),
+        });
+        assert!(
+            !sse_deny_guardrail
+                .allows_in_context(&put_access, Some(&RequestContext::from_trace(&wrong_sse))),
+            "non-matching x-amz-server-side-encryption must trigger StringNotEquals Deny"
+        );
+        let mut matching_sse = omitted_sse;
+        matching_sse
+            .request
+            .headers
+            .push(crate::trace::HeaderTrace {
+                name: "x-amz-server-side-encryption".into(),
+                value: "aws:kms".into(),
+            });
+        assert!(
+            sse_deny_guardrail.allows_in_context(
+                &put_access,
+                Some(&RequestContext::from_trace(&matching_sse))
+            ),
+            "matching aws:kms header satisfies guardrail"
+        );
 
         let principal_scoped = r#"{
             "Version": "2012-10-17",
