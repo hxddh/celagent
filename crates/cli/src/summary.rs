@@ -36,6 +36,11 @@ pub struct Summary {
     pub unmapped: BTreeMap<String, usize>,
     pub failures: Vec<Failure>,
     pub access: BTreeMap<Access, AccessUse>,
+    /// Concrete or fail-closed permissions rejected by the active gate.
+    pub denied_access: BTreeSet<Access>,
+    /// Footprint keys that had at least one call rejected by the active gate.
+    pub denied_footprints: BTreeSet<Access>,
+    pub gate_evaluated: bool,
     pending: HashSet<String>,
     invocations: HashSet<String>,
 }
@@ -109,6 +114,11 @@ impl Summary {
             *self.unmapped.entry(trace.service.clone()).or_default() += 1;
         }
         let failed = trace.problem.is_some();
+        for item in trace.access.iter().chain(trace.implied.iter()) {
+            if item.new {
+                self.denied_footprints.insert(item.key());
+            }
+        }
         for (index, access) in trace_access(trace).enumerate() {
             let entry = self.access.entry(access).or_default();
             entry.calls += 1;
@@ -248,6 +258,7 @@ impl Report {
 
     /// Fill in the access table and compare against either a lock file or an IAM policy gate.
     pub fn set_access_with_gate(&mut self, summary: &Summary, gate: Option<&crate::lock::Gate>) {
+        let policy_evaluated = gate.is_some_and(|g| g.is_policy()) && summary.gate_evaluated;
         self.access = summary
             .access
             .iter()
@@ -255,16 +266,27 @@ impl Report {
                 action: access.action.clone(),
                 resource: access.resource.clone(),
                 used: used.clone(),
-                new: gate.is_some_and(|gate| !gate.allows(access)),
+                new: if policy_evaluated {
+                    summary.denied_footprints.contains(access)
+                } else {
+                    summary.denied_footprints.contains(access)
+                        || gate.is_some_and(|gate| !gate.allows(access))
+                },
             })
             .collect();
         if let Some(gate) = gate {
-            self.access_added = summary
-                .access
-                .keys()
-                .filter(|access| !gate.allows(access))
-                .cloned()
-                .collect();
+            if policy_evaluated {
+                self.access_added = summary.denied_access.iter().cloned().collect();
+            } else {
+                let mut added: BTreeSet<Access> = summary
+                    .access
+                    .keys()
+                    .filter(|access| !gate.allows(access))
+                    .cloned()
+                    .collect();
+                added.extend(summary.denied_access.iter().cloned());
+                self.access_added = added.into_iter().collect();
+            }
             if let Some(locked) = gate.locked_set() {
                 self.access_unused = locked
                     .iter()

@@ -271,29 +271,95 @@ impl TraceSink {
 
     /// Write one call. Never fails the caller: trace problems are logged to
     /// stderr and the proxy keeps forwarding.
-    pub fn record(&self, mut trace: Trace) {
+    pub fn record(&self, trace: Trace) {
+        self.record_evaluated(trace, None);
+    }
+
+    /// Write one call, deriving permissions and gate decisions from `eval_trace`
+    /// when supplied (so a small `--max-body` capture limit on `trace` never
+    /// hides permissions present in the complete request body).
+    pub fn record_evaluated(&self, mut trace: Trace, eval_trace: Option<&Trace>) {
         let gate = self.gate.as_ref();
-        if !trace.pending && trace.access.is_empty() {
-            let (own, implied) = access::derive(&trace);
-            trace.access = own
-                .into_iter()
-                .map(|entry| CallAccess::from_gate(entry, gate))
-                .collect();
-            trace.implied = implied
-                .into_iter()
-                .map(|entry| CallAccess::from_gate(entry, gate))
-                .collect();
-        } else if let Some(gate) = gate {
-            for entry in trace.access.iter_mut().chain(trace.implied.iter_mut()) {
-                entry.new = !gate.allows(&entry.key());
+        let mut newly_denied: Vec<Access> = Vec::new();
+        if !trace.pending {
+            let source = eval_trace.unwrap_or(&trace);
+            if let Some(gate) = gate
+                && gate.is_policy()
+            {
+                let (fp_own, fp_implied) = if trace.access.is_empty() && trace.implied.is_empty() {
+                    access::derive(source)
+                } else {
+                    (
+                        trace.access.iter().map(CallAccess::key).collect(),
+                        trace.implied.iter().map(CallAccess::key).collect(),
+                    )
+                };
+                let (c_own, c_implied) = access::derive_for_gate(source, true);
+                let own_denied: Vec<Access> = c_own
+                    .into_iter()
+                    .filter(|entry| !gate.allows(entry))
+                    .collect();
+                let imp_denied: Vec<Access> = c_implied
+                    .into_iter()
+                    .filter(|entry| !gate.allows(entry))
+                    .collect();
+                let matches_denied = |fp: &Access, denied: &[Access]| -> bool {
+                    denied.iter().any(|d| {
+                        d.action == fp.action
+                            && (d.resource == crate::lock::UNVERIFIED_RESOURCE
+                                || crate::lock::arn_matches(&fp.resource, &d.resource))
+                    })
+                };
+                trace.access = fp_own
+                    .into_iter()
+                    .map(|entry| CallAccess {
+                        new: matches_denied(&entry, &own_denied),
+                        action: entry.action,
+                        resource: entry.resource,
+                    })
+                    .collect();
+                trace.implied = fp_implied
+                    .into_iter()
+                    .map(|entry| CallAccess {
+                        new: matches_denied(&entry, &imp_denied),
+                        action: entry.action,
+                        resource: entry.resource,
+                    })
+                    .collect();
+                newly_denied.extend(own_denied);
+                newly_denied.extend(imp_denied);
+                trace.new = !newly_denied.is_empty();
+            } else {
+                let gate_derived = gate.map(|_| access::derive_for_gate(source, false));
+                if trace.access.is_empty() {
+                    let (own, implied) = access::derive(source);
+                    trace.access = own
+                        .into_iter()
+                        .map(|entry| CallAccess::from_gate(entry, gate))
+                        .collect();
+                    trace.implied = implied
+                        .into_iter()
+                        .map(|entry| CallAccess::from_gate(entry, gate))
+                        .collect();
+                } else if let Some(gate) = gate {
+                    for entry in trace.access.iter_mut().chain(trace.implied.iter_mut()) {
+                        entry.new = !gate.allows(&entry.key());
+                    }
+                }
+                if let (Some(gate), Some((g_own, g_implied))) = (gate, gate_derived) {
+                    for entry in g_own.into_iter().chain(g_implied) {
+                        if !gate.allows(&entry) {
+                            newly_denied.push(entry);
+                        }
+                    }
+                    trace.new = !newly_denied.is_empty()
+                        || trace
+                            .access
+                            .iter()
+                            .chain(trace.implied.iter())
+                            .any(|entry| entry.new);
+                }
             }
-        }
-        if gate.is_some() {
-            trace.new = trace
-                .access
-                .iter()
-                .chain(trace.implied.iter())
-                .any(|entry| entry.new);
         }
         // The sink lock serializes writes, so this check and the write are
         // atomic: a pending line can never land after the call's final line.
@@ -303,6 +369,10 @@ impl TraceSink {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if trace.pending && !state.summary.in_flight(&trace.id) {
             return;
+        }
+        if gate.is_some() && !trace.pending {
+            state.summary.gate_evaluated = true;
+            state.summary.denied_access.extend(newly_denied);
         }
         state.summary.observe(&trace);
         write_record(&mut state.file, "call", &trace);

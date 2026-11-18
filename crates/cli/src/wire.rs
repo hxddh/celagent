@@ -114,6 +114,15 @@ pub fn query_param(path: &str, name: &str) -> Option<String> {
 }
 
 fn percent_decode(value: &str) -> String {
+    percent_decode_inner(value, true)
+}
+
+/// Percent-decode a URI path segment (`%XX` only; literal `+` stays `+`).
+pub fn percent_decode_path(value: &str) -> String {
+    percent_decode_inner(value, false)
+}
+
+fn percent_decode_inner(value: &str, plus_as_space: bool) -> String {
     fn hex(byte: u8) -> Option<u8> {
         (byte as char).to_digit(16).map(|digit| digit as u8)
     }
@@ -130,7 +139,11 @@ fn percent_decode(value: &str) -> String {
             index += 3;
             continue;
         }
-        out.push(if byte == b'+' { b' ' } else { byte });
+        out.push(if plus_as_space && byte == b'+' {
+            b' '
+        } else {
+            byte
+        });
         index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()

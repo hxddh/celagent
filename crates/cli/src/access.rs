@@ -68,20 +68,38 @@ impl From<Access> for CallAccess {
 }
 
 /// Whether deriving IAM access for `service` requires inspecting the request
-/// body (as opposed to REST-URI services like S3, Lambda, and Bedrock whose
-/// operation and resource live in the path and headers).
-pub fn needs_request_body(service: &str, advertised_operation: Option<&str>) -> bool {
+/// body (as opposed to REST-URI services whose operation and resource live in
+/// the path and headers).
+pub fn needs_request_body(
+    service: &str,
+    advertised_operation: Option<&str>,
+    resolved_operation: &str,
+    path: &str,
+) -> bool {
     match service {
-        "s3" | "s3-object-lambda" | "bedrock" | "bedrock-runtime" | "execute-api"
-        | "apigateway" | "appconfig" | "appconfigdata" => false,
+        // S3 DeleteObjects (`POST /bucket?delete`) names its `<Key>` targets in XML.
+        "s3" => resolved_operation == "DeleteObjects",
+        "s3-object-lambda" | "execute-api" | "apigateway" | "appconfig" | "appconfigdata" => false,
+        "bedrock" | "bedrock-runtime" => bedrock_model(path).is_none(),
         // Lambda CreateFunction / UpdateFunctionConfiguration may pass a Role in JSON,
         // whereas Invoke / GetFunction / DeleteFunction only use the URL path.
         "lambda" => matches!(
-            advertised_operation,
+            advertised_operation.or(Some(resolved_operation)),
             None | Some("CreateFunction" | "UpdateFunctionConfiguration")
         ),
         _ => true,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Normalized footprint ARNs for `lenslet.lock` and summaries (`*` for
+    /// generated IDs, region, account, and S3 object keys).
+    Footprint,
+    /// Concrete request ARNs for IAM `--policy` evaluation (preserving exact
+    /// S3 object keys, DeleteObjects `<Key>` elements, signing region, and
+    /// un-normalized resource names).
+    Concrete,
 }
 
 /// Whether a finished call had no recognizable IAM mapping (excluding calls
@@ -93,38 +111,93 @@ pub fn is_unmapped(trace: &Trace) -> bool {
         && !(trace.service == "sts" && trace.operation == "GetCallerIdentity")
 }
 
-/// The access one call needs, and the permissions it implies on other
-/// resources (the KMS key behind an SSE-KMS object, the role passed to Lambda).
-///
-/// One call can need several permissions: a batch names several tables, a
-/// DynamoDB transaction needs each item's own action, and a copy reads its
-/// source as well as writing its destination.
+/// The normalized footprint access one call needs (for `lenslet.lock` and reports).
 pub fn derive(trace: &Trace) -> (Vec<Access>, Vec<Access>) {
+    derive_inner(trace, Mode::Footprint, false)
+}
+
+/// Derive permissions for checking or actively enforcing against a [`crate::lock::Gate`].
+///
+/// When `concrete` is true (`--policy`), exact request ARNs (S3 object keys,
+/// signing region, concrete names) are preserved so path-scoped `Allow` and
+/// `Deny` rules evaluate accurately. When a body-dependent request was
+/// truncated or unreadable, a fail-closed sentinel permission is included so an
+/// uninspected body tail can never slip past `--enforce` or `--check`.
+pub fn derive_for_gate(trace: &Trace, concrete: bool) -> (Vec<Access>, Vec<Access>) {
+    let mode = if concrete {
+        Mode::Concrete
+    } else {
+        Mode::Footprint
+    };
+    derive_inner(trace, mode, true)
+}
+
+fn derive_inner(trace: &Trace, mode: Mode, fail_closed_body: bool) -> (Vec<Access>, Vec<Access>) {
     let operation = trace.operation.as_str();
     if operation.is_empty()
         || operation == trace.method
         || trace.service == "aws"
         || !operation.bytes().all(|byte| byte.is_ascii_alphanumeric())
     {
+        if fail_closed_body
+            && trace.service != "aws"
+            && trace
+                .request
+                .body
+                .as_ref()
+                .is_some_and(|b| b.truncated || b.binary)
+        {
+            return (
+                vec![Access::new(
+                    format!("{}:*", iam_prefix(&trace.service)),
+                    crate::lock::UNVERIFIED_RESOURCE,
+                )],
+                Vec::new(),
+            );
+        }
         return (Vec::new(), Vec::new());
     }
     let prefix = iam_prefix(&trace.service);
     let body = Body::parse(trace);
-    let implied = implied(prefix, operation, trace, &body);
+    let body_incomplete = fail_closed_body
+        && needs_request_body(&trace.service, None, operation, &trace.path)
+        && trace
+            .request
+            .body
+            .as_ref()
+            .is_some_and(|b| b.truncated || b.binary);
+
+    let implied = implied(mode, prefix, operation, trace, &body);
     if prefix == "dynamodb" && operation.starts_with("Transact") {
-        return (transaction(&body), implied);
+        let mut own = transaction(mode, trace, &body);
+        if fail_closed_body && (body_incomplete || own.is_empty()) {
+            own.push(Access::new(
+                format!("dynamodb:{operation}"),
+                crate::lock::UNVERIFIED_RESOURCE,
+            ));
+        }
+        return (own, implied);
     }
     let Some(action) = action_name(prefix, operation) else {
         return (Vec::new(), Vec::new());
     };
-    let mut own: Vec<Access> = resources(prefix, operation, trace, &body)
+    let mut own: Vec<Access> = resources(mode, prefix, operation, trace, &body)
         .into_iter()
         .map(|resource| Access::new(action.clone(), resource))
         .collect();
     if prefix == "s3"
-        && let Some(source) = copy_source(trace)
+        && let Some(source) = copy_source(mode, trace)
     {
         own.push(Access::new("s3:GetObject", source));
+    }
+    if body_incomplete
+        || (fail_closed_body
+            && mode == Mode::Concrete
+            && prefix == "s3"
+            && operation == "DeleteObjects"
+            && own.is_empty())
+    {
+        own.push(Access::new(action, crate::lock::UNVERIFIED_RESOURCE));
     }
     (own, implied)
 }
@@ -133,7 +206,7 @@ pub fn derive(trace: &Trace) -> (Vec<Access>, Vec<Access>) {
 /// needs its own (`PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem`,
 /// `GetItem`) on its table. A body that cannot be read yields nothing rather
 /// than a guess.
-fn transaction(body: &Body) -> Vec<Access> {
+fn transaction(mode: Mode, trace: &Trace, body: &Body) -> Vec<Access> {
     let mut out: Vec<Access> = match body {
         Body::Json(value) => {
             let Some(items) = value.get("TransactItems").and_then(Value::as_array) else {
@@ -148,12 +221,17 @@ fn transaction(body: &Body) -> Vec<Access> {
                     let table = request.get("TableName")?.as_str()?;
                     Some(Access::new(
                         format!("dynamodb:{action}"),
-                        arn("dynamodb", &format!("table/{}", normalize(table))),
+                        arn_for(
+                            mode,
+                            trace,
+                            "dynamodb",
+                            &format!("table/{}", norm(mode, table)),
+                        ),
                     ))
                 })
                 .collect()
         }
-        Body::TruncatedJson(raw) => scan_truncated_transact(raw),
+        Body::TruncatedJson(raw) => scan_truncated_transact(mode, trace, raw),
         _ => Vec::new(),
     };
     out.sort();
@@ -172,7 +250,7 @@ fn transact_action(kind: &str) -> Option<&'static str> {
     }
 }
 
-fn scan_truncated_transact(raw: &str) -> Vec<Access> {
+fn scan_truncated_transact(mode: Mode, trace: &Trace, raw: &str) -> Vec<Access> {
     let mut out = Vec::new();
     for (kind, action) in [
         ("Put", "PutItem"),
@@ -229,7 +307,12 @@ fn scan_truncated_transact(raw: &str) -> Vec<Access> {
             {
                 out.push(Access::new(
                     format!("dynamodb:{action}"),
-                    arn("dynamodb", &format!("table/{}", normalize(&table))),
+                    arn_for(
+                        mode,
+                        trace,
+                        "dynamodb",
+                        &format!("table/{}", norm(mode, &table)),
+                    ),
                 ));
             }
         }
@@ -237,8 +320,8 @@ fn scan_truncated_transact(raw: &str) -> Vec<Access> {
     out
 }
 
-/// The bucket a `CopyObject` / `UploadPartCopy` reads from, as an object ARN.
-fn copy_source(trace: &Trace) -> Option<String> {
+/// The bucket (and in Concrete mode, key) a `CopyObject` / `UploadPartCopy` reads from.
+fn copy_source(mode: Mode, trace: &Trace) -> Option<String> {
     let value = trace
         .request
         .headers
@@ -246,14 +329,29 @@ fn copy_source(trace: &Trace) -> Option<String> {
         .find(|header| header.name.eq_ignore_ascii_case("x-amz-copy-source"))?
         .value
         .as_str();
-    let decoded = wire::query_param(&format!("?v={value}"), "v")?;
+    let decoded = wire::percent_decode_path(value);
     let path = decoded.split('?').next().unwrap_or(&decoded);
     if path.starts_with("arn:") {
-        // An access point or Outposts ARN, not a bucket name.
-        return Some("*".to_string());
+        return Some(match mode {
+            Mode::Footprint => "*".to_string(),
+            Mode::Concrete => path.to_string(),
+        });
     }
-    let bucket = path.trim_start_matches('/').split('/').next()?;
-    (!bucket.is_empty()).then(|| format!("arn:aws:s3:::{}/*", normalize(bucket)))
+    let trimmed = path.trim_start_matches('/');
+    let (bucket, key) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+    if bucket.is_empty() {
+        return None;
+    }
+    Some(match mode {
+        Mode::Footprint => format!("arn:aws:s3:::{}/*", normalize(bucket)),
+        Mode::Concrete => {
+            if key.is_empty() {
+                format!("arn:aws:s3:::{bucket}/*")
+            } else {
+                format!("arn:aws:s3:::{bucket}/{key}")
+            }
+        }
+    })
 }
 
 /// SigV4 signing names that differ from the IAM action prefix.
@@ -535,8 +633,32 @@ fn parse_leading_json_string(s: &str) -> Option<(String, &str)> {
     None
 }
 
-fn arn(service: &str, rest: &str) -> String {
-    format!("arn:aws:{service}:*:*:{rest}")
+fn arn_for(mode: Mode, trace: &Trace, service: &str, rest: &str) -> String {
+    match mode {
+        Mode::Footprint => format!("arn:aws:{service}:*:*:{rest}"),
+        Mode::Concrete => {
+            let region = trace
+                .region
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or("*");
+            format!("arn:aws:{service}:{region}:*:{rest}")
+        }
+    }
+}
+
+fn norm(mode: Mode, name: &str) -> String {
+    match mode {
+        Mode::Footprint => normalize(name),
+        Mode::Concrete => name.to_string(),
+    }
+}
+
+fn norm_path(mode: Mode, path: &str) -> String {
+    match mode {
+        Mode::Footprint => normalize_path(path),
+        Mode::Concrete => path.to_string(),
+    }
 }
 
 /// Generated names (UUIDs, timestamps, long hex) become `*`, so a test that
@@ -635,82 +757,131 @@ fn last_segment(value: &str) -> &str {
 }
 
 /// The resources an action applies to: usually one; one per table for a
-/// DynamoDB batch, and one per parameter for SSM `GetParameters`/`DeleteParameters`.
-fn resources(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<String> {
+/// DynamoDB batch, one per `<Key>` for concrete S3 `DeleteObjects`, and one per
+/// parameter for SSM `GetParameters`/`DeleteParameters`.
+fn resources(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<String> {
+    if prefix == "s3" {
+        return s3_resources(mode, operation, trace);
+    }
     if prefix == "ssm" {
         let names = body.string_list("Names");
         if !names.is_empty() {
-            return names.iter().map(|name| ssm_parameter(name)).collect();
+            return names
+                .iter()
+                .map(|name| ssm_parameter(mode, trace, name))
+                .collect();
         }
     }
     if prefix != "dynamodb" {
-        return vec![resource(prefix, operation, trace, body)];
+        return vec![resource(mode, prefix, operation, trace, body)];
     }
     let tables = body.tables();
     match tables.as_slice() {
         [] => vec!["*".to_string()],
         [one] => vec![match body.field("IndexName") {
-            Some(index) => arn(
+            Some(index) => arn_for(
+                mode,
+                trace,
                 "dynamodb",
-                &format!("table/{}/index/{}", normalize(one), normalize(&index)),
+                &format!("table/{}/index/{}", norm(mode, one), norm(mode, &index)),
             ),
-            None => arn("dynamodb", &format!("table/{}", normalize(one))),
+            None => arn_for(
+                mode,
+                trace,
+                "dynamodb",
+                &format!("table/{}", norm(mode, one)),
+            ),
         }],
         many => many
             .iter()
-            .map(|table| arn("dynamodb", &format!("table/{}", normalize(table))))
+            .map(|table| {
+                arn_for(
+                    mode,
+                    trace,
+                    "dynamodb",
+                    &format!("table/{}", norm(mode, table)),
+                )
+            })
             .collect(),
     }
 }
 
-fn resource(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String {
+fn resource(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String {
     match prefix {
-        "s3" => s3_resource(operation, trace),
         "sqs" => body
             .field("QueueUrl")
             .or_else(|| body.field("QueueName"))
-            .map(|queue| arn("sqs", &normalize(last_segment(&queue))))
+            .map(|queue| {
+                if mode == Mode::Concrete && queue.starts_with("arn:") {
+                    queue
+                } else {
+                    arn_for(mode, trace, "sqs", &norm(mode, last_segment(&queue)))
+                }
+            })
             .unwrap_or_else(|| "*".to_string()),
         "sns" => body
             .field("TopicArn")
             .or_else(|| body.field("TargetArn"))
-            .map(|topic| last_segment(&topic).to_string())
+            .map(|topic| {
+                if mode == Mode::Concrete && topic.starts_with("arn:") {
+                    topic
+                } else {
+                    arn_for(mode, trace, "sns", &norm(mode, last_segment(&topic)))
+                }
+            })
             .or_else(|| {
                 (operation == "CreateTopic")
                     .then(|| body.field("Name"))
                     .flatten()
+                    .map(|topic| arn_for(mode, trace, "sns", &norm(mode, &topic)))
             })
-            .map(|topic| arn("sns", &normalize(&topic)))
             .unwrap_or_else(|| "*".to_string()),
         "lambda" => lambda_function(&trace.path)
             .or_else(|| body.field("FunctionName"))
             .map(|function| {
-                arn(
-                    "lambda",
-                    &format!("function:{}", normalize(last_segment(&function))),
-                )
+                if mode == Mode::Concrete && function.starts_with("arn:") {
+                    function
+                } else {
+                    arn_for(
+                        mode,
+                        trace,
+                        "lambda",
+                        &format!("function:{}", norm(mode, last_segment(&function))),
+                    )
+                }
             })
             .unwrap_or_else(|| "*".to_string()),
         "secretsmanager" => body
             .field("SecretId")
             .or_else(|| body.field("Name"))
             .map(|secret| {
-                arn(
-                    "secretsmanager",
-                    &format!("secret:{}-*", secret_name(&secret)),
-                )
+                if mode == Mode::Concrete && secret.starts_with("arn:") {
+                    secret
+                } else {
+                    arn_for(
+                        mode,
+                        trace,
+                        "secretsmanager",
+                        &format!("secret:{}-*", secret_name(mode, &secret)),
+                    )
+                }
             })
             .unwrap_or_else(|| "*".to_string()),
         "ssm" => body
             .field("Name")
-            .map(|name| ssm_parameter(&name))
+            .map(|name| ssm_parameter(mode, trace, &name))
             .or_else(|| {
                 body.field("Path").map(|path| {
                     let clean = path.trim_matches('/');
                     if clean.is_empty() {
-                        arn("ssm", "parameter/*")
+                        arn_for(mode, trace, "ssm", "parameter/*")
                     } else {
-                        arn("ssm", &format!("parameter/{}/*", normalize_path(clean)))
+                        arn_for(
+                            mode,
+                            trace,
+                            "ssm",
+                            &format!("parameter/{}/*", norm_path(mode, clean)),
+                        )
                     }
                 })
             })
@@ -718,52 +889,97 @@ fn resource(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String
         "logs" => body
             .field("logGroupName")
             .map(|group| {
-                let raw = group
-                    .split_once(":log-group:")
-                    .map_or(group.as_str(), |(_, rest)| rest)
-                    .trim_end_matches(":*");
-                arn("logs", &format!("log-group:{}:*", normalize_path(raw)))
+                if mode == Mode::Concrete && group.starts_with("arn:") {
+                    group
+                } else {
+                    let raw = group
+                        .split_once(":log-group:")
+                        .map_or(group.as_str(), |(_, rest)| rest)
+                        .trim_end_matches(":*");
+                    arn_for(
+                        mode,
+                        trace,
+                        "logs",
+                        &format!("log-group:{}:*", norm_path(mode, raw)),
+                    )
+                }
             })
             .unwrap_or_else(|| "*".to_string()),
         "kinesis" => body
             .field("StreamARN")
-            .and_then(|stream| stream.split(":stream/").nth(1).map(str::to_string))
-            .or_else(|| body.field("StreamName"))
-            .map(|stream| arn("kinesis", &format!("stream/{}", normalize_path(&stream))))
+            .and_then(|stream| {
+                if mode == Mode::Concrete && stream.starts_with("arn:") {
+                    Some(stream)
+                } else {
+                    stream.split(":stream/").nth(1).map(|s| {
+                        arn_for(
+                            mode,
+                            trace,
+                            "kinesis",
+                            &format!("stream/{}", norm_path(mode, s)),
+                        )
+                    })
+                }
+            })
+            .or_else(|| {
+                body.field("StreamName").map(|stream| {
+                    arn_for(
+                        mode,
+                        trace,
+                        "kinesis",
+                        &format!("stream/{}", norm_path(mode, &stream)),
+                    )
+                })
+            })
             .unwrap_or_else(|| "*".to_string()),
         "bedrock" => bedrock_model(&trace.path)
             .or_else(|| body.field("modelId"))
-            .map(|model| bedrock_resource(&model))
+            .map(|model| bedrock_resource(mode, trace, &model))
             .unwrap_or_else(|| "*".to_string()),
         "kms" => body
             .field("KeyId")
-            .map(|key| kms_key(&key))
+            .map(|key| kms_key(mode, trace, &key))
             .unwrap_or_else(|| "*".to_string()),
         "sts" => body
             .field("RoleArn")
-            .map(|role| iam_entity("role", &role))
+            .map(|role| iam_entity(mode, "role", &role))
             .unwrap_or_else(|| "*".to_string()),
         "iam" => body
             .field("RoleName")
-            .map(|role| iam_entity("role", &role))
-            .or_else(|| body.field("UserName").map(|user| iam_entity("user", &user)))
+            .map(|role| iam_entity(mode, "role", &role))
+            .or_else(|| {
+                body.field("UserName")
+                    .map(|user| iam_entity(mode, "user", &user))
+            })
             .unwrap_or_else(|| "*".to_string()),
         "events" => body
             .field("EventBusName")
             .map(|bus| {
-                arn(
-                    "events",
-                    &format!("event-bus/{}", normalize(last_segment(&bus))),
-                )
+                if mode == Mode::Concrete && bus.starts_with("arn:") {
+                    bus
+                } else {
+                    arn_for(
+                        mode,
+                        trace,
+                        "events",
+                        &format!("event-bus/{}", norm(mode, last_segment(&bus))),
+                    )
+                }
             })
             .unwrap_or_else(|| "*".to_string()),
         "states" => body
             .field("stateMachineArn")
             .map(|machine| {
-                arn(
-                    "states",
-                    &format!("stateMachine:{}", normalize(last_segment(&machine))),
-                )
+                if mode == Mode::Concrete && machine.starts_with("arn:") {
+                    machine
+                } else {
+                    arn_for(
+                        mode,
+                        trace,
+                        "states",
+                        &format!("stateMachine:{}", norm(mode, last_segment(&machine))),
+                    )
+                }
             })
             .unwrap_or_else(|| "*".to_string()),
         _ => "*".to_string(),
@@ -772,7 +988,7 @@ fn resource(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> String
 
 /// Preserve hierarchical secret names (`db/password`) whether given by name or
 /// by full ARN (`arn:aws:secretsmanager:...:secret:db/password-AbCdEf`).
-fn secret_name(secret: &str) -> String {
+fn secret_name(mode: Mode, secret: &str) -> String {
     if let Some((_, rest)) = secret.split_once(":secret:") {
         let base = match rest.rsplit_once('-') {
             Some((prefix, suffix))
@@ -784,28 +1000,39 @@ fn secret_name(secret: &str) -> String {
             }
             _ => rest,
         };
-        normalize_path(base)
+        norm_path(mode, base)
     } else {
-        normalize_path(secret.trim_start_matches('/'))
+        norm_path(mode, secret.trim_start_matches('/'))
     }
 }
 
-fn ssm_parameter(name: &str) -> String {
+fn ssm_parameter(mode: Mode, trace: &Trace, name: &str) -> String {
+    if mode == Mode::Concrete && name.starts_with("arn:") {
+        return name.to_string();
+    }
     let raw = name
         .split_once(":parameter/")
         .map_or(name, |(_, rest)| rest)
         .trim_start_matches('/');
-    arn("ssm", &format!("parameter/{}", normalize_path(raw)))
+    arn_for(
+        mode,
+        trace,
+        "ssm",
+        &format!("parameter/{}", norm_path(mode, raw)),
+    )
 }
 
 /// Preserve IAM role/user paths (`service-role/my-role`) from names or ARNs.
-fn iam_entity(kind: &str, value: &str) -> String {
+fn iam_entity(mode: Mode, kind: &str, value: &str) -> String {
+    if mode == Mode::Concrete && value.starts_with("arn:") {
+        return value.to_string();
+    }
     let needle = format!(":{kind}/");
     let raw = value
         .split_once(&needle)
         .map_or(value, |(_, rest)| rest)
         .trim_start_matches('/');
-    format!("arn:aws:iam::*:{kind}/{}", normalize_path(raw))
+    format!("arn:aws:iam::*:{kind}/{}", norm_path(mode, raw))
 }
 
 fn bedrock_model(path: &str) -> Option<String> {
@@ -820,28 +1047,43 @@ fn bedrock_model(path: &str) -> Option<String> {
         ["foundation-models" | "inference-profiles", id] => (*id).to_string(),
         _ => return None,
     };
-    let decoded = wire::query_param(&format!("?v={raw}"), "v").unwrap_or_default();
+    let decoded = wire::percent_decode_path(&raw);
     (!decoded.is_empty()).then_some(decoded)
 }
 
-fn bedrock_resource(model: &str) -> String {
+fn bedrock_resource(mode: Mode, trace: &Trace, model: &str) -> String {
     if model.starts_with("arn:") {
+        if mode == Mode::Concrete {
+            return model.to_string();
+        }
         let Some(rest) = model.splitn(6, ':').nth(5).filter(|s| !s.is_empty()) else {
             return "*".to_string();
         };
         if let Some((kind, id)) = rest.split_once('/') {
             return match kind {
-                "foundation-model" => arn("bedrock", rest),
-                "inference-profile" if is_system_inference_profile(id) => arn("bedrock", rest),
-                _ => arn("bedrock", &format!("{kind}/{}", normalize_path(id))),
+                "foundation-model" => arn_for(mode, trace, "bedrock", rest),
+                "inference-profile" if is_system_inference_profile(id) => {
+                    arn_for(mode, trace, "bedrock", rest)
+                }
+                _ => arn_for(
+                    mode,
+                    trace,
+                    "bedrock",
+                    &format!("{kind}/{}", norm_path(mode, id)),
+                ),
             };
         }
-        return arn("bedrock", rest);
+        return arn_for(mode, trace, "bedrock", rest);
     }
     if is_system_inference_profile(model) {
-        arn("bedrock", &format!("inference-profile/{model}"))
+        arn_for(
+            mode,
+            trace,
+            "bedrock",
+            &format!("inference-profile/{model}"),
+        )
     } else if is_foundation_model_id(model) {
-        arn("bedrock", &format!("foundation-model/{model}"))
+        arn_for(mode, trace, "bedrock", &format!("foundation-model/{model}"))
     } else {
         "*".to_string()
     }
@@ -870,15 +1112,23 @@ fn is_foundation_model_id(id: &str) -> bool {
         && provider.bytes().any(|b| b.is_ascii_alphabetic())
 }
 
-fn kms_key(key: &str) -> String {
+fn kms_key(mode: Mode, trace: &Trace, key: &str) -> String {
+    if mode == Mode::Concrete && key.starts_with("arn:") {
+        return key.to_string();
+    }
     let raw = key
         .split_once(":alias/")
         .map(|(_, alias)| format!("alias/{alias}"))
         .unwrap_or_else(|| key.to_string());
     if raw.starts_with("alias/") {
-        arn("kms", &normalize_path(&raw))
+        arn_for(mode, trace, "kms", &norm_path(mode, &raw))
     } else {
-        arn("kms", &format!("key/{}", normalize(last_segment(&raw))))
+        arn_for(
+            mode,
+            trace,
+            "kms",
+            &format!("key/{}", norm(mode, last_segment(&raw))),
+        )
     }
 }
 
@@ -888,26 +1138,27 @@ fn lambda_function(path: &str) -> Option<String> {
     let mut segments = bare.split('/');
     segments.find(|segment| *segment == "functions")?;
     let name = segments.next()?;
-    let name = wire::query_param(&format!("?v={name}"), "v").unwrap_or_default();
+    let name = wire::percent_decode_path(name);
     (!name.is_empty()).then_some(name)
 }
 
-fn s3_resource(operation: &str, trace: &Trace) -> String {
+fn s3_resources(mode: Mode, operation: &str, trace: &Trace) -> Vec<String> {
     let bare = trace.path.split('?').next().unwrap_or(&trace.path);
     let host = wire::strip_port(&trace.host);
     let host_bucket = (host.ends_with(".localhost") || host.contains(".s3"))
         .then(|| host.split('.').next().unwrap_or(""))
         .filter(|bucket| !bucket.is_empty());
     let mut segments = bare.split('/').filter(|segment| !segment.is_empty());
-    let bucket = match host_bucket {
+    let raw_bucket = match host_bucket {
         Some(bucket) => Some(bucket.to_string()),
-        None => segments.next().map(str::to_string),
+        None => segments.next().map(wire::percent_decode_path),
     };
-    let has_key = segments.next().is_some();
-    let Some(bucket) = bucket else {
-        return "*".to_string();
+    let rest_segments: Vec<String> = segments.map(wire::percent_decode_path).collect();
+    let has_key = !rest_segments.is_empty();
+    let Some(raw_bucket) = raw_bucket else {
+        return vec!["*".to_string()];
     };
-    let bucket = normalize(&bucket);
+    let bucket = norm(mode, &raw_bucket);
     let bucket_level = matches!(
         operation,
         "ListObjects"
@@ -916,15 +1167,59 @@ fn s3_resource(operation: &str, trace: &Trace) -> String {
             | "ListObjectVersions"
             | "ListMultipartUploads"
     );
-    if has_key || (operation == "DeleteObjects" && !bucket_level) {
-        format!("arn:aws:s3:::{bucket}/*")
+    if operation == "DeleteObjects" && !bucket_level {
+        return match mode {
+            Mode::Footprint => vec![format!("arn:aws:s3:::{bucket}/*")],
+            Mode::Concrete => {
+                let xml = trace
+                    .request
+                    .body
+                    .as_ref()
+                    .and_then(|b| b.text.as_deref())
+                    .unwrap_or("");
+                xml_elements(xml, "Key")
+                    .into_iter()
+                    .map(|key| format!("arn:aws:s3:::{bucket}/{}", key.trim_start_matches('/')))
+                    .collect()
+            }
+        };
+    }
+    if has_key && !bucket_level {
+        match mode {
+            Mode::Footprint => vec![format!("arn:aws:s3:::{bucket}/*")],
+            Mode::Concrete => vec![format!("arn:aws:s3:::{bucket}/{}", rest_segments.join("/"))],
+        }
     } else {
-        format!("arn:aws:s3:::{bucket}")
+        vec![format!("arn:aws:s3:::{bucket}")]
     }
 }
 
+fn xml_elements(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start_tag) = rest.find(&open) {
+        let after = &rest[start_tag + open.len()..];
+        let Some(end_tag) = after.find(&close) else {
+            break;
+        };
+        let decoded = after[..end_tag]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&");
+        if !decoded.is_empty() {
+            out.push(decoded);
+        }
+        rest = &after[end_tag + close.len()..];
+    }
+    out
+}
+
 /// Permissions a call needs on resources it does not name in its target.
-fn implied(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<Access> {
+fn implied(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<Access> {
     let mut out = Vec::new();
     if prefix == "s3" {
         // SSE-KMS: reading needs kms:Decrypt, writing kms:GenerateDataKey on the key.
@@ -948,7 +1243,7 @@ fn implied(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<Acc
             });
         if kms || kms_key_id.is_some() {
             let key = kms_key_id
-                .map(|key| kms_key(&key))
+                .map(|key| kms_key(mode, trace, &key))
                 .unwrap_or_else(|| "*".to_string());
             let action = match operation {
                 "GetObject" | "HeadObject" | "CopyObject" => Some("kms:Decrypt"),
@@ -980,7 +1275,7 @@ fn implied(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<Acc
             _ => None,
         };
         if let Some(action) = kms_action {
-            out.push(Access::new(action, kms_key(&key)));
+            out.push(Access::new(action, kms_key(mode, trace, &key)));
         }
     }
     // Passing a role to a service needs iam:PassRole on that role.
@@ -994,7 +1289,7 @@ fn implied(prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<Acc
         _ => None,
     };
     if let Some(role) = passed_role {
-        out.push(Access::new("iam:PassRole", iam_entity("role", &role)));
+        out.push(Access::new("iam:PassRole", iam_entity(mode, "role", &role)));
     }
     out
 }
@@ -1520,6 +1815,55 @@ mod tests {
                 "dynamodb:PutItem",
                 "arn:aws:dynamodb:*:*:table/orders"
             )]
+        );
+    }
+
+    #[test]
+    fn concrete_gate_derivation_preserves_object_keys_delete_objects_and_fails_closed() {
+        let get = call("s3", "GetObject", "GET", "/bucket/public/a+b.txt", None);
+        assert_eq!(
+            derive(&get).0,
+            vec![Access::new("s3:GetObject", "arn:aws:s3:::bucket/*")]
+        );
+        assert_eq!(
+            derive_for_gate(&get, true).0,
+            vec![Access::new(
+                "s3:GetObject",
+                "arn:aws:s3:::bucket/public/a+b.txt"
+            )]
+        );
+
+        let del = call(
+            "s3",
+            "DeleteObjects",
+            "POST",
+            "/bucket?delete",
+            Some(
+                r#"<Delete><Object><Key>public/a.txt</Key></Object><Object><Key>private/secret.txt</Key></Object></Delete>"#,
+            ),
+        );
+        assert_eq!(
+            derive_for_gate(&del, true).0,
+            vec![
+                Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/public/a.txt"),
+                Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/private/secret.txt"),
+            ]
+        );
+
+        let mut truncated = call(
+            "dynamodb",
+            "BatchWriteItem",
+            "POST",
+            "/",
+            Some(r#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"k":{"S":"v"#),
+        );
+        truncated.request.body.as_mut().unwrap().truncated = true;
+        assert!(
+            derive_for_gate(&truncated, false).0.contains(&Access::new(
+                "dynamodb:BatchWriteItem",
+                crate::lock::UNVERIFIED_RESOURCE
+            )),
+            "truncated body-dependent call emits fail-closed sentinel"
         );
     }
 }

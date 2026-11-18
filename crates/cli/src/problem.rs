@@ -70,14 +70,29 @@ pub fn blocked(
     gate_label: &str,
     request_id: &str,
 ) -> BlockedWire {
-    let message = format!(
-        "User is not authorized to perform: {} on resource: {} (blocked by Lenslet --enforce against {gate_label})",
-        denied.action, denied.resource
-    );
-    let hint = format!(
-        "Blocked locally by `lenslet run --enforce`: `{}` on `{}` is not permitted by `{gate_label}`. Run `lenslet run --update` if intended.",
-        denied.action, denied.resource
-    );
+    let (message, hint) = if denied.resource == crate::lock::UNVERIFIED_RESOURCE {
+        (
+            format!(
+                "Request body for {} could not be completely inspected and was blocked fail-closed by Lenslet --enforce against {gate_label}",
+                denied.action
+            ),
+            format!(
+                "Blocked fail-closed by `lenslet run --enforce`: the request body for `{}` was unreadable or exceeded the inspection ceiling.",
+                denied.action
+            ),
+        )
+    } else {
+        (
+            format!(
+                "User is not authorized to perform: {} on resource: {} (blocked by Lenslet --enforce against {gate_label})",
+                denied.action, denied.resource
+            ),
+            format!(
+                "Blocked locally by `lenslet run --enforce`: `{}` on `{}` is not permitted by `{gate_label}`. Run `lenslet run --update` if intended.",
+                denied.action, denied.resource
+            ),
+        )
+    };
 
     let has_target = request_headers
         .iter()

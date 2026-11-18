@@ -53,6 +53,10 @@ use crate::{
 type Body = BoxBody<Bytes, std::io::Error>;
 type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 
+/// Upper bound on request body inspection during `--enforce` (64 MiB — 4×
+/// AWS DynamoDB's 16 MiB batch limit). Anything larger fails closed.
+const MAX_ENFORCE_INSPECT_BYTES: usize = 64 * 1024 * 1024;
+
 /// A call still running after this long gets a `pending` trace line.
 const PENDING_AFTER: Duration = Duration::from_secs(1);
 
@@ -77,6 +81,10 @@ struct Pending {
     advertised_operation: Option<String>,
     request_capture: Arc<Mutex<Capture>>,
     request_content: Content,
+    /// Full-body snapshot or capture for gate evaluation when `--max-body` is
+    /// smaller than [`MAX_ENFORCE_INSPECT_BYTES`].
+    enforce_full_body: Option<trace::BodyTrace>,
+    gate_capture: Option<Arc<Mutex<Capture>>>,
     response_capture: Arc<Mutex<Capture>>,
     response_content: Content,
 }
@@ -87,10 +95,14 @@ impl Pending {
         self.trace.ms = self.started.elapsed().as_millis() as u64;
         self.trace.request.body = snapshot(&self.request_capture, &self.request_content);
         self.trace.response.body = snapshot(&self.response_capture, &self.response_content);
+        let op_capture = self
+            .gate_capture
+            .as_deref()
+            .unwrap_or(&self.request_capture);
         resolve_operation(
             &mut self.trace,
             self.advertised_operation.as_deref(),
-            &self.request_capture,
+            op_capture,
             &self.request_content,
         );
         self.trace.problem = problem::from_response(
@@ -102,7 +114,20 @@ impl Pending {
                 .as_ref()
                 .and_then(|body| body.text.as_deref()),
         );
-        self.state.trace.record(self.trace);
+        let eval_body = self.enforce_full_body.or_else(|| {
+            self.gate_capture
+                .as_deref()
+                .and_then(|cap| snapshot(cap, &self.request_content))
+        });
+        if let Some(full) = eval_body {
+            let mut eval_trace = self.trace.clone();
+            eval_trace.request.body = Some(full);
+            self.state
+                .trace
+                .record_evaluated(self.trace, Some(&eval_trace));
+        } else {
+            self.state.trace.record(self.trace);
+        }
     }
 }
 
@@ -462,11 +487,20 @@ where
     };
 
     // Active IAM enforcement (`--enforce`): deny unauthorized calls locally
-    // before a single unauthorized write reaches the emulator.
+    // before a single unauthorized write reaches the emulator. Request bodies
+    // are inspected against `MAX_ENFORCE_INSPECT_BYTES` independently of
+    // `--max-body`, so a small trace capture limit never hides trailing items.
+    let mut enforce_full_body: Option<trace::BodyTrace> = None;
+    let mut gate_capture: Option<Arc<Mutex<Capture>>> = None;
     let upstream_body: Body = if state.enforce
         && let Some(gate) = state.trace.gate()
     {
-        if access::needs_request_body(&service, advertised_operation.as_deref()) {
+        if access::needs_request_body(
+            &service,
+            advertised_operation.as_deref(),
+            &trace.operation,
+            &raw_path,
+        ) {
             let collected = match body.collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(err) => {
@@ -478,16 +512,33 @@ where
                 cap.feed(&collected);
             }
             trace.request.body = snapshot(&request_capture, &request_content);
+
+            let eval_cap = Mutex::new({
+                let mut c = Capture::with_limit(MAX_ENFORCE_INSPECT_BYTES);
+                c.feed(&collected);
+                c
+            });
             resolve_operation(
                 &mut trace,
                 advertised_operation.as_deref(),
-                &request_capture,
+                &eval_cap,
                 &request_content,
             );
-            if let Some(denied) = first_denied(&trace, gate) {
+            let full_body = snapshot(&eval_cap, &request_content);
+            let mut eval_trace = trace.clone();
+            eval_trace.request.body = full_body.clone();
+            if let Some(denied) = first_denied(&eval_trace, gate) {
                 state.trace.start(&trace.id);
-                return Ok(reject_blocked(trace, &denied, gate, &state, started));
+                return Ok(reject_blocked(
+                    trace,
+                    &eval_trace,
+                    &denied,
+                    gate,
+                    &state,
+                    started,
+                ));
             }
+            enforce_full_body = full_body;
             Full::new(collected).map_err(|never| match never {}).boxed()
         } else {
             if let Some(denied) = first_denied(&trace, gate) {
@@ -505,12 +556,27 @@ where
                     trace.request.body = snapshot(&request_capture, &request_content);
                 }
                 state.trace.start(&trace.id);
-                return Ok(reject_blocked(trace, &denied, gate, &state, started));
+                let eval_trace = trace.clone();
+                return Ok(reject_blocked(
+                    trace,
+                    &eval_trace,
+                    &denied,
+                    gate,
+                    &state,
+                    started,
+                ));
             }
             TeeBody::new(body, request_capture.clone())
                 .map_err(std::io::Error::other)
                 .boxed()
         }
+    } else if state.trace.gate().is_some() && state.max_body < MAX_ENFORCE_INSPECT_BYTES {
+        let gate_cap = Arc::new(Mutex::new(Capture::with_limit(MAX_ENFORCE_INSPECT_BYTES)));
+        gate_capture = Some(gate_cap.clone());
+        let inner = TeeBody::new(body, request_capture.clone());
+        TeeBody::new(inner, gate_cap)
+            .map_err(std::io::Error::other)
+            .boxed()
     } else {
         TeeBody::new(body, request_capture.clone())
             .map_err(std::io::Error::other)
@@ -583,17 +649,30 @@ where
                     },
                     ..trace.clone()
                 };
-                check_trace.request.body = snapshot(&request_capture, &request_content);
-                resolve_operation(
-                    &mut check_trace,
-                    advertised_operation.as_deref(),
-                    &request_capture,
-                    &request_content,
-                );
+                check_trace.request.body = enforce_full_body
+                    .clone()
+                    .or_else(|| snapshot(&request_capture, &request_content));
+                if enforce_full_body.is_none() {
+                    resolve_operation(
+                        &mut check_trace,
+                        advertised_operation.as_deref(),
+                        &request_capture,
+                        &request_content,
+                    );
+                }
                 if let Some(denied) = first_denied(&check_trace, gate) {
                     finished.store(true, Ordering::SeqCst);
                     drop(response);
-                    return Ok(reject_blocked(check_trace, &denied, gate, &state, started));
+                    let mut out_trace = check_trace.clone();
+                    out_trace.request.body = snapshot(&request_capture, &request_content);
+                    return Ok(reject_blocked(
+                        out_trace,
+                        &check_trace,
+                        &denied,
+                        gate,
+                        &state,
+                        started,
+                    ));
                 }
             }
 
@@ -614,6 +693,8 @@ where
                 advertised_operation,
                 request_capture,
                 request_content,
+                enforce_full_body,
+                gate_capture,
                 response_capture: response_capture.clone(),
                 response_content,
             };
@@ -669,7 +750,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 
 /// Return the first derived permission on `trace` that `gate` does not allow.
 fn first_denied(trace: &Trace, gate: &Gate) -> Option<Access> {
-    let (own, implied) = access::derive(trace);
+    let (own, implied) = access::derive_for_gate(trace, gate.is_policy());
     own.into_iter()
         .chain(implied)
         .find(|entry| !gate.allows(entry))
@@ -679,6 +760,7 @@ fn first_denied(trace: &Trace, gate: &Gate) -> Option<Access> {
 /// `AccessDenied` / `AccessDeniedException` response.
 fn reject_blocked(
     mut trace: Trace,
+    eval_trace: &Trace,
     denied: &Access,
     gate: &Gate,
     state: &State,
@@ -733,7 +815,7 @@ fn reject_blocked(
             sha256,
         }),
     };
-    state.trace.record(trace);
+    state.trace.record_evaluated(trace, Some(eval_trace));
 
     let mut response = Response::new(
         Full::new(Bytes::from(wire.body))
@@ -1606,6 +1688,153 @@ mod tests {
         assert!(written[1].blocked);
         assert!(written[2].blocked);
         assert_eq!(state.trace.summary().blocked, 2);
+    }
+
+    #[tokio::test]
+    async fn policy_gate_enforces_s3_prefix_allow_and_explicit_deny_on_concrete_keys() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("policy-s3-prefix");
+        let policy = Gate::from_policy_str(
+            r#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:DeleteObject"],
+                        "Resource": "arn:aws:s3:::bucket/public/*"
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:GetObject", "s3:DeleteObject"],
+                        "Resource": "arn:aws:s3:::bucket/public/secret/*"
+                    }
+                ]
+            }"#,
+            "policy.json",
+        )
+        .unwrap();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: MAX_CAPTURE_BYTES,
+            enforce: true,
+            trace: Arc::new(
+                TraceSink::with_gate(temp.trace(), &RunHeader::default(), Some(policy.clone()))
+                    .unwrap(),
+            ),
+        });
+
+        // 1. Concrete key inside allowed prefix (`public/readme.txt`) succeeds and is NOT marked new.
+        let ok = handle(
+            sdk_request("GET", "/bucket/public/readme.txt?x-id=GetObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let _ = ok.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_ok());
+
+        // 2. Concrete key matching explicit Deny (`public/secret/keys.txt`) is blocked.
+        let denied_sub = handle(
+            sdk_request("GET", "/bucket/public/secret/keys.txt?x-id=GetObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied_sub.status(), StatusCode::FORBIDDEN);
+        let _ = denied_sub.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_err());
+
+        // 3. Multi-object DeleteObjects naming a denied `<Key>` in XML is blocked.
+        let del_xml = br#"<Delete><Object><Key>public/readme.txt</Key></Object><Object><Key>public/secret/keys.txt</Key></Object></Delete>"#;
+        let del_req = sdk_request("POST", "/bucket?delete", del_xml);
+        let denied_del = handle(del_req, state.clone()).await.unwrap();
+        assert_eq!(denied_del.status(), StatusCode::FORBIDDEN);
+        let _ = denied_del.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_err());
+
+        let written = traces(&temp.trace());
+        assert_eq!(written.len(), 3);
+        assert!(!written[0].new, "allowed prefix call is not marked new");
+        assert!(!written[0].access[0].new);
+        assert!(written[1].blocked && written[1].new);
+        assert!(written[2].blocked && written[2].new);
+
+        let mut report = crate::summary::Report::default();
+        report.set_access_with_gate(&state.trace.summary(), Some(&policy));
+        assert_eq!(
+            report.access_added,
+            vec![
+                Access::new(
+                    "s3:DeleteObject",
+                    "arn:aws:s3:::bucket/public/secret/keys.txt"
+                ),
+                Access::new("s3:GetObject", "arn:aws:s3:::bucket/public/secret/keys.txt"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_inspects_complete_request_body_beyond_max_body_limit() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("enforce-max-body");
+        let locked: BTreeSet<Access> = [Access::new(
+            "dynamodb:BatchWriteItem",
+            "arn:aws:dynamodb:*:*:table/orders",
+        )]
+        .into();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        // Tiny 64-byte capture limit: `"orders"` fits in the prefix, while
+        // `"secret_orders"` appears past byte 140.
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: 64,
+            enforce: true,
+            trace: Arc::new(
+                TraceSink::new(temp.trace(), &RunHeader::default(), Some(locked)).unwrap(),
+            ),
+        });
+
+        let payload = br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"order-padding-0000000000000000000000000000"}}}}],"secret_orders":[{"PutRequest":{"Item":{"id":{"S":"2"}}}}]}}"#;
+        assert!(payload.len() > 140);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.BatchWriteItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(Full::new(Bytes::from_static(payload)))
+            .unwrap();
+
+        let resp = handle(req, state.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _ = resp.into_body().collect().await.unwrap();
+        assert!(
+            upstream.try_recv().is_err(),
+            "trailing unauthorized table past --max-body must be blocked before reaching upstream"
+        );
+
+        let written = traces(&temp.trace());
+        assert_eq!(written.len(), 1);
+        assert!(written[0].blocked);
+        assert!(
+            written[0].request.body.as_ref().unwrap().truncated,
+            "trace file still honors --max-body"
+        );
+        assert_eq!(written[0].access.len(), 2);
+        assert!(!written[0].access[0].new); // orders
+        assert!(written[0].access[1].new); // secret_orders
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {

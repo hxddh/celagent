@@ -146,12 +146,20 @@ struct Statement {
     not_resources: Vec<String>,
 }
 
+/// Sentinel resource emitted when a request body needed for permission
+/// derivation was truncated or unreadable: every gate rejects it (fail closed).
+pub const UNVERIFIED_RESOURCE: &str = "<unverified-request-body>";
+
 impl Gate {
     pub fn from_lock(label: impl Into<String>, access: BTreeSet<Access>) -> Self {
         Gate {
             label: label.into(),
             kind: GateKind::Lock(access),
         }
+    }
+
+    pub fn is_policy(&self) -> bool {
+        matches!(self.kind, GateKind::Policy(_))
     }
 
     pub fn from_policy_file(path: &Path, label: impl Into<String>) -> Result<Self> {
@@ -173,6 +181,23 @@ impl Gate {
             let Some(obj) = item.as_object() else {
                 anyhow::bail!("each IAM Statement must be a JSON object");
             };
+            if obj
+                .get("Condition")
+                .is_some_and(|c| !c.is_null() && c.as_object().is_none_or(|m| !m.is_empty()))
+            {
+                anyhow::bail!(
+                    "IAM Statement contains `Condition`, which Lenslet cannot evaluate locally; remove `Condition` or use `lenslet.lock`"
+                );
+            }
+            if obj.get("NotPrincipal").is_some()
+                || obj
+                    .get("Principal")
+                    .is_some_and(|p| p != "*" && p.get("AWS") != Some(&serde_json::json!("*")))
+            {
+                anyhow::bail!(
+                    "IAM Statement restricts `Principal`, which Lenslet cannot evaluate locally; pass an identity policy without principal restrictions"
+                );
+            }
             let effect = obj.get("Effect").and_then(|v| v.as_str()).unwrap_or("");
             let allow = if effect.eq_ignore_ascii_case("allow") {
                 true
@@ -191,12 +216,22 @@ impl Gate {
                     _ => Vec::new(),
                 }
             };
+            let actions = list("Action");
+            let not_actions = list("NotAction");
+            let resources = list("Resource");
+            let not_resources = list("NotResource");
+            if actions.is_empty() && not_actions.is_empty() {
+                anyhow::bail!("IAM Statement must specify `Action` or `NotAction`");
+            }
+            if resources.is_empty() && not_resources.is_empty() {
+                anyhow::bail!("IAM Statement must specify `Resource` or `NotResource`");
+            }
             statements.push(Statement {
                 allow,
-                actions: list("Action"),
-                not_actions: list("NotAction"),
-                resources: list("Resource"),
-                not_resources: list("NotResource"),
+                actions,
+                not_actions,
+                resources,
+                not_resources,
             });
         }
         Ok(Gate {
@@ -214,6 +249,9 @@ impl Gate {
 
     /// Whether `access` is permitted by this lock or IAM policy.
     pub fn allows(&self, access: &Access) -> bool {
+        if access.resource == UNVERIFIED_RESOURCE {
+            return false;
+        }
         match &self.kind {
             GateKind::Lock(entries) => {
                 entries.contains(access)
@@ -273,6 +311,10 @@ impl Statement {
 
 fn iam_action_matches(pattern: &str, actual: &str) -> bool {
     glob_match(&pattern.to_ascii_lowercase(), &actual.to_ascii_lowercase())
+}
+
+pub(crate) fn arn_matches(pattern: &str, actual: &str) -> bool {
+    iam_arn_matches(pattern, actual)
 }
 
 fn iam_arn_matches(pattern: &str, actual: &str) -> bool {
@@ -443,5 +485,50 @@ mod tests {
             "dynamodb:DeleteTable",
             "arn:aws:dynamodb:*:*:table/orders"
         )));
+    }
+
+    #[test]
+    fn policy_gate_rejects_conditions_and_restricted_principals() {
+        let conditional = r#"{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": "arn:aws:s3:::assets/*",
+                "Condition": {
+                    "StringEquals": { "s3:x-amz-server-side-encryption": "aws:kms" }
+                }
+            }]
+        }"#;
+        let Err(err) = Gate::from_policy_str(conditional, "cond.json") else {
+            panic!("Condition must be rejected");
+        };
+        let err = err.to_string();
+        assert!(err.contains("Condition"), "{err}");
+
+        let principal_scoped = r#"{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "AWS": "arn:aws:iam::123456789012:root" },
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::assets/*"
+            }]
+        }"#;
+        let Err(err) = Gate::from_policy_str(principal_scoped, "principal.json") else {
+            panic!("Restricted Principal must be rejected");
+        };
+        let err = err.to_string();
+        assert!(err.contains("Principal"), "{err}");
+
+        let admin = Gate::from_policy_str(
+            r#"{"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+            "admin.json",
+        )
+        .unwrap();
+        assert!(
+            !admin.allows(&access("dynamodb:BatchWriteItem", UNVERIFIED_RESOURCE)),
+            "unverified request bodies always fail closed"
+        );
     }
 }
