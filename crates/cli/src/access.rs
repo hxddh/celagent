@@ -329,21 +329,23 @@ fn copy_source(mode: Mode, trace: &Trace) -> Option<String> {
         .find(|header| header.name.eq_ignore_ascii_case("x-amz-copy-source"))?
         .value
         .as_str();
-    let decoded = wire::percent_decode_path(value);
-    let path = decoded.split('?').next().unwrap_or(&decoded);
-    if path.starts_with("arn:") {
+    let raw_path = value.split('?').next().unwrap_or(value);
+    if raw_path.starts_with("arn:") {
+        let decoded_arn = wire::percent_decode_path(raw_path);
         return Some(match mode {
             Mode::Footprint => "*".to_string(),
-            Mode::Concrete => path.to_string(),
+            Mode::Concrete => decoded_arn,
         });
     }
-    let trimmed = path.strip_prefix('/').unwrap_or(path);
-    let (bucket, key) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+    let trimmed = raw_path.strip_prefix('/').unwrap_or(raw_path);
+    let (raw_bucket, raw_key) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+    let bucket = wire::percent_decode_path(raw_bucket);
+    let key = wire::percent_decode_path(raw_key);
     if bucket.is_empty() {
         return None;
     }
     Some(match mode {
-        Mode::Footprint => format!("arn:aws:s3:::{}/*", normalize(bucket)),
+        Mode::Footprint => format!("arn:aws:s3:::{}/*", normalize(&bucket)),
         Mode::Concrete => {
             if key.is_empty() {
                 format!("arn:aws:s3:::{bucket}/*")
@@ -2073,6 +2075,21 @@ mod tests {
                 vec![Access::new("s3:GetObject", expected_arn)]
             );
         }
+
+        // Percent-encoded `?` (`%3F`) in `x-amz-copy-source` stays part of the source key
+        // while literal `?versionId=...` query parameters are stripped first.
+        let mut copy = call("s3", "CopyObject", "PUT", "/dest/out.txt", None);
+        copy.request.headers = vec![HeaderTrace {
+            name: "x-amz-copy-source".into(),
+            value: "assets/public%3Fsecret?versionId=v1".into(),
+        }];
+        assert_eq!(
+            derive_for_gate(&copy, true).0,
+            vec![
+                Access::new("s3:PutObject", "arn:aws:s3:::dest/out.txt"),
+                Access::new("s3:GetObject", "arn:aws:s3:::assets/public?secret"),
+            ]
+        );
 
         let del = call(
             "s3",

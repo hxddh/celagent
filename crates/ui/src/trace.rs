@@ -1251,8 +1251,15 @@ fn posix_single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-/// Build an exact, unredacted `curl` command reproducing `trace`'s HTTP request.
-pub fn to_curl(trace: &Trace, endpoint: Option<&str>) -> String {
+/// Build an exact, unredacted `curl` command reproducing `trace`'s HTTP request,
+/// or `None` when the request carried a binary or truncated body whose complete
+/// payload cannot be reconstructed from the trace.
+pub fn to_curl(trace: &Trace, endpoint: Option<&str>) -> Option<String> {
+    if let Some(body) = trace.request.as_ref().and_then(|req| req.body.as_ref())
+        && (body.truncated || (body.bytes > 0 && body.text.is_none()))
+    {
+        return None;
+    }
     let base = endpoint
         .filter(|e| !e.is_empty())
         .map(|e| e.trim_end_matches('/').to_string())
@@ -1280,7 +1287,7 @@ pub fn to_curl(trace: &Trace, endpoint: Option<&str>) -> String {
         let decoded_wire = req
             .body
             .as_ref()
-            .is_some_and(|body| body.encoding.is_some() || (body.bytes > 0 && body.text.is_none()));
+            .is_some_and(|body| body.encoding.is_some());
         let compressed_wire = req
             .body
             .as_ref()
@@ -1336,7 +1343,7 @@ pub fn to_curl(trace: &Trace, endpoint: Option<&str>) -> String {
             parts.push(format!("--data-raw {}", posix_single_quote(text)));
         }
     }
-    parts.join(" \\\n  ")
+    Some(parts.join(" \\\n  "))
 }
 
 /// Render a lowercase hex string (`89504e47...`) as a classic 16-byte-per-row
@@ -2335,7 +2342,7 @@ mod tests {
 
         assert!(call.blocked);
         assert!(Filter::Blocked.matches(&call));
-        let curl = to_curl(&call, Some("http://127.0.0.1:41234"));
+        let curl = to_curl(&call, Some("http://127.0.0.1:41234")).unwrap();
         assert!(
             curl.contains("'http://127.0.0.1:41234/?x-id=PutItem'"),
             "{curl}"
@@ -2390,7 +2397,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let encoded_curl = to_curl(&encoded_call, Some("http://127.0.0.1:9297"));
+        let encoded_curl = to_curl(&encoded_call, Some("http://127.0.0.1:9297")).unwrap();
         assert!(!encoded_curl.contains("content-encoding"), "{encoded_curl}");
         assert!(
             !encoded_curl.contains("x-amz-decoded-content-length"),
@@ -2405,5 +2412,30 @@ mod tests {
             encoded_curl.contains("--data-raw '{\"order\":\"#42\"}'"),
             "{encoded_curl}"
         );
+
+        // Binary and truncated request bodies refuse `to_curl` rather than emitting
+        // an incomplete or empty write.
+        let mut binary_call = encoded_call.clone();
+        binary_call.request.as_mut().unwrap().body = Some(Body {
+            text: None,
+            hex: Some("89504e47".into()),
+            encoding: None,
+            bytes: 4096,
+            truncated: false,
+            binary: true,
+            sha256: None,
+        });
+        assert!(to_curl(&binary_call, None).is_none());
+
+        let mut truncated_call = call.clone();
+        truncated_call
+            .request
+            .as_mut()
+            .unwrap()
+            .body
+            .as_mut()
+            .unwrap()
+            .truncated = true;
+        assert!(to_curl(&truncated_call, None).is_none());
     }
 }

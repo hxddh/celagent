@@ -274,7 +274,9 @@ impl LensletApp {
             .as_ref()
             .map(|r| r.header.endpoint.as_str())
             .filter(|e| !e.is_empty());
-        let curl = trace::to_curl(&trace, endpoint);
+        let Some(curl) = trace::to_curl(&trace, endpoint) else {
+            return;
+        };
         self.copy_text("curl", curl, cx);
     }
 

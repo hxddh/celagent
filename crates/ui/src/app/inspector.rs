@@ -104,13 +104,15 @@ impl LensletApp {
                     .child(trace::ellipsize(trace::display_path(trace), 40)),
             )
             .child(self.copy_button("copy-path", "path", Some(trace.path.clone()), cx))
-            .child(
-                action_button("copy-curl", i18n::pick("Copy curl", "复制 curl")).on_click(
-                    cx.listener(move |this, _, _, cx| {
-                        this.copy_text("curl", curl_cmd.clone(), cx);
-                    }),
-                ),
-            );
+            .when_some(curl_cmd, |el, curl_cmd| {
+                el.child(
+                    action_button("copy-curl", i18n::pick("Copy curl", "复制 curl")).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.copy_text("curl", curl_cmd.clone(), cx);
+                        }),
+                    ),
+                )
+            });
 
         let (status_tint, status_value, status_words) = if trace.pending {
             (rgb(t.amber), "…".to_string(), "pending")
