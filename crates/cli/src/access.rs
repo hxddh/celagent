@@ -337,7 +337,7 @@ fn copy_source(mode: Mode, trace: &Trace) -> Option<String> {
             Mode::Concrete => path.to_string(),
         });
     }
-    let trimmed = path.trim_start_matches('/');
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
     let (bucket, key) = trimmed.split_once('/').unwrap_or((trimmed, ""));
     if bucket.is_empty() {
         return None;
@@ -1145,23 +1145,39 @@ fn lambda_function(path: &str) -> Option<String> {
 fn s3_resources(mode: Mode, operation: &str, trace: &Trace) -> Vec<String> {
     let bare = trace.path.split('?').next().unwrap_or(&trace.path);
     let host = wire::strip_port(&trace.host);
-    let host_bucket = (host.ends_with(".localhost") || host.contains(".s3"))
-        .then(|| host.split('.').next().unwrap_or(""))
-        .filter(|bucket| !bucket.is_empty());
-    let mut segments = bare.split('/').filter(|segment| !segment.is_empty());
-    let raw_bucket = match host_bucket {
-        Some(bucket) => Some(bucket.to_string()),
-        None => segments.next().map(wire::percent_decode_path),
+    let host_bucket = (host.ends_with(".localhost")
+        || host.contains(".s3.")
+        || host.contains(".s3-")
+        || host.ends_with(".s3"))
+    .then(|| host.split('.').next().unwrap_or(""))
+    .filter(|bucket| !bucket.is_empty());
+    let (raw_bucket, raw_key): (Option<String>, &str) = match host_bucket {
+        Some(bucket) => (
+            Some(bucket.to_string()),
+            bare.strip_prefix('/').unwrap_or(bare),
+        ),
+        None => {
+            let after_root = bare.strip_prefix('/').unwrap_or(bare);
+            match after_root.split_once('/') {
+                Some((bucket, key)) if !bucket.is_empty() => {
+                    (Some(wire::percent_decode_path(bucket)), key)
+                }
+                None if !after_root.is_empty() => (Some(wire::percent_decode_path(after_root)), ""),
+                _ => (None, ""),
+            }
+        }
     };
-    let rest_segments: Vec<String> = segments.map(wire::percent_decode_path).collect();
-    let has_key = !rest_segments.is_empty();
+    let decoded_key = wire::percent_decode_path(raw_key);
+    let has_key = !decoded_key.is_empty();
     let Some(raw_bucket) = raw_bucket else {
         return vec!["*".to_string()];
     };
     let bucket = norm(mode, &raw_bucket);
     let bucket_level = matches!(
         operation,
-        "ListObjects"
+        "CreateBucket"
+            | "DeleteBucket"
+            | "ListObjects"
             | "ListObjectsV2"
             | "HeadBucket"
             | "ListObjectVersions"
@@ -1179,7 +1195,7 @@ fn s3_resources(mode: Mode, operation: &str, trace: &Trace) -> Vec<String> {
                     .unwrap_or("");
                 xml_elements(xml, "Key")
                     .into_iter()
-                    .map(|key| format!("arn:aws:s3:::{bucket}/{}", key.trim_start_matches('/')))
+                    .map(|key| format!("arn:aws:s3:::{bucket}/{key}"))
                     .collect()
             }
         };
@@ -1187,7 +1203,7 @@ fn s3_resources(mode: Mode, operation: &str, trace: &Trace) -> Vec<String> {
     if has_key && !bucket_level {
         match mode {
             Mode::Footprint => vec![format!("arn:aws:s3:::{bucket}/*")],
-            Mode::Concrete => vec![format!("arn:aws:s3:::{bucket}/{}", rest_segments.join("/"))],
+            Mode::Concrete => vec![format!("arn:aws:s3:::{bucket}/{decoded_key}")],
         }
     } else {
         vec![format!("arn:aws:s3:::{bucket}")]
@@ -1833,20 +1849,36 @@ mod tests {
             )]
         );
 
+        // Consecutive, leading, and trailing slashes in S3 object keys are preserved verbatim.
+        for (path, expected_arn) in [
+            ("/bucket/private//file", "arn:aws:s3:::bucket/private//file"),
+            ("/bucket//leading", "arn:aws:s3:::bucket//leading"),
+            ("/bucket/dir/", "arn:aws:s3:::bucket/dir/"),
+        ] {
+            let weird = call("s3", "GetObject", "GET", path, None);
+            assert_eq!(
+                derive_for_gate(&weird, true).0,
+                vec![Access::new("s3:GetObject", expected_arn)]
+            );
+        }
+
         let del = call(
             "s3",
             "DeleteObjects",
             "POST",
             "/bucket?delete",
             Some(
-                r#"<Delete><Object><Key>public/a.txt</Key></Object><Object><Key>private/secret.txt</Key></Object></Delete>"#,
+                r#"<Delete><Object><Key>public/a.txt</Key></Object><Object><Key>/private//secret.txt</Key></Object></Delete>"#,
             ),
         );
         assert_eq!(
             derive_for_gate(&del, true).0,
             vec![
                 Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/public/a.txt"),
-                Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/private/secret.txt"),
+                Access::new(
+                    "s3:DeleteObject",
+                    "arn:aws:s3:::bucket//private//secret.txt"
+                ),
             ]
         );
 

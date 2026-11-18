@@ -402,7 +402,48 @@ fn client(roots: RootCertStore) -> HttpsClient {
     Client::builder(TokioExecutor::new()).build(https)
 }
 
+enum CollectedBody {
+    Complete(Bytes),
+    ExceedsLimit(Bytes),
+}
+
+/// Buffer up to `limit` bytes from `body`, returning `ExceedsLimit` as soon as
+/// incoming data crosses `limit` so a large or streaming upload never exhausts
+/// proxy memory under `--enforce`.
+async fn collect_bounded<B>(mut body: B, limit: usize) -> Result<CollectedBody, String>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let cap_hint = body.size_hint().lower().min(limit as u64).min(64 * 1024) as usize;
+    let mut buf = Vec::with_capacity(cap_hint);
+    while let Some(frame_res) = body.frame().await {
+        let frame = frame_res.map_err(|err| err.into().to_string())?;
+        if let Ok(chunk) = frame.into_data() {
+            if buf.len().saturating_add(chunk.len()) > limit {
+                let take = limit.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+                return Ok(CollectedBody::ExceedsLimit(Bytes::from(buf)));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    Ok(CollectedBody::Complete(Bytes::from(buf)))
+}
+
 async fn handle<B>(req: Request<B>, state: Arc<State>) -> Result<Response<Body>, Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    handle_with_inspect_limit(req, state, MAX_ENFORCE_INSPECT_BYTES).await
+}
+
+async fn handle_with_inspect_limit<B>(
+    req: Request<B>,
+    state: Arc<State>,
+    inspect_limit: usize,
+) -> Result<Response<Body>, Infallible>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -501,10 +542,10 @@ where
             &trace.operation,
             &raw_path,
         ) {
-            let collected = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(err) => {
-                    let detail = err.into().to_string();
+            let (collected, over_limit) = match collect_bounded(body, inspect_limit).await {
+                Ok(CollectedBody::Complete(bytes)) => (bytes, false),
+                Ok(CollectedBody::ExceedsLimit(prefix)) => (prefix, true),
+                Err(detail) => {
                     return Ok(error_response(StatusCode::BAD_REQUEST, &detail));
                 }
             };
@@ -512,9 +553,12 @@ where
                 cap.feed(&collected);
             }
             trace.request.body = snapshot(&request_capture, &request_content);
+            if over_limit && let Some(ref mut b) = trace.request.body {
+                b.truncated = true;
+            }
 
             let eval_cap = Mutex::new({
-                let mut c = Capture::with_limit(MAX_ENFORCE_INSPECT_BYTES);
+                let mut c = Capture::with_limit(inspect_limit);
                 c.feed(&collected);
                 c
             });
@@ -524,9 +568,42 @@ where
                 &eval_cap,
                 &request_content,
             );
-            let full_body = snapshot(&eval_cap, &request_content);
+            let mut full_body = snapshot(&eval_cap, &request_content);
+            if over_limit {
+                match full_body.as_mut() {
+                    Some(b) => b.truncated = true,
+                    None => {
+                        full_body = Some(trace::BodyTrace {
+                            text: None,
+                            hex: None,
+                            encoding: request_content.wire_encoding.clone(),
+                            bytes: collected.len() as u64,
+                            truncated: true,
+                            binary: false,
+                            sha256: String::new(),
+                        });
+                    }
+                }
+            }
             let mut eval_trace = trace.clone();
             eval_trace.request.body = full_body.clone();
+            if over_limit {
+                let denied = first_denied(&eval_trace, gate).unwrap_or_else(|| {
+                    Access::new(
+                        format!("{}:*", trace.service),
+                        crate::lock::UNVERIFIED_RESOURCE,
+                    )
+                });
+                state.trace.start(&trace.id);
+                return Ok(reject_blocked(
+                    trace,
+                    &eval_trace,
+                    &denied,
+                    gate,
+                    &state,
+                    started,
+                ));
+            }
             if let Some(denied) = first_denied(&eval_trace, gate) {
                 state.trace.start(&trace.id);
                 return Ok(reject_blocked(
@@ -542,14 +619,16 @@ where
             Full::new(collected).map_err(|never| match never {}).boxed()
         } else {
             if let Some(denied) = first_denied(&trace, gate) {
-                // Drain small bodies so keep-alive clients read the 403 cleanly
-                // and the blocked request body is still visible in the trace.
+                // Drain small bodies with a strict size cap so keep-alive clients
+                // read the 403 cleanly without trusting `size_hint` blindly.
                 let small_exact = body
                     .size_hint()
                     .exact()
                     .is_some_and(|len| len <= state.max_body as u64);
-                if small_exact && let Ok(collected) = body.collect().await {
-                    let bytes = collected.to_bytes();
+                if small_exact
+                    && let Ok(CollectedBody::Complete(bytes)) =
+                        collect_bounded(body, state.max_body.min(inspect_limit)).await
+                {
                     if let Ok(mut cap) = request_capture.lock() {
                         cap.feed(&bytes);
                     }
@@ -570,8 +649,8 @@ where
                 .map_err(std::io::Error::other)
                 .boxed()
         }
-    } else if state.trace.gate().is_some() && state.max_body < MAX_ENFORCE_INSPECT_BYTES {
-        let gate_cap = Arc::new(Mutex::new(Capture::with_limit(MAX_ENFORCE_INSPECT_BYTES)));
+    } else if state.trace.gate().is_some() && state.max_body < inspect_limit {
+        let gate_cap = Arc::new(Mutex::new(Capture::with_limit(inspect_limit)));
         gate_capture = Some(gate_cap.clone());
         let inner = TeeBody::new(body, request_capture.clone());
         TeeBody::new(inner, gate_cap)
@@ -999,13 +1078,16 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
+            use std::sync::atomic::AtomicUsize;
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
             let path = std::env::temp_dir().join(format!(
-                "lenslet-proxy-{tag}-{}-{}",
+                "lenslet-proxy-{tag}-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
             ));
             TempDir(path)
         }
@@ -1757,12 +1839,25 @@ mod tests {
         let _ = denied_del.into_body().collect().await.unwrap();
         assert!(upstream.try_recv().is_err());
 
+        // 4. Consecutive slashes (`/bucket/public/secret//keys.txt`) preserve empty key segments
+        //    so an explicit Deny on `public/secret/*` still blocks it.
+        let denied_double_slash = handle(
+            sdk_request("GET", "/bucket/public/secret//keys.txt?x-id=GetObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied_double_slash.status(), StatusCode::FORBIDDEN);
+        let _ = denied_double_slash.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_err());
+
         let written = traces(&temp.trace());
-        assert_eq!(written.len(), 3);
+        assert_eq!(written.len(), 4);
         assert!(!written[0].new, "allowed prefix call is not marked new");
         assert!(!written[0].access[0].new);
         assert!(written[1].blocked && written[1].new);
         assert!(written[2].blocked && written[2].new);
+        assert!(written[3].blocked && written[3].new);
 
         let mut report = crate::summary::Report::default();
         report.set_access_with_gate(&state.trace.summary(), Some(&policy));
@@ -1772,6 +1867,10 @@ mod tests {
                 Access::new(
                     "s3:DeleteObject",
                     "arn:aws:s3:::bucket/public/secret/keys.txt"
+                ),
+                Access::new(
+                    "s3:GetObject",
+                    "arn:aws:s3:::bucket/public/secret//keys.txt"
                 ),
                 Access::new("s3:GetObject", "arn:aws:s3:::bucket/public/secret/keys.txt"),
             ]
@@ -1835,6 +1934,81 @@ mod tests {
         assert_eq!(written[0].access.len(), 2);
         assert!(!written[0].access[0].new); // orders
         assert!(written[0].access[1].new); // secret_orders
+    }
+
+    #[tokio::test]
+    async fn enforce_bounds_request_collection_and_fails_closed_when_exceeded() {
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll};
+
+        struct InfiniteStream {
+            polled_frames: Arc<AtomicUsize>,
+        }
+        impl hyper::body::Body for InfiniteStream {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+                self.polled_frames.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                    br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"chunk"}}}}]}}"#,
+                )))))
+            }
+        }
+
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("enforce-bounded");
+        let admin = Gate::from_policy_str(
+            r#"{"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+            "admin.json",
+        )
+        .unwrap();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: 64,
+            enforce: true,
+            trace: Arc::new(
+                TraceSink::with_gate(temp.trace(), &RunHeader::default(), Some(admin)).unwrap(),
+            ),
+        });
+
+        let polled = Arc::new(AtomicUsize::new(0));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.BatchWriteItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(InfiniteStream {
+                polled_frames: polled.clone(),
+            })
+            .unwrap();
+
+        // With a 128-byte inspect limit, an infinite streaming body stops after 2
+        // frames (74 * 2 = 148 > 128) and fails closed immediately instead of hanging/OOMing.
+        let resp = handle_with_inspect_limit(req, state.clone(), 128)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(polled.load(Ordering::SeqCst), 2);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("AccessDeniedException")
+        );
+        assert!(upstream.try_recv().is_err());
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {

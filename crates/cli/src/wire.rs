@@ -249,14 +249,23 @@ fn s3_operation(method: &str, path: &str, headers: &HeaderMap) -> Option<String>
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     let host = strip_port(host);
-    let bucket_in_host =
-        host.ends_with(".localhost") || host.contains(".s3.") || host.contains(".s3-");
-    let segments = bare
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
-        + usize::from(bucket_in_host);
-    let object = segments >= 2;
+    let bucket_in_host = host.ends_with(".localhost")
+        || host.contains(".s3.")
+        || host.contains(".s3-")
+        || host.ends_with(".s3");
+    let (has_bucket, object) = if bucket_in_host {
+        (true, !bare.strip_prefix('/').unwrap_or(bare).is_empty())
+    } else {
+        let after_root = bare.strip_prefix('/').unwrap_or(bare);
+        if after_root.is_empty() {
+            (false, false)
+        } else {
+            match after_root.split_once('/') {
+                Some((bucket, key)) => (!bucket.is_empty(), !bucket.is_empty() && !key.is_empty()),
+                None => (true, false),
+            }
+        }
+    };
     let copy = headers.contains_key("x-amz-copy-source");
     let name = |verb: &str, noun: &str| Some(format!("{verb}{noun}"));
     let verb = match method {
@@ -266,7 +275,7 @@ fn s3_operation(method: &str, path: &str, headers: &HeaderMap) -> Option<String>
         _ => "",
     };
 
-    if segments == 0 {
+    if !has_bucket {
         return (method == "GET").then(|| "ListBuckets".to_string());
     }
     // Multipart uploads.

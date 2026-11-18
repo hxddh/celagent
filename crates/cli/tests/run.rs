@@ -44,13 +44,16 @@ fn fake_emulator() -> u16 {
 }
 
 fn temp_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "lenslet-run-test-{}-{}",
+        "lenslet-run-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
