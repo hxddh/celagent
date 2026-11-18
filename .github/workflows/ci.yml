@@ -114,3 +114,24 @@ jobs:
           test "$SAME" = 0
           test "$GROWN" = 3
           test "$GROWN_OUTCOME" = failure
+      - name: Fresh emulator state before enforce
+        run: curl -fsS -X POST http://127.0.0.1:9298/moto-api/reset
+      - name: Enforce blocks unlocked boto3 DeleteItem live
+        id: enforced
+        continue-on-error: true
+        uses: ./
+        with:
+          binary: target/release/lenslet
+          upstream: http://127.0.0.1:9298
+          working-directory: examples/python
+          command: SHOP_REFUNDS=1 python test_shop.py
+          enforce: 'true'
+          comment: 'false'
+      - name: Check enforced outcome
+        env:
+          ENFORCED: ${{ steps.enforced.outputs.exit-code }}
+          REPORT: ${{ steps.enforced.outputs.report }}
+        run: |
+          set -x
+          test "$ENFORCED" = 1
+          test "$(jq -r '.blocked' "$REPORT")" = 1

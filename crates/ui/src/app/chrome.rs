@@ -4,8 +4,9 @@ use super::*;
 
 impl LensletApp {
     pub(super) fn render_header(&self, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let dot = if self.paused {
-            theme::h(theme::AMBER, 0.95)
+            theme::h(t.amber, 0.95)
         } else {
             self.proxy_light().dot
         };
@@ -18,9 +19,9 @@ impl LensletApp {
                 .unwrap_or_default()
         };
         let pause_icon = if self.paused {
-            glyph::play_icon(theme::h(theme::AMBER, 0.95)).into_any_element()
+            glyph::play_icon(theme::h(t.amber, 0.95)).into_any_element()
         } else {
-            glyph::pause_icon(theme::h(theme::TEXT_DIM, 0.95)).into_any_element()
+            glyph::pause_icon(theme::h(t.text_dim, 0.95)).into_any_element()
         };
 
         let mut brand = div()
@@ -32,7 +33,7 @@ impl LensletApp {
                 div()
                     .text_size(px(14.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(t.text))
                     .child("Lenslet"),
             )
             .child(self.render_run_summary(cx));
@@ -45,11 +46,11 @@ impl LensletApp {
                     .items_center()
                     .rounded(px(3.0))
                     .border_1()
-                    .border_color(theme::line(theme::AMBER, 0.35))
-                    .bg(theme::h(theme::AMBER, 0.08))
+                    .border_color(theme::line(t.amber, 0.35))
+                    .bg(theme::h(t.amber, 0.08))
                     .text_size(px(9.5))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(theme::AMBER))
+                    .text_color(rgb(t.amber))
                     .child("DEMO"),
             );
         }
@@ -59,10 +60,10 @@ impl LensletApp {
             .items_center()
             .h(px(theme::HEADER_H))
             .px(px(14.0))
-            .gap(px(14.0))
-            .bg(rgb(theme::HEADER))
+            .gap(px(8.0))
+            .bg(rgb(t.header))
             .border_b_1()
-            .border_color(rgb(theme::BORDER_SUBTLE))
+            .border_color(rgb(t.border_subtle))
             .child(brand)
             .child(div().flex_1())
             .child(
@@ -74,23 +75,31 @@ impl LensletApp {
                     .px(px(9.0))
                     .rounded_full()
                     .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .bg(theme::h(theme::TEXT, 0.02))
+                    .border_color(rgb(t.border))
+                    .bg(theme::h(t.text, 0.02))
                     .child(glyph::dot(dot, 5.5))
                     .child(
                         div()
                             .font_family(fonts::mono())
                             .text_size(px(11.5))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(rgb(t.text_dim))
                             .child(self.endpoint_label()),
                     )
                     .child(
                         div()
                             .text_size(px(9.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(rgb(t.text_faint))
                             .child(kind),
                     ),
+            )
+            .child(
+                header_pill("theme-button", i18n::theme_button_label(self.prefs.theme))
+                    .on_click(cx.listener(|this, _, _, cx| this.cycle_theme(cx))),
+            )
+            .child(
+                header_pill("lang-button", i18n::lang_button_label())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_lang(cx))),
             )
             .child(
                 div()
@@ -103,35 +112,36 @@ impl LensletApp {
                     .rounded(px(6.0))
                     .border_1()
                     .border_color(if self.paused {
-                        theme::line(theme::AMBER, 0.35)
+                        theme::line(t.amber, 0.35)
                     } else {
-                        theme::h(theme::BORDER, 1.0)
+                        theme::h(t.border, 1.0)
                     })
                     .bg(if self.paused {
-                        theme::h(theme::AMBER, 0.07)
+                        theme::h(t.amber, 0.07)
                     } else {
-                        theme::h(theme::TEXT, 0.02)
+                        theme::h(t.text, 0.02)
                     })
                     .text_size(px(11.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(if self.paused {
-                        rgb(theme::AMBER)
+                        rgb(t.amber)
                     } else {
-                        rgb(theme::TEXT_DIM)
+                        rgb(t.text_dim)
                     })
                     .cursor_pointer()
-                    .hover(|style| {
-                        style
-                            .bg(theme::h(theme::TEXT, 0.06))
-                            .text_color(rgb(theme::TEXT))
-                    })
+                    .hover(move |style| style.bg(theme::h(t.text, 0.06)).text_color(rgb(t.text)))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx)))
                     .child(pause_icon)
-                    .child(if self.paused { "Resume" } else { "Pause" }),
+                    .child(if self.paused {
+                        i18n::pick("Resume", "继续")
+                    } else {
+                        i18n::pick("Pause", "暂停")
+                    }),
             )
     }
 
     pub(super) fn render_toolbar(&self, compact: bool, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let limit = if compact { 3 } else { 5 };
         let visible = self.visible_facets(limit);
         let hidden = self.facets.len().saturating_sub(visible.len());
@@ -150,21 +160,34 @@ impl LensletApp {
             .overflow_hidden()
             .child(self.chip(
                 "filter-all",
-                "All",
+                i18n::pick("All", "全部"),
                 self.counts.total,
                 None,
+                Filter::All,
                 self.filter == Filter::All,
                 cx,
             ))
             .child(self.chip(
                 "filter-errors",
-                "Errors",
+                i18n::pick("Errors", "错误"),
                 self.counts.errors,
-                Some(theme::RED),
+                Some(t.red),
+                Filter::Errors,
                 self.filter == Filter::Errors,
                 cx,
-            ))
-            .children(visible_chips);
+            ));
+        if self.counts.blocked > 0 || self.filter == Filter::Blocked {
+            chip_row = chip_row.child(self.chip(
+                "filter-blocked",
+                i18n::pick("Blocked", "已拦截"),
+                self.counts.blocked,
+                Some(t.red),
+                Filter::Blocked,
+                self.filter == Filter::Blocked,
+                cx,
+            ));
+        }
+        chip_row = chip_row.children(visible_chips);
         if let Filter::Access(access) = &self.filter {
             chip_row = chip_row.child(
                 div()
@@ -177,15 +200,15 @@ impl LensletApp {
                     .px(px(8.0))
                     .rounded(px(5.0))
                     .border_1()
-                    .border_color(theme::line(theme::ACCENT, 0.45))
-                    .bg(theme::h(theme::ACCENT, 0.08))
+                    .border_color(theme::line(t.accent, 0.45))
+                    .bg(theme::h(t.accent, 0.08))
                     .font_family(fonts::mono())
                     .text_size(px(10.5))
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(t.text))
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| this.set_filter(Filter::All, cx)))
                     .child(trace::ellipsize(&access.action, 34))
-                    .child(div().text_color(rgb(theme::TEXT_MUTED)).child("×")),
+                    .child(div().text_color(rgb(t.text_muted)).child("×")),
             );
         }
 
@@ -200,19 +223,21 @@ impl LensletApp {
                     .px(px(6.0))
                     .rounded(px(5.0))
                     .text_size(px(11.5))
-                    .text_color(rgb(theme::TEXT_MUTED))
+                    .text_color(rgb(t.text_muted))
                     .cursor_pointer()
-                    .hover(|style| {
+                    .hover(move |style| {
                         style
-                            .bg(theme::h(theme::TEXT, 0.05))
-                            .text_color(rgb(theme::TEXT_SOFT))
+                            .bg(theme::h(t.text, 0.05))
+                            .text_color(rgb(t.text_soft))
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_all_services = !this.show_all_services;
                         cx.notify();
                     }))
                     .child(if self.show_all_services {
-                        "Less".to_string()
+                        i18n::pick("Less", "收起").to_string()
+                    } else if i18n::is_zh() {
+                        format!("更多 +{hidden}")
                     } else {
                         format!("More +{hidden}")
                     }),
@@ -221,50 +246,58 @@ impl LensletApp {
 
         let (state_dot, state_label, state_color) = if self.demo {
             (
-                theme::h(theme::AMBER, 0.95),
+                theme::h(t.amber, 0.95),
                 if self.paused {
-                    "PAUSED · DEMO".to_string()
+                    i18n::pick("PAUSED · DEMO", "已暂停 · DEMO").to_string()
                 } else {
-                    "DEMO DATA".to_string()
+                    i18n::pick("DEMO DATA", "演示数据").to_string()
                 },
-                rgb(theme::AMBER),
+                rgb(t.amber),
             )
         } else if self.paused {
             (
-                theme::h(theme::AMBER, 0.95),
+                theme::h(t.amber, 0.95),
                 if self.buffered.is_empty() {
-                    "PAUSED".to_string()
+                    i18n::pick("PAUSED", "已暂停").to_string()
+                } else if i18n::is_zh() {
+                    format!("已暂停 · 缓存 {}", self.buffered.len())
                 } else {
                     format!("PAUSED · {} BUFFERED", self.buffered.len())
                 },
-                rgb(theme::AMBER),
+                rgb(t.amber),
             )
         } else {
             match &self.health {
                 TraceHealth::Ok => match self.run.as_ref().filter(|run| run.ended()) {
                     Some(run) => (
-                        theme::h(theme::TEXT_FAINT, 0.9),
+                        theme::h(t.text_faint, 0.9),
                         match run.exit_code() {
-                            Some(code) => format!("RUN ENDED · EXIT {code}"),
-                            None => "PROXY STOPPED".to_string(),
+                            Some(code) => {
+                                if i18n::is_zh() {
+                                    format!("已结束 · EXIT {code}")
+                                } else {
+                                    format!("RUN ENDED · EXIT {code}")
+                                }
+                            }
+                            None => i18n::pick("PROXY STOPPED", "代理已停止").to_string(),
                         },
-                        rgb(theme::TEXT_MUTED),
+                        rgb(t.text_muted),
                     ),
                     None => (
-                        theme::h(theme::GREEN, 0.95),
-                        "LIVE".to_string(),
-                        rgb(theme::TEXT_MUTED),
+                        theme::h(t.green, 0.95),
+                        i18n::pick("LIVE", "实时").to_string(),
+                        rgb(t.text_muted),
                     ),
                 },
                 TraceHealth::Missing => (
-                    theme::h(theme::AMBER, 0.95),
-                    "WAITING FOR A RUN".to_string(),
-                    rgb(theme::AMBER),
+                    theme::h(t.amber, 0.95),
+                    i18n::pick("WAITING FOR A RUN", "等待运行").to_string(),
+                    rgb(t.amber),
                 ),
                 TraceHealth::Error(_) => (
-                    theme::h(theme::RED, 0.95),
-                    "TRACE ERROR".to_string(),
-                    rgb(theme::RED),
+                    theme::h(t.red, 0.95),
+                    i18n::pick("TRACE ERROR", "TRACE 异常").to_string(),
+                    rgb(t.red),
                 ),
             }
         };
@@ -275,9 +308,9 @@ impl LensletApp {
             .h(px(theme::TOOLBAR_H))
             .px(px(14.0))
             .gap(px(10.0))
-            .bg(rgb(theme::TOOLBAR))
+            .bg(rgb(t.toolbar))
             .border_b_1()
-            .border_color(rgb(theme::BORDER_SUBTLE))
+            .border_color(rgb(t.border_subtle))
             .child(div().w(px(search_width)).child(self.search.clone()))
             .child(chip_row)
             .child(
@@ -298,6 +331,7 @@ impl LensletApp {
     }
 
     pub(super) fn render_service_strip(&self, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let chips: Vec<Stateful<Div>> = self
             .facets
             .iter()
@@ -310,9 +344,9 @@ impl LensletApp {
             .h(px(32.0))
             .px(px(14.0))
             .gap(px(8.0))
-            .bg(rgb(0x0B0E14))
+            .bg(rgb(t.strip))
             .border_b_1()
-            .border_color(rgb(theme::BORDER_SUBTLE))
+            .border_color(rgb(t.border_subtle))
             .child(micro_label("SERVICES"))
             .child(
                 div()
@@ -327,10 +361,12 @@ impl LensletApp {
                     .children(chips),
             )
             .child(
-                action_button("close-services", "Close").on_click(cx.listener(|this, _, _, cx| {
-                    this.show_all_services = false;
-                    cx.notify();
-                })),
+                action_button("close-services", i18n::pick("Close", "关闭")).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.show_all_services = false;
+                        cx.notify();
+                    },
+                )),
             )
     }
 
@@ -348,21 +384,19 @@ impl LensletApp {
         visible
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn chip(
         &self,
         id: &'static str,
         label: &'static str,
         count: usize,
         dot: Option<u32>,
+        filter: Filter,
         active: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let error_color = dot == Some(theme::RED);
-        let filter = if id == "filter-all" {
-            Filter::All
-        } else {
-            Filter::Errors
-        };
+        let t = theme::p();
+        let error_color = dot == Some(t.red);
         let mut chip = div()
             .id(id)
             .flex()
@@ -374,12 +408,12 @@ impl LensletApp {
             .rounded(px(5.0))
             .border_1()
             .border_color(if active {
-                rgb(theme::BORDER_STRONG)
+                rgb(t.border_strong)
             } else {
                 rgba(0x00000000)
             })
             .bg(if active {
-                theme::h(theme::TEXT, 0.06)
+                theme::h(t.text, 0.06)
             } else {
                 theme::h(0x000000, 0.0)
             })
@@ -390,15 +424,15 @@ impl LensletApp {
                 FontWeight::NORMAL
             })
             .text_color(if active {
-                rgb(theme::TEXT)
+                rgb(t.text)
             } else {
-                rgb(theme::TEXT_MUTED)
+                rgb(t.text_muted)
             })
             .cursor_pointer()
-            .hover(|style| {
+            .hover(move |style| {
                 style
-                    .bg(theme::h(theme::TEXT, 0.05))
-                    .text_color(rgb(theme::TEXT_SOFT))
+                    .bg(theme::h(t.text, 0.05))
+                    .text_color(rgb(t.text_soft))
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.set_filter(filter.clone(), cx);
@@ -415,9 +449,9 @@ impl LensletApp {
                 .font_family(fonts::mono())
                 .text_size(px(10.0))
                 .text_color(if error_color && count > 0 {
-                    rgb(theme::RED)
+                    rgb(t.red)
                 } else {
-                    rgb(theme::TEXT_FAINT)
+                    rgb(t.text_faint)
                 })
                 .child(count.to_string()),
         );
@@ -430,6 +464,7 @@ impl LensletApp {
         scope: &'static str,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let t = theme::p();
         let active = self.filter == Filter::Service(facet.id.clone());
         let color = theme::service_color(&facet.label);
         div()
@@ -448,7 +483,7 @@ impl LensletApp {
                 theme::h(0x000000, 0.0)
             })
             .bg(if active {
-                theme::h(theme::TEXT, 0.06)
+                theme::h(t.text, 0.06)
             } else {
                 theme::h(0x000000, 0.0)
             })
@@ -459,15 +494,15 @@ impl LensletApp {
                 FontWeight::NORMAL
             })
             .text_color(if active {
-                rgb(theme::TEXT)
+                rgb(t.text)
             } else {
-                rgb(theme::TEXT_MUTED)
+                rgb(t.text_muted)
             })
             .cursor_pointer()
-            .hover(|style| {
+            .hover(move |style| {
                 style
-                    .bg(theme::h(theme::TEXT, 0.05))
-                    .text_color(rgb(theme::TEXT_SOFT))
+                    .bg(theme::h(t.text, 0.05))
+                    .text_color(rgb(t.text_soft))
             })
             .on_click(cx.listener({
                 let id = facet.id.clone();
@@ -481,42 +516,46 @@ impl LensletApp {
                 div()
                     .font_family(fonts::mono())
                     .text_size(px(10.5))
-                    .text_color(rgb(theme::TEXT_FAINT))
+                    .text_color(rgb(t.text_faint))
                     .child(facet.count.to_string()),
             )
     }
 
     pub(super) fn render_footer(&self, compact: bool) -> Div {
+        let t = theme::p();
         let center = if let Some((message, _)) = self.toast.as_ref() {
             div()
                 .flex()
                 .items_center()
                 .gap(px(6.0))
-                .child(glyph::dot(theme::h(theme::GREEN, 0.95), 4.5))
+                .child(glyph::dot(theme::h(t.green, 0.95), 4.5))
                 .child(
                     div()
                         .font_family(fonts::mono())
                         .text_size(px(10.5))
-                        .text_color(rgb(theme::GREEN))
+                        .text_color(rgb(t.green))
                         .child(message.clone()),
                 )
                 .into_any_element()
         } else {
+            let mut summary = format!(
+                "{} · {} · {}",
+                i18n::call_count(self.counts.total),
+                i18n::error_count(self.counts.errors),
+                i18n::service_count(self.counts.services),
+            );
+            if self.counts.blocked > 0 {
+                summary.push_str(&format!(
+                    " · {} {}",
+                    self.counts.blocked,
+                    i18n::pick("blocked", "已拦截")
+                ));
+            }
             div()
                 .font_family(fonts::mono())
                 .text_size(px(10.5))
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(format!(
-                    "{} · {} · {} {}",
-                    call_count(self.counts.total),
-                    error_count(self.counts.errors),
-                    self.counts.services,
-                    if self.counts.services == 1 {
-                        "service"
-                    } else {
-                        "services"
-                    }
-                ))
+                .text_color(rgb(t.text_muted))
+                .child(summary)
                 .into_any_element()
         };
 
@@ -526,9 +565,9 @@ impl LensletApp {
             .h(px(theme::FOOTER_H))
             .px(px(14.0))
             .gap(px(14.0))
-            .bg(rgb(theme::FOOTER))
+            .bg(rgb(t.footer))
             .border_t_1()
-            .border_color(rgb(theme::BORDER_SUBTLE))
+            .border_color(rgb(t.border_subtle))
             .children(
                 [Some(self.proxy_light()), self.emulator_light()]
                     .into_iter()
@@ -554,7 +593,7 @@ impl LensletApp {
             .child(
                 div()
                     .text_size(px(10.0))
-                    .text_color(rgb(theme::TEXT_FAINT))
+                    .text_color(rgb(t.text_faint))
                     .child(concat!("lenslet ", env!("CARGO_PKG_VERSION"))),
             );
 
@@ -562,11 +601,17 @@ impl LensletApp {
             div()
                 .font_family(fonts::mono())
                 .text_size(px(10.0))
-                .text_color(rgb(theme::TEXT_FAINT))
+                .text_color(rgb(t.text_faint))
                 .child(if compact {
-                    "a access · ↑↓ · space pause"
+                    i18n::pick(
+                        "a access · c curl · t theme",
+                        "a 权限 · c curl · t 主题 · l 语言",
+                    )
                 } else {
-                    "a access · space pause · 1 2 3 tabs"
+                    i18n::pick(
+                        "a access · c curl · t theme · l 中文 · space pause · 1 2 3 tabs",
+                        "a 权限 · c curl · t 主题 · l EN · space 暂停 · 1 2 3 切换",
+                    )
                 }),
         );
         footer
@@ -574,6 +619,7 @@ impl LensletApp {
 
     /// `‹ 3/7 ›  $ npm test  exit 1  +2 access  1 new failure`: the run at a glance.
     fn render_run_summary(&self, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let mut line = div().flex().items_center().gap(px(8.0)).min_w(px(0.0));
         if let Some((position, total)) = self.run_position() {
             let pinned = position < total;
@@ -591,9 +637,9 @@ impl LensletApp {
                             .font_family(fonts::mono())
                             .text_size(px(10.5))
                             .text_color(if pinned {
-                                rgb(theme::AMBER)
+                                rgb(t.amber)
                             } else {
-                                rgb(theme::TEXT_MUTED)
+                                rgb(t.text_muted)
                             })
                             .child(format!("{position}/{total}")),
                     )
@@ -607,35 +653,43 @@ impl LensletApp {
             return line.child(
                 div()
                     .text_size(px(11.5))
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child("local AWS lens"),
+                    .text_color(rgb(t.text_muted))
+                    .child(i18n::pick("local AWS lens", "本地 AWS 观测镜")),
             );
         };
         let command = if run.header.command.is_empty() {
-            "proxy session".to_string()
+            i18n::pick("proxy session", "代理会话").to_string()
         } else {
-            format!("$ {}", trace::ellipsize(&run.command_line(), 40))
+            format!("$ {}", trace::ellipsize(&run.command_line(), 36))
         };
         line = line.child(
             div()
                 .font_family(fonts::mono())
                 .text_size(px(11.5))
-                .text_color(rgb(theme::TEXT_SOFT))
+                .text_color(rgb(t.text_soft))
                 .whitespace_nowrap()
                 .child(command),
         );
+        if run.header.enforce {
+            line = line.child(badge("ENFORCE", t.purple));
+        }
         match run.exit_code() {
-            Some(0) => line = line.child(badge("exit 0", theme::GREEN)),
-            Some(code) => line = line.child(badge(format!("exit {code}"), theme::RED)),
-            None if !run.ended() => line = line.child(badge("running", theme::ACCENT)),
+            Some(0) => line = line.child(badge("exit 0", t.green)),
+            Some(code) => line = line.child(badge(format!("exit {code}"), t.red)),
+            None if !run.ended() => {
+                line = line.child(badge(i18n::pick("running", "运行中"), t.accent))
+            }
             None => {}
+        }
+        if self.counts.blocked > 0 {
+            line = line.child(badge(format!("{} blocked", self.counts.blocked), t.red));
         }
         let added = match run.report.as_ref() {
             Some(report) => report.access_added.len(),
             None => self.access_rows().iter().filter(|row| row.new).count(),
         };
         if added > 0 {
-            line = line.child(badge(format!("+{added} access"), theme::AMBER));
+            line = line.child(badge(format!("+{added} access"), t.amber));
         }
         let unused = run
             .report
@@ -643,25 +697,56 @@ impl LensletApp {
             .map(|report| report.access_unused.len())
             .unwrap_or(0);
         if unused > 0 && run.exit_code() == Some(3) {
-            line = line.child(badge(format!("−{unused} unused"), theme::AMBER));
+            line = line.child(badge(format!("−{unused} unused"), t.amber));
         }
         if let Some(regressions) = run
             .report
             .as_ref()
             .and_then(|report| report.regressions.as_ref())
-            && !regressions.new_failures.is_empty()
         {
-            let count = regressions.new_failures.len();
-            line = line.child(badge(
-                format!(
-                    "{count} new {}",
-                    if count == 1 { "failure" } else { "failures" }
-                ),
-                theme::RED,
-            ));
+            if !regressions.new_failures.is_empty() {
+                let count = regressions.new_failures.len();
+                line = line.child(badge(
+                    if i18n::is_zh() {
+                        format!("{count} 新增异常")
+                    } else {
+                        format!(
+                            "{count} new {}",
+                            if count == 1 { "failure" } else { "failures" }
+                        )
+                    },
+                    t.red,
+                ));
+            } else if added == 0 && !regressions.new_access.is_empty() {
+                line = line.child(badge(
+                    format!("+{} vs prev", regressions.new_access.len()),
+                    t.amber,
+                ));
+            }
         }
         line
     }
+}
+
+fn header_pill(id: &'static str, label: &'static str) -> Stateful<Div> {
+    let t = theme::p();
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(26.0))
+        .px(px(8.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(rgb(t.border))
+        .bg(theme::h(t.text, 0.02))
+        .text_size(px(11.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(t.text_dim))
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme::h(t.text, 0.06)).text_color(rgb(t.text)))
+        .child(label)
 }
 
 /// A small outlined label in an accent color.
@@ -684,6 +769,7 @@ fn badge(text: impl Into<SharedString>, color: u32) -> Div {
 }
 
 fn nav_button(id: &'static str, label: &'static str, enabled: bool) -> Stateful<Div> {
+    let t = theme::p();
     let button = div()
         .id(id)
         .w(px(18.0))
@@ -694,17 +780,15 @@ fn nav_button(id: &'static str, label: &'static str, enabled: bool) -> Stateful<
         .rounded(px(4.0))
         .text_size(px(14.0))
         .text_color(if enabled {
-            rgb(theme::TEXT_DIM)
+            rgb(t.text_dim)
         } else {
-            rgb(theme::TEXT_FAINT)
+            rgb(t.text_faint)
         })
         .child(label);
     if enabled {
-        button.cursor_pointer().hover(|style| {
-            style
-                .bg(theme::h(theme::TEXT, 0.06))
-                .text_color(rgb(theme::TEXT))
-        })
+        button
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme::h(t.text, 0.06)).text_color(rgb(t.text)))
     } else {
         button
     }

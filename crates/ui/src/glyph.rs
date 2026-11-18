@@ -8,10 +8,11 @@ use crate::theme;
 
 /// The lens/aperture mark: a machined tile with an iris and six blades.
 pub fn lens_mark(size: f32) -> impl IntoElement {
+    let t = theme::p();
     let ring = (size * 0.50).max(6.0);
     let dot = (size * 0.15).max(2.0);
-    let blade = theme::h(theme::ACCENT, 0.82);
-    let blade_dim = theme::h(theme::ACCENT, 0.34);
+    let blade = theme::h(t.accent, 0.82);
+    let blade_dim = theme::h(t.accent, 0.34);
 
     div()
         .relative()
@@ -19,9 +20,9 @@ pub fn lens_mark(size: f32) -> impl IntoElement {
         .w(px(size))
         .h(px(size))
         .rounded(px((size * 0.28).max(4.0)))
-        .bg(rgb(0x141B25))
+        .bg(rgb(t.mark_bg))
         .border_1()
-        .border_color(theme::line(0x7DD3FC, 0.18))
+        .border_color(theme::line(t.accent, 0.22))
         .overflow_hidden()
         .child(
             canvas(
@@ -56,7 +57,7 @@ pub fn lens_mark(size: f32) -> impl IntoElement {
                 .h(px(ring))
                 .rounded_full()
                 .border_1()
-                .border_color(theme::h(theme::ACCENT, 0.55)),
+                .border_color(theme::h(t.accent, 0.55)),
         )
         .child(
             div()
@@ -66,7 +67,7 @@ pub fn lens_mark(size: f32) -> impl IntoElement {
                 .w(px(dot))
                 .h(px(dot))
                 .rounded_full()
-                .bg(theme::h(theme::ACCENT, 0.95)),
+                .bg(theme::h(t.accent, 0.95)),
         )
 }
 
@@ -101,10 +102,11 @@ pub fn search_icon(color: Hsla) -> impl IntoElement {
 
 /// A tiny key silhouettes whether SigV4 authorization was present.
 pub fn auth_mark(present: bool) -> impl IntoElement {
+    let t = theme::p();
     let color = if present {
-        theme::h(theme::GREEN, 0.9)
+        theme::h(t.green, 0.9)
     } else {
-        theme::h(theme::TEXT_FAINT, 0.65)
+        theme::h(t.text_faint, 0.65)
     };
     div()
         .relative()

@@ -30,6 +30,7 @@ pub struct Summary {
     pub calls: usize,
     pub retries: usize,
     pub errors: usize,
+    pub blocked: usize,
     pub unfinished: usize,
     pub services: BTreeMap<String, usize>,
     pub unmapped: BTreeMap<String, usize>,
@@ -54,6 +55,8 @@ pub struct Failure {
     pub attempt: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +101,9 @@ impl Summary {
         if retried {
             self.retries += 1;
         }
+        if trace.blocked {
+            self.blocked += 1;
+        }
         *self.services.entry(trace.service.clone()).or_default() += 1;
         if access::is_unmapped(trace) {
             *self.unmapped.entry(trace.service.clone()).or_default() += 1;
@@ -132,6 +138,7 @@ impl Summary {
                 hint: problem.hint.clone(),
                 attempt: trace.attempt.filter(|attempt| *attempt > 1),
                 max_attempts: trace.max_attempts.filter(|_| retried),
+                blocked: trace.blocked,
             });
         }
     }
@@ -163,10 +170,17 @@ pub struct Regressions {
     /// Run id it was compared with.
     pub previous_run: String,
     pub previous_exit_code: Option<i32>,
+    #[serde(default)]
+    pub previous_calls: usize,
+    #[serde(default)]
+    pub previous_duration_ms: u64,
     /// Failing now, not failing then.
     pub new_failures: Vec<FailureKind>,
     /// Failing then, not failing now.
     pub fixed: Vec<FailureKind>,
+    /// Permissions used now that the previous run did not exercise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_access: Vec<Access>,
 }
 
 /// The `end` record: everything a person or an agent needs about one run.
@@ -183,6 +197,8 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub retries: usize,
     pub errors: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub blocked: usize,
     pub unfinished: usize,
     pub services: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -191,6 +207,9 @@ pub struct Report {
     pub access: Vec<AccessEntry>,
     /// Compared with this lock file; `null` when there is none.
     pub lock: Option<String>,
+    /// Compared/enforced with this IAM policy document, when `--policy` was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
     /// In this run, not in the lock.
     pub access_added: Vec<Access>,
     /// In the lock, not exercised by this run.
@@ -213,8 +232,22 @@ impl Report {
             .collect()
     }
 
+    pub fn access_set(&self) -> BTreeSet<Access> {
+        self.access
+            .iter()
+            .map(|entry| Access::new(entry.action.clone(), entry.resource.clone()))
+            .collect()
+    }
+
     /// Fill in the access table and the comparison with a lock file.
+    #[allow(dead_code)]
     pub fn set_access(&mut self, summary: &Summary, locked: Option<&BTreeSet<Access>>) {
+        let gate = locked.map(|set| crate::lock::Gate::from_lock("lenslet.lock", set.clone()));
+        self.set_access_with_gate(summary, gate.as_ref());
+    }
+
+    /// Fill in the access table and compare against either a lock file or an IAM policy gate.
+    pub fn set_access_with_gate(&mut self, summary: &Summary, gate: Option<&crate::lock::Gate>) {
         self.access = summary
             .access
             .iter()
@@ -222,32 +255,39 @@ impl Report {
                 action: access.action.clone(),
                 resource: access.resource.clone(),
                 used: used.clone(),
-                new: locked.is_some_and(|locked| !locked.contains(access)),
+                new: gate.is_some_and(|gate| !gate.allows(access)),
             })
             .collect();
-        if let Some(locked) = locked {
+        if let Some(gate) = gate {
             self.access_added = summary
                 .access
                 .keys()
-                .filter(|access| !locked.contains(*access))
+                .filter(|access| !gate.allows(access))
                 .cloned()
                 .collect();
-            self.access_unused = locked
-                .iter()
-                .filter(|access| !summary.access.contains_key(*access))
-                .cloned()
-                .collect();
+            if let Some(locked) = gate.locked_set() {
+                self.access_unused = locked
+                    .iter()
+                    .filter(|access| !summary.access.contains_key(*access))
+                    .cloned()
+                    .collect();
+            }
         }
     }
 
     pub fn compare_with(&mut self, previous: &Report) {
         let now = self.failure_kinds();
         let then = previous.failure_kinds();
+        let now_access = self.access_set();
+        let then_access = previous.access_set();
         self.regressions = Some(Regressions {
             previous_run: previous.run.clone(),
             previous_exit_code: previous.exit_code,
+            previous_calls: previous.calls,
+            previous_duration_ms: previous.duration_ms,
             new_failures: now.difference(&then).cloned().collect(),
             fixed: then.difference(&now).cloned().collect(),
+            new_access: now_access.difference(&then_access).cloned().collect(),
         });
     }
 
@@ -265,8 +305,13 @@ impl Report {
             )
         };
         let retries = retries_label(self.retries);
+        let blocked_summary = if self.blocked > 0 {
+            format!(" ({} blocked)", self.blocked)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "lenslet: {}{retries} · {}{} · {}\n",
+            "lenslet: {}{retries} · {}{blocked_summary}{} · {}\n",
             plural(self.calls, "call"),
             plural(self.errors, "error"),
             services,
@@ -274,8 +319,9 @@ impl Report {
         ));
         for failure in self.failures.iter().take(LISTED_FAILURES) {
             let attempt = attempt_label(failure.attempt, failure.max_attempts);
+            let blocked_tag = if failure.blocked { " [blocked]" } else { "" };
             out.push_str(&format!(
-                "  ✗ {} {}  {}  {}{attempt}",
+                "  ✗ {} {}  {}  {}{attempt}{blocked_tag}",
                 failure.service.to_ascii_uppercase(),
                 failure.operation,
                 failure.status,
@@ -297,14 +343,29 @@ impl Report {
             ));
         }
         if let Some(regressions) = self.regressions.as_ref()
-            && (!regressions.new_failures.is_empty() || !regressions.fixed.is_empty())
+            && (!regressions.new_failures.is_empty()
+                || !regressions.fixed.is_empty()
+                || !regressions.new_access.is_empty())
         {
             let new = regressions.new_failures.len();
+            let mut parts = Vec::new();
+            if new > 0 || !regressions.fixed.is_empty() {
+                parts.push(format!(
+                    "{new} new {}, {} fixed",
+                    if new == 1 { "failure" } else { "failures" },
+                    regressions.fixed.len()
+                ));
+            }
+            if !regressions.new_access.is_empty() {
+                parts.push(format!(
+                    "+{} vs previous run",
+                    plural(regressions.new_access.len(), "permission")
+                ));
+            }
             out.push_str(&format!(
-                "  since run {}: {new} new {}, {} fixed\n",
+                "  since run {}: {}\n",
                 regressions.previous_run,
-                if new == 1 { "failure" } else { "failures" },
-                regressions.fixed.len()
+                parts.join(" · ")
             ));
             for kind in &regressions.new_failures {
                 out.push_str(&format!(
@@ -315,10 +376,11 @@ impl Report {
                 ));
             }
         }
-        match self.lock.as_deref() {
-            Some(lock) if !self.access_added.is_empty() => {
+        let gate_name = self.policy.as_deref().or(self.lock.as_deref());
+        match gate_name {
+            Some(gate) if !self.access_added.is_empty() => {
                 out.push_str(&format!(
-                    "  access: {} not in {lock}\n",
+                    "  access: {} not in {gate}\n",
                     plural(self.access_added.len(), "permission")
                 ));
                 for access in self.access_added.iter().take(LISTED_ACCESS) {
@@ -334,8 +396,8 @@ impl Report {
                     ));
                 }
             }
-            Some(lock) => out.push_str(&format!(
-                "  access: within {lock} ({} used)\n",
+            Some(gate) => out.push_str(&format!(
+                "  access: within {gate} ({} used)\n",
                 plural(self.access.len(), "permission")
             )),
             None if !self.access.is_empty() => out.push_str(&format!(
@@ -408,8 +470,13 @@ impl Report {
             None => "ended".to_string(),
         };
         out.push_str(&format!("### Lenslet · {command} {exit}\n\n"));
+        let blocked_md = if self.blocked > 0 {
+            format!(" ({} blocked)", self.blocked)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "{}{} · {} · {}\n\n",
+            "{}{} · {}{blocked_md} · {}\n\n",
             plural(self.calls, "AWS call"),
             retries_label(self.retries),
             plural(self.errors, "error"),
@@ -429,10 +496,18 @@ impl Report {
                 })
                 .unwrap_or_default()
         };
-        match self.lock.as_deref() {
-            Some(lock) if !self.access_added.is_empty() => {
+        let gate_name = self.policy.as_deref().or(self.lock.as_deref());
+        match gate_name {
+            Some(gate) if !self.access_added.is_empty() => {
+                let remedy = if self.policy.is_some() {
+                    format!("Review them or grant them in `{gate}`.")
+                } else {
+                    format!(
+                        "Review them; if they are intended, run `lenslet run --update` and commit `{gate}`."
+                    )
+                };
                 out.push_str(&format!(
-                    "**{} not in `{lock}`.** Review them; if they are intended, run `lenslet run --update` and commit `{lock}`.\n\n",
+                    "**{} not in `{gate}`.** {remedy}\n\n",
                     plural(self.access_added.len(), "permission")
                 ));
                 out.push_str("| | Permission | Resource | Needed by |\n|---|---|---|---|\n");
@@ -469,8 +544,8 @@ impl Report {
                     out.push_str("\n</details>\n\n");
                 }
             }
-            Some(lock) => out.push_str(&format!(
-                "AWS access is within `{lock}` ({} used).\n\n",
+            Some(gate) => out.push_str(&format!(
+                "AWS access is within `{gate}` ({} used).\n\n",
                 plural(self.access.len(), "permission")
             )),
             None => out.push_str(&format!(
@@ -530,7 +605,13 @@ impl Report {
                     operation: failure.operation.clone(),
                     code: failure.code.clone(),
                 };
-                let marker = if new.contains(&kind) { " **new**" } else { "" };
+                let marker = if failure.blocked {
+                    " **blocked**"
+                } else if new.contains(&kind) {
+                    " **new**"
+                } else {
+                    ""
+                };
                 let attempt = attempt_label(failure.attempt, failure.max_attempts);
                 out.push_str(&format!(
                     "| {} {}{marker}{attempt} | {} | `{}` {} | {} |\n",
@@ -626,6 +707,7 @@ mod tests {
             }],
             implied: Vec::new(),
             new: false,
+            blocked: false,
             request: Message::default(),
             response: Message::default(),
         }

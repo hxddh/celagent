@@ -123,6 +123,212 @@ pub fn policy(lock: &Lock) -> serde_json::Value {
     serde_json::json!({ "Version": "2012-10-17", "Statement": statements })
 }
 
+/// What a run's derived permissions are checked or actively enforced against:
+/// either `lenslet.lock` or an AWS IAM policy JSON document (`--policy`).
+#[derive(Clone, Debug)]
+pub struct Gate {
+    pub label: String,
+    kind: GateKind,
+}
+
+#[derive(Clone, Debug)]
+enum GateKind {
+    Lock(BTreeSet<Access>),
+    Policy(Vec<Statement>),
+}
+
+#[derive(Clone, Debug)]
+struct Statement {
+    allow: bool,
+    actions: Vec<String>,
+    not_actions: Vec<String>,
+    resources: Vec<String>,
+    not_resources: Vec<String>,
+}
+
+impl Gate {
+    pub fn from_lock(label: impl Into<String>, access: BTreeSet<Access>) -> Self {
+        Gate {
+            label: label.into(),
+            kind: GateKind::Lock(access),
+        }
+    }
+
+    pub fn from_policy_file(path: &Path, label: impl Into<String>) -> Result<Self> {
+        let text =
+            fs::read_to_string(path).with_context(|| format!("read policy {}", path.display()))?;
+        Self::from_policy_str(&text, label)
+            .with_context(|| format!("parse IAM policy {}", path.display()))
+    }
+
+    pub fn from_policy_str(text: &str, label: impl Into<String>) -> Result<Self> {
+        let doc: serde_json::Value = serde_json::from_str(text).context("invalid JSON")?;
+        let raw_statements = match doc.get("Statement") {
+            Some(serde_json::Value::Array(items)) => items.clone(),
+            Some(single @ serde_json::Value::Object(_)) => vec![single.clone()],
+            _ => anyhow::bail!("IAM policy must contain a `Statement` array or object"),
+        };
+        let mut statements = Vec::with_capacity(raw_statements.len());
+        for item in raw_statements {
+            let Some(obj) = item.as_object() else {
+                anyhow::bail!("each IAM Statement must be a JSON object");
+            };
+            let effect = obj.get("Effect").and_then(|v| v.as_str()).unwrap_or("");
+            let allow = if effect.eq_ignore_ascii_case("allow") {
+                true
+            } else if effect.eq_ignore_ascii_case("deny") {
+                false
+            } else {
+                anyhow::bail!("IAM Statement Effect must be `Allow` or `Deny`, got `{effect}`");
+            };
+            let list = |key: &str| -> Vec<String> {
+                match obj.get(key) {
+                    Some(serde_json::Value::String(s)) => vec![s.clone()],
+                    Some(serde_json::Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            };
+            statements.push(Statement {
+                allow,
+                actions: list("Action"),
+                not_actions: list("NotAction"),
+                resources: list("Resource"),
+                not_resources: list("NotResource"),
+            });
+        }
+        Ok(Gate {
+            label: label.into(),
+            kind: GateKind::Policy(statements),
+        })
+    }
+
+    pub fn locked_set(&self) -> Option<&BTreeSet<Access>> {
+        match &self.kind {
+            GateKind::Lock(set) => Some(set),
+            GateKind::Policy(_) => None,
+        }
+    }
+
+    /// Whether `access` is permitted by this lock or IAM policy.
+    pub fn allows(&self, access: &Access) -> bool {
+        match &self.kind {
+            GateKind::Lock(entries) => {
+                entries.contains(access)
+                    || entries.iter().any(|rule| {
+                        iam_action_matches(&rule.action, &access.action)
+                            && iam_arn_matches(&rule.resource, &access.resource)
+                    })
+            }
+            GateKind::Policy(statements) => {
+                let mut allowed = false;
+                for stmt in statements {
+                    if !stmt.matches(access) {
+                        continue;
+                    }
+                    if !stmt.allow {
+                        return false;
+                    }
+                    allowed = true;
+                }
+                allowed
+            }
+        }
+    }
+}
+
+impl Statement {
+    fn matches(&self, access: &Access) -> bool {
+        let action_ok = if !self.actions.is_empty() {
+            self.actions
+                .iter()
+                .any(|p| iam_action_matches(p, &access.action))
+        } else if !self.not_actions.is_empty() {
+            !self
+                .not_actions
+                .iter()
+                .any(|p| iam_action_matches(p, &access.action))
+        } else {
+            false
+        };
+        if !action_ok {
+            return false;
+        }
+        if !self.resources.is_empty() {
+            self.resources
+                .iter()
+                .any(|p| iam_arn_matches(p, &access.resource))
+        } else if !self.not_resources.is_empty() {
+            !self
+                .not_resources
+                .iter()
+                .any(|p| iam_arn_matches(p, &access.resource))
+        } else {
+            false
+        }
+    }
+}
+
+fn iam_action_matches(pattern: &str, actual: &str) -> bool {
+    glob_match(&pattern.to_ascii_lowercase(), &actual.to_ascii_lowercase())
+}
+
+fn iam_arn_matches(pattern: &str, actual: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let (Some(p), Some(a)) = (split_arn(pattern), split_arn(actual)) {
+        let partition_ok = p[0] == "*" || a[0] == "*" || glob_match(p[0], a[0]);
+        let service_ok = glob_match(&p[1].to_ascii_lowercase(), &a[1].to_ascii_lowercase());
+        // Lenslet normalizes region and account to `*`; concrete values in a
+        // production IAM policy should still match local normalized ARNs.
+        let region_ok = a[2] == "*" || p[2] == "*" || glob_match(p[2], a[2]);
+        let account_ok = a[3] == "*" || p[3] == "*" || glob_match(p[3], a[3]);
+        let resource_ok = glob_match(p[4], a[4]);
+        return partition_ok && service_ok && region_ok && account_ok && resource_ok;
+    }
+    glob_match(pattern, actual)
+}
+
+fn split_arn(arn: &str) -> Option<[&str; 5]> {
+    let rest = arn.strip_prefix("arn:")?;
+    let (partition, rest) = rest.split_once(':')?;
+    let (service, rest) = rest.split_once(':')?;
+    let (region, rest) = rest.split_once(':')?;
+    let (account, resource) = rest.split_once(':')?;
+    Some([partition, service, region, account, resource])
+}
+
+/// Standard IAM wildcard matching (`*` matches 0+ chars, `?` matches 1 char).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +407,41 @@ mod tests {
             statements[1]["Action"],
             serde_json::json!(["sqs:ReceiveMessage", "sqs:SendMessage"])
         );
+    }
+
+    #[test]
+    fn policy_gate_evaluates_allow_deny_wildcards_and_concrete_arns() {
+        let json = r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:Get*", "dynamodb:PutItem"],
+                    "Resource": [
+                        "arn:aws:s3:::assets/*",
+                        "arn:aws:dynamodb:us-east-1:123456789012:table/orders"
+                    ]
+                },
+                {
+                    "Effect": "Deny",
+                    "Action": "s3:GetObjectAcl",
+                    "Resource": "*"
+                }
+            ]
+        }"#;
+        let gate = Gate::from_policy_str(json, "iam.json").unwrap();
+        assert!(gate.allows(&access("s3:GetObject", "arn:aws:s3:::assets/*")));
+        assert!(gate.allows(&access(
+            "dynamodb:PutItem",
+            "arn:aws:dynamodb:*:*:table/orders"
+        )));
+        assert!(
+            !gate.allows(&access("s3:GetObjectAcl", "arn:aws:s3:::assets/*")),
+            "explicit Deny overrides Allow"
+        );
+        assert!(!gate.allows(&access(
+            "dynamodb:DeleteTable",
+            "arn:aws:dynamodb:*:*:table/orders"
+        )));
     }
 }

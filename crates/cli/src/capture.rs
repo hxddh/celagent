@@ -1,10 +1,10 @@
-//! Bounded, content-type-aware body capture.
+//! Bounded, content-type- and wire-encoding-aware body capture.
 //!
-//! Bodies are never buffered for forwarding: [`TeeBody`] wraps the hyper body
-//! that is being forwarded and records a bounded prefix plus a SHA-256 of every
-//! byte as the bytes stream through. Forwarding therefore stays byte-exact (so
-//! SigV4 signatures remain valid) and has no size limit, while memory stays at
-//! [`MAX_CAPTURE_BYTES`] per request and per response.
+//! Bodies are never buffered for forwarding unless `--enforce` needs to inspect
+//! a JSON/Query request before letting it reach the emulator: [`TeeBody`] wraps
+//! the hyper body and records a bounded prefix plus a SHA-256 of every wire
+//! byte as it streams through. Forwarding stays byte-exact (so SigV4 signatures
+//! remain valid) and has no size limit.
 
 use std::{
     borrow::Cow,
@@ -14,6 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use hyper::{
@@ -24,11 +25,14 @@ use sha2::{Digest, Sha256};
 
 use crate::trace::BodyTrace;
 
-/// Maximum number of body bytes kept for the trace (64 KiB).
-pub const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+/// Default maximum number of body bytes kept for the trace (1 MiB).
+pub const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// Binary payloads keep an unredacted hex preview of their first 512 bytes.
+pub const HEX_PREVIEW_BYTES: usize = 512;
 
 /// Content encodings Lenslet can decode on the captured prefix while forwarding
-/// the compressed wire bytes untouched.
+/// the wire bytes untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
     Identity,
@@ -36,23 +40,74 @@ pub enum Encoding {
     Deflate,
 }
 
-/// The classified `content-type` of a message.
+/// The classified `content-type` and wire encoding of a message.
 #[derive(Clone, Debug)]
 pub struct Content {
     /// Friendly media type without parameters, e.g. `application/xml`.
     pub content_type: Option<String>,
-    /// Whether the body is captured as text (JSON, XML, form, or text types).
+    /// Whether the declared media type is a known text format with a decodable encoding.
     pub text: bool,
-    /// Supported content encoding for text decoding, when present.
+    /// Whether an untyped or `octet-stream` payload may be shown as text when it is valid UTF-8.
+    pub sniff_utf8: bool,
+    /// Whether the wire body is framed with AWS SigV4/trailer `aws-chunked` chunks.
+    pub aws_chunked: bool,
+    /// Supported compression layer (after unframing `aws-chunked`, when present).
     pub encoding: Option<Encoding>,
+    /// Non-identity wire encoding label for trace metadata, e.g. `aws-chunked` or `gzip`.
+    pub wire_encoding: Option<String>,
+}
+
+/// Parse a `--max-body` byte limit such as `1048576`, `256K`, `4M`, or `unlimited`.
+pub fn parse_size(raw: &str) -> Result<usize> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("--max-body requires a byte count (e.g. 1M, 256K) or `unlimited`");
+    }
+    if trimmed.eq_ignore_ascii_case("unlimited")
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("max")
+    {
+        return Ok(usize::MAX / 2);
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let (digits, scale) = if let Some(n) = upper
+        .strip_suffix("KIB")
+        .or_else(|| upper.strip_suffix("KB"))
+        .or_else(|| upper.strip_suffix('K'))
+    {
+        (n.trim(), 1024usize)
+    } else if let Some(n) = upper
+        .strip_suffix("MIB")
+        .or_else(|| upper.strip_suffix("MB"))
+        .or_else(|| upper.strip_suffix('M'))
+    {
+        (n.trim(), 1024usize * 1024)
+    } else if let Some(n) = upper
+        .strip_suffix("GIB")
+        .or_else(|| upper.strip_suffix("GB"))
+        .or_else(|| upper.strip_suffix('G'))
+    {
+        (n.trim(), 1024usize * 1024 * 1024)
+    } else if let Some(n) = upper.strip_suffix('B') {
+        (n.trim(), 1usize)
+    } else {
+        (upper.as_str(), 1usize)
+    };
+    let count: usize = digits.parse().with_context(|| {
+        format!("invalid --max-body `{raw}` (expected bytes, 256K, 4M, or unlimited)")
+    })?;
+    count
+        .checked_mul(scale)
+        .with_context(|| format!("--max-body `{raw}` is too large"))
 }
 
 /// Classify a message's body from its headers.
 ///
-/// Classification is deliberately content-type driven (no sniffing): known text
-/// types with identity, `gzip` or `deflate` encoding are decoded into bounded
-/// text for error/access inspection; unknown encodings or binary media types
-/// are recorded as metadata only.
+/// Known text types (`json`, `xml`, `text/*`, form, ...) are decoded across
+/// `identity`, `aws-chunked`, `gzip` and `deflate`. Missing `content-type` or
+/// `octet-stream` (the SDK default on S3 `PutObject`/`GetObject` and raw Lambda
+/// invocations) also surfaces readable UTF-8 text instead of hiding it as
+/// opaque binary, while true binary payloads keep size, SHA-256 and a hex preview.
 pub fn content(headers: &HeaderMap) -> Content {
     let media = headers
         .get("content-type")
@@ -60,22 +115,58 @@ pub fn content(headers: &HeaderMap) -> Content {
         .and_then(|value| value.split(';').next())
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
-    let encoding = match headers
+
+    let raw_encoding = headers
         .get("content-encoding")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        None | Some("") | Some("identity") => Some(Encoding::Identity),
-        Some("gzip" | "x-gzip") => Some(Encoding::Gzip),
-        Some("deflate") => Some(Encoding::Deflate),
-        Some(_) => None,
+        .filter(|value| !value.is_empty() && value != "identity");
+
+    let streaming_sha = headers
+        .get("x-amz-content-sha256")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().starts_with("STREAMING-"));
+
+    let mut aws_chunked = streaming_sha;
+    let mut compression = Some(Encoding::Identity);
+    if let Some(enc) = raw_encoding.as_deref() {
+        for layer in enc.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match layer {
+                "identity" => {}
+                "aws-chunked" => aws_chunked = true,
+                "gzip" | "x-gzip" if compression == Some(Encoding::Identity) => {
+                    compression = Some(Encoding::Gzip);
+                }
+                "deflate" if compression == Some(Encoding::Identity) => {
+                    compression = Some(Encoding::Deflate);
+                }
+                _ => {
+                    compression = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    let wire_encoding = match (&raw_encoding, aws_chunked) {
+        (Some(raw), _) => Some(raw.clone()),
+        (None, true) => Some("aws-chunked".to_string()),
+        (None, false) => None,
     };
-    let text = media.as_deref().map(is_text).unwrap_or(false) && encoding.is_some();
+
+    let known_text = media.as_deref().is_some_and(is_text);
+    let untyped_or_octet = matches!(
+        media.as_deref(),
+        None | Some("application/octet-stream" | "binary/octet-stream")
+    );
+
     Content {
         content_type: media,
-        text,
-        encoding,
+        text: known_text && compression.is_some(),
+        sniff_utf8: untyped_or_octet && compression.is_some(),
+        aws_chunked,
+        encoding: compression,
+        wire_encoding,
     }
 }
 
@@ -92,110 +183,233 @@ fn is_text(media: &str) -> bool {
                 | "application/x-yaml"
                 | "application/graphql"
                 | "application/sql"
+                | "application/csv"
         )
 }
 
 /// A bounded capture of one body.
 pub struct Capture {
     prefix: Vec<u8>,
-    keep_bytes: bool,
+    limit: usize,
     bytes: u64,
     hasher: Sha256,
 }
 
 impl Capture {
+    #[cfg(test)]
     pub fn new(keep_bytes: bool) -> Self {
+        Self::with_limit(if keep_bytes { MAX_CAPTURE_BYTES } else { 0 })
+    }
+
+    pub fn with_limit(limit: usize) -> Self {
         Capture {
             prefix: Vec::new(),
-            keep_bytes,
+            limit,
             bytes: 0,
             hasher: Sha256::new(),
         }
     }
 
-    fn feed(&mut self, data: &[u8]) {
+    pub fn feed(&mut self, data: &[u8]) {
         self.bytes = self.bytes.saturating_add(data.len() as u64);
         self.hasher.update(data);
-        if !self.keep_bytes {
+        if self.limit == 0 {
             return;
         }
-        let room = MAX_CAPTURE_BYTES.saturating_sub(self.prefix.len());
+        let room = self.limit.saturating_sub(self.prefix.len());
         if room > 0 {
             self.prefix.extend_from_slice(&data[..data.len().min(room)]);
         }
     }
 
-    /// The retained prefix of the body (at most [`MAX_CAPTURE_BYTES`]), decoded
-    /// when a supported content encoding was used.
+    /// The retained prefix of the body, unframed and decompressed when a
+    /// supported wire encoding was used.
     pub fn decoded_prefix(&self, content: &Content) -> Cow<'_, [u8]> {
-        match content.encoding {
-            Some(Encoding::Identity) | None => Cow::Borrowed(&self.prefix),
-            Some(encoding) => decode_compressed(&self.prefix, encoding)
-                .map(|(bytes, _)| Cow::Owned(bytes))
-                .unwrap_or(Cow::Borrowed(&[])),
+        if self.limit == 0 || self.prefix.is_empty() {
+            return Cow::Borrowed(&[]);
         }
+        if !content.aws_chunked && matches!(content.encoding, Some(Encoding::Identity) | None) {
+            return Cow::Borrowed(&self.prefix);
+        }
+        decode_payload(&self.prefix, content, self.limit)
+            .map(|(bytes, _)| Cow::Owned(bytes))
+            .unwrap_or(Cow::Borrowed(&[]))
     }
 
     /// Build the trace body, or `None` when no bytes were captured.
     ///
     /// `sha256` always covers every wire byte seen (not just the retained
     /// prefix), so a large, compressed or binary body still has an exact wire
-    /// integrity value. `truncated` marks a text capture that holds only a
-    /// prefix of the body; binary bodies are never truncated because no bytes
-    /// are kept.
+    /// integrity value.
     pub fn body(&self, content: &Content) -> Option<BodyTrace> {
         if self.bytes == 0 {
             return None;
         }
-        let wire_truncated = self.keep_bytes && self.bytes > self.prefix.len() as u64;
-        let decoded = if content.text && self.keep_bytes {
-            match content.encoding {
-                Some(Encoding::Identity) => Some((
-                    String::from_utf8_lossy(&self.prefix).into_owned(),
-                    wire_truncated,
-                )),
-                Some(encoding) => {
-                    decode_compressed(&self.prefix, encoding).map(|(bytes, capped)| {
-                        (
-                            String::from_utf8_lossy(&bytes).into_owned(),
-                            wire_truncated || capped,
-                        )
-                    })
-                }
-                None => None,
+        let sha256 = hex(&self.hasher.clone().finalize());
+        if self.limit == 0 {
+            return Some(BodyTrace {
+                text: None,
+                hex: None,
+                encoding: content.wire_encoding.clone(),
+                bytes: self.bytes,
+                truncated: false,
+                binary: true,
+                sha256,
+            });
+        }
+
+        let wire_truncated = self.bytes > self.prefix.len() as u64;
+        let decoded = decode_payload(&self.prefix, content, self.limit);
+
+        if let Some((ref bytes, capped)) = decoded {
+            let truncated = wire_truncated || capped;
+            if content.text {
+                let text = lossy_trimmed_utf8(bytes, truncated);
+                return Some(BodyTrace {
+                    text: Some(text),
+                    hex: None,
+                    encoding: content.wire_encoding.clone(),
+                    bytes: self.bytes,
+                    truncated,
+                    binary: false,
+                    sha256,
+                });
             }
-        } else {
-            None
+            if content.sniff_utf8
+                && !bytes.is_empty()
+                && let Some(text) = clean_utf8(bytes, truncated)
+            {
+                return Some(BodyTrace {
+                    text: Some(text),
+                    hex: None,
+                    encoding: content.wire_encoding.clone(),
+                    bytes: self.bytes,
+                    truncated,
+                    binary: false,
+                    sha256,
+                });
+            }
+            if content.aws_chunked && bytes.is_empty() && !truncated {
+                return Some(BodyTrace {
+                    text: Some(String::new()),
+                    hex: None,
+                    encoding: content.wire_encoding.clone(),
+                    bytes: self.bytes,
+                    truncated: false,
+                    binary: false,
+                    sha256,
+                });
+            }
+        }
+
+        let preview_source: &[u8] = match decoded.as_ref() {
+            Some((bytes, _)) if !bytes.is_empty() => bytes,
+            _ => &self.prefix,
         };
-        let (text, truncated, binary) = match decoded {
-            Some((text, truncated)) => (Some(text), truncated, false),
-            None => (None, false, true),
-        };
+        let preview_len = preview_source.len().min(HEX_PREVIEW_BYTES);
+        let hex_preview = (preview_len > 0).then(|| hex(&preview_source[..preview_len]));
+
         Some(BodyTrace {
-            text,
+            text: None,
+            hex: hex_preview,
+            encoding: content.wire_encoding.clone(),
             bytes: self.bytes,
-            truncated,
-            binary,
-            sha256: hex(&self.hasher.clone().finalize()),
+            truncated: wire_truncated,
+            binary: true,
+            sha256,
         })
     }
 }
 
-/// Decompress up to [`MAX_CAPTURE_BYTES`] of a `gzip` or `deflate` stream.
-/// Partial streams still yield whatever prefix decoded before EOF; unreadable
-/// data returns `None` so the caller falls back to binary metadata.
-fn decode_compressed(prefix: &[u8], encoding: Encoding) -> Option<(Vec<u8>, bool)> {
+/// Unframe `aws-chunked` (when present) and decompress `gzip`/`deflate` up to `limit`.
+fn decode_payload(prefix: &[u8], content: &Content, limit: usize) -> Option<(Vec<u8>, bool)> {
+    let encoding = content.encoding?;
+    let (unframed, chunk_capped): (Cow<'_, [u8]>, bool) = if content.aws_chunked {
+        let (bytes, capped) = decode_aws_chunked(prefix, limit)?;
+        (Cow::Owned(bytes), capped)
+    } else {
+        (Cow::Borrowed(prefix), false)
+    };
+    match encoding {
+        Encoding::Identity => Some((unframed.into_owned(), chunk_capped)),
+        other => decode_compressed(&unframed, other, limit)
+            .map(|(bytes, comp_capped)| (bytes, chunk_capped || comp_capped)),
+    }
+}
+
+/// Strip AWS `aws-chunked` chunk headers (`<hex-size>[;chunk-signature=...]\r\n<data>\r\n`)
+/// and trailing checksum headers while keeping at most `limit` payload bytes.
+fn decode_aws_chunked(input: &[u8], limit: usize) -> Option<(Vec<u8>, bool)> {
+    let mut pos = 0usize;
+    let mut out = Vec::new();
+    let mut capped = false;
+
+    while pos < input.len() {
+        let rest = &input[pos..];
+        let Some(rel_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            return if !out.is_empty() {
+                Some((out, true))
+            } else {
+                None
+            };
+        };
+        let header = &rest[..rel_end];
+        let size_part = header
+            .split(|&b| b == b';')
+            .next()
+            .unwrap_or(header)
+            .trim_ascii();
+        let size_str = std::str::from_utf8(size_part).ok()?;
+        let chunk_size = usize::from_str_radix(size_str, 16).ok()?;
+        pos += rel_end + 2;
+
+        if chunk_size == 0 {
+            return Some((out, capped));
+        }
+
+        let available = input.len().saturating_sub(pos);
+        let take = available.min(chunk_size);
+        let room = limit.saturating_sub(out.len());
+        if take > room {
+            out.extend_from_slice(&input[pos..pos + room]);
+            capped = true;
+        } else {
+            out.extend_from_slice(&input[pos..pos + take]);
+        }
+        if take < chunk_size {
+            return Some((out, true));
+        }
+        pos += chunk_size;
+        if input.get(pos..pos + 2) == Some(b"\r\n") {
+            pos += 2;
+        }
+        if out.len() >= limit && pos < input.len() {
+            // Check whether only the terminal 0-chunk remains.
+            let rem = &input[pos..];
+            if !rem.starts_with(b"0\r\n") && !rem.starts_with(b"0;") {
+                capped = true;
+            }
+            return Some((out, capped));
+        }
+    }
+
+    Some((out, capped))
+}
+
+/// Decompress up to `limit` bytes of a `gzip` or `deflate` stream.
+fn decode_compressed(prefix: &[u8], encoding: Encoding, limit: usize) -> Option<(Vec<u8>, bool)> {
     if prefix.is_empty() {
         return Some((Vec::new(), false));
     }
+    let ceiling = limit.saturating_add(1);
     let read_bounded = |mut reader: Box<dyn Read + '_>| -> Vec<u8> {
         let mut out = Vec::new();
         let mut chunk = [0u8; 4096];
-        while out.len() <= MAX_CAPTURE_BYTES {
+        while out.len() < ceiling {
             match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let keep = n.min((MAX_CAPTURE_BYTES + 1).saturating_sub(out.len()));
+                    let keep = n.min(ceiling.saturating_sub(out.len()));
                     out.extend_from_slice(&chunk[..keep]);
                 }
             }
@@ -217,14 +431,47 @@ fn decode_compressed(prefix: &[u8], encoding: Encoding) -> Option<(Vec<u8>, bool
     if out.is_empty() {
         return None;
     }
-    let capped = out.len() > MAX_CAPTURE_BYTES;
+    let capped = out.len() > limit;
     if capped {
-        out.truncate(MAX_CAPTURE_BYTES);
+        out.truncate(limit);
     }
     Some((out, capped))
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Decode declared text, dropping an incomplete trailing multi-byte UTF-8 sequence
+/// when the byte stream was truncated mid-codepoint.
+fn lossy_trimmed_utf8(bytes: &[u8], truncated: bool) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(valid) => valid.to_string(),
+        Err(err) if truncated && err.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..err.valid_up_to()])
+                .unwrap_or_default()
+                .to_string()
+        }
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Validate that an untyped/`octet-stream` payload is genuine readable UTF-8
+/// (allowing tabs, newlines, and all Unicode characters, rejecting NUL/control bytes).
+fn clean_utf8(bytes: &[u8], truncated: bool) -> Option<String> {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(valid) => valid,
+        Err(err) if truncated && err.error_len().is_none() && err.valid_up_to() > 0 => {
+            std::str::from_utf8(&bytes[..err.valid_up_to()]).ok()?
+        }
+        Err(_) => return None,
+    };
+    let clean = !text.bytes().any(|b| {
+        matches!(
+            b,
+            0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F
+        )
+    });
+    clean.then(|| text.to_string())
+}
+
+pub fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -354,14 +601,23 @@ mod tests {
 
         let binary = content(&headers(&[("content-type", "application/octet-stream")]));
         assert!(!binary.text);
+        assert!(binary.sniff_utf8);
 
-        // Gzip and deflate text bodies are decoded for inspection; unknown encodings stay binary.
         let gzip = content(&headers(&[
             ("content-type", "application/json"),
             ("content-encoding", "gzip"),
         ]));
         assert!(gzip.text);
         assert_eq!(gzip.encoding, Some(Encoding::Gzip));
+
+        let chunked = content(&headers(&[
+            ("content-type", "application/json"),
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+        ]));
+        assert!(chunked.text);
+        assert!(chunked.aws_chunked);
+        assert_eq!(chunked.wire_encoding.as_deref(), Some("aws-chunked"));
 
         let br = content(&headers(&[
             ("content-type", "application/json"),
@@ -372,7 +628,51 @@ mod tests {
 
         let missing = content(&HeaderMap::new());
         assert!(!missing.text);
+        assert!(missing.sniff_utf8);
         assert!(missing.content_type.is_none());
+    }
+
+    #[test]
+    fn unframes_aws_chunked_and_surfaces_untyped_utf8_and_binary_hex() {
+        // Modern boto3 / AWS SDK v3 S3 PutObject with aws-chunked + trailer checksum,
+        // and default binary/octet-stream Content-Type.
+        let wire = b"1f;chunk-signature=deadbeef\r\n{\"order\":\"#42\",\"note\":\"\xe4\xb8\xad\xe6\x96\x87\"}\r\n0;chunk-signature=feedface\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n";
+        let meta = content(&headers(&[
+            ("content-type", "binary/octet-stream"),
+            ("content-encoding", "aws-chunked"),
+        ]));
+        let mut capture = Capture::new(true);
+        capture.feed(wire);
+        let body = capture.body(&meta).unwrap();
+        assert!(!body.binary, "valid UTF-8 inside aws-chunked is readable");
+        assert!(!body.truncated);
+        assert_eq!(body.encoding.as_deref(), Some("aws-chunked"));
+        assert_eq!(
+            body.text.as_deref(),
+            Some("{\"order\":\"#42\",\"note\":\"中文\"}")
+        );
+        assert_eq!(body.bytes as usize, wire.len());
+        assert_eq!(body.sha256, hex(&Sha256::digest(wire)));
+
+        // Genuine binary bytes keep binary=true plus an unredacted hex preview.
+        let raw_bin = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff];
+        let png = content(&headers(&[("content-type", "image/png")]));
+        let mut bin_cap = Capture::new(true);
+        bin_cap.feed(&raw_bin);
+        let bin_body = bin_cap.body(&png).unwrap();
+        assert!(bin_body.binary);
+        assert!(bin_body.text.is_none());
+        assert_eq!(bin_body.hex.as_deref(), Some("89504e470d0a1a0a00ff"));
+    }
+
+    #[test]
+    fn parses_max_body_sizes() {
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert_eq!(parse_size("64K").unwrap(), 64 * 1024);
+        assert_eq!(parse_size("4MB").unwrap(), 4 * 1024 * 1024);
+        assert!(parse_size("unlimited").unwrap() > 1024 * 1024 * 1024);
+        assert!(parse_size("").is_err());
+        assert!(parse_size("nope").is_err());
     }
 
     #[test]
@@ -401,8 +701,9 @@ mod tests {
             Some(std::str::from_utf8(json).unwrap())
         );
 
-        // Large compressed payloads are capped at MAX_CAPTURE_BYTES when decoded.
-        let huge = vec![b'z'; MAX_CAPTURE_BYTES * 4];
+        // Large compressed payloads are capped at the configured limit when decoded.
+        let limit = 64 * 1024;
+        let huge = vec![b'z'; limit * 4];
         let mut zlib = ZlibEncoder::new(Vec::new(), Compression::fast());
         zlib.write_all(&huge).unwrap();
         let deflated = zlib.finish().unwrap();
@@ -410,13 +711,13 @@ mod tests {
             ("content-type", "text/plain"),
             ("content-encoding", "deflate"),
         ]));
-        let mut big_capture = Capture::new(true);
+        let mut big_capture = Capture::with_limit(limit);
         big_capture.feed(&deflated);
         let big_body = big_capture.body(&deflate).unwrap();
         assert!(big_body.truncated);
-        assert_eq!(big_body.text.as_ref().unwrap().len(), MAX_CAPTURE_BYTES);
+        assert_eq!(big_body.text.as_ref().unwrap().len(), limit);
 
-        // Corrupt gzip falls back to metadata rather than empty text.
+        // Corrupt gzip falls back to binary metadata rather than empty text.
         let mut bad = Capture::new(true);
         bad.feed(b"not-gzip");
         let bad_body = bad.body(&gzip).unwrap();
@@ -425,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_body_is_metadata_only() {
+    fn binary_body_is_metadata_only_when_limit_is_zero() {
         let binary = content(&headers(&[("content-type", "application/octet-stream")]));
         let mut capture = Capture::new(false);
         capture.feed(b"abc");
@@ -445,8 +746,9 @@ mod tests {
 
     #[test]
     fn truncates_large_text_bodies_but_hashes_everything() {
-        let data = vec![b'a'; MAX_CAPTURE_BYTES + 1024];
-        let mut capture = Capture::new(true);
+        let limit = 64 * 1024;
+        let data = vec![b'a'; limit + 1024];
+        let mut capture = Capture::with_limit(limit);
         capture.feed(&data[..1024]);
         capture.feed(&data[1024..]);
         let body = capture.body(&text_content()).unwrap();
@@ -454,7 +756,7 @@ mod tests {
         assert!(!body.binary);
         assert_eq!(body.bytes as usize, data.len());
         let text = body.text.expect("text bodies keep a prefix");
-        assert_eq!(text.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(text.len(), limit);
         assert!(text.bytes().all(|byte| byte == b'a'));
         assert_eq!(body.sha256, hex(&Sha256::digest(&data)));
     }

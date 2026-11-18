@@ -13,7 +13,7 @@ use gpui::{
     UnderlineStyle, Window, div, fill, point, prelude::*, px, relative, rgb, size,
 };
 
-use crate::{fonts, glyph, theme};
+use crate::{fonts, glyph, i18n, theme};
 
 pub struct SearchInput {
     focus: FocusHandle,
@@ -298,16 +298,7 @@ impl SearchInput {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
+        utf16_to_utf8(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
@@ -426,19 +417,11 @@ impl EntityInputHandler for SearchInput {
         );
 
         let new_text = new_text.replace(['\n', '\r'], " ");
-        self.content =
-            (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
-                .into();
-        if new_text.is_empty() {
-            self.marked_range = None;
-        } else {
-            self.marked_range = Some(range.start..range.start + new_text.len());
-        }
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .map(|range| range.start + range.start..range.start + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        let (next_content, marked, selected) =
+            compose_marked_edit(&self.content, range, &new_text, new_selected_range_utf16);
+        self.content = next_content.into();
+        self.marked_range = marked;
+        self.selected_range = self.clamp_range(selected);
         cx.notify();
     }
 
@@ -552,8 +535,9 @@ impl Element for SearchTextElement {
             .filter(|range| range.start < range.end);
         let style = window.text_style();
 
+        let t = theme::p();
         let (display_text, text_color) = if content.is_empty() {
-            (self.placeholder.clone(), theme::h(theme::TEXT_FAINT, 0.95))
+            (self.placeholder.clone(), theme::h(t.text_faint, 0.95))
         } else {
             (content, style.color)
         };
@@ -607,7 +591,7 @@ impl Element for SearchTextElement {
                         point(bounds.left() + cursor_x, bounds.top() + px(2.0)),
                         size(px(1.5), bounds.bottom() - bounds.top() - px(4.0)),
                     ),
-                    rgb(theme::ACCENT),
+                    rgb(t.accent),
                 )),
             )
         } else {
@@ -623,7 +607,7 @@ impl Element for SearchTextElement {
                             bounds.bottom() - px(1.0),
                         ),
                     ),
-                    theme::line(theme::ACCENT, 0.22),
+                    theme::line(t.accent, 0.22),
                 )),
                 None,
             )
@@ -675,13 +659,18 @@ impl Element for SearchTextElement {
 
 impl Render for SearchInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme::p();
         let focused = self.focus.is_focused(window);
         let compact = window.viewport_size().width < px(1_180.0);
         let has_query = !self.content.is_empty();
         let placeholder: SharedString = if compact {
-            "Search calls, paths…".into()
+            i18n::pick("Search calls, paths…", "搜索请求、Path…").into()
         } else {
-            "Search calls, operations, paths…".into()
+            i18n::pick(
+                "Search calls, operations, paths…",
+                "搜索请求、Operation、Path…",
+            )
+            .into()
         };
         let clear = div()
             .id("search-clear")
@@ -693,12 +682,12 @@ impl Render for SearchInput {
             .rounded(px(4.0))
             .text_size(px(13.0))
             .line_height(px(14.0))
-            .text_color(rgb(theme::TEXT_MUTED))
+            .text_color(rgb(t.text_muted))
             .cursor_pointer()
-            .hover(|style| {
+            .hover(move |style| {
                 style
-                    .bg(theme::h(theme::TEXT, 0.06))
-                    .text_color(rgb(theme::TEXT_SOFT))
+                    .bg(theme::h(t.text, 0.06))
+                    .text_color(rgb(t.text_soft))
             })
             .child("×")
             .on_click(cx.listener(|this, _, window, cx| this.clear(window, cx)));
@@ -711,7 +700,7 @@ impl Render for SearchInput {
                 .font_family(fonts::mono())
                 .text_size(px(10.5))
                 .line_height(px(14.0))
-                .text_color(rgb(theme::TEXT_FAINT))
+                .text_color(rgb(t.text_faint))
                 .child(if cfg!(target_os = "macos") {
                     "⌘K"
                 } else {
@@ -730,19 +719,19 @@ impl Render for SearchInput {
             .rounded(px(6.0))
             .border_1()
             .border_color(if focused {
-                theme::line(theme::ACCENT, 0.52)
+                theme::line(t.accent, 0.52)
             } else {
-                theme::h(theme::BORDER, 1.0)
+                theme::h(t.border, 1.0)
             })
             .bg(if focused {
-                rgb(0x0A0E14)
+                rgb(t.input_focused)
             } else {
-                rgb(0x0B0F15)
+                rgb(t.input)
             })
             .text_size(px(13.0))
             .line_height(px(16.0))
             .font_family(fonts::sans())
-            .text_color(rgb(theme::TEXT_SOFT))
+            .text_color(rgb(t.text_soft))
             .track_focus(&self.focus)
             .cursor_text()
             .on_key_down(cx.listener(Self::on_key_down))
@@ -751,9 +740,9 @@ impl Render for SearchInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(glyph::search_icon(if focused {
-                theme::h(theme::ACCENT, 0.75)
+                theme::h(t.accent, 0.75)
             } else {
-                theme::h(theme::TEXT_MUTED, 0.9)
+                theme::h(t.text_muted, 0.9)
             }))
             .child(
                 div()
@@ -766,5 +755,74 @@ impl Render for SearchInput {
                     }),
             )
             .child(trailing)
+    }
+}
+
+fn utf16_to_utf8(text: &str, offset_utf16: usize) -> usize {
+    let mut utf8_offset = 0;
+    let mut utf16_count = 0;
+    for ch in text.chars() {
+        if utf16_count >= offset_utf16 {
+            break;
+        }
+        utf16_count += ch.len_utf16();
+        utf8_offset += ch.len_utf8();
+    }
+    utf8_offset
+}
+
+/// Apply an IME preedit (`new_text`) at `replace_range` inside `content`,
+/// computing `new_selected_range_utf16` relative to `new_text` and offsetting
+/// by `replace_range.start`.
+fn compose_marked_edit(
+    content: &str,
+    replace_range: Range<usize>,
+    new_text: &str,
+    new_selected_range_utf16: Option<Range<usize>>,
+) -> (String, Option<Range<usize>>, Range<usize>) {
+    let base = replace_range.start;
+    let next = format!(
+        "{}{}{}",
+        &content[..replace_range.start],
+        new_text,
+        &content[replace_range.end..]
+    );
+    let marked = (!new_text.is_empty()).then_some(base..base + new_text.len());
+    let selected = match new_selected_range_utf16 {
+        Some(rel_utf16) => {
+            let rel_start = utf16_to_utf8(new_text, rel_utf16.start);
+            let rel_end = utf16_to_utf8(new_text, rel_utf16.end);
+            base + rel_start..base + rel_end
+        }
+        None => base + new_text.len()..base + new_text.len(),
+    };
+    (next, marked, selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ime_preedit_computes_selection_relative_to_marked_text() {
+        // Existing Chinese prefix ("订单 ": 7 UTF-8 bytes) followed by Pinyin
+        // preedit ("zhong'wen", cursor at UTF-16 offset 5 inside preedit).
+        let prefix = "订单 ";
+        assert_eq!(prefix.len(), 7);
+        let (content, marked, selected) =
+            compose_marked_edit(prefix, 7..7, "zhong'wen", Some(5..5));
+        assert_eq!(content, "订单 zhong'wen");
+        assert_eq!(marked, Some(7..16));
+        assert_eq!(selected, 12..12, "cursor stays at 'zhong|' inside preedit");
+
+        // Replacing preedit with CJK candidate ("中文": 2 UTF-16 code units, 6 UTF-8 bytes)
+        // with candidate selection 0..2 in UTF-16.
+        let (content2, marked2, selected2) =
+            compose_marked_edit(&content, 7..16, "中文", Some(0..2));
+        assert_eq!(content2, "订单 中文");
+        assert_eq!(marked2, Some(7..13));
+        assert_eq!(selected2, 7..13);
+        assert!(content2.is_char_boundary(selected2.start));
+        assert!(content2.is_char_boundary(selected2.end));
     }
 }

@@ -40,11 +40,8 @@ pub struct CallAccess {
 }
 
 impl CallAccess {
-    pub fn from_access(
-        access: Access,
-        locked: Option<&std::collections::BTreeSet<Access>>,
-    ) -> Self {
-        let new = locked.is_some_and(|locked| !locked.contains(&access));
+    pub fn from_gate(access: Access, gate: Option<&crate::lock::Gate>) -> Self {
+        let new = gate.is_some_and(|gate| !gate.allows(&access));
         CallAccess {
             action: access.action,
             resource: access.resource,
@@ -67,6 +64,23 @@ impl From<Access> for CallAccess {
             resource: access.resource,
             new: false,
         }
+    }
+}
+
+/// Whether deriving IAM access for `service` requires inspecting the request
+/// body (as opposed to REST-URI services like S3, Lambda, and Bedrock whose
+/// operation and resource live in the path and headers).
+pub fn needs_request_body(service: &str, advertised_operation: Option<&str>) -> bool {
+    match service {
+        "s3" | "s3-object-lambda" | "bedrock" | "bedrock-runtime" | "execute-api"
+        | "apigateway" | "appconfig" | "appconfigdata" => false,
+        // Lambda CreateFunction / UpdateFunctionConfiguration may pass a Role in JSON,
+        // whereas Invoke / GetFunction / DeleteFunction only use the URL path.
+        "lambda" => matches!(
+            advertised_operation,
+            None | Some("CreateFunction" | "UpdateFunctionConfiguration")
+        ),
+        _ => true,
     }
 }
 
@@ -120,34 +134,106 @@ pub fn derive(trace: &Trace) -> (Vec<Access>, Vec<Access>) {
 /// `GetItem`) on its table. A body that cannot be read yields nothing rather
 /// than a guess.
 fn transaction(body: &Body) -> Vec<Access> {
-    let Body::Json(value) = body else {
-        return Vec::new();
-    };
-    let Some(items) = value.get("TransactItems").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut out: Vec<Access> = items
-        .iter()
-        .filter_map(Value::as_object)
-        .flat_map(|item| item.iter())
-        .filter_map(|(kind, request)| {
-            let action = match kind.as_str() {
-                "Put" => "PutItem",
-                "Update" => "UpdateItem",
-                "Delete" => "DeleteItem",
-                "ConditionCheck" => "ConditionCheckItem",
-                "Get" => "GetItem",
-                _ => return None,
+    let mut out: Vec<Access> = match body {
+        Body::Json(value) => {
+            let Some(items) = value.get("TransactItems").and_then(Value::as_array) else {
+                return Vec::new();
             };
-            let table = request.get("TableName")?.as_str()?;
-            Some(Access::new(
-                format!("dynamodb:{action}"),
-                arn("dynamodb", &format!("table/{}", normalize(table))),
-            ))
-        })
-        .collect();
+            items
+                .iter()
+                .filter_map(Value::as_object)
+                .flat_map(|item| item.iter())
+                .filter_map(|(kind, request)| {
+                    let action = transact_action(kind)?;
+                    let table = request.get("TableName")?.as_str()?;
+                    Some(Access::new(
+                        format!("dynamodb:{action}"),
+                        arn("dynamodb", &format!("table/{}", normalize(table))),
+                    ))
+                })
+                .collect()
+        }
+        Body::TruncatedJson(raw) => scan_truncated_transact(raw),
+        _ => Vec::new(),
+    };
     out.sort();
     out.dedup();
+    out
+}
+
+fn transact_action(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Put" => Some("PutItem"),
+        "Update" => Some("UpdateItem"),
+        "Delete" => Some("DeleteItem"),
+        "ConditionCheck" => Some("ConditionCheckItem"),
+        "Get" => Some("GetItem"),
+        _ => None,
+    }
+}
+
+fn scan_truncated_transact(raw: &str) -> Vec<Access> {
+    let mut out = Vec::new();
+    for (kind, action) in [
+        ("Put", "PutItem"),
+        ("Update", "UpdateItem"),
+        ("Delete", "DeleteItem"),
+        ("ConditionCheck", "ConditionCheckItem"),
+        ("Get", "GetItem"),
+    ] {
+        let needle = format!("\"{kind}\"");
+        let mut rest = raw;
+        while let Some(pos) = rest.find(&needle) {
+            rest = &rest[pos + needle.len()..];
+            let after = rest.trim_start();
+            let Some(after_colon) = after.strip_prefix(':') else {
+                continue;
+            };
+            let Some(obj) = after_colon.trim_start().strip_prefix('{') else {
+                continue;
+            };
+            // Scan within this item's leading fields up to the closing `}` at depth 0.
+            let mut end = obj.len();
+            let mut depth = 0i32;
+            let mut in_str = false;
+            let mut escape = false;
+            for (idx, ch) in obj.char_indices() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if in_str {
+                    if ch == '\\' {
+                        escape = true;
+                    } else if ch == '"' {
+                        in_str = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_str = true,
+                    '{' | '[' => depth += 1,
+                    '}' | ']' => {
+                        if depth == 0 {
+                            end = idx;
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(table) = scan_json_string_values(&obj[..end], "TableName")
+                .into_iter()
+                .next()
+            {
+                out.push(Access::new(
+                    format!("dynamodb:{action}"),
+                    arn("dynamodb", &format!("table/{}", normalize(&table))),
+                ));
+            }
+        }
+    }
     out
 }
 
@@ -217,26 +303,29 @@ fn action_name(prefix: &str, operation: &str) -> Option<String> {
     Some(format!("{prefix}:{mapped}"))
 }
 
-/// The request body, parsed once: JSON fields or form fields.
+/// The request body, parsed once: JSON fields, truncated JSON, or form fields.
 enum Body {
     Json(Value),
+    TruncatedJson(String),
     Form(Vec<(String, String)>),
     None,
 }
 
 impl Body {
     fn parse(trace: &Trace) -> Body {
-        let Some(text) = trace
-            .request
-            .body
-            .as_ref()
-            .and_then(|body| body.text.as_deref())
-        else {
+        let Some(body_trace) = trace.request.body.as_ref() else {
+            return Body::None;
+        };
+        let Some(text) = body_trace.text.as_deref() else {
             return Body::None;
         };
         let trimmed = text.trim_start();
         if trimmed.starts_with('{') {
-            return serde_json::from_str(text).map_or(Body::None, Body::Json);
+            return match serde_json::from_str(text) {
+                Ok(json) => Body::Json(json),
+                Err(_) if body_trace.truncated => Body::TruncatedJson(text.to_string()),
+                Err(_) => Body::None,
+            };
         }
         if trace.request.content_type.as_deref() == Some("application/x-www-form-urlencoded")
             || trimmed.starts_with("Action=")
@@ -260,6 +349,7 @@ impl Body {
     fn field(&self, name: &str) -> Option<String> {
         match self {
             Body::Json(value) => value.get(name)?.as_str().map(str::to_string),
+            Body::TruncatedJson(raw) => scan_json_string_values(raw, name).into_iter().next(),
             Body::Form(fields) => fields
                 .iter()
                 .find(|(key, _)| key == name)
@@ -310,14 +400,139 @@ impl Body {
                 _ => {}
             }
         }
-        let mut out = Vec::new();
-        if let Body::Json(value) = self {
-            walk(value, &mut out);
-        }
+        let mut out = match self {
+            Body::Json(value) => {
+                let mut found = Vec::new();
+                walk(value, &mut found);
+                found
+            }
+            Body::TruncatedJson(raw) => {
+                let mut found = scan_json_string_values(raw, "TableName");
+                found.extend(scan_request_items_tables(raw));
+                found
+            }
+            _ => Vec::new(),
+        };
         out.sort();
         out.dedup();
         out
     }
+}
+
+/// Extract complete `"key": "value"` string fields from a truncated JSON prefix.
+fn scan_json_string_values(raw: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\"");
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while let Some(pos) = rest.find(&needle) {
+        rest = &rest[pos + needle.len()..];
+        let after = rest.trim_start();
+        let Some(after_colon) = after.strip_prefix(':') else {
+            continue;
+        };
+        if let Some((val, tail)) = parse_leading_json_string(after_colon.trim_start()) {
+            if !val.is_empty() {
+                out.push(val);
+            }
+            rest = tail;
+        }
+    }
+    out
+}
+
+/// Extract complete table keys under `"RequestItems": { "table_a": ... }` from truncated JSON.
+fn scan_request_items_tables(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(pos) = raw.find("\"RequestItems\"") else {
+        return out;
+    };
+    let after = raw[pos + "\"RequestItems\"".len()..].trim_start();
+    let Some(after_colon) = after.strip_prefix(':') else {
+        return out;
+    };
+    let Some(mut cur) = after_colon.trim_start().strip_prefix('{') else {
+        return out;
+    };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    while !cur.is_empty() {
+        if depth == 0 {
+            let trimmed = cur.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+            if trimmed.starts_with('}') {
+                break;
+            }
+            if let Some((table, after_key)) = parse_leading_json_string(trimmed)
+                && let Some(after_sep) = after_key.trim_start().strip_prefix(':')
+            {
+                if !table.is_empty() {
+                    out.push(table);
+                }
+                cur = after_sep;
+                // Advance past the value at depth 0 until `,` or `}`.
+                let mut val_bytes = 0usize;
+                for (idx, ch) in cur.char_indices() {
+                    val_bytes = idx + ch.len_utf8();
+                    if escape {
+                        escape = false;
+                        continue;
+                    }
+                    if in_str {
+                        if ch == '\\' {
+                            escape = true;
+                        } else if ch == '"' {
+                            in_str = false;
+                        }
+                        continue;
+                    }
+                    match ch {
+                        '"' => in_str = true,
+                        '{' | '[' => depth += 1,
+                        '}' | ']' => {
+                            if depth == 0 {
+                                val_bytes = idx;
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        ',' if depth == 0 => {
+                            val_bytes = idx + 1;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                cur = &cur[val_bytes..];
+                if depth != 0 || in_str {
+                    break;
+                }
+                continue;
+            }
+        }
+        break;
+    }
+    out
+}
+
+fn parse_leading_json_string(s: &str) -> Option<(String, &str)> {
+    let rest = s.strip_prefix('"')?;
+    let mut escape = false;
+    for (idx, ch) in rest.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' {
+            escape = true;
+            continue;
+        }
+        if ch == '"' {
+            let literal = &s[..=idx + 1];
+            let parsed: String = serde_json::from_str(literal).ok()?;
+            return Some((parsed, &rest[idx + 1..]));
+        }
+    }
+    None
 }
 
 fn arn(service: &str, rest: &str) -> String {
@@ -679,10 +894,7 @@ fn lambda_function(path: &str) -> Option<String> {
 
 fn s3_resource(operation: &str, trace: &Trace) -> String {
     let bare = trace.path.split('?').next().unwrap_or(&trace.path);
-    let host = trace
-        .host
-        .rsplit_once(':')
-        .map_or(trace.host.as_str(), |(name, _)| name);
+    let host = wire::strip_port(&trace.host);
     let host_bucket = (host.ends_with(".localhost") || host.contains(".s3"))
         .then(|| host.split('.').next().unwrap_or(""))
         .filter(|bucket| !bucket.is_empty());
@@ -814,6 +1026,7 @@ mod tests {
             access: Vec::new(),
             implied: Vec::new(),
             new: false,
+            blocked: false,
             request: Message {
                 headers: Vec::new(),
                 content_type: Some(if body.is_some_and(|b| b.starts_with('{')) {
@@ -823,6 +1036,8 @@ mod tests {
                 }),
                 body: body.map(|text| BodyTrace {
                     text: Some(text.into()),
+                    hex: None,
+                    encoding: None,
                     bytes: text.len() as u64,
                     truncated: false,
                     binary: false,
@@ -1261,6 +1476,49 @@ mod tests {
             vec![Access::new(
                 "iam:PassRole",
                 "arn:aws:iam::*:role/lambda-exec"
+            )]
+        );
+    }
+
+    #[test]
+    fn salvages_table_permissions_from_truncated_dynamodb_batches() {
+        let mut batch = call(
+            "dynamodb",
+            "BatchWriteItem",
+            "POST",
+            "/",
+            Some(
+                r#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"k":{"S":"v"}}}}],"audit":[{"PutRequest":{"Item":{"x":"#,
+            ),
+        );
+        batch.request.body.as_mut().unwrap().truncated = true;
+        assert_eq!(
+            derive(&batch).0,
+            vec![
+                Access::new(
+                    "dynamodb:BatchWriteItem",
+                    "arn:aws:dynamodb:*:*:table/audit"
+                ),
+                Access::new(
+                    "dynamodb:BatchWriteItem",
+                    "arn:aws:dynamodb:*:*:table/orders"
+                ),
+            ]
+        );
+
+        let mut tx = call(
+            "dynamodb",
+            "TransactWriteItems",
+            "POST",
+            "/",
+            Some(r#"{"TransactItems":[{"Put":{"TableName":"orders","Item":{"blob":{"S":"xxxx"#),
+        );
+        tx.request.body.as_mut().unwrap().truncated = true;
+        assert_eq!(
+            derive(&tx).0,
+            vec![Access::new(
+                "dynamodb:PutItem",
+                "arn:aws:dynamodb:*:*:table/orders"
             )]
         );
     }

@@ -4,15 +4,16 @@ use super::*;
 
 impl LensletApp {
     pub(super) fn render_stream(&mut self, op_width: f32, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         if self.pane == Pane::Access && !self.rows.is_empty() {
             return div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_w(px(0.0))
-                .bg(rgb(theme::PANEL))
+                .bg(rgb(t.panel))
                 .border_r_1()
-                .border_color(rgb(theme::BORDER))
+                .border_color(rgb(t.border))
                 .child(self.render_stream_head(cx))
                 .child(self.render_access(cx))
                 .child(self.render_stream_footer());
@@ -32,9 +33,9 @@ impl LensletApp {
             .flex_col()
             .flex_1()
             .min_w(px(0.0))
-            .bg(rgb(theme::PANEL))
+            .bg(rgb(t.panel))
             .border_r_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(rgb(t.border))
             .child(self.render_stream_head(cx))
             .child(self.render_table_head(op_width))
             .child(body)
@@ -42,20 +43,25 @@ impl LensletApp {
     }
 
     pub(super) fn render_stream_head(&self, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let filtered = !self.query.is_empty() || self.filter != Filter::All;
         let access = self.access_rows();
         let used_access = access.iter().filter(|entry| !entry.unused).count();
         let new_access = access.iter().filter(|entry| entry.new).count();
         let unused_access = access.iter().filter(|entry| entry.unused).count();
         let counts = if self.pane == Pane::Access {
-            let mut text = format!(
-                "{used_access} {}",
-                if used_access == 1 {
-                    "PERMISSION"
-                } else {
-                    "PERMISSIONS"
-                }
-            );
+            let mut text = if i18n::is_zh() {
+                format!("{used_access} 项权限")
+            } else {
+                format!(
+                    "{used_access} {}",
+                    if used_access == 1 {
+                        "PERMISSION"
+                    } else {
+                        "PERMISSIONS"
+                    }
+                )
+            };
             if new_access > 0 {
                 text.push_str(&format!(" · {new_access} NEW"));
             }
@@ -64,24 +70,42 @@ impl LensletApp {
             }
             text
         } else if filtered {
-            format!(
-                "{} OF {} CALLS · {}",
-                self.counts.visible,
-                self.counts.total,
-                error_count(self.counts.visible_errors)
-            )
+            if i18n::is_zh() {
+                format!(
+                    "显示 {} / {} · {}",
+                    self.counts.visible,
+                    self.counts.total,
+                    i18n::error_count(self.counts.visible_errors)
+                )
+            } else {
+                format!(
+                    "{} OF {} CALLS · {}",
+                    self.counts.visible,
+                    self.counts.total,
+                    i18n::error_count(self.counts.visible_errors)
+                )
+            }
         } else if let Some(reported) = self.counts.reported_total {
-            format!(
-                "LATEST {} OF {} CALLS · {}",
-                self.counts.total,
-                reported,
-                error_count(self.counts.errors)
-            )
+            if i18n::is_zh() {
+                format!(
+                    "最近 {} / {} 次 · {}",
+                    self.counts.total,
+                    reported,
+                    i18n::error_count(self.counts.errors)
+                )
+            } else {
+                format!(
+                    "LATEST {} OF {} CALLS · {}",
+                    self.counts.total,
+                    reported,
+                    i18n::error_count(self.counts.errors)
+                )
+            }
         } else {
             let mut text = format!(
                 "{} · {}",
-                call_count(self.counts.total),
-                error_count(self.counts.errors)
+                i18n::call_count(self.counts.total),
+                i18n::error_count(self.counts.errors)
             );
             if self.counts.retries > 0 {
                 text.push_str(&format!(
@@ -94,6 +118,9 @@ impl LensletApp {
                     }
                 ));
             }
+            if self.counts.blocked > 0 {
+                text.push_str(&format!(" · {} blocked", self.counts.blocked));
+            }
             text
         };
 
@@ -104,16 +131,16 @@ impl LensletApp {
             .h(px(theme::STREAM_HEAD_H))
             .px(px(theme::ROW_PAD_X))
             .border_b_1()
-            .border_color(rgb(theme::BORDER_SUBTLE))
+            .border_color(rgb(t.border_subtle))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(2.0))
-                    .child(self.pane_tab(Pane::Calls, "CALLS", None, cx))
+                    .child(self.pane_tab(Pane::Calls, i18n::pick("CALLS", "请求流"), None, cx))
                     .child(self.pane_tab(
                         Pane::Access,
-                        "ACCESS",
+                        i18n::pick("ACCESS", "IAM 权限"),
                         (new_access > 0).then(|| format!("+{new_access}")),
                         cx,
                     )),
@@ -122,22 +149,23 @@ impl LensletApp {
                 div()
                     .font_family(fonts::mono())
                     .text_size(px(10.0))
-                    .text_color(rgb(theme::TEXT_FAINT))
+                    .text_color(rgb(t.text_faint))
                     .child(counts),
             )
     }
 
     pub(super) fn render_table_head(&self, op_width: f32) -> Div {
+        let t = theme::p();
         div()
             .flex()
             .items_center()
             .h(px(theme::TABLE_HEAD_H))
             .px(px(theme::ROW_PAD_X))
             .gap(px(theme::COL_GAP))
-            .bg(rgb(0x0C0F14))
+            .bg(rgb(t.table_head))
             .border_b_1()
-            .border_color(rgb(theme::BORDER_SUBTLE))
-            .child(table_label("TIME", theme::COL_TIME))
+            .border_color(rgb(t.border_subtle))
+            .child(table_label(i18n::pick("TIME", "时间"), theme::COL_TIME))
             .child(table_label("SERVICE", theme::COL_SERVICE))
             .child(div().w(px(op_width)).child(micro_label("OPERATION / PATH")))
             .child(table_label("STATUS", theme::COL_STATUS))
@@ -145,7 +173,7 @@ impl LensletApp {
                 div()
                     .w(px(theme::COL_LATENCY))
                     .text_right()
-                    .child(micro_label("LATENCY")),
+                    .child(micro_label(i18n::pick("LATENCY", "耗时"))),
             )
             .child(
                 div()
@@ -156,6 +184,7 @@ impl LensletApp {
     }
 
     pub(super) fn render_rows(&mut self, op_width: f32, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let rows = self.rows.clone();
         let view = self.view.clone();
         let selected = self.selected;
@@ -206,22 +235,32 @@ impl LensletApp {
                     .h(px(16.0))
                     .bg(linear_gradient(
                         0.0,
-                        linear_color_stop(theme::h(theme::PANEL, 0.0), 0.0),
-                        linear_color_stop(theme::h(theme::PANEL, 0.94), 1.0),
+                        linear_color_stop(theme::h(t.panel, 0.0), 0.0),
+                        linear_color_stop(theme::h(t.panel, 0.94), 1.0),
                     )),
             )
     }
 
     pub(super) fn render_first_run(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let (title, description) = match &self.health {
             TraceHealth::Missing => (
-                "Run your code through Lenslet",
-                "Start AWS Emulator, then run your program, tests or script with the command below. Every AWS call it makes appears here, with the reason when one fails.",
+                i18n::pick("Run your code through Lenslet", "通过 Lenslet 运行你的程序"),
+                i18n::pick(
+                    "Start AWS Emulator, then run your program, tests or script with the command below. Every AWS call it makes appears here, with the reason when one fails.",
+                    "先启动本地 AWS Emulator，再用下方命令运行程序、测试或脚本。每条 AWS 调用都会实时显示在这里，并在失败时给出原因。",
+                ),
             ),
-            TraceHealth::Error(error) => ("Can't read the trace file", error.as_str()),
+            TraceHealth::Error(error) => (
+                i18n::pick("Can't read the trace file", "无法读取 Trace 文件"),
+                error.as_str(),
+            ),
             TraceHealth::Ok => (
-                "No calls captured yet",
-                "The run is live, but nothing has called AWS through it. SDKs that honor AWS_ENDPOINT_URL are routed automatically; others need the endpoint set by hand.",
+                i18n::pick("No calls captured yet", "尚未捕获到请求"),
+                i18n::pick(
+                    "The run is live, but nothing has called AWS through it. SDKs that honor AWS_ENDPOINT_URL are routed automatically; others need the endpoint set by hand.",
+                    "当前会话已连接，但尚未收到 AWS 调用。支持 AWS_ENDPOINT_URL 的 SDK 会自动路由至此。",
+                ),
             ),
         };
         let command = match self.run.as_ref() {
@@ -239,14 +278,14 @@ impl LensletApp {
             .px(px(9.0))
             .rounded(px(6.0))
             .border_1()
-            .border_color(rgb(theme::BORDER))
-            .bg(rgb(theme::CODE))
-            .child(glyph::dot(theme::h(theme::GREEN, 0.9), 5.0))
+            .border_color(rgb(t.border))
+            .bg(rgb(t.code))
+            .child(glyph::dot(theme::h(t.green, 0.9), 5.0))
             .child(
                 div()
                     .font_family(fonts::mono())
                     .text_size(px(12.0))
-                    .text_color(rgb(theme::TEXT_SOFT))
+                    .text_color(rgb(t.text_soft))
                     .child(command.clone()),
             )
             .child(div().flex_1())
@@ -273,14 +312,14 @@ impl LensletApp {
                             .pt(px(2.0))
                             .text_size(px(14.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(rgb(t.text))
                             .child(title),
                     )
                     .child(
                         div()
                             .text_size(px(12.0))
                             .line_height(px(17.0))
-                            .text_color(rgb(theme::TEXT_MUTED))
+                            .text_color(rgb(t.text_muted))
                             .text_center()
                             .child(description.to_string()),
                     )
@@ -290,9 +329,10 @@ impl LensletApp {
                         div()
                             .font_family(fonts::mono())
                             .text_size(px(10.0))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(rgb(t.text_faint))
                             .child(format!(
-                                "watching {}",
+                                "{} {}",
+                                i18n::pick("watching", "监听"),
                                 display_trace_path(self.trace_path.as_deref())
                             )),
                     )
@@ -300,7 +340,7 @@ impl LensletApp {
                         this.child(
                             div()
                                 .text_size(px(10.5))
-                                .text_color(rgb(theme::AMBER))
+                                .text_color(rgb(t.amber))
                                 .child("Demo data · LENSLET_DEMO=1"),
                         )
                     }),
@@ -308,28 +348,57 @@ impl LensletApp {
     }
 
     pub(super) fn render_no_matches(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let query = if self.query.is_empty() {
             None
         } else {
             Some(format!("\"{}\"", trace::clip_utf8(&self.query, 40)))
         };
-        let mut description = String::from("Try a different search");
+        let mut description =
+            i18n::pick("Try a different search", "请尝试其他搜索关键词").to_string();
         if let Filter::Access(access) = &self.filter {
             description = if self.counts.reported_total.is_some() {
-                format!(
-                    "Earlier calls that needed {} fell outside the latest {}-call window",
-                    access.action, self.counts.total
-                )
+                if i18n::is_zh() {
+                    format!(
+                        "使用 {} 的早期请求已超出最近 {} 条窗口",
+                        access.action, self.counts.total
+                    )
+                } else {
+                    format!(
+                        "Earlier calls that needed {} fell outside the latest {}-call window",
+                        access.action, self.counts.total
+                    )
+                }
+            } else if i18n::is_zh() {
+                format!("当前没有请求使用 {}", access.action)
             } else {
                 format!("No calls needed {} here", access.action)
             };
         } else if let Filter::Service(id) = &self.filter {
-            description = format!("No calls for the {id} filter");
+            description = if i18n::is_zh() {
+                format!("当前没有 {id} 的请求")
+            } else {
+                format!("No calls for the {id} filter")
+            };
         } else if self.filter == Filter::Errors {
-            description = "No error calls in the current trace".to_string();
+            description = i18n::pick(
+                "No error calls in the current trace",
+                "当前 Trace 中没有错误请求",
+            )
+            .to_string();
+        } else if self.filter == Filter::Blocked {
+            description = i18n::pick(
+                "No blocked calls in the current trace",
+                "当前 Trace 中没有被拦截的请求",
+            )
+            .to_string();
         }
         if let Some(query) = query {
-            description = format!("Nothing matches {query}.");
+            description = if i18n::is_zh() {
+                format!("没有匹配 {query} 的结果。")
+            } else {
+                format!("Nothing matches {query}.")
+            };
         }
 
         div()
@@ -345,34 +414,41 @@ impl LensletApp {
                 div()
                     .text_size(px(13.0))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(theme::TEXT_SOFT))
-                    .child("No calls match"),
+                    .text_color(rgb(t.text_soft))
+                    .child(i18n::pick("No calls match", "没有匹配的请求")),
             )
             .child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(theme::TEXT_MUTED))
+                    .text_color(rgb(t.text_muted))
                     .text_center()
                     .child(description),
             )
             .child(
-                action_button("clear-filters", "Clear search & filters").on_click(
+                action_button(
+                    "clear-filters",
+                    i18n::pick("Clear search & filters", "清除搜索与筛选"),
+                )
+                .on_click(
                     cx.listener(|this, _, window, cx| this.clear_search_and_filter(window, cx)),
                 ),
             )
     }
 
     pub(super) fn render_stream_footer(&self) -> Div {
+        let t = theme::p();
         let (dot, text) = if self.demo && !self.paused {
             (
-                theme::h(theme::AMBER, 0.9),
-                "demo data · static".to_string(),
+                theme::h(t.amber, 0.9),
+                i18n::pick("demo data · static", "演示数据 · 静态").to_string(),
             )
         } else if self.paused {
             (
-                theme::h(theme::AMBER, 0.95),
+                theme::h(t.amber, 0.95),
                 if self.buffered.is_empty() {
-                    "paused".to_string()
+                    i18n::pick("paused", "已暂停").to_string()
+                } else if i18n::is_zh() {
+                    format!("已暂停 · 缓存 {}", self.buffered.len())
                 } else {
                     format!("paused · {} buffered", self.buffered.len())
                 },
@@ -380,11 +456,15 @@ impl LensletApp {
         } else {
             match &self.health {
                 TraceHealth::Missing => (
-                    theme::h(theme::AMBER, 0.9),
-                    format!("waiting for a run in {}", display_trace_path(None)),
+                    theme::h(t.amber, 0.9),
+                    if i18n::is_zh() {
+                        format!("等待运行记录 {}", display_trace_path(None))
+                    } else {
+                        format!("waiting for a run in {}", display_trace_path(None))
+                    },
                 ),
                 TraceHealth::Error(error) => {
-                    (theme::h(theme::RED, 0.9), format!("trace error · {error}"))
+                    (theme::h(t.red, 0.9), format!("trace error · {error}"))
                 }
                 TraceHealth::Ok => (
                     self.proxy_light().dot,
@@ -399,7 +479,8 @@ impl LensletApp {
                             display_trace_path(self.trace_path.as_deref())
                         ),
                         None => format!(
-                            "watching {}",
+                            "{} {}",
+                            i18n::pick("watching", "监听"),
                             display_trace_path(self.trace_path.as_deref())
                         ),
                     },
@@ -418,7 +499,7 @@ impl LensletApp {
                 div()
                     .font_family(fonts::mono())
                     .text_size(px(10.0))
-                    .text_color(rgb(theme::TEXT_MUTED))
+                    .text_color(rgb(t.text_muted))
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .child(text),
@@ -428,7 +509,7 @@ impl LensletApp {
                 div()
                     .font_family(fonts::mono())
                     .text_size(px(10.0))
-                    .text_color(rgb(theme::AMBER))
+                    .text_color(rgb(t.amber))
                     .child(format!(
                         "· {} {}",
                         self.skipped,
@@ -448,8 +529,8 @@ impl LensletApp {
             .h(px(32.0))
             .px(px(theme::ROW_PAD_X))
             .border_t_1()
-            .border_color(rgb(theme::BORDER_SUBTLE))
-            .bg(rgb(0x0B0E14))
+            .border_color(rgb(t.border_subtle))
+            .bg(rgb(t.strip))
             .child(left)
     }
 }
@@ -464,18 +545,17 @@ pub(super) fn trace_row(
     prev_end_ms: Option<i64>,
     this: WeakEntity<LensletApp>,
 ) -> Stateful<Div> {
+    let t = theme::p();
     let service_color = theme::service_color(trace.service_name());
     let idle_gap_ms = match (trace.at_ms(), prev_end_ms) {
         (Some(at), Some(prev_end)) if at - prev_end >= 500 => Some((at - prev_end) as u64),
         _ => None,
     };
     let time_sub = if let Some(gap) = idle_gap_ms {
-        Some((format!("Δ {}", format_latency(gap)), rgb(theme::AMBER)))
+        Some((format!("Δ {}", format_latency(gap)), rgb(t.amber)))
     } else {
         match (trace.at_ms(), run_start_ms) {
-            (Some(at), Some(start)) => {
-                Some((trace::format_offset(at - start), rgb(theme::TEXT_FAINT)))
-            }
+            (Some(at), Some(start)) => Some((trace::format_offset(at - start), rgb(t.text_faint))),
             _ => None,
         }
     };
@@ -489,11 +569,11 @@ pub(super) fn trace_row(
         .px(px(theme::ROW_PAD_X))
         .gap(px(theme::COL_GAP))
         .border_b_1()
-        .border_color(rgb(theme::BORDER_SUBTLE))
+        .border_color(rgb(t.border_subtle))
         .bg(if selected {
-            rgb(theme::ROW_SELECTED)
+            rgb(t.row_selected)
         } else {
-            rgb(theme::ROW)
+            rgb(t.row)
         })
         .cursor_pointer()
         .on_click(move |_, window, cx| {
@@ -508,7 +588,9 @@ pub(super) fn trace_row(
                 .bottom_0()
                 .w(px(2.0))
                 .bg(if selected {
-                    rgb(theme::ACCENT)
+                    rgb(t.accent)
+                } else if trace.blocked {
+                    rgb(t.red)
                 } else {
                     rgba(0x00000000)
                 }),
@@ -524,7 +606,7 @@ pub(super) fn trace_row(
                 .child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(rgb(theme::TEXT_MUTED))
+                        .text_color(rgb(t.text_muted))
                         .child(short_clock(&trace.at)),
                 )
                 .when_some(time_sub, |col, (label, color)| {
@@ -567,16 +649,19 @@ pub(super) fn trace_row(
                             div()
                                 .text_size(px(13.0))
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT))
+                                .text_color(rgb(t.text))
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .overflow_hidden()
                                 .child(operation_label(trace).to_string()),
                         )
+                        .when(trace.blocked, |title| title.child(blocked_pill("BLOCKED")))
                         .when_some(trace.retry_badge(), |title, badge| {
                             title.child(retry_pill(badge))
                         })
-                        .when(trace.new, |title| title.child(new_pill("NEW ACCESS"))),
+                        .when(trace.new && !trace.blocked, |title| {
+                            title.child(new_pill("NEW ACCESS"))
+                        }),
                 )
                 .child(row_detail(trace, op_width)),
         )
@@ -589,7 +674,7 @@ pub(super) fn trace_row(
                 .gap(px(5.0))
                 .child(glyph::dot(
                     if trace.pending {
-                        rgb(theme::AMBER)
+                        rgb(t.amber)
                     } else {
                         status_color(trace.status)
                     },
@@ -600,11 +685,11 @@ pub(super) fn trace_row(
                         .font_family(fonts::mono())
                         .text_size(px(12.0))
                         .text_color(if trace.pending {
-                            rgb(theme::AMBER)
+                            rgb(t.amber)
                         } else if trace.is_error() {
                             status_color(trace.status)
                         } else {
-                            rgb(theme::TEXT_BODY)
+                            rgb(t.text_body)
                         })
                         .child(if trace.pending {
                             "…".to_string()
@@ -621,7 +706,7 @@ pub(super) fn trace_row(
                 .font_family(fonts::mono())
                 .text_size(px(12.0))
                 .text_color(if trace.pending {
-                    rgb(theme::AMBER)
+                    rgb(t.amber)
                 } else {
                     latency_color(trace.ms)
                 })
@@ -641,15 +726,16 @@ pub(super) fn trace_row(
         );
 
     if selected {
-        row.hover(|style| style.bg(rgb(theme::ROW_SELECTED_HOVER)))
+        row.hover(move |style| style.bg(rgb(t.row_selected_hover)))
     } else {
-        row.hover(|style| style.bg(rgb(theme::ROW_HOVER)))
+        row.hover(move |style| style.bg(rgb(t.row_hover)))
     }
 }
 
 /// The row's second line: the AWS error when the call failed, otherwise the
 /// method and path.
 fn row_detail(trace: &Trace, op_width: f32) -> Div {
+    let t = theme::p();
     let line = div().flex().items_center().gap(px(6.0)).min_w(px(0.0));
     if let Some(problem) = trace.problem.as_ref() {
         let message = problem.message.as_deref().unwrap_or("");
@@ -668,7 +754,7 @@ fn row_detail(trace: &Trace, op_width: f32) -> Div {
                     .flex_1()
                     .min_w(px(0.0))
                     .text_size(px(12.5))
-                    .text_color(rgb(theme::TEXT_DIM))
+                    .text_color(rgb(t.text_dim))
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .overflow_hidden()
@@ -680,7 +766,7 @@ fn row_detail(trace: &Trace, op_width: f32) -> Div {
             .font_family(fonts::mono())
             .text_size(px(10.5))
             .text_color(if status_is_success(trace.status) || trace.pending {
-                rgb(theme::TEXT_MUTED)
+                rgb(t.text_muted)
             } else {
                 status_color(trace.status)
             })
@@ -692,7 +778,7 @@ fn row_detail(trace: &Trace, op_width: f32) -> Div {
             .flex_shrink_0()
             .font_family(fonts::mono())
             .text_size(px(12.0))
-            .text_color(rgb(theme::TEXT_MUTED))
+            .text_color(rgb(t.text_muted))
             .min_w(px(0.0))
             .whitespace_nowrap()
             .text_ellipsis()
@@ -710,9 +796,14 @@ impl LensletApp {
         badge: Option<String>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let t = theme::p();
         let active = self.pane == pane;
+        let id = match pane {
+            Pane::Calls => "pane-calls",
+            Pane::Access => "pane-access",
+        };
         let mut tab = div()
-            .id(label)
+            .id(id)
             .flex()
             .items_center()
             .gap(px(5.0))
@@ -720,19 +811,19 @@ impl LensletApp {
             .px(px(8.0))
             .rounded(px(5.0))
             .bg(if active {
-                theme::h(theme::TEXT, 0.07)
+                theme::h(t.text, 0.07)
             } else {
                 theme::h(0x000000, 0.0)
             })
             .text_size(px(10.0))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(if active {
-                rgb(theme::TEXT)
+                rgb(t.text)
             } else {
-                rgb(theme::TEXT_MUTED)
+                rgb(t.text_muted)
             })
             .cursor_pointer()
-            .hover(|style| style.text_color(rgb(theme::TEXT_SOFT)))
+            .hover(move |style| style.text_color(rgb(t.text_soft)))
             .on_click(cx.listener(move |this, _, _, cx| this.set_pane(pane, cx)))
             .child(label);
         if let Some(badge) = badge {
@@ -744,6 +835,7 @@ impl LensletApp {
 
 /// The small amber marker for access outside the lock file.
 pub(super) fn new_pill(text: impl Into<SharedString>) -> Div {
+    let t = theme::p();
     div()
         .h(px(15.0))
         .px(px(4.0))
@@ -751,16 +843,35 @@ pub(super) fn new_pill(text: impl Into<SharedString>) -> Div {
         .items_center()
         .rounded(px(3.0))
         .border_1()
-        .border_color(theme::line(theme::AMBER, 0.4))
-        .bg(theme::h(theme::AMBER, 0.1))
+        .border_color(theme::line(t.amber, 0.4))
+        .bg(theme::h(t.amber, 0.1))
         .font_family(fonts::mono())
         .text_size(px(9.0))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(theme::AMBER))
+        .text_color(rgb(t.amber))
+        .child(text.into())
+}
+
+pub(super) fn blocked_pill(text: impl Into<SharedString>) -> Div {
+    let t = theme::p();
+    div()
+        .h(px(15.0))
+        .px(px(4.0))
+        .flex()
+        .items_center()
+        .rounded(px(3.0))
+        .border_1()
+        .border_color(theme::line(t.red, 0.45))
+        .bg(theme::h(t.red, 0.12))
+        .font_family(fonts::mono())
+        .text_size(px(9.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(t.red))
         .child(text.into())
 }
 
 fn retry_pill(text: impl Into<SharedString>) -> Div {
+    let t = theme::p();
     div()
         .h(px(15.0))
         .px(px(4.0))
@@ -768,11 +879,11 @@ fn retry_pill(text: impl Into<SharedString>) -> Div {
         .items_center()
         .rounded(px(3.0))
         .border_1()
-        .border_color(theme::line(theme::ACCENT, 0.38))
-        .bg(theme::h(theme::ACCENT, 0.09))
+        .border_color(theme::line(t.accent, 0.38))
+        .bg(theme::h(t.accent, 0.09))
         .font_family(fonts::mono())
         .text_size(px(9.0))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(theme::ACCENT))
+        .text_color(rgb(t.accent))
         .child(text.into())
 }

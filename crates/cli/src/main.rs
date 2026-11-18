@@ -60,10 +60,13 @@ Usage:
       Open the window (same as `lenslet` with no arguments).
 
 Run options:
-  --check              exit {changed} if the run used access not in the lock
+  --enforce            block calls outside lenslet.lock (or --policy) with AWS AccessDenied
+  --check              exit {changed} if the run used access not in the lock (or --policy)
   --strict             with --check: also exit {changed} for locked access the run did not use
   --update             write the lock from this run (keeps `# test` marks)
   --lock PATH          the lock file (default ./lenslet.lock)
+  --policy PATH        check or enforce against an IAM policy JSON document instead of lock
+  --max-body SIZE      body bytes captured per message, e.g. 256K, 4M, unlimited (default {mib} MiB)
   --json PATH          also write the report as JSON (`-` for stdout)
   --markdown PATH      also write the report as Markdown (PR comments, job summaries)
   --quiet              no banner or report on stderr
@@ -76,10 +79,10 @@ Run options:
 
 Exit codes: COMMAND's own code when it fails; {changed} when it passed but --check
 found a change in access; 2 for Lenslet's own errors; otherwise 0.
-Bodies are forwarded unchanged; traces keep up to {kib} KiB of each text body.",
+Bodies are forwarded unchanged with no redaction; traces keep up to {mib} MiB per body by default.",
         version = env!("CARGO_PKG_VERSION"),
         changed = EXIT_ACCESS_CHANGED,
-        kib = MAX_CAPTURE_BYTES / 1024,
+        mib = MAX_CAPTURE_BYTES / (1024 * 1024),
     )
 }
 
@@ -151,6 +154,7 @@ struct RunArgs {
     strict: bool,
     update: bool,
     lock: Option<PathBuf>,
+    policy: Option<PathBuf>,
 }
 
 fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
@@ -166,6 +170,7 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
         strict: false,
         update: false,
         lock: None,
+        policy: None,
     };
     let mut listen_given = false;
     let mut it = args.into_iter();
@@ -179,6 +184,7 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
             "--json" => parsed.json = Some(value()?),
             "--markdown" => parsed.markdown = Some(value()?),
             "--lock" => parsed.lock = Some(PathBuf::from(value()?)),
+            "--policy" => parsed.policy = Some(PathBuf::from(value()?)),
             "--strict" => parsed.strict = true,
             "--quiet" | "-q" => parsed.quiet = true,
             "--ui" => parsed.ui = true,
@@ -210,6 +216,12 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
     if parsed.check && parsed.update {
         bail!("use --check or --update, not both");
     }
+    if parsed.options.enforce && parsed.update {
+        bail!("use --enforce or --update, not both");
+    }
+    if parsed.policy.is_some() && parsed.update {
+        bail!("--update writes lenslet.lock; remove --policy when updating the lock");
+    }
     if parsed.strict && !parsed.check {
         bail!("--strict goes with --check");
     }
@@ -240,14 +252,22 @@ fn child_env(
     if no_env {
         return env;
     }
-    // Real credentials never reach the emulator or the trace: keys and
-    // profiles from the environment always go, whatever happens next.
+    // Real credentials never reach the emulator or the trace: keys, profiles,
+    // OIDC web-identity tokens, container credential URIs and bearer tokens go.
     for name in [
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "AWS_PROFILE",
         "AWS_DEFAULT_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
     ] {
         if current(name).is_some() {
             env.remove.push(name.to_string());
@@ -292,15 +312,33 @@ async fn run(args: Vec<String>) -> Result<i32> {
         strict,
         update,
         lock,
+        policy,
     } = parse_run(args, &home)?;
     let cwd = std::env::current_dir().context("read the current directory")?;
     let lock_path = lock.unwrap_or_else(|| lock::path_in(&cwd));
     // How the lock is named in reports: relative to the run's directory.
     let lock_label = relative_to(&lock_path, &cwd);
     let locked = lock::read(&lock_path)?;
-    if check && locked.is_none() {
-        bail!("--check needs {lock_label}; create it with `lenslet run --update -- <tests>`");
-    }
+    let (policy_label, gate) = if let Some(policy_path) = policy.as_ref() {
+        let label = relative_to(policy_path, &cwd);
+        let gate = lock::Gate::from_policy_file(policy_path, label.clone())?;
+        (Some(label), Some(gate))
+    } else {
+        if (check || options.enforce) && locked.is_none() {
+            let flag = if options.enforce {
+                "--enforce"
+            } else {
+                "--check"
+            };
+            bail!(
+                "{flag} needs {lock_label} (or --policy PATH); create it with `lenslet run --update -- <tests>`"
+            );
+        }
+        let gate = locked
+            .as_ref()
+            .map(|lock| lock::Gate::from_lock(lock_label.clone(), lock.access.clone()));
+        (None, gate)
+    };
     let runs_dir = runs::dir(&home);
     let trace_path = match options.trace.clone() {
         Some(path) => path,
@@ -320,16 +358,13 @@ async fn run(args: Vec<String>) -> Result<i32> {
         cwd: cwd.display().to_string(),
         pid: std::process::id(),
         started: runs::now(),
-        lock: locked.is_some().then(|| lock_label.clone()),
+        lock: (policy_label.is_none() && locked.is_some()).then(|| lock_label.clone()),
+        policy: policy_label.clone(),
+        enforce: options.enforce,
         ..RunHeader::default()
     };
-    let server = Server::start(
-        &options,
-        trace_path.clone(),
-        header,
-        locked.as_ref().map(|lock| lock.access.clone()),
-    )
-    .await?;
+    let server =
+        Server::start_with_gate(&options, trace_path.clone(), header, gate.clone()).await?;
     let endpoint = server.endpoint();
     let started = Instant::now();
 
@@ -341,8 +376,12 @@ async fn run(args: Vec<String>) -> Result<i32> {
             std::env::var_os(name)
         });
         if !quiet {
+            let enforce_note = match (options.enforce, gate.as_ref()) {
+                (true, Some(g)) => format!(" · enforcing {}", g.label),
+                _ => String::new(),
+            };
             eprintln!(
-                "lenslet: {} → {} · trace {}",
+                "lenslet: {} → {} · trace {}{enforce_note}",
                 endpoint,
                 options.upstream.base,
                 tilde(&trace_path, &home)
@@ -382,17 +421,19 @@ async fn run(args: Vec<String>) -> Result<i32> {
         calls: summary.calls,
         retries: summary.retries,
         errors: summary.errors,
+        blocked: summary.blocked,
         unfinished: summary.unfinished,
         services: summary.services.clone(),
         unmapped: summary.unmapped.clone(),
         failures: summary.failures.clone(),
-        lock: locked.is_some().then(|| lock_label.clone()),
+        lock: (policy_label.is_none() && locked.is_some()).then(|| lock_label.clone()),
+        policy: policy_label,
         trace: trace_path.display().to_string(),
         endpoint: endpoint.clone(),
         upstream: options.upstream.base.clone(),
         ..Report::default()
     };
-    report.set_access(&summary, locked.as_ref().map(|lock| &lock.access));
+    report.set_access_with_gate(&summary, gate.as_ref());
     let runs_dir = trace_path
         .parent()
         .map(Path::to_path_buf)
@@ -862,7 +903,12 @@ mod tests {
         let real = |name: &str| {
             matches!(
                 name,
-                "AWS_PROFILE" | "AWS_ACCESS_KEY_ID" | "AWS_SESSION_TOKEN"
+                "AWS_PROFILE"
+                    | "AWS_ACCESS_KEY_ID"
+                    | "AWS_SESSION_TOKEN"
+                    | "AWS_WEB_IDENTITY_TOKEN_FILE"
+                    | "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+                    | "AWS_BEARER_TOKEN_BEDROCK"
             )
             .then(|| OsString::from("real"))
         };
@@ -877,7 +923,14 @@ mod tests {
         );
         assert_eq!(
             env.remove,
-            ["AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN", "AWS_PROFILE"]
+            [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SESSION_TOKEN",
+                "AWS_PROFILE",
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                "AWS_BEARER_TOKEN_BEDROCK",
+            ]
         );
 
         // No emulator credentials: real keys still go, placeholders come in,

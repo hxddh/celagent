@@ -521,3 +521,85 @@ fn init_detects_moto_and_run_tracks_retries() {
     assert_eq!(report["failures"][1]["max_attempts"], 3);
     let _ = summary;
 }
+
+#[test]
+fn enforce_and_policy_gate_live_calls_end_to_end() {
+    if !has_curl() {
+        eprintln!("skipping: curl is not installed");
+        return;
+    }
+    let env = Env::new();
+    // Write a lock allowing only SendMessage.
+    let output = env.run(&["--update"], &["SendMessage"], 0);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // With --enforce, SendMessage gets 200 and PurgeQueue gets 400 AccessDeniedException.
+    let script = "code1=$(curl -s -o /dev/null -w '%{http_code}' -X POST \"$AWS_ENDPOINT_URL/\" \
+        -H 'x-amz-target: AmazonSQS.SendMessage' -H 'content-type: application/x-amz-json-1.0' \
+        -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261118/us-east-1/sqs/aws4_request, Signature=x' \
+        -d '{\"QueueUrl\":\"http://127.0.0.1/000000000000/jobs\"}'); \
+      code2=$(curl -s -o /dev/null -w '%{http_code}' -X POST \"$AWS_ENDPOINT_URL/\" \
+        -H 'x-amz-target: AmazonSQS.PurgeQueue' -H 'content-type: application/x-amz-json-1.0' \
+        -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261118/us-east-1/sqs/aws4_request, Signature=x' \
+        -d '{\"QueueUrl\":\"http://127.0.0.1/000000000000/jobs\"}'); \
+      test \"$code1\" = 200 && test \"$code2\" = 400";
+    let upstream = format!("http://127.0.0.1:{}", env.port);
+    let report_path = env.home.join("enforce.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_lenslet"))
+        .args([
+            "run",
+            "--enforce",
+            "--upstream",
+            &upstream,
+            "--json",
+            report_path.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
+        .current_dir(&env.work)
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("(1 blocked)"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("[blocked]"), "{}", stderr(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["blocked"], 1);
+    assert_eq!(report["failures"][0]["blocked"], true);
+
+    // Export the lock to an IAM policy JSON and enforce against `--policy` + `--check`.
+    let pol = env.lenslet(&["policy"]);
+    let pol_path = env.work.join("iam.json");
+    std::fs::write(&pol_path, &pol.stdout).unwrap();
+    let check_out = Command::new(env!("CARGO_BIN_EXE_lenslet"))
+        .args([
+            "run",
+            "--enforce",
+            "--check",
+            "--policy",
+            pol_path.to_str().unwrap(),
+            "--upstream",
+            &upstream,
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
+        .current_dir(&env.work)
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    assert_eq!(check_out.status.code(), Some(3), "{}", stderr(&check_out));
+    assert!(
+        stderr(&check_out).contains("not in iam.json"),
+        "{}",
+        stderr(&check_out)
+    );
+}

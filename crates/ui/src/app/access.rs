@@ -9,8 +9,14 @@ const COL_FLAGS: f32 = 126.0;
 
 impl LensletApp {
     pub(super) fn render_access(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = theme::p();
         let rows = self.access_rows();
-        let lock = self.run.as_ref().and_then(|run| run.header.lock.clone());
+        let gate = self.run.as_ref().and_then(|run| {
+            run.header
+                .policy
+                .clone()
+                .or_else(|| run.header.lock.clone())
+        });
         let new_count = rows.iter().filter(|row| row.new).count();
         let unused_count = rows.iter().filter(|row| row.unused).count();
         let unmapped: usize = self
@@ -19,26 +25,48 @@ impl LensletApp {
             .and_then(|run| run.report.as_ref())
             .map(|report| report.unmapped.values().sum())
             .unwrap_or(0);
-        let mut note = match (&lock, new_count, unused_count) {
-            (None, _, _) => "No lenslet.lock in this run's directory. `lenslet run --update -- <tests>` writes one; then new access is flagged here and fails `--check`.".to_string(),
-            (Some(lock), 0, 0) => format!("Everything this run used is in {lock}."),
-            (Some(lock), new, 0) => format!(
-                "{new} {} not in {lock}: review them, then `lenslet run --update` to accept.",
-                if new == 1 { "permission is" } else { "permissions are" }
-            ),
-            (Some(lock), 0, unused) => format!(
-                "Within {lock}, with {unused} locked {} not exercised by this run (`--strict` fails on unused access).",
-                if unused == 1 { "permission" } else { "permissions" }
-            ),
-            (Some(lock), new, unused) => format!(
-                "{new} not in {lock}, and {unused} in {lock} not exercised by this run: review changes, then `lenslet run --update`.",
-            ),
+        let mut note = if i18n::is_zh() {
+            match (&gate, new_count, unused_count) {
+                (None, _, _) => "当前运行目录没有 lenslet.lock。执行 `lenslet run --update -- <tests>` 可生成锁文件；后续新增权限会在此高亮，并在 `--check` / `--enforce` 下触发检查。".to_string(),
+                (Some(gate), 0, 0) => format!("本次运行使用的全部权限均在 {gate} 范围内。"),
+                (Some(gate), new, 0) => format!(
+                    "有 {new} 项权限不在 {gate} 中：请审阅变更，确认无误后执行 `lenslet run --update` 更新。"
+                ),
+                (Some(gate), 0, unused) => format!(
+                    "所有权限均在 {gate} 范围内，另有 {unused} 项已锁定权限本次未触发（`--strict` 会对此报错）。"
+                ),
+                (Some(gate), new, unused) => format!(
+                    "有 {new} 项不在 {gate} 中，另有 {unused} 项本次未触发：请审阅后执行 `lenslet run --update`。"
+                ),
+            }
+        } else {
+            match (&gate, new_count, unused_count) {
+                (None, _, _) => "No lenslet.lock in this run's directory. `lenslet run --update -- <tests>` writes one; then new access is flagged here and fails `--check` / `--enforce`.".to_string(),
+                (Some(gate), 0, 0) => format!("Everything this run used is in {gate}."),
+                (Some(gate), new, 0) => format!(
+                    "{new} {} not in {gate}: review them, then `lenslet run --update` to accept.",
+                    if new == 1 { "permission is" } else { "permissions are" }
+                ),
+                (Some(gate), 0, unused) => format!(
+                    "Within {gate}, with {unused} locked {} not exercised by this run (`--strict` fails on unused access).",
+                    if unused == 1 { "permission" } else { "permissions" }
+                ),
+                (Some(gate), new, unused) => format!(
+                    "{new} not in {gate}, and {unused} in {gate} not exercised by this run: review changes, then `lenslet run --update`.",
+                ),
+            }
         };
         if unmapped > 0 {
-            note.push_str(&format!(
-                " · {unmapped} {} had no recognizable operation.",
-                if unmapped == 1 { "call" } else { "calls" }
-            ));
+            if i18n::is_zh() {
+                note.push_str(&format!(
+                    " · 另有 {unmapped} 次调用无法识别具体 AWS Operation。"
+                ));
+            } else {
+                note.push_str(&format!(
+                    " · {unmapped} {} had no recognizable operation.",
+                    if unmapped == 1 { "call" } else { "calls" }
+                ));
+            }
         }
         let header = div()
             .flex()
@@ -46,9 +74,9 @@ impl LensletApp {
             .h(px(theme::TABLE_HEAD_H))
             .px(px(theme::ROW_PAD_X))
             .gap(px(theme::COL_GAP))
-            .bg(rgb(0x0C0F14))
+            .bg(rgb(t.table_head))
             .border_b_1()
-            .border_color(rgb(theme::BORDER_SUBTLE))
+            .border_color(rgb(t.border_subtle))
             .child(
                 div()
                     .w(px(230.0))
@@ -60,7 +88,7 @@ impl LensletApp {
                 div()
                     .w(px(COL_CALLS))
                     .text_right()
-                    .child(micro_label("CALLS")),
+                    .child(micro_label(i18n::pick("CALLS", "次数"))),
             )
             .child(div().w(px(COL_FLAGS)));
 
@@ -72,8 +100,11 @@ impl LensletApp {
                 .justify_center()
                 .p(px(24.0))
                 .text_size(px(12.0))
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child("No call in this run maps to an IAM action yet.")
+                .text_color(rgb(t.text_muted))
+                .child(i18n::pick(
+                    "No call in this run maps to an IAM action yet.",
+                    "本次运行暂无可映射至 IAM Action 的调用。",
+                ))
                 .into_any_element()
         } else {
             let this = cx.entity().downgrade();
@@ -99,10 +130,10 @@ impl LensletApp {
                     .px(px(theme::ROW_PAD_X))
                     .py(px(9.0))
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER_SUBTLE))
+                    .border_color(rgb(t.border_subtle))
                     .text_size(px(11.5))
                     .line_height(px(16.0))
-                    .text_color(rgb(theme::TEXT_DIM))
+                    .text_color(rgb(t.text_dim))
                     .child(note),
             )
             .child(header)
@@ -115,6 +146,7 @@ fn access_row(
     index: usize,
     this: WeakEntity<LensletApp>,
 ) -> Stateful<Div> {
+    let t = theme::p();
     let access = trace::Access {
         action: entry.action.clone(),
         resource: entry.resource.clone(),
@@ -142,7 +174,7 @@ fn access_row(
             div()
                 .font_family(fonts::mono())
                 .text_size(px(10.0))
-                .text_color(rgb(theme::TEXT_FAINT))
+                .text_color(rgb(t.text_faint))
                 .child("test"),
         );
     }
@@ -151,12 +183,12 @@ fn access_row(
             div()
                 .font_family(fonts::mono())
                 .text_size(px(10.0))
-                .text_color(rgb(theme::TEXT_MUTED))
+                .text_color(rgb(t.text_muted))
                 .child("implied"),
         );
     }
     if entry.errors > 0 {
-        flags = flags.child(glyph::dot(rgb(theme::RED), 4.5));
+        flags = flags.child(glyph::dot(rgb(t.red), 4.5));
     }
     div()
         .id(ElementId::named_usize("access-row", index))
@@ -167,24 +199,26 @@ fn access_row(
         .px(px(theme::ROW_PAD_X))
         .gap(px(theme::COL_GAP))
         .border_b_1()
-        .border_color(rgb(theme::BORDER_SUBTLE))
+        .border_color(rgb(t.border_subtle))
         .bg(if entry.new {
-            theme::h(theme::AMBER, 0.045)
+            theme::h(t.amber, 0.055)
         } else if unused {
-            theme::h(theme::TEXT_FAINT, 0.05)
+            theme::h(t.text_faint, 0.05)
         } else {
-            theme::h(theme::ROW, 1.0)
+            theme::h(t.row, 1.0)
         })
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(theme::ROW_HOVER)))
+        .hover(move |style| style.bg(rgb(t.row_hover)))
         .on_click(move |_, _, cx| {
             let access = access.clone();
             this.update(cx, |app, cx| {
                 if unused {
-                    app.show_toast(
-                        format!("{} was not exercised in this run", access.action),
-                        cx,
-                    );
+                    let msg = if i18n::is_zh() {
+                        format!("{} 在本次运行中未被触发", access.action)
+                    } else {
+                        format!("{} was not exercised in this run", access.action)
+                    };
+                    app.show_toast(msg, cx);
                 } else {
                     app.show_access(access, cx);
                 }
@@ -209,17 +243,13 @@ fn access_row(
                         .whitespace_nowrap()
                         .child(
                             div()
-                                .text_color(rgb(theme::TEXT_MUTED))
+                                .text_color(rgb(t.text_muted))
                                 .child(format!("{service}:")),
                         )
                         .child(
                             div()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(if unused {
-                                    rgb(theme::TEXT_DIM)
-                                } else {
-                                    rgb(theme::TEXT)
-                                })
+                                .text_color(if unused { rgb(t.text_dim) } else { rgb(t.text) })
                                 .child(action.to_string()),
                         ),
                 ),
@@ -231,9 +261,9 @@ fn access_row(
                 .font_family(fonts::mono())
                 .text_size(px(11.0))
                 .text_color(if unused {
-                    rgb(theme::TEXT_FAINT)
+                    rgb(t.text_faint)
                 } else {
-                    rgb(theme::TEXT_DIM)
+                    rgb(t.text_dim)
                 })
                 .whitespace_nowrap()
                 .text_ellipsis()
@@ -248,9 +278,9 @@ fn access_row(
                 .font_family(fonts::mono())
                 .text_size(px(11.5))
                 .text_color(if unused {
-                    rgb(theme::TEXT_FAINT)
+                    rgb(t.text_faint)
                 } else {
-                    rgb(theme::TEXT_BODY)
+                    rgb(t.text_body)
                 })
                 .child(entry.calls.to_string()),
         )
@@ -258,6 +288,7 @@ fn access_row(
 }
 
 fn unused_pill(text: impl Into<SharedString>) -> Div {
+    let t = theme::p();
     div()
         .h(px(15.0))
         .px(px(4.0))
@@ -265,11 +296,11 @@ fn unused_pill(text: impl Into<SharedString>) -> Div {
         .items_center()
         .rounded(px(3.0))
         .border_1()
-        .border_color(rgb(theme::BORDER_STRONG))
-        .bg(theme::h(theme::TEXT, 0.04))
+        .border_color(rgb(t.border_strong))
+        .bg(theme::h(t.text, 0.04))
         .font_family(fonts::mono())
         .text_size(px(9.0))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(theme::TEXT_DIM))
+        .text_color(rgb(t.text_dim))
         .child(text.into())
 }

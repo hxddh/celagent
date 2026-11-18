@@ -235,7 +235,7 @@ fn s3_operation(method: &str, path: &str, headers: &HeaderMap) -> Option<String>
         .get("host")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let host = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    let host = strip_port(host);
     let bucket_in_host =
         host.ends_with(".localhost") || host.contains(".s3.") || host.contains(".s3-");
     let segments = bare
@@ -346,6 +346,23 @@ pub fn form_action(body: &[u8]) -> Option<String> {
         }
         Some(value.to_string())
     })
+}
+
+/// Strip an optional `:port` from a `Host` header value without mangling
+/// bracketed IPv6 literals such as `[::1]` or `[::1]:9297`.
+pub fn strip_port(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &host[..=end + 1];
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            name
+        }
+        _ => host,
+    }
 }
 
 #[cfg(test)]
@@ -625,6 +642,21 @@ mod tests {
                 &none
             ),
             "GetLatestConfiguration"
+        );
+    }
+
+    #[test]
+    fn strips_ports_without_breaking_ipv6_hosts() {
+        assert_eq!(
+            strip_port("my-bucket.localhost:9297"),
+            "my-bucket.localhost"
+        );
+        assert_eq!(strip_port("[::1]:9297"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("127.0.0.1:9297"), "127.0.0.1");
+        assert_eq!(
+            strip_port("s3.us-east-1.amazonaws.com"),
+            "s3.us-east-1.amazonaws.com"
         );
     }
 }

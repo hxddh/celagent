@@ -52,6 +52,141 @@ pub fn unreachable(upstream: &str, error: &str) -> Problem {
     }
 }
 
+/// Protocol-accurate AWS `AccessDenied` / `AccessDeniedException` wire reply
+/// synthesized when `--enforce` blocks a call locally.
+pub struct BlockedWire {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: String,
+    pub problem: Problem,
+}
+
+pub fn blocked(
+    service: &str,
+    request_headers: &[HeaderTrace],
+    request_content_type: Option<&str>,
+    denied: &crate::access::Access,
+    gate_label: &str,
+    request_id: &str,
+) -> BlockedWire {
+    let message = format!(
+        "User is not authorized to perform: {} on resource: {} (blocked by Lenslet --enforce against {gate_label})",
+        denied.action, denied.resource
+    );
+    let hint = format!(
+        "Blocked locally by `lenslet run --enforce`: `{}` on `{}` is not permitted by `{gate_label}`. Run `lenslet run --update` if intended.",
+        denied.action, denied.resource
+    );
+
+    let has_target = request_headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("x-amz-target"));
+    let is_form = request_content_type == Some("application/x-www-form-urlencoded");
+
+    if matches!(service, "s3" | "s3-object-lambda") {
+        let escaped = xml_escape(&message);
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>{escaped}</Message><RequestId>{request_id}</RequestId></Error>"
+        );
+        BlockedWire {
+            status: 403,
+            content_type: "application/xml",
+            headers: vec![("x-amz-request-id", request_id.to_string())],
+            body,
+            problem: Problem {
+                code: "AccessDenied".to_string(),
+                message: Some(message),
+                hint: Some(hint),
+            },
+        }
+    } else if !has_target
+        && (is_form
+            || matches!(
+                service,
+                "sts"
+                    | "iam"
+                    | "sns"
+                    | "sqs"
+                    | "email"
+                    | "ses"
+                    | "monitoring"
+                    | "cloudwatch"
+                    | "ec2"
+            ))
+    {
+        let escaped = xml_escape(&message);
+        let body = format!(
+            "<ErrorResponse><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>{escaped}</Message></Error><RequestId>{request_id}</RequestId></ErrorResponse>"
+        );
+        BlockedWire {
+            status: 403,
+            content_type: "text/xml; charset=utf-8",
+            headers: vec![("x-amzn-requestid", request_id.to_string())],
+            body,
+            problem: Problem {
+                code: "AccessDenied".to_string(),
+                message: Some(message),
+                hint: Some(hint),
+            },
+        }
+    } else if has_target {
+        let content_type = if request_content_type == Some("application/x-amz-json-1.1") {
+            "application/x-amz-json-1.1"
+        } else {
+            "application/x-amz-json-1.0"
+        };
+        let body = serde_json::json!({
+            "__type": "com.amazonaws.iam#AccessDeniedException",
+            "message": message,
+            "Message": message,
+        })
+        .to_string();
+        BlockedWire {
+            status: 400,
+            content_type,
+            headers: vec![
+                ("x-amzn-errortype", "AccessDeniedException".to_string()),
+                ("x-amzn-requestid", request_id.to_string()),
+            ],
+            body,
+            problem: Problem {
+                code: "AccessDeniedException".to_string(),
+                message: Some(message),
+                hint: Some(hint),
+            },
+        }
+    } else {
+        let body = serde_json::json!({
+            "message": message,
+            "Message": message,
+        })
+        .to_string();
+        BlockedWire {
+            status: 403,
+            content_type: "application/json",
+            headers: vec![
+                ("x-amzn-errortype", "AccessDeniedException".to_string()),
+                ("x-amzn-requestid", request_id.to_string()),
+            ],
+            body,
+            problem: Problem {
+                code: "AccessDeniedException".to_string(),
+                message: Some(message),
+                hint: Some(hint),
+            },
+        }
+    }
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// `com.amazon.coral.service#ResourceNotFoundException:http://...` → `ResourceNotFoundException`.
 fn normalize(code: &str) -> Option<String> {
     let code = code.rsplit('#').next().unwrap_or(code);

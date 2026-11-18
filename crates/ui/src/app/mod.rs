@@ -20,9 +20,13 @@ mod inspector;
 mod stream;
 mod widgets;
 
-use self::{stream::new_pill, widgets::*};
+use self::{
+    stream::{blocked_pill, new_pill},
+    widgets::*,
+};
 use crate::{
-    demo, fonts, glyph,
+    demo, fonts, glyph, i18n,
+    prefs::{self, UiPrefs},
     search::SearchInput,
     theme::{self, latency_color, status_color},
     trace::{
@@ -40,7 +44,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(420);
 const PROBE_EVERY: u64 = 5;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const TOAST_MILLIS: u64 = 1_600;
-const MAX_BODY_DISPLAY: usize = 24_000;
+const MAX_BODY_DISPLAY: usize = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TraceHealth {
@@ -66,7 +70,8 @@ enum InspectorTab {
 impl InspectorTab {
     fn label(self) -> &'static str {
         match self {
-            InspectorTab::Overview => "Overview",
+            InspectorTab::Overview => i18n::pick("Overview", "概览"),
+            // Professional HTTP exchange sides stay canonical.
             InspectorTab::Request => "Request",
             InspectorTab::Response => "Response",
         }
@@ -87,6 +92,7 @@ struct Counts {
     reported_total: Option<usize>,
     retries: usize,
     errors: usize,
+    blocked: usize,
     visible: usize,
     visible_errors: usize,
     services: usize,
@@ -105,6 +111,9 @@ pub struct LensletApp {
     tab: InspectorTab,
     pane: Pane,
     show_all_services: bool,
+    raw_body: bool,
+    expand_body: bool,
+    prefs: UiPrefs,
 
     search: gpui::Entity<SearchInput>,
     search_focus: FocusHandle,
@@ -133,6 +142,9 @@ pub struct LensletApp {
 
 impl LensletApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let prefs = prefs::load(&home());
+        i18n::set_lang(prefs.lang);
+
         let source = trace_source();
         let demo = std::env::var_os("LENSLET_DEMO")
             .map(|value| value.to_string_lossy() == "1")
@@ -179,6 +191,9 @@ impl LensletApp {
             tab: InspectorTab::Overview,
             pane: Pane::Calls,
             show_all_services: false,
+            raw_body: false,
+            expand_body: false,
+            prefs,
             search,
             search_focus,
             root_focus,
@@ -222,8 +237,45 @@ impl LensletApp {
         app
     }
 
+    pub fn observe_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.observe_window_appearance(window, |_, _, cx| {
+            cx.notify();
+        })
+        .detach();
+    }
+
     pub fn root_focus(&self) -> FocusHandle {
         self.root_focus.clone()
+    }
+
+    pub(super) fn cycle_theme(&mut self, cx: &mut Context<Self>) {
+        self.prefs.theme = self.prefs.theme.cycle();
+        prefs::save(&home(), &self.prefs);
+        self.show_toast(i18n::theme_toast(self.prefs.theme), cx);
+    }
+
+    pub(super) fn toggle_lang(&mut self, cx: &mut Context<Self>) {
+        self.prefs.lang = self.prefs.lang.toggle();
+        i18n::set_lang(self.prefs.lang);
+        prefs::save(&home(), &self.prefs);
+        self.show_toast(i18n::lang_toast(), cx);
+    }
+
+    pub(super) fn copy_selected_curl(&mut self, cx: &mut Context<Self>) {
+        let Some(trace) = self
+            .selected
+            .and_then(|index| self.rows.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let endpoint = self
+            .run
+            .as_ref()
+            .map(|r| r.header.endpoint.as_str())
+            .filter(|e| !e.is_empty());
+        let curl = trace::to_curl(&trace, endpoint);
+        self.copy_text("curl", curl, cx);
     }
 
     // -- data ---------------------------------------------------------------
@@ -246,6 +298,13 @@ impl LensletApp {
             .map(|r| r.retries)
             .filter(|retries| *retries > 0)
             .unwrap_or_else(|| self.rows.iter().filter(|row| row.is_retry()).count());
+        self.counts.blocked = report
+            .map(|r| r.blocked)
+            .filter(|blocked| *blocked > 0)
+            .unwrap_or_else(|| self.rows.iter().filter(|row| row.blocked).count());
+        if self.filter == Filter::Blocked && self.counts.blocked == 0 {
+            self.filter = Filter::All;
+        }
         self.counts.errors = self.rows.iter().filter(|row| row.is_error()).count();
         self.counts.services = self.facets.len();
 
@@ -473,7 +532,10 @@ impl LensletApp {
 
     fn reload_now(&mut self, cx: &mut Context<Self>) {
         if self.demo {
-            self.show_toast("demo data is static".to_string(), cx);
+            self.show_toast(
+                i18n::pick("demo data is static", "演示数据为静态内容").to_string(),
+                cx,
+            );
             return;
         }
         self.tailer_generation += 1;
@@ -482,7 +544,10 @@ impl LensletApp {
         self.skipped = tailer.skipped();
         self.tailer = Some(tailer);
         self.apply_tail(event, cx);
-        self.show_toast("reloaded trace".to_string(), cx);
+        self.show_toast(
+            i18n::pick("reloaded trace", "已重新加载 Trace").to_string(),
+            cx,
+        );
     }
 
     fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
@@ -506,6 +571,7 @@ impl LensletApp {
     fn select_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(index);
         self.selection_locked = true;
+        self.expand_body = false;
         window.focus(&self.root_focus);
         cx.notify();
     }
@@ -533,6 +599,7 @@ impl LensletApp {
             }
         };
         self.selected = Some(self.view[next]);
+        self.expand_body = false;
         self.scroll.scroll_to_item(next, ScrollStrategy::Center);
         cx.notify();
     }
@@ -554,7 +621,7 @@ impl LensletApp {
 
     fn copy_text(&mut self, label: &'static str, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.show_toast(format!("copied {label}"), cx);
+        self.show_toast(i18n::copied_toast(label), cx);
     }
 
     fn show_toast(&mut self, message: String, cx: &mut Context<Self>) {
@@ -599,6 +666,11 @@ impl LensletApp {
                 && !keystroke.modifiers.alt =>
             {
                 self.reload_now(cx)
+            }
+            "t" if !search_focused && !keystroke.modifiers.modified() => self.cycle_theme(cx),
+            "l" if !search_focused && !keystroke.modifiers.modified() => self.toggle_lang(cx),
+            "c" if !search_focused && !keystroke.modifiers.modified() => {
+                self.copy_selected_curl(cx)
             }
             "a" if !search_focused && !keystroke.modifiers.modified() => {
                 let next = if self.pane == Pane::Calls {
@@ -678,6 +750,7 @@ impl LensletApp {
         self.source = Source::Runs { dir, pinned };
         self.selected = None;
         self.selection_locked = false;
+        self.expand_body = false;
         self.filter = Filter::All;
         self.tailer_generation += 1;
         let mut tailer = Tailer::follow(self.source.clone());
@@ -785,7 +858,7 @@ impl LensletApp {
         let Some(text) = text else {
             return div().into_any_element();
         };
-        action_button(id, "Copy")
+        action_button(id, i18n::pick("Copy", "复制"))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.copy_text(label, text.clone(), cx);
             }))
@@ -795,6 +868,10 @@ impl LensletApp {
 
 impl Render for LensletApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        i18n::set_lang(self.prefs.lang);
+        theme::set_appearance(theme::resolve(self.prefs.theme, window.appearance()));
+        let t = theme::p();
+
         let viewport_width = window.viewport_size().width.to_f64() as f32;
         let compact = viewport_width < 1_180.0;
         let fixed_columns = theme::COL_TIME
@@ -824,9 +901,9 @@ impl Render for LensletApp {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(theme::CANVAS))
-            .text_color(rgb(theme::TEXT))
-            .font_family(fonts::sans())
+            .bg(rgb(t.canvas))
+            .text_color(rgb(t.text))
+            .font(fonts::sans_font())
             .track_focus(&self.root_focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(
@@ -952,41 +1029,55 @@ impl LensletApp {
             .as_ref()
             .and_then(|run| RunInfo::address(&run.header.endpoint))
             .map(str::to_string)
-            .unwrap_or_else(|| "no run yet".to_string())
+            .unwrap_or_else(|| i18n::pick("no run yet", "暂无运行").to_string())
     }
 
     /// The proxy light: live, gone, or the finished run's exit code.
     pub(super) fn proxy_light(&self) -> Light {
+        let t = theme::p();
         if self.demo {
-            return Light::new(theme::AMBER, 0.9, "demo data".into(), theme::AMBER);
+            return Light::new(
+                t.amber,
+                0.9,
+                i18n::pick("demo data", "演示数据").into(),
+                t.amber,
+            );
         }
         let Some(run) = self.run.as_ref() else {
             return Light::new(
-                theme::TEXT_FAINT,
+                t.text_faint,
                 0.8,
-                "no run · lenslet run -- <command>".into(),
-                theme::TEXT_MUTED,
+                i18n::pick(
+                    "no run · lenslet run -- <command>",
+                    "未运行 · lenslet run -- <command>",
+                )
+                .into(),
+                t.text_muted,
             );
         };
         if run.ended() {
             return match run.exit_code() {
                 Some(0) => Light::new(
-                    theme::GREEN,
+                    t.green,
                     0.6,
-                    "run ended · exit 0".into(),
-                    theme::TEXT_MUTED,
+                    i18n::pick("run ended · exit 0", "运行结束 · exit 0").into(),
+                    t.text_muted,
                 ),
                 Some(code) => Light::new(
-                    theme::RED,
+                    t.red,
                     0.9,
-                    format!("run ended · exit {code}"),
-                    theme::RED,
+                    if i18n::is_zh() {
+                        format!("运行结束 · exit {code}")
+                    } else {
+                        format!("run ended · exit {code}")
+                    },
+                    t.red,
                 ),
                 None => Light::new(
-                    theme::TEXT_FAINT,
+                    t.text_faint,
                     0.8,
-                    "proxy stopped".into(),
-                    theme::TEXT_MUTED,
+                    i18n::pick("proxy stopped", "代理已停止").into(),
+                    t.text_muted,
                 ),
             };
         }
@@ -995,34 +1086,30 @@ impl LensletApp {
             .unwrap_or("?");
         match self.probe.proxy {
             Some(true) => Light::new(
-                theme::GREEN,
+                t.green,
                 0.95,
-                format!("proxy :{port} live"),
-                theme::TEXT_MUTED,
+                format!("proxy :{port} {}", i18n::pick("live", "在线")),
+                t.text_muted,
             ),
             Some(false) => Light::new(
-                theme::RED,
+                t.red,
                 0.95,
-                format!("proxy :{port} not answering"),
-                theme::RED,
+                format!("proxy :{port} {}", i18n::pick("not answering", "无响应")),
+                t.red,
             ),
-            None => Light::new(
-                theme::AMBER,
-                0.9,
-                format!("proxy :{port}"),
-                theme::TEXT_MUTED,
-            ),
+            None => Light::new(t.amber, 0.9, format!("proxy :{port}"), t.text_muted),
         }
     }
 
     /// The emulator light, from a TCP probe of the run's upstream.
     pub(super) fn emulator_light(&self) -> Option<Light> {
+        let t = theme::p();
         if self.demo {
             return Some(Light::new(
-                theme::AMBER,
+                t.amber,
                 0.6,
                 "emulator :9298".into(),
-                theme::TEXT_MUTED,
+                t.text_muted,
             ));
         }
         let run = self.run.as_ref()?;
@@ -1030,23 +1117,18 @@ impl LensletApp {
         let port = address.rsplit(':').next().unwrap_or(address);
         Some(match self.probe.emulator {
             Some(true) => Light::new(
-                theme::GREEN,
+                t.green,
                 0.95,
-                format!("emulator :{port} up"),
-                theme::TEXT_MUTED,
+                format!("emulator :{port} {}", i18n::pick("up", "在线")),
+                t.text_muted,
             ),
             Some(false) => Light::new(
-                theme::RED,
+                t.red,
                 0.95,
-                format!("emulator :{port} down"),
-                theme::RED,
+                format!("emulator :{port} {}", i18n::pick("down", "离线")),
+                t.red,
             ),
-            None => Light::new(
-                theme::TEXT_FAINT,
-                0.8,
-                format!("emulator :{port}"),
-                theme::TEXT_MUTED,
-            ),
+            None => Light::new(t.text_faint, 0.8, format!("emulator :{port}"), t.text_muted),
         })
     }
 
@@ -1076,20 +1158,4 @@ fn display_trace_path(path: Option<&Path>) -> String {
         }
     }
     text
-}
-
-fn call_count(count: usize) -> String {
-    if count == 1 {
-        "1 call".to_string()
-    } else {
-        format!("{count} calls")
-    }
-}
-
-fn error_count(count: usize) -> String {
-    if count == 1 {
-        "1 error".to_string()
-    } else {
-        format!("{count} errors")
-    }
 }

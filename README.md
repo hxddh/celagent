@@ -10,7 +10,9 @@ request widens AWS access, the PR says so, call by call, and CI fails until
 someone accepts the change.
 
 AWS Emulator does not evaluate IAM, so code that works locally can still be
-denied on AWS. Lenslet covers that gap in code review, before deploy.
+denied on AWS. Lenslet covers that gap in code review—and, with `--enforce`,
+blocks unauthorized calls live at the proxy with real AWS `AccessDenied`
+responses before they ever reach the emulator.
 
 > **Lenslet · `npm test` passed**
 >
@@ -51,7 +53,7 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   # install your test dependencies
-  - uses: hxddh/lenslet@lenslet-v4.1.0
+  - uses: hxddh/lenslet@lenslet-v5.0.0
     with:
       command: npm test
       emulator: moto_server -p 9298           # or however you start your emulator
@@ -75,8 +77,10 @@ Until a `lenslet.lock` exists, it only reports.
 | `emulator` | | a command that starts the emulator in the background |
 | `working-directory` | `.` | where to run and find the lock |
 | `lock` | `lenslet.lock` | lock path, relative to `working-directory` |
+| `policy` | | IAM policy JSON path to check/enforce instead of `lenslet.lock` |
 | `check` | `true` | fail when access grows (exit 3) |
 | `strict` | `false` | also fail when the lock lists access the run did not use |
+| `enforce` | `false` | actively deny calls outside the lock/policy with AWS `AccessDenied` |
 | `comment` | `true` | post or update the PR comment (fork PRs get the job summary only) |
 | `version` / `binary` | from the pinned tag | another release, or a binary you built |
 
@@ -138,11 +142,13 @@ rewrites the lock and keeps the marks. It only writes when the command passed.
 
 `lenslet ui` (or `Lenslet.app`) shows the newest run live. It has two views:
 
-- **Calls**: every call, with errors in the row and an inspector.
+- **Calls**: every call, with errors and `BLOCKED` markers in the row, `Copy curl` (`c`), formatted/raw wire toggle, and binary Hex + ASCII preview in the inspector.
 - **Access** (`a`): one row per permission. Click a row to see the calls
   behind it.
 
-`[` and `]` step through earlier runs.
+`[` and `]` step through earlier runs. `t` switches between System, Light and
+Dark themes; `l` toggles Chinese / English UI labels (keeping AWS, IAM and HTTP
+technical terms canonical). Preferences are stored in `~/.lenslet/ui.json`.
 
 ![A run in the Lenslet window](docs/lenslet.png)
 
@@ -175,9 +181,9 @@ lenslet last [--json]                          the newest run's report
 lenslet policy [--lock PATH]                   an IAM policy from the lock (without `# test` lines)
 lenslet ui                                     the window
 
-run: --check  --strict  --update  --lock PATH  --json PATH  --markdown PATH
-     --quiet  --ui  --no-env  --listen PORT  --upstream ADDRESS
-     --emulator-ca PATH  --trace PATH
+run: --enforce  --check  --strict  --update  --lock PATH  --policy PATH
+     --max-body SIZE  --json PATH  --markdown PATH  --quiet  --ui  --no-env
+     --listen PORT  --upstream ADDRESS  --emulator-ca PATH  --trace PATH
 ```
 
 `lenslet run` sets the following for the child process:
@@ -186,10 +192,13 @@ run: --check  --strict  --update  --lock PATH  --json PATH  --markdown PATH
 - the emulator's credentials and config, when you have not set your own;
 - placeholder keys, when the emulator has no credentials file.
 
-It always removes `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_SESSION_TOKEN` and `AWS_PROFILE` from the environment it hands over, so
-real credentials never reach the emulator or the trace. `--no-env` sets only
-the endpoint. Both `127.0.0.1` and `localhost` work on IPv4 and IPv6 loopback.
+It always removes ambient cloud credentials (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`,
+`AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`, `AWS_CONTAINER_CREDENTIALS_*`,
+`AWS_BEARER_TOKEN_BEDROCK`) from the environment it hands over, so real
+credentials never reach the emulator or the unredacted local trace. `--no-env`
+sets only the endpoint. Both `127.0.0.1` and `localhost` work on IPv4 and IPv6
+loopback.
 
 ## Install
 
@@ -240,15 +249,17 @@ examples/      a project the action is tested against
 ## Limits
 
 - Between the SDK and the proxy: HTTP/1.1 only, loopback only.
-- Text capture keeps the first 64 KiB of each body (including `gzip` and
-  `deflate` payloads).
+- Capture keeps the first 1 MiB of each body by default (`--max-body` or
+  `--max-body unlimited` to change), unframing `aws-chunked` streams and
+  decompressing `gzip` and `deflate` for inspection while forwarding wire bytes
+  untouched and unredacted.
 - Resources are read for S3, DynamoDB, SQS, SNS, Lambda, SSM Parameter Store,
   CloudWatch Logs, Kinesis, Bedrock, Secrets Manager, KMS, STS, IAM, EventBridge
   and Step Functions. Other services get `*`. Calls with unrecognized operations
   are reported as unmapped rather than guessed.
 - No Windows build. The macOS app is not notarized.
 
-Earlier versions: [lenslet-v4.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v4.0.0).
+Earlier versions: [lenslet-v4.1.0](https://github.com/hxddh/lenslet/tree/lenslet-v4.1.0).
 This repository used to be `celagent`; that project is at
 [v4.1.0](https://github.com/hxddh/lenslet/tree/v4.1.0).
 

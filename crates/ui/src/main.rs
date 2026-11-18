@@ -4,6 +4,8 @@ mod app;
 mod demo;
 mod fonts;
 mod glyph;
+mod i18n;
+mod prefs;
 mod search;
 mod theme;
 mod trace;
@@ -37,6 +39,7 @@ fn main() {
 
         window
             .update(cx, |view, window, cx| {
+                view.observe_appearance(window, cx);
                 window.focus(&view.root_focus());
                 cx.activate(true);
             })

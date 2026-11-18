@@ -27,6 +27,8 @@ not compatible with earlier files.
 | `upstream` | the emulator, e.g. `https://127.0.0.1:9298` |
 | `started` | RFC3339 |
 | `lock` | the lock path (relative to `cwd` when inside it) when the run is compared with one |
+| `policy` | the IAM policy JSON path when `--policy` is used |
+| `enforce` | `true` when `--enforce` actively blocks unlocked calls |
 
 ## `call`
 
@@ -42,19 +44,22 @@ not compatible with earlier files.
 | `operation` | from `x-amz-target`, `x-id`, the Query `Action=`, the S3/Lambda/Bedrock/API Gateway REST shape, or the HTTP method |
 | `status`, `ms` | HTTP status (`0` while pending) and full exchange time |
 | `authorization` | an Authorization header was present |
-| `pending` | `true` on a line for a call still running after 1 s |
+| `pending` | `true` on a line for a call still running after 1 s (carries full request headers and captured body) |
 | `error` | proxy-side failure, e.g. the emulator was unreachable |
 | `problem` | `{code, message?, hint?}` for status ≥ 400 or a proxy failure |
 | `access` | `[{action, resource, new?}]` this call needs: usually one; one per table/parameter for batches; each item's action for a DynamoDB transaction; the source read for an S3 copy |
 | `implied` | `[{action, resource, new?}]` needed elsewhere (SSE-KMS key, passed role) |
-| `new` | at least one permission on this call is not in the lock |
+| `new` | at least one permission on this call is not in the lock/policy |
+| `blocked` | `true` when `--enforce` denied the call at the proxy before reaching the emulator |
 | `request`, `response` | `{headers, content_type?, body?}` |
 
-`body` is `{text?, bytes, truncated, binary, sha256}`. Headers are raw and
-duplicate-preserving, with no redaction. `text` holds the first 64 KiB of a text
-body (`identity`, `gzip` or `deflate` decoded for reading; wire bytes are
-forwarded untouched) and is absent for binary or unknown encodings. `bytes` and
-`sha256` cover the whole wire body.
+`body` is `{text?, hex?, encoding?, bytes, truncated, binary, sha256}`. Headers,
+query strings and bodies are preserved verbatim with **zero redaction**. `text`
+holds up to 1 MiB by default (`--max-body` to change) of decoded text (`identity`,
+`aws-chunked`, `gzip` or `deflate` unframed/decompressed for reading, including
+readable UTF-8 payloads without an explicit text `content-type`; wire bytes are
+forwarded untouched). Binary payloads record `hex` (first 512 bytes) alongside
+`bytes` and `sha256` over the whole wire body.
 
 ### Access derivation
 
@@ -87,13 +92,13 @@ summaries.
 | field | meaning |
 | --- | --- |
 | `run`, `command`, `exit_code`, `ended`, `duration_ms` | the run; `exit_code` is the program's (`null` for a proxy session) |
-| `calls`, `retries`, `errors`, `unfinished`, `services`, `unmapped` | counts (`retries` and `unmapped` omitted when empty) |
-| `failures` | `[{id, service, operation, status, code, message?, hint?, attempt?, max_attempts?}]` |
+| `calls`, `retries`, `errors`, `blocked`, `unfinished`, `services`, `unmapped` | counts (`retries`, `blocked` and `unmapped` omitted when empty) |
+| `failures` | `[{id, service, operation, status, code, message?, hint?, attempt?, max_attempts?, blocked?}]` |
 | `access` | `[{action, resource, calls, errors, implied?, new?, via?}]`, sorted; `via` names the first calls that needed it, e.g. `DYNAMODB DeleteItem` |
-| `lock` | the lock file compared with, or `null` |
-| `access_added` | used by this run, not in the lock |
+| `lock`, `policy` | the lock file or IAM policy JSON compared/enforced with, or `null` |
+| `access_added` | used by this run, not in the lock/policy |
 | `access_unused` | in the lock, not used by this run |
-| `regressions` | `{previous_run, previous_exit_code, new_failures, fixed}` compared with the previous run of the same command in the same directory, or `null` |
+| `regressions` | `{previous_run, previous_exit_code, previous_calls, previous_duration_ms, new_failures, fixed, new_access?}` compared with the previous run of the same command in the same directory, or `null` |
 | `trace`, `endpoint`, `upstream` | where to look |
 
 ## `lenslet.lock`

@@ -33,8 +33,25 @@ pub fn create(dir: &Path) -> Result<PathBuf> {
         set_mode(dir, 0o700)?;
     }
     prune(dir, KEEP_RUNS.saturating_sub(1));
-    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
-    Ok(dir.join(format!("{stamp}-{}.jsonl", std::process::id())))
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let pid = std::process::id();
+    Ok(unique_run_path(dir, &stamp, pid))
+}
+
+fn unique_run_path(dir: &Path, stamp: &str, pid: u32) -> PathBuf {
+    let base = dir.join(format!("{stamp}-{pid}.jsonl"));
+    if !base.exists() {
+        return base;
+    }
+    // `_` (0x5f) sorts after `.` (0x2e), preserving chronological order when
+    // two runs share a second and PID (e.g. PID 1 in containers, or `init`).
+    for seq in 2u32.. {
+        let candidate = dir.join(format!("{stamp}-{pid}_{seq:02}.jsonl"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 /// `…/20261115-054628-15569.jsonl` → `20261115-054628-15569`.
@@ -131,7 +148,22 @@ pub fn previous(dir: &Path, current: &Path, command: &[String], cwd: &str) -> Op
         .find_map(|run| report(&run))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if pid == 0 {
+        return false;
+    }
+    let Ok(target) = fs::metadata(format!("/proc/{pid}")) else {
+        return false;
+    };
+    let Ok(me) = fs::metadata("/proc/self") else {
+        return true;
+    };
+    target.uid() == me.uid() || me.uid() == 0
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn process_alive(pid: u32) -> bool {
     // `kill -0` only checks that the process exists and is ours to signal.
     pid != 0
@@ -237,6 +269,15 @@ mod tests {
         assert_eq!(last_line(&big).unwrap().len(), 300_000);
         fs::write(&big, "only line\n").unwrap();
         assert_eq!(last_line(&big).unwrap(), "only line");
+
+        // Same-second PID-1 runs never overwrite or sort out of order.
+        let first = unique_run_path(&dir, "20261118-120000", 1);
+        fs::write(&first, "").unwrap();
+        let second = unique_run_path(&dir, "20261118-120000", 1);
+        fs::write(&second, "").unwrap();
+        assert_ne!(first, second);
+        assert!(first < second, "{first:?} should sort before {second:?}");
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }
