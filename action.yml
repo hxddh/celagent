@@ -27,6 +27,12 @@ inputs:
   strict:
     description: With check, also fail when the lock lists access the run did not use.
     default: 'false'
+  enforce:
+    description: Block calls outside the lock (or policy) live at the proxy with realistic AWS AccessDenied responses.
+    default: 'false'
+  policy:
+    description: Check or enforce against an IAM policy JSON document instead of lenslet.lock.
+    default: ''
   comment:
     description: On pull requests, post the report as one comment and keep it updated. Needs `pull-requests write` permission.
     default: 'true'
@@ -87,6 +93,7 @@ runs:
         address="${address%%/*}"
         case "$address" in *:*) ;; *) address="127.0.0.1:$address" ;; esac
         host="${address%:*}"; port="${address##*:}"
+        host="${host#[}"; host="${host%]}"
         [ "$host" = "localhost" ] && host=127.0.0.1
         for _ in $(seq 120); do
           if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
@@ -107,8 +114,10 @@ runs:
         COMMAND: ${{ inputs.command }}
         UPSTREAM: ${{ inputs.upstream }}
         LOCK: ${{ inputs.lock }}
+        POLICY: ${{ inputs.policy }}
         CHECK: ${{ inputs.check }}
         STRICT: ${{ inputs.strict }}
+        ENFORCE: ${{ inputs.enforce }}
       run: |
         # GitHub runs this with `bash -e`: a failing lenslet must not end the
         # step before the summary and outputs are written.
@@ -120,12 +129,19 @@ runs:
         markdown="$dir/report.md"
         args=(run --upstream "$UPSTREAM" --json "$report" --markdown "$markdown")
         lock="${LOCK:-lenslet.lock}"
-        args+=(--lock "$lock")
-        if [ "$CHECK" = "true" ]; then
+        if [ -n "$POLICY" ]; then
+          args+=(--policy "$POLICY")
+          [ "$CHECK" = "true" ] && args+=(--check)
+          [ "$ENFORCE" = "true" ] && args+=(--enforce)
+        else
+          args+=(--lock "$lock")
           if [ -f "$lock" ]; then
-            args+=(--check)
-            [ "$STRICT" = "true" ] && args+=(--strict)
-          else
+            if [ "$CHECK" = "true" ]; then
+              args+=(--check)
+              [ "$STRICT" = "true" ] && args+=(--strict)
+            fi
+            [ "$ENFORCE" = "true" ] && args+=(--enforce)
+          elif [ "$CHECK" = "true" ] || [ "$ENFORCE" = "true" ]; then
             echo "::notice::No $lock yet: reporting only. Create it with \`lenslet run --update -- $COMMAND\` and commit it."
           fi
         fi

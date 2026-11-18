@@ -42,8 +42,9 @@ use tokio::{
 };
 
 use crate::{
-    access::Access,
+    access::{self, Access},
     capture::{self, Capture, Content, TeeBody},
+    lock::Gate,
     problem,
     trace::{self, Message, RunHeader, Trace, TraceSink},
     wire,
@@ -51,6 +52,10 @@ use crate::{
 
 type Body = BoxBody<Bytes, std::io::Error>;
 type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
+
+/// Upper bound on request body inspection during `--enforce` (64 MiB — 4×
+/// AWS DynamoDB's 16 MiB batch limit). Anything larger fails closed.
+const MAX_ENFORCE_INSPECT_BYTES: usize = 64 * 1024 * 1024;
 
 /// A call still running after this long gets a `pending` trace line.
 const PENDING_AFTER: Duration = Duration::from_secs(1);
@@ -60,6 +65,8 @@ pub struct State {
     client: HttpsClient,
     /// Upstream base URL without a trailing slash, e.g. `https://127.0.0.1:9298`.
     upstream: String,
+    pub max_body: usize,
+    pub enforce: bool,
     pub trace: Arc<TraceSink>,
 }
 
@@ -74,6 +81,10 @@ struct Pending {
     advertised_operation: Option<String>,
     request_capture: Arc<Mutex<Capture>>,
     request_content: Content,
+    /// Full-body snapshot or capture for gate evaluation when `--max-body` is
+    /// smaller than [`MAX_ENFORCE_INSPECT_BYTES`].
+    enforce_full_body: Option<trace::BodyTrace>,
+    gate_capture: Option<Arc<Mutex<Capture>>>,
     response_capture: Arc<Mutex<Capture>>,
     response_content: Content,
 }
@@ -84,10 +95,14 @@ impl Pending {
         self.trace.ms = self.started.elapsed().as_millis() as u64;
         self.trace.request.body = snapshot(&self.request_capture, &self.request_content);
         self.trace.response.body = snapshot(&self.response_capture, &self.response_content);
+        let op_capture = self
+            .gate_capture
+            .as_deref()
+            .unwrap_or(&self.request_capture);
         resolve_operation(
             &mut self.trace,
             self.advertised_operation.as_deref(),
-            &self.request_capture,
+            op_capture,
             &self.request_content,
         );
         self.trace.problem = problem::from_response(
@@ -99,7 +114,20 @@ impl Pending {
                 .as_ref()
                 .and_then(|body| body.text.as_deref()),
         );
-        self.state.trace.record(self.trace);
+        let eval_body = self.enforce_full_body.or_else(|| {
+            self.gate_capture
+                .as_deref()
+                .and_then(|cap| snapshot(cap, &self.request_content))
+        });
+        if let Some(full) = eval_body {
+            let mut eval_trace = self.trace.clone();
+            eval_trace.request.body = Some(full);
+            self.state
+                .trace
+                .record_evaluated(self.trace, Some(&eval_trace));
+        } else {
+            self.state.trace.record(self.trace);
+        }
     }
 }
 
@@ -161,6 +189,10 @@ pub struct Options {
     pub emulator_ca: Option<PathBuf>,
     /// Fixed trace file; by default each session gets its own run file.
     pub trace: Option<PathBuf>,
+    /// Maximum body bytes captured per message (default 1 MiB).
+    pub max_body: usize,
+    /// Actively block calls whose IAM access is denied by the lock or policy.
+    pub enforce: bool,
     pub home: PathBuf,
 }
 
@@ -171,6 +203,8 @@ impl Options {
             upstream: Upstream::parse("9298").expect("default upstream"),
             emulator_ca: None,
             trace: None,
+            max_body: capture::MAX_CAPTURE_BYTES,
+            enforce: false,
             home: home.to_path_buf(),
         }
     }
@@ -187,6 +221,8 @@ impl Options {
             "--upstream" => self.upstream = Upstream::parse(&value()?)?,
             "--emulator-ca" => self.emulator_ca = Some(PathBuf::from(value()?)),
             "--trace" => self.trace = Some(PathBuf::from(value()?)),
+            "--max-body" => self.max_body = capture::parse_size(&value()?)?,
+            "--enforce" => self.enforce = true,
             _ => return Ok(false),
         }
         Ok(true)
@@ -366,7 +402,48 @@ fn client(roots: RootCertStore) -> HttpsClient {
     Client::builder(TokioExecutor::new()).build(https)
 }
 
+enum CollectedBody {
+    Complete(Bytes),
+    ExceedsLimit(Bytes),
+}
+
+/// Buffer up to `limit` bytes from `body`, returning `ExceedsLimit` as soon as
+/// incoming data crosses `limit` so a large or streaming upload never exhausts
+/// proxy memory under `--enforce`.
+async fn collect_bounded<B>(mut body: B, limit: usize) -> Result<CollectedBody, String>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let cap_hint = body.size_hint().lower().min(limit as u64).min(64 * 1024) as usize;
+    let mut buf = Vec::with_capacity(cap_hint);
+    while let Some(frame_res) = body.frame().await {
+        let frame = frame_res.map_err(|err| err.into().to_string())?;
+        if let Ok(chunk) = frame.into_data() {
+            if buf.len().saturating_add(chunk.len()) > limit {
+                let take = limit.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+                return Ok(CollectedBody::ExceedsLimit(Bytes::from(buf)));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    Ok(CollectedBody::Complete(Bytes::from(buf)))
+}
+
 async fn handle<B>(req: Request<B>, state: Arc<State>) -> Result<Response<Body>, Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    handle_with_inspect_limit(req, state, MAX_ENFORCE_INSPECT_BYTES).await
+}
+
+async fn handle_with_inspect_limit<B>(
+    req: Request<B>,
+    state: Arc<State>,
+    inspect_limit: usize,
+) -> Result<Response<Body>, Infallible>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -382,6 +459,8 @@ where
         .headers()
         .get("host")
         .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .or_else(|| req.uri().authority().map(|authority| authority.as_str()))
         .unwrap_or("")
         .to_string();
     let authorization = req.headers().contains_key("authorization");
@@ -403,34 +482,15 @@ where
 
     let request_content = capture::content(req.headers());
     let request_headers = trace::headers(req.headers());
-    let request_capture = Arc::new(Mutex::new(Capture::new(request_content.text)));
+    let request_capture = Arc::new(Mutex::new(Capture::with_limit(state.max_body)));
 
-    let (parts, body) = req.into_parts();
-    let upstream_uri = format!("{}{}", state.upstream, raw_path);
-    let mut upstream = match Request::builder()
-        .method(parts.method)
-        .uri(upstream_uri)
-        .body(
-            TeeBody::new(body, request_capture.clone())
-                .map_err(std::io::Error::other)
-                .boxed(),
-        ) {
-        Ok(request) => request,
-        Err(error) => {
-            return Ok(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
-        }
-    };
-    // Headers (including Host and Authorization) are forwarded verbatim so
-    // SigV4 signatures remain valid.
-    *upstream.headers_mut() = parts.headers;
-
-    let trace = Trace {
+    let mut trace = Trace {
         id: next_id(),
         at: Utc::now().to_rfc3339(),
         method: method.to_string(),
         path: raw_path.clone(),
         host,
-        service,
+        service: service.clone(),
         operation,
         status: 0,
         ms: 0,
@@ -445,6 +505,7 @@ where
         access: Vec::new(),
         implied: Vec::new(),
         new: false,
+        blocked: false,
         request: Message {
             headers: request_headers,
             content_type: request_content.content_type.clone(),
@@ -453,21 +514,194 @@ where
         response: Message::default(),
     };
 
+    let (parts, body) = req.into_parts();
+    let forward_path = if raw_path.starts_with('/') {
+        raw_path.as_str()
+    } else if raw_path == "*" {
+        "/"
+    } else {
+        // Guard against authority-form or bare paths lacking a leading `/`.
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid request path",
+        ));
+    };
+
+    // Active IAM enforcement (`--enforce`): deny unauthorized calls locally
+    // before a single unauthorized write reaches the emulator. Request bodies
+    // are inspected against `MAX_ENFORCE_INSPECT_BYTES` independently of
+    // `--max-body`, so a small trace capture limit never hides trailing items.
+    let mut enforce_full_body: Option<trace::BodyTrace> = None;
+    let mut gate_capture: Option<Arc<Mutex<Capture>>> = None;
+    let upstream_body: Body = if state.enforce
+        && let Some(gate) = state.trace.gate()
+    {
+        if access::needs_request_body(
+            &service,
+            advertised_operation.as_deref(),
+            &trace.operation,
+            &raw_path,
+        ) {
+            let (collected, over_limit) = match collect_bounded(body, inspect_limit).await {
+                Ok(CollectedBody::Complete(bytes)) => (bytes, false),
+                Ok(CollectedBody::ExceedsLimit(prefix)) => (prefix, true),
+                Err(detail) => {
+                    return Ok(error_response(StatusCode::BAD_REQUEST, &detail));
+                }
+            };
+            if let Ok(mut cap) = request_capture.lock() {
+                cap.feed(&collected);
+            }
+            trace.request.body = snapshot(&request_capture, &request_content);
+            if over_limit && let Some(ref mut b) = trace.request.body {
+                b.truncated = true;
+            }
+
+            let eval_cap = Mutex::new({
+                let mut c = Capture::with_limit(inspect_limit);
+                c.feed(&collected);
+                c
+            });
+            resolve_operation(
+                &mut trace,
+                advertised_operation.as_deref(),
+                &eval_cap,
+                &request_content,
+            );
+            let mut full_body = snapshot(&eval_cap, &request_content);
+            if over_limit {
+                match full_body.as_mut() {
+                    Some(b) => b.truncated = true,
+                    None => {
+                        full_body = Some(trace::BodyTrace {
+                            text: None,
+                            hex: None,
+                            encoding: request_content.wire_encoding.clone(),
+                            bytes: collected.len() as u64,
+                            truncated: true,
+                            binary: false,
+                            sha256: String::new(),
+                        });
+                    }
+                }
+            }
+            let mut eval_trace = trace.clone();
+            eval_trace.request.body = full_body.clone();
+            if over_limit {
+                let denied = first_denied(&eval_trace, gate).unwrap_or_else(|| {
+                    Access::new(
+                        format!("{}:*", trace.service),
+                        crate::lock::UNVERIFIED_RESOURCE,
+                    )
+                });
+                state.trace.start(&trace.id);
+                return Ok(reject_blocked(
+                    trace,
+                    &eval_trace,
+                    &denied,
+                    gate,
+                    &state,
+                    started,
+                ));
+            }
+            if let Some(denied) = first_denied(&eval_trace, gate) {
+                state.trace.start(&trace.id);
+                return Ok(reject_blocked(
+                    trace,
+                    &eval_trace,
+                    &denied,
+                    gate,
+                    &state,
+                    started,
+                ));
+            }
+            enforce_full_body = full_body;
+            Full::new(collected).map_err(|never| match never {}).boxed()
+        } else {
+            if let Some(denied) = first_denied(&trace, gate) {
+                // Drain small bodies with a strict size cap so keep-alive clients
+                // read the 403 cleanly without trusting `size_hint` blindly.
+                let small_exact = body
+                    .size_hint()
+                    .exact()
+                    .is_some_and(|len| len <= state.max_body as u64);
+                if small_exact
+                    && let Ok(CollectedBody::Complete(bytes)) =
+                        collect_bounded(body, state.max_body.min(inspect_limit)).await
+                {
+                    if let Ok(mut cap) = request_capture.lock() {
+                        cap.feed(&bytes);
+                    }
+                    trace.request.body = snapshot(&request_capture, &request_content);
+                }
+                state.trace.start(&trace.id);
+                let eval_trace = trace.clone();
+                return Ok(reject_blocked(
+                    trace,
+                    &eval_trace,
+                    &denied,
+                    gate,
+                    &state,
+                    started,
+                ));
+            }
+            TeeBody::new(body, request_capture.clone())
+                .map_err(std::io::Error::other)
+                .boxed()
+        }
+    } else if state.trace.gate().is_some() && state.max_body < inspect_limit {
+        let gate_cap = Arc::new(Mutex::new(Capture::with_limit(inspect_limit)));
+        gate_capture = Some(gate_cap.clone());
+        let inner = TeeBody::new(body, request_capture.clone());
+        TeeBody::new(inner, gate_cap)
+            .map_err(std::io::Error::other)
+            .boxed()
+    } else {
+        TeeBody::new(body, request_capture.clone())
+            .map_err(std::io::Error::other)
+            .boxed()
+    };
+
+    let upstream_uri = format!("{}{}", state.upstream, forward_path);
+    let mut upstream = match Request::builder()
+        .method(parts.method)
+        .uri(upstream_uri)
+        .body(upstream_body)
+    {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
+        }
+    };
+    // Headers (including Host and Authorization) are forwarded verbatim so
+    // SigV4 signatures remain valid.
+    *upstream.headers_mut() = parts.headers;
+
     // A slow call (long poll, large transfer, a hung emulator) shows up as
-    // pending instead of being invisible until it ends.
+    // pending—with its full request headers and captured body—instead of
+    // being invisible until it ends.
     state.trace.start(&trace.id);
     let finished = Arc::new(AtomicBool::new(false));
     {
         let state = state.clone();
         let finished = finished.clone();
+        let pending_capture = request_capture.clone();
+        let pending_content = request_content.clone();
+        let pending_adv = advertised_operation.clone();
         let mut pending = Trace {
             pending: true,
             ..trace.clone()
         };
-        pending.request.headers.clear();
         tokio::spawn(async move {
             tokio::time::sleep(PENDING_AFTER).await;
             if !finished.load(Ordering::SeqCst) {
+                pending.request.body = snapshot(&pending_capture, &pending_content);
+                resolve_operation(
+                    &mut pending,
+                    pending_adv.as_deref(),
+                    &pending_capture,
+                    &pending_content,
+                );
                 state.trace.record(pending);
             }
         });
@@ -477,14 +711,57 @@ where
         Ok(response) => {
             let status = response.status();
             let headers = response.headers().clone();
+            let response_headers = trace::headers(&headers);
             let response_content = capture::content(&headers);
-            let response_capture = Arc::new(Mutex::new(Capture::new(response_content.text)));
+
+            // Enforce response-discovered implied permissions (such as `kms:Decrypt`
+            // on an SSE-KMS S3 `GetObject`) before returning the payload.
+            if state.enforce
+                && let Some(gate) = state.trace.gate()
+            {
+                let mut check_trace = Trace {
+                    status: status.as_u16(),
+                    response: Message {
+                        headers: response_headers.clone(),
+                        content_type: response_content.content_type.clone(),
+                        body: None,
+                    },
+                    ..trace.clone()
+                };
+                check_trace.request.body = enforce_full_body
+                    .clone()
+                    .or_else(|| snapshot(&request_capture, &request_content));
+                if enforce_full_body.is_none() {
+                    resolve_operation(
+                        &mut check_trace,
+                        advertised_operation.as_deref(),
+                        &request_capture,
+                        &request_content,
+                    );
+                }
+                if let Some(denied) = first_denied(&check_trace, gate) {
+                    finished.store(true, Ordering::SeqCst);
+                    drop(response);
+                    let mut out_trace = check_trace.clone();
+                    out_trace.request.body = snapshot(&request_capture, &request_content);
+                    return Ok(reject_blocked(
+                        out_trace,
+                        &check_trace,
+                        &denied,
+                        gate,
+                        &state,
+                        started,
+                    ));
+                }
+            }
+
+            let response_capture = Arc::new(Mutex::new(Capture::with_limit(state.max_body)));
             let pending = Pending {
                 state: state.clone(),
                 trace: Trace {
                     status: status.as_u16(),
                     response: Message {
-                        headers: trace::headers(&headers),
+                        headers: response_headers,
                         content_type: response_content.content_type.clone(),
                         body: None,
                     },
@@ -495,6 +772,8 @@ where
                 advertised_operation,
                 request_capture,
                 request_content,
+                enforce_full_body,
+                gate_capture,
                 response_capture: response_capture.clone(),
                 response_content,
             };
@@ -548,6 +827,85 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
+/// Return the first derived permission on `trace` that `gate` does not allow.
+fn first_denied(trace: &Trace, gate: &Gate) -> Option<Access> {
+    let (own, implied) = access::derive_for_gate(trace, gate.is_policy());
+    own.into_iter()
+        .chain(implied)
+        .find(|entry| !gate.allows(entry))
+}
+
+/// Record a blocked call in the trace and return a protocol-accurate AWS
+/// `AccessDenied` / `AccessDeniedException` response.
+fn reject_blocked(
+    mut trace: Trace,
+    eval_trace: &Trace,
+    denied: &Access,
+    gate: &Gate,
+    state: &State,
+    started: Instant,
+) -> Response<Body> {
+    let wire = problem::blocked(
+        &trace.service,
+        &trace.request.headers,
+        trace.request.content_type.as_deref(),
+        denied,
+        &gate.label,
+        &trace.id,
+    );
+    let mut resp_headers = hyper::HeaderMap::new();
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(wire.content_type),
+    );
+    for (name, value) in &wire.headers {
+        if let (Ok(hname), Ok(hval)) = (
+            header::HeaderName::from_bytes(name.as_bytes()),
+            header::HeaderValue::from_str(value),
+        ) {
+            resp_headers.insert(hname, hval);
+        }
+    }
+    let body_bytes = wire.body.as_bytes();
+    let sha256 = {
+        use sha2::{Digest, Sha256};
+        capture::hex(&Sha256::digest(body_bytes))
+    };
+    trace.status = wire.status;
+    trace.ms = started.elapsed().as_millis() as u64;
+    trace.blocked = true;
+    trace.problem = Some(wire.problem);
+    trace.response = Message {
+        headers: trace::headers(&resp_headers),
+        content_type: Some(
+            wire.content_type
+                .split(';')
+                .next()
+                .unwrap_or(wire.content_type)
+                .to_string(),
+        ),
+        body: Some(trace::BodyTrace {
+            text: Some(wire.body.clone()),
+            hex: None,
+            encoding: None,
+            bytes: body_bytes.len() as u64,
+            truncated: false,
+            binary: false,
+            sha256,
+        }),
+    };
+    state.trace.record_evaluated(trace, Some(eval_trace));
+
+    let mut response = Response::new(
+        Full::new(Bytes::from(wire.body))
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = StatusCode::from_u16(wire.status).unwrap_or(StatusCode::FORBIDDEN);
+    *response.headers_mut() = resp_headers;
+    response
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response<Body> {
     let body = Full::new(Bytes::from(message.to_string()))
         .map_err(|never| match never {})
@@ -570,14 +928,30 @@ pub struct Server {
 }
 
 impl Server {
-    /// Validate everything, bind loopback (IPv4 + best-effort IPv6 so
-    /// `localhost` works on either stack), write the run header, and start
-    /// serving in the background.
+    #[allow(dead_code)]
     pub async fn start(
         options: &Options,
         trace_path: PathBuf,
-        mut header: RunHeader,
+        header: RunHeader,
         locked: Option<BTreeSet<Access>>,
+    ) -> Result<Server> {
+        Self::start_with_gate(
+            options,
+            trace_path,
+            header,
+            locked.map(|set| Gate::from_lock("lenslet.lock", set)),
+        )
+        .await
+    }
+
+    /// Validate everything, bind loopback (IPv4 + best-effort IPv6 so
+    /// `localhost` works on either stack), write the run header, and start
+    /// serving in the background.
+    pub async fn start_with_gate(
+        options: &Options,
+        trace_path: PathBuf,
+        mut header: RunHeader,
+        gate: Option<Gate>,
     ) -> Result<Server> {
         options.validate()?;
         // rustls needs a crypto provider before any TLS config is built.
@@ -600,10 +974,12 @@ impl Server {
             .ok();
         header.endpoint = format!("http://{addr}");
         header.upstream = options.upstream.base.clone();
-        let trace = Arc::new(TraceSink::new(trace_path, &header, locked)?);
+        let trace = Arc::new(TraceSink::with_gate(trace_path, &header, gate)?);
         let state = Arc::new(State {
             client: client(roots),
             upstream: options.upstream.base.clone(),
+            max_body: options.max_body,
+            enforce: options.enforce,
             trace,
         });
         let task = tokio::spawn(serve(listener, state.clone()));
@@ -702,13 +1078,16 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
+            use std::sync::atomic::AtomicUsize;
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
             let path = std::env::temp_dir().join(format!(
-                "lenslet-proxy-{tag}-{}-{}",
+                "lenslet-proxy-{tag}-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
             ));
             TempDir(path)
         }
@@ -764,7 +1143,7 @@ mod tests {
                                 );
                             }
                             let (content_type, body) = if big {
-                                ("text/plain", "x".repeat(100 * 1024))
+                                ("text/plain", "x".repeat(MAX_CAPTURE_BYTES + 36 * 1024))
                             } else {
                                 (
                                     "application/json",
@@ -797,6 +1176,8 @@ mod tests {
         Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: upstream.to_string(),
+            max_body: MAX_CAPTURE_BYTES,
+            enforce: false,
             trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), None).unwrap()),
         })
     }
@@ -989,22 +1370,23 @@ mod tests {
             "the run header, then one line per call"
         );
 
-        // A 100 KiB response keeps forwarding everything and captures a prefix.
+        // A >1 MiB response keeps forwarding everything and captures a prefix.
+        let big_len = MAX_CAPTURE_BYTES + 36 * 1024;
         let request = sdk_request("GET", "/bucket/big", b"");
         let response = handle(request, state.clone()).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(body.len(), 100 * 1024, "large responses are not truncated");
+        assert_eq!(body.len(), big_len, "large responses are not truncated");
 
         let written = traces(&trace_path);
         assert_eq!(written.len(), 2);
         let big = written[1].response.body.as_ref().expect("big body traced");
         assert!(big.truncated, "capture is bounded");
         assert!(!big.binary);
-        assert_eq!(big.bytes, 100 * 1024);
+        assert_eq!(big.bytes, big_len as u64);
         let text = big.text.as_deref().unwrap();
         assert_eq!(text.len(), MAX_CAPTURE_BYTES);
         assert!(text.bytes().all(|byte| byte == b'x'));
-        assert_eq!(big.sha256, sha256_hex(&vec![b'x'; 100 * 1024]));
+        assert_eq!(big.sha256, sha256_hex(&vec![b'x'; big_len]));
     }
 
     #[tokio::test]
@@ -1165,13 +1547,29 @@ mod tests {
         let temp = TempDir::new("pending");
         let trace_path = temp.trace();
         let state = state(&format!("http://127.0.0.1:{port}"), trace_path.clone());
-        let call = tokio::spawn(handle(sdk_request("GET", "/q/slow", b""), state.clone()));
+        let call = tokio::spawn(handle(
+            sdk_request("POST", "/q/slow", br#"{"WaitTimeSeconds":20}"#),
+            state.clone(),
+        ));
 
         tokio::time::sleep(Duration::from_millis(1200)).await;
         let written = traces(&trace_path);
         assert_eq!(written.len(), 1, "a pending line appears after a second");
         assert!(written[0].pending);
         assert_eq!(written[0].status, 0);
+        assert!(
+            !written[0].request.headers.is_empty(),
+            "pending trace keeps full request headers for live debugging"
+        );
+        assert_eq!(
+            written[0]
+                .request
+                .body
+                .as_ref()
+                .and_then(|b| b.text.as_deref()),
+            Some(r#"{"WaitTimeSeconds":20}"#),
+            "pending trace keeps captured request body"
+        );
         assert_eq!(state.trace.summary().unfinished, 1);
 
         let response = call.await.unwrap().unwrap();
@@ -1265,6 +1663,8 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            max_body: MAX_CAPTURE_BYTES,
+            enforce: false,
             trace: Arc::new(
                 TraceSink::new(temp.trace(), &RunHeader::default(), Some(locked)).unwrap(),
             ),
@@ -1280,6 +1680,335 @@ mod tests {
         assert!(!written[0].new);
         assert!(written[1].new);
         assert_eq!(written[1].access[0].action, "s3:DeleteObject");
+    }
+
+    #[tokio::test]
+    async fn enforce_blocks_unlocked_calls_before_they_reach_the_emulator() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("enforce");
+        let locked: BTreeSet<Access> = [
+            Access::new("s3:GetObject", "arn:aws:s3:::bucket/*"),
+            Access::new("dynamodb:GetItem", "arn:aws:dynamodb:*:*:table/orders"),
+        ]
+        .into();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: MAX_CAPTURE_BYTES,
+            enforce: true,
+            trace: Arc::new(
+                TraceSink::new(temp.trace(), &RunHeader::default(), Some(locked)).unwrap(),
+            ),
+        });
+
+        // Allowed S3 call reaches upstream normally.
+        let ok = handle(
+            sdk_request("GET", "/bucket/key?x-id=GetObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let _ = ok.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_ok());
+
+        // Unlocked S3 DeleteObject is blocked with XML AccessDenied (403) and never hits upstream.
+        let s3_denied = handle(
+            sdk_request("DELETE", "/bucket/key?x-id=DeleteObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s3_denied.status(), StatusCode::FORBIDDEN);
+        let s3_body = s3_denied.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            std::str::from_utf8(&s3_body)
+                .unwrap()
+                .contains("<Code>AccessDenied</Code>")
+        );
+        assert!(
+            upstream.try_recv().is_err(),
+            "blocked S3 call never reached upstream"
+        );
+
+        // Unlocked DynamoDB PutItem (table in JSON body) is blocked with JSON AccessDeniedException (400).
+        let ddb_req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.PutItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(Full::new(Bytes::from_static(br#"{"TableName":"orders","Item":{}}"#)))
+            .unwrap();
+        let ddb_denied = handle(ddb_req, state.clone()).await.unwrap();
+        assert_eq!(ddb_denied.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            ddb_denied.headers().get("x-amzn-errortype").unwrap(),
+            "AccessDeniedException"
+        );
+        let ddb_body = ddb_denied.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            std::str::from_utf8(&ddb_body)
+                .unwrap()
+                .contains("AccessDeniedException")
+        );
+        assert!(
+            upstream.try_recv().is_err(),
+            "blocked DynamoDB call never reached upstream"
+        );
+
+        let written = traces(&temp.trace());
+        assert_eq!(written.len(), 3);
+        assert!(!written[0].blocked);
+        assert!(written[1].blocked);
+        assert!(written[2].blocked);
+        assert_eq!(state.trace.summary().blocked, 2);
+    }
+
+    #[tokio::test]
+    async fn policy_gate_enforces_s3_prefix_allow_and_explicit_deny_on_concrete_keys() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("policy-s3-prefix");
+        let policy = Gate::from_policy_str(
+            r#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:DeleteObject"],
+                        "Resource": "arn:aws:s3:::bucket/public/*"
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:GetObject", "s3:DeleteObject"],
+                        "Resource": "arn:aws:s3:::bucket/public/secret/*"
+                    }
+                ]
+            }"#,
+            "policy.json",
+        )
+        .unwrap();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: MAX_CAPTURE_BYTES,
+            enforce: true,
+            trace: Arc::new(
+                TraceSink::with_gate(temp.trace(), &RunHeader::default(), Some(policy.clone()))
+                    .unwrap(),
+            ),
+        });
+
+        // 1. Concrete key inside allowed prefix (`public/readme.txt`) succeeds and is NOT marked new.
+        let ok = handle(
+            sdk_request("GET", "/bucket/public/readme.txt?x-id=GetObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let _ = ok.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_ok());
+
+        // 2. Concrete key matching explicit Deny (`public/secret/keys.txt`) is blocked.
+        let denied_sub = handle(
+            sdk_request("GET", "/bucket/public/secret/keys.txt?x-id=GetObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied_sub.status(), StatusCode::FORBIDDEN);
+        let _ = denied_sub.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_err());
+
+        // 3. Multi-object DeleteObjects naming a denied `<Key>` in XML is blocked.
+        let del_xml = br#"<Delete><Object><Key>public/readme.txt</Key></Object><Object><Key>public/secret/keys.txt</Key></Object></Delete>"#;
+        let del_req = sdk_request("POST", "/bucket?delete", del_xml);
+        let denied_del = handle(del_req, state.clone()).await.unwrap();
+        assert_eq!(denied_del.status(), StatusCode::FORBIDDEN);
+        let _ = denied_del.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_err());
+
+        // 4. Consecutive slashes (`/bucket/public/secret//keys.txt`) preserve empty key segments
+        //    so an explicit Deny on `public/secret/*` still blocks it.
+        let denied_double_slash = handle(
+            sdk_request("GET", "/bucket/public/secret//keys.txt?x-id=GetObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied_double_slash.status(), StatusCode::FORBIDDEN);
+        let _ = denied_double_slash.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_err());
+
+        let written = traces(&temp.trace());
+        assert_eq!(written.len(), 4);
+        assert!(!written[0].new, "allowed prefix call is not marked new");
+        assert!(!written[0].access[0].new);
+        assert!(written[1].blocked && written[1].new);
+        assert!(written[2].blocked && written[2].new);
+        assert!(written[3].blocked && written[3].new);
+
+        let mut report = crate::summary::Report::default();
+        report.set_access_with_gate(&state.trace.summary(), Some(&policy));
+        assert_eq!(
+            report.access_added,
+            vec![
+                Access::new(
+                    "s3:DeleteObject",
+                    "arn:aws:s3:::bucket/public/secret/keys.txt"
+                ),
+                Access::new(
+                    "s3:GetObject",
+                    "arn:aws:s3:::bucket/public/secret//keys.txt"
+                ),
+                Access::new("s3:GetObject", "arn:aws:s3:::bucket/public/secret/keys.txt"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_inspects_complete_request_body_beyond_max_body_limit() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("enforce-max-body");
+        let locked: BTreeSet<Access> = [Access::new(
+            "dynamodb:BatchWriteItem",
+            "arn:aws:dynamodb:*:*:table/orders",
+        )]
+        .into();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        // Tiny 64-byte capture limit: `"orders"` fits in the prefix, while
+        // `"secret_orders"` appears past byte 140.
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: 64,
+            enforce: true,
+            trace: Arc::new(
+                TraceSink::new(temp.trace(), &RunHeader::default(), Some(locked)).unwrap(),
+            ),
+        });
+
+        let payload = br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"order-padding-0000000000000000000000000000"}}}}],"secret_orders":[{"PutRequest":{"Item":{"id":{"S":"2"}}}}]}}"#;
+        assert!(payload.len() > 140);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.BatchWriteItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(Full::new(Bytes::from_static(payload)))
+            .unwrap();
+
+        let resp = handle(req, state.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _ = resp.into_body().collect().await.unwrap();
+        assert!(
+            upstream.try_recv().is_err(),
+            "trailing unauthorized table past --max-body must be blocked before reaching upstream"
+        );
+
+        let written = traces(&temp.trace());
+        assert_eq!(written.len(), 1);
+        assert!(written[0].blocked);
+        assert!(
+            written[0].request.body.as_ref().unwrap().truncated,
+            "trace file still honors --max-body"
+        );
+        assert_eq!(written[0].access.len(), 2);
+        assert!(!written[0].access[0].new); // orders
+        assert!(written[0].access[1].new); // secret_orders
+    }
+
+    #[tokio::test]
+    async fn enforce_bounds_request_collection_and_fails_closed_when_exceeded() {
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll};
+
+        struct InfiniteStream {
+            polled_frames: Arc<AtomicUsize>,
+        }
+        impl hyper::body::Body for InfiniteStream {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+                self.polled_frames.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                    br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"chunk"}}}}]}}"#,
+                )))))
+            }
+        }
+
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("enforce-bounded");
+        let admin = Gate::from_policy_str(
+            r#"{"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+            "admin.json",
+        )
+        .unwrap();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: 64,
+            enforce: true,
+            trace: Arc::new(
+                TraceSink::with_gate(temp.trace(), &RunHeader::default(), Some(admin)).unwrap(),
+            ),
+        });
+
+        let polled = Arc::new(AtomicUsize::new(0));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.BatchWriteItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(InfiniteStream {
+                polled_frames: polled.clone(),
+            })
+            .unwrap();
+
+        // With a 128-byte inspect limit, an infinite streaming body stops after 2
+        // frames (74 * 2 = 148 > 128) and fails closed immediately instead of hanging/OOMing.
+        let resp = handle_with_inspect_limit(req, state.clone(), 128)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(polled.load(Ordering::SeqCst), 2);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("AccessDeniedException")
+        );
+        assert!(upstream.try_recv().is_err());
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {

@@ -1,8 +1,13 @@
-//! Bundled static fonts. Loaded once through `cx.text_system().add_fonts(...)`.
+//! Bundled static fonts plus cross-platform CJK fallback chains.
+//!
+//! Western UI and code faces (`Inter`, `JetBrains Mono`) are bundled directly
+//! in the binary; Chinese glyphs in UI labels and JSON/XML payloads resolve
+//! through explicit platform CJK system fallbacks so characters never render as
+//! missing-glyph boxes (`□`).
 
 use std::{borrow::Cow, sync::OnceLock};
 
-use gpui::App;
+use gpui::{App, FontFallbacks};
 
 pub const SANS_FAMILY: &str = "Inter";
 pub const MONO_FAMILY: &str = "JetBrains Mono";
@@ -16,9 +21,24 @@ const MONO_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-M
 struct FontSet {
     sans: String,
     mono: String,
+    fallbacks: FontFallbacks,
 }
 
 static FONTS: OnceLock<FontSet> = OnceLock::new();
+
+fn default_cjk_fallbacks() -> FontFallbacks {
+    FontFallbacks::from_fonts(vec![
+        "PingFang SC".to_string(),
+        "Hiragino Sans GB".to_string(),
+        "Heiti SC".to_string(),
+        "Noto Sans CJK SC".to_string(),
+        "Source Han Sans SC".to_string(),
+        "WenQuanYi Micro Hei".to_string(),
+        "Droid Sans Fallback".to_string(),
+        "Microsoft YaHei UI".to_string(),
+        "Microsoft YaHei".to_string(),
+    ])
+}
 
 /// Register the bundled faces and remember the resolved family names.
 pub fn install(cx: &mut App) {
@@ -52,6 +72,7 @@ pub fn install(cx: &mut App) {
         } else {
             "monospace".to_string()
         },
+        fallbacks: default_cjk_fallbacks(),
     });
 }
 
@@ -59,12 +80,29 @@ pub fn sans() -> &'static str {
     FONTS
         .get()
         .map(|fonts| fonts.sans.as_str())
-        .unwrap_or("sans-serif")
+        .unwrap_or(SANS_FAMILY)
 }
 
 pub fn mono() -> &'static str {
     FONTS
         .get()
         .map(|fonts| fonts.mono.as_str())
-        .unwrap_or("monospace")
+        .unwrap_or(MONO_FAMILY)
+}
+
+pub fn fallbacks() -> FontFallbacks {
+    FONTS
+        .get()
+        .map(|fonts| fonts.fallbacks.clone())
+        .unwrap_or_else(default_cjk_fallbacks)
+}
+
+pub fn sans_font() -> gpui::Font {
+    gpui::Font {
+        family: sans().into(),
+        features: gpui::FontFeatures::default(),
+        fallbacks: Some(fallbacks()),
+        weight: gpui::FontWeight::NORMAL,
+        style: gpui::FontStyle::Normal,
+    }
 }

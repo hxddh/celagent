@@ -114,6 +114,15 @@ pub fn query_param(path: &str, name: &str) -> Option<String> {
 }
 
 fn percent_decode(value: &str) -> String {
+    percent_decode_inner(value, true)
+}
+
+/// Percent-decode a URI path segment (`%XX` only; literal `+` stays `+`).
+pub fn percent_decode_path(value: &str) -> String {
+    percent_decode_inner(value, false)
+}
+
+fn percent_decode_inner(value: &str, plus_as_space: bool) -> String {
     fn hex(byte: u8) -> Option<u8> {
         (byte as char).to_digit(16).map(|digit| digit as u8)
     }
@@ -130,7 +139,11 @@ fn percent_decode(value: &str) -> String {
             index += 3;
             continue;
         }
-        out.push(if byte == b'+' { b' ' } else { byte });
+        out.push(if plus_as_space && byte == b'+' {
+            b' '
+        } else {
+            byte
+        });
         index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -235,15 +248,24 @@ fn s3_operation(method: &str, path: &str, headers: &HeaderMap) -> Option<String>
         .get("host")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let host = host.rsplit_once(':').map_or(host, |(name, _)| name);
-    let bucket_in_host =
-        host.ends_with(".localhost") || host.contains(".s3.") || host.contains(".s3-");
-    let segments = bare
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
-        + usize::from(bucket_in_host);
-    let object = segments >= 2;
+    let host = strip_port(host);
+    let bucket_in_host = host.ends_with(".localhost")
+        || host.contains(".s3.")
+        || host.contains(".s3-")
+        || host.ends_with(".s3");
+    let (has_bucket, object) = if bucket_in_host {
+        (true, !bare.strip_prefix('/').unwrap_or(bare).is_empty())
+    } else {
+        let after_root = bare.strip_prefix('/').unwrap_or(bare);
+        if after_root.is_empty() {
+            (false, false)
+        } else {
+            match after_root.split_once('/') {
+                Some((bucket, key)) => (!bucket.is_empty(), !bucket.is_empty() && !key.is_empty()),
+                None => (true, false),
+            }
+        }
+    };
     let copy = headers.contains_key("x-amz-copy-source");
     let name = |verb: &str, noun: &str| Some(format!("{verb}{noun}"));
     let verb = match method {
@@ -253,7 +275,7 @@ fn s3_operation(method: &str, path: &str, headers: &HeaderMap) -> Option<String>
         _ => "",
     };
 
-    if segments == 0 {
+    if !has_bucket {
         return (method == "GET").then(|| "ListBuckets".to_string());
     }
     // Multipart uploads.
@@ -346,6 +368,23 @@ pub fn form_action(body: &[u8]) -> Option<String> {
         }
         Some(value.to_string())
     })
+}
+
+/// Strip an optional `:port` from a `Host` header value without mangling
+/// bracketed IPv6 literals such as `[::1]` or `[::1]:9297`.
+pub fn strip_port(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &host[..=end + 1];
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            name
+        }
+        _ => host,
+    }
 }
 
 #[cfg(test)]
@@ -625,6 +664,21 @@ mod tests {
                 &none
             ),
             "GetLatestConfiguration"
+        );
+    }
+
+    #[test]
+    fn strips_ports_without_breaking_ipv6_hosts() {
+        assert_eq!(
+            strip_port("my-bucket.localhost:9297"),
+            "my-bucket.localhost"
+        );
+        assert_eq!(strip_port("[::1]:9297"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("127.0.0.1:9297"), "127.0.0.1");
+        assert_eq!(
+            strip_port("s3.us-east-1.amazonaws.com"),
+            "s3.us-east-1.amazonaws.com"
         );
     }
 }

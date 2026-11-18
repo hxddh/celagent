@@ -21,11 +21,11 @@ pub const MAX_ROWS: usize = 500;
 const TAIL_BLOCK_BYTES: u64 = 1 << 20;
 /// Upper bound on what a reload reads, whatever the line sizes.
 const MAX_TAIL_BYTES: u64 = 256 << 20;
-/// Never let a partially written line grow without bound. One record holds at
-/// most two 64 KiB bodies plus headers, even fully JSON-escaped.
-const MAX_CARRY_BYTES: usize = 4 << 20;
+/// Never let a partially written line grow without bound. One record holds up
+/// to two 1 MiB bodies plus headers, even fully JSON-escaped.
+const MAX_CARRY_BYTES: usize = 16 << 20;
 /// Body text contributed to the search index (per request/response).
-const SEARCH_BODY_BYTES: usize = 16 * 1024;
+const SEARCH_BODY_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Header {
@@ -39,6 +39,10 @@ pub struct Header {
 pub struct Body {
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub hex: Option<String>,
+    #[serde(default)]
+    pub encoding: Option<String>,
     #[serde(default)]
     pub bytes: usize,
     #[serde(default)]
@@ -140,6 +144,12 @@ pub struct RunHeader {
     /// Compared with this lock file.
     #[serde(default)]
     pub lock: Option<String>,
+    /// Compared/enforced with this IAM policy document.
+    #[serde(default)]
+    pub policy: Option<String>,
+    /// Whether `--enforce` actively blocked unauthorized calls.
+    #[serde(default)]
+    pub enforce: bool,
 }
 
 /// One line of the run's access table.
@@ -183,9 +193,15 @@ pub struct Regressions {
     #[serde(default)]
     pub previous_run: String,
     #[serde(default)]
+    pub previous_calls: usize,
+    #[serde(default)]
+    pub previous_duration_ms: u64,
+    #[serde(default)]
     pub new_failures: Vec<FailureKind>,
     #[serde(default)]
     pub fixed: Vec<FailureKind>,
+    #[serde(default)]
+    pub new_access: Vec<Access>,
 }
 
 /// The last line of a finished run file (the same object as `--json`).
@@ -200,9 +216,13 @@ pub struct Report {
     #[serde(default)]
     pub retries: usize,
     #[serde(default)]
+    pub blocked: usize,
+    #[serde(default)]
     pub access: Vec<AccessEntry>,
     #[serde(default)]
     pub lock: Option<String>,
+    #[serde(default)]
+    pub policy: Option<String>,
     #[serde(default)]
     pub access_added: Vec<Access>,
     #[serde(default)]
@@ -307,6 +327,9 @@ pub struct Trace {
     /// The call used access that is not in the lock file.
     #[serde(default)]
     pub new: bool,
+    /// Blocked locally by `--enforce` before reaching the emulator.
+    #[serde(default)]
+    pub blocked: bool,
     #[serde(default)]
     pub request: Option<Exchange>,
     #[serde(default)]
@@ -411,6 +434,9 @@ impl Trace {
         }
         if self.new {
             haystack.push_str("new\n");
+        }
+        if self.blocked {
+            haystack.push_str("blocked denied enforce\n");
         }
         haystack.push_str(&self.id);
         haystack.push('\n');
@@ -991,6 +1017,7 @@ pub fn service_facets<'a>(rows: impl IntoIterator<Item = &'a Trace>) -> Vec<Serv
 pub enum Filter {
     All,
     Errors,
+    Blocked,
     Service(String),
     /// Calls that need this permission (directly or implied).
     Access(Access),
@@ -1001,6 +1028,7 @@ impl Filter {
         match self {
             Filter::All => true,
             Filter::Errors => trace.is_error(),
+            Filter::Blocked => trace.blocked,
             Filter::Service(key) => trace.service_key() == key,
             Filter::Access(access) => trace.uses(access),
         }
@@ -1217,6 +1245,149 @@ pub fn headers_to_text(headers: &[Header]) -> String {
         let _ = writeln!(out, "{}: {}", header.name, header.value);
     }
     out
+}
+
+fn posix_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// Build an exact, unredacted `curl` command reproducing `trace`'s HTTP request,
+/// or `None` when the request carried a binary or truncated body whose complete
+/// payload cannot be reconstructed from the trace.
+pub fn to_curl(trace: &Trace, endpoint: Option<&str>) -> Option<String> {
+    if let Some(body) = trace.request.as_ref().and_then(|req| req.body.as_ref())
+        && (body.truncated || (body.bytes > 0 && body.text.is_none()))
+    {
+        return None;
+    }
+    let base = endpoint
+        .filter(|e| !e.is_empty())
+        .map(|e| e.trim_end_matches('/').to_string())
+        .or_else(|| (!trace.host.is_empty()).then(|| format!("http://{}", trace.host)))
+        .unwrap_or_else(|| "http://127.0.0.1:9297".to_string());
+    let path = display_path(trace);
+    let url = if path.starts_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
+    };
+    let method = if trace.method.trim().is_empty() {
+        "GET".to_string()
+    } else {
+        trace.method.trim().to_ascii_uppercase()
+    };
+    let mut parts = vec![
+        "curl".to_string(),
+        "-i".to_string(),
+        "-X".to_string(),
+        method,
+        posix_single_quote(&url),
+    ];
+    if let Some(req) = trace.request.as_ref() {
+        let decoded_wire = req
+            .body
+            .as_ref()
+            .is_some_and(|body| body.encoding.is_some());
+        let compressed_wire = req
+            .body
+            .as_ref()
+            .and_then(|body| body.encoding.as_deref())
+            .is_some_and(|enc| {
+                let low = enc.to_ascii_lowercase();
+                low.contains("gzip") || low.contains("deflate")
+            });
+        for header in &req.headers {
+            let low = header.name.to_ascii_lowercase();
+            // Skip hop-by-hop framing headers, and when replaying a decoded
+            // (`gzip` / `deflate` / `aws-chunked`) plaintext payload, strip
+            // wire-encoding & trailing-checksum headers that no longer match
+            // the decoded `--data-raw` bytes.
+            if matches!(low.as_str(), "content-length" | "transfer-encoding") {
+                continue;
+            }
+            if decoded_wire
+                && (matches!(
+                    low.as_str(),
+                    "content-encoding"
+                        | "x-amz-decoded-content-length"
+                        | "x-amz-trailer"
+                        | "x-amz-sdk-checksum-algorithm"
+                ) || low.starts_with("x-amz-checksum-")
+                    || (compressed_wire && low == "content-md5"))
+            {
+                continue;
+            }
+            if low == "x-amz-content-sha256"
+                && (decoded_wire
+                    || header
+                        .value
+                        .trim()
+                        .to_ascii_uppercase()
+                        .starts_with("STREAMING-"))
+            {
+                parts.push(format!(
+                    "-H {}",
+                    posix_single_quote(&format!("{}: UNSIGNED-PAYLOAD", header.name))
+                ));
+                continue;
+            }
+            parts.push(format!(
+                "-H {}",
+                posix_single_quote(&format!("{}: {}", header.name, header.value))
+            ));
+        }
+        if let Some(body) = req.body.as_ref()
+            && let Some(text) = body.text.as_deref()
+            && !text.is_empty()
+        {
+            parts.push(format!("--data-raw {}", posix_single_quote(text)));
+        }
+    }
+    Some(parts.join(" \\\n  "))
+}
+
+/// Render a lowercase hex string (`89504e47...`) as a classic 16-byte-per-row
+/// Hex + ASCII dump (`0000  89 50 4e 47 ...  |.PNG...|`).
+pub fn format_hex_dump(hex_str: &str) -> String {
+    let clean: Vec<u8> = hex_str.bytes().filter(|b| b.is_ascii_hexdigit()).collect();
+    let mut bytes = Vec::with_capacity(clean.len() / 2);
+    for pair in clean.as_chunks::<2>().0 {
+        if let Ok(s) = std::str::from_utf8(pair)
+            && let Ok(val) = u8::from_str_radix(s, 16)
+        {
+            bytes.push(val);
+        }
+    }
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (row_idx, row) in bytes.chunks(16).enumerate() {
+        let _ = write!(out, "{:04x}  ", row_idx * 16);
+        for (i, byte) in row.iter().enumerate() {
+            if i == 8 {
+                out.push(' ');
+            }
+            let _ = write!(out, "{byte:02x} ");
+        }
+        for i in row.len()..16 {
+            if i == 8 {
+                out.push(' ');
+            }
+            out.push_str("   ");
+        }
+        out.push_str(" |");
+        for &byte in row {
+            let ch = if (0x20..=0x7e).contains(&byte) {
+                byte as char
+            } else {
+                '.'
+            };
+            out.push(ch);
+        }
+        out.push_str("|\n");
+    }
+    out.trim_end().to_string()
 }
 
 /// Parse `attempt=2; max=3` from `amz-sdk-request`.
@@ -2141,5 +2312,130 @@ mod tests {
             resource: "arn:aws:dynamodb:*:*:table/orders".into(),
         }));
         let _ = fs::remove_file(&lock_file);
+    }
+
+    #[test]
+    fn builds_unredacted_curl_and_hex_dump() {
+        let call = parse_line(&serde_json::to_string(&serde_json::json!({
+            "type": "call",
+            "id": "c1",
+            "at": "2026-11-18T00:00:00Z",
+            "method": "POST",
+            "path": "/?x-id=PutItem",
+            "host": "127.0.0.1:9297",
+            "service": "dynamodb",
+            "operation": "PutItem",
+            "status": 400,
+            "ms": 4,
+            "authorization": true,
+            "blocked": true,
+            "request": {
+                "headers": [
+                    {"name": "authorization", "value": "AWS4-HMAC-SHA256 Credential=AKID/s, Signature=rawsig"},
+                    {"name": "x-amz-security-token", "value": "RAWTOKEN123"},
+                    {"name": "content-length", "value": "99"}
+                ],
+                "content_type": "application/x-amz-json-1.0",
+                "body": {"text": "{\"TableName\":\"orders\",\"note\":\"it's raw\"}", "bytes": 40, "truncated": false, "binary": false}
+            }
+        })).unwrap()).unwrap();
+
+        assert!(call.blocked);
+        assert!(Filter::Blocked.matches(&call));
+        let curl = to_curl(&call, Some("http://127.0.0.1:41234")).unwrap();
+        assert!(
+            curl.contains("'http://127.0.0.1:41234/?x-id=PutItem'"),
+            "{curl}"
+        );
+        assert!(
+            curl.contains("Signature=rawsig"),
+            "headers stay unredacted: {curl}"
+        );
+        assert!(curl.contains("RAWTOKEN123"), "{curl}");
+        assert!(!curl.contains("content-length"), "{curl}");
+        assert!(
+            curl.contains(r#"it'\''s raw"#),
+            "single quotes escaped: {curl}"
+        );
+
+        let dump = format_hex_dump("89504e470d0a1a0a");
+        assert!(dump.starts_with("0000  89 50 4e 47 0d 0a 1a 0a"), "{dump}");
+        assert!(dump.ends_with("|.PNG....|"), "{dump}");
+
+        // Decoded gzip / aws-chunked requests strip wire framing headers so
+        // `--data-raw` replays cleanly against the emulator.
+        let encoded_call = parse_line(
+            &serde_json::to_string(&serde_json::json!({
+                "type": "call",
+                "id": "c2",
+                "at": "2026-11-18T00:00:01Z",
+                "method": "PUT",
+                "path": "/bucket/key.json?x-id=PutObject",
+                "host": "127.0.0.1:9297",
+                "service": "s3",
+                "operation": "PutObject",
+                "status": 200,
+                "ms": 3,
+                "request": {
+                    "headers": [
+                        {"name": "content-encoding", "value": "aws-chunked,gzip"},
+                        {"name": "x-amz-decoded-content-length", "value": "16"},
+                        {"name": "x-amz-trailer", "value": "x-amz-checksum-crc32"},
+                        {"name": "x-amz-content-sha256", "value": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"},
+                        {"name": "content-type", "value": "application/json"}
+                    ],
+                    "content_type": "application/json",
+                    "body": {
+                        "text": "{\"order\":\"#42\"}",
+                        "encoding": "aws-chunked,gzip",
+                        "bytes": 98,
+                        "truncated": false,
+                        "binary": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let encoded_curl = to_curl(&encoded_call, Some("http://127.0.0.1:9297")).unwrap();
+        assert!(!encoded_curl.contains("content-encoding"), "{encoded_curl}");
+        assert!(
+            !encoded_curl.contains("x-amz-decoded-content-length"),
+            "{encoded_curl}"
+        );
+        assert!(!encoded_curl.contains("x-amz-trailer"), "{encoded_curl}");
+        assert!(
+            encoded_curl.contains("x-amz-content-sha256: UNSIGNED-PAYLOAD"),
+            "{encoded_curl}"
+        );
+        assert!(
+            encoded_curl.contains("--data-raw '{\"order\":\"#42\"}'"),
+            "{encoded_curl}"
+        );
+
+        // Binary and truncated request bodies refuse `to_curl` rather than emitting
+        // an incomplete or empty write.
+        let mut binary_call = encoded_call.clone();
+        binary_call.request.as_mut().unwrap().body = Some(Body {
+            text: None,
+            hex: Some("89504e47".into()),
+            encoding: None,
+            bytes: 4096,
+            truncated: false,
+            binary: true,
+            sha256: None,
+        });
+        assert!(to_curl(&binary_call, None).is_none());
+
+        let mut truncated_call = call.clone();
+        truncated_call
+            .request
+            .as_mut()
+            .unwrap()
+            .body
+            .as_mut()
+            .unwrap()
+            .truncated = true;
+        assert!(to_curl(&truncated_call, None).is_none());
     }
 }
