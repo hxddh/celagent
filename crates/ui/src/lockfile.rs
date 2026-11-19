@@ -5,12 +5,7 @@
 //! signatures match the `lenslet_core::lock` writers so they can be swapped
 //! for them. All of it is blocking IO: call from the background executor.
 
-use std::{
-    collections::BTreeSet,
-    fmt::Write as _,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use lenslet_core::{access::Access, lock::Lock};
 
@@ -40,118 +35,31 @@ pub fn read(path: &Path) -> anyhow::Result<Option<Lock>> {
 }
 
 /// Add permissions to the lock (`test` marks them `# test`). Returns how many
-/// were not already in it. Same signature as `lenslet_core::lock::accept`.
+/// were not already in it. The write is `lenslet_core::lock`'s: atomic and
+/// canonical, the same file `lenslet run --update` writes.
 pub fn accept(path: &Path, entries: &[(Access, bool)]) -> anyhow::Result<usize> {
     fsguard::assert_io_allowed();
-    let mut live = LiveLock::read(path)?;
-    let mut added = 0;
-    for (access, test) in entries {
-        if live.access.insert(access.clone()) {
-            added += 1;
-        }
-        if *test {
-            live.test.insert(access.clone());
-        }
-    }
-    live.write(path)?;
-    Ok(added)
+    lenslet_core::lock::accept(path, entries)
 }
 
-/// Mark or unmark a permission `# test` (adding it to the lock if missing).
-/// Returns whether the file changed. Same signature as
-/// `lenslet_core::lock::set_test_mark`.
+/// Mark or unmark a permission `# test`. Marking one the lock does not have
+/// yet accepts it as a test line. Returns whether the file changed.
 pub fn set_test_mark(path: &Path, access: &Access, test: bool) -> anyhow::Result<bool> {
     fsguard::assert_io_allowed();
-    let mut live = LiveLock::read(path)?;
-    let mut changed = live.access.insert(access.clone());
-    changed |= if test {
-        live.test.insert(access.clone())
-    } else {
-        live.test.remove(access)
-    };
-    if changed {
-        live.write(path)?;
+    if lenslet_core::lock::set_test_mark(path, access, test)? {
+        return Ok(true);
     }
-    Ok(changed)
-}
-
-/// The lock with the `implied` notes the core `Lock` does not keep.
-#[derive(Default)]
-struct LiveLock {
-    access: BTreeSet<Access>,
-    test: BTreeSet<Access>,
-    implied: BTreeSet<Access>,
-}
-
-impl LiveLock {
-    fn read(path: &Path) -> anyhow::Result<Self> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let lock = lenslet_core::lock::parse(&text);
-        let mut implied = BTreeSet::new();
-        for line in text.lines() {
-            let Some((entry, comment)) = line.split_once('#') else {
-                continue;
-            };
-            if comment
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .any(|word| word == "implied")
-            {
-                let mut fields = entry.split_whitespace();
-                if let Some(action) = fields.next() {
-                    implied.insert(Access::new(action, fields.next().unwrap_or("*")));
-                }
-            }
-        }
-        Ok(LiveLock {
-            access: lock.access,
-            test: lock.test,
-            implied,
-        })
+    let missing = read(path)?.is_none_or(|lock| !lock.access.contains(access));
+    if test && missing {
+        return Ok(lenslet_core::lock::accept(path, &[(access.clone(), true)])? > 0);
     }
-
-    fn write(&self, path: &Path) -> anyhow::Result<()> {
-        let width = self
-            .access
-            .iter()
-            .map(|a| a.action.len())
-            .max()
-            .unwrap_or(0);
-        let mut out = String::from(
-            "# AWS access observed by `lenslet run`: action, resource.\n\
-             # Regenerate with `lenslet run --update -- <tests>`; review changes like code.\n\
-             # Mark a line `# test` when only the tests need it; `lenslet policy` leaves it out.\n",
-        );
-        for entry in &self.access {
-            let _ = write!(out, "{:<width$}  {}", entry.action, entry.resource);
-            let mut notes = Vec::new();
-            if self.test.contains(entry) {
-                notes.push("test");
-            }
-            if self.implied.contains(entry) {
-                notes.push("implied");
-            }
-            if !notes.is_empty() {
-                let _ = write!(out, "  # {}", notes.join(", "));
-            }
-            out.push('\n');
-        }
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("lock.tmp");
-        fs::write(&tmp, out)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    }
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn accepts_and_marks_permissions_keeping_notes() {

@@ -70,7 +70,12 @@ pub fn analyze<'a>(calls: impl IntoIterator<Item = &'a Trace>) -> Vec<Finding> {
 /// [`analyze`], naming `gate` (the lock or policy file the run was compared
 /// with) in access findings.
 pub fn analyze_against<'a>(calls: impl IntoIterator<Item = &'a Trace>, gate: &str) -> Vec<Finding> {
-    let calls: Vec<&Trace> = calls.into_iter().filter(|call| !call.pending).collect();
+    // Replays sent from the window are experiments on top of the run, not
+    // part of what the tests did: they would read as retries and repeats.
+    let calls: Vec<&Trace> = calls
+        .into_iter()
+        .filter(|call| !call.pending && call.replay_of.is_none())
+        .collect();
     let mut found = Vec::new();
     failures(&calls, &mut found);
     access(&calls, gate, &mut found);
@@ -648,6 +653,25 @@ mod tests {
             retries.title,
             "DYNAMODB PutItem retried ×3 → ThrottlingException"
         );
+    }
+
+    #[test]
+    fn replays_from_the_window_are_not_retries_or_repeats() {
+        let mut original = failing(
+            call("o", "sqs", "GetQueueUrl", 0, 1),
+            400,
+            "QueueDoesNotExist",
+            None,
+        );
+        original.invocation_id = Some("inv".into());
+        let mut replay = original.clone();
+        replay.id = "r".into();
+        replay.at = call("r", "sqs", "GetQueueUrl", 50, 1).at;
+        replay.replay_of = Some("o".into());
+        let findings = analyze(&[original, replay]);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].kind, FindingKind::Failure);
+        assert_eq!(findings[0].calls, ["o"]);
     }
 
     #[test]

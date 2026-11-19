@@ -307,10 +307,12 @@ impl Summary {
         self.pending.remove(&trace.id);
         self.unfinished = self.pending.len();
         self.calls += 1;
-        let seen_invocation = trace
-            .invocation_id
-            .as_ref()
-            .is_some_and(|id| !self.invocations.insert(id.clone()));
+        // A replay re-sends its call's invocation id; it is not an SDK retry.
+        let seen_invocation = trace.replay_of.is_none()
+            && trace
+                .invocation_id
+                .as_ref()
+                .is_some_and(|id| !self.invocations.insert(id.clone()));
         let retried = trace.attempt.is_some_and(|attempt| attempt > 1) || seen_invocation;
         if retried {
             self.retries += 1;

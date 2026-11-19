@@ -810,9 +810,23 @@ impl LensletApp {
                 widgets::icon_button(
                     ui,
                     "palette",
-                    false,
-                    glyph::search_icon(theme::h(t.text_dim, 1.0)),
+                    self.palette_open,
+                    div()
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(rgb(t.border))
+                        .text_size(px(10.5))
+                        .text_color(theme::h(t.text_dim, 1.0))
+                        .child(if cfg!(target_os = "macos") {
+                            "⌘K"
+                        } else {
+                            "^K"
+                        }),
                 )
+                .w_auto()
+                .px(px(4.0))
                 .tooltip(widgets::tip(
                     ui.t("Commands", "命令"),
                     Some(i18n::shortcut("K")),

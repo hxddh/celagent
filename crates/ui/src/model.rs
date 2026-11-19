@@ -164,6 +164,9 @@ pub struct Trace {
     /// Blocked locally by `--enforce` before reaching the emulator.
     #[serde(default)]
     pub blocked: bool,
+    /// When `--enforce` blocked it: before the emulator, or after (response).
+    #[serde(default)]
+    pub blocked_phase: Option<lenslet_core::trace::BlockedPhase>,
     /// Re-sent from the window: the id of the call this replays.
     #[serde(default)]
     pub replay_of: Option<String>,
@@ -455,6 +458,7 @@ impl Trace {
             implied: self.implied.clone(),
             new: self.new,
             blocked: self.blocked,
+            blocked_phase: self.blocked_phase,
             replay_of: self.replay_of.clone(),
             request: message(self.request.as_ref()),
             response: message(self.response.as_ref()),
@@ -1421,6 +1425,7 @@ mod tests {
                 action: "s3:GetObject".into(),
                 resource: "arn:aws:s3:::shop-assets/*".into(),
                 new: true,
+                unverified: false,
             }],
             implied: vec![CallAccess::from(Access::new("kms:Decrypt", "*"))],
             new: true,

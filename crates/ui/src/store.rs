@@ -34,6 +34,7 @@ struct AccessAgg {
     errors: usize,
     direct: usize,
     new: usize,
+    unverified: usize,
     via: Vec<String>,
 }
 
@@ -129,6 +130,7 @@ impl CallStore {
             step(&mut agg.errors, row.is_error());
             step(&mut agg.direct, !implied);
             step(&mut agg.new, row.is_access_new(call_access));
+            step(&mut agg.unverified, call_access.unverified);
             if add && agg.via.len() < 3 {
                 let via = format!("{} {}", row.service_name(), operation_label(row));
                 if !agg.via.contains(&via) {
@@ -229,12 +231,17 @@ impl CallStore {
 
     /// Ids of the calls in the same SDK invocation as `trace`, in order.
     pub fn invocation_peers(&self, trace: &Trace) -> Vec<Arc<Trace>> {
-        let Some(id) = trace.invocation_id.as_deref() else {
+        // A replay re-sends the original invocation id but is not a retry.
+        let Some(id) = trace
+            .invocation_id
+            .as_deref()
+            .filter(|_| trace.replay_of.is_none())
+        else {
             return Vec::new();
         };
         self.rows
             .iter()
-            .filter(|row| row.invocation_id.as_deref() == Some(id))
+            .filter(|row| row.replay_of.is_none() && row.invocation_id.as_deref() == Some(id))
             .cloned()
             .collect()
     }
@@ -250,6 +257,7 @@ impl CallStore {
                     calls: agg.calls,
                     errors: agg.errors,
                     implied: agg.direct == 0,
+                    unverified: agg.unverified > 0,
                     via: agg.via.clone(),
                 },
                 new: agg.new > 0,
@@ -510,6 +518,7 @@ pub fn policy_json(rows: &[AccessRow]) -> String {
             .filter(|row| row.test)
             .map(|row| row.access.clone())
             .collect(),
+        ..Lock::default()
     };
     serde_json::to_string_pretty(&lenslet_core::lock::policy(&lock)).unwrap_or_else(|_| "{}".into())
 }

@@ -640,6 +640,20 @@ impl Render for AccessDetail {
                         session.update(cx, |session, cx| session.accept(entries, cx));
                     }),
             );
+        } else if row.used && !row.in_lock {
+            // Shown, not hidden: the action exists, this run just has no lock to write.
+            actions = actions.child(
+                widgets::primary_button(&ui, "accept", ui.t("Accept into lock", "写入 lock"))
+                    .opacity(0.45)
+                    .cursor_default()
+                    .tooltip(widgets::tip(
+                        ui.t(
+                            "This run has no lenslet.lock to write: it is checked against an IAM policy, or its project folder is unknown",
+                            "此运行没有可写的 lenslet.lock：它按 IAM policy 检查，或项目目录未知",
+                        ),
+                        None,
+                    )),
+            );
         }
         if editable && (row.in_lock || row.used) {
             let session = self.session.clone();
