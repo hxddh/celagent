@@ -4,6 +4,7 @@
 //! kept; a run that is still going is never deleted.
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -14,7 +15,7 @@ use chrono::Utc;
 
 use crate::{
     summary::Report,
-    trace::{Record, RunHeader},
+    trace::{Record, RunHeader, Trace},
 };
 
 pub const KEEP_RUNS: usize = 20;
@@ -150,6 +151,30 @@ pub fn header(path: &Path) -> Option<RunHeader> {
         Record::Run(header) => Some(header),
         _ => None,
     }
+}
+
+/// A run's finished calls in arrival order: the last line of each call id
+/// (a final line replaces its `pending` one). Calls still pending when the
+/// run ended are left out.
+pub fn calls(path: &Path) -> Result<Vec<Trace>> {
+    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: HashMap<String, Trace> = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let Ok(Record::Call(call)) = serde_json::from_str::<Record>(&line) else {
+            continue;
+        };
+        if !latest.contains_key(&call.id) {
+            order.push(call.id.clone());
+        }
+        latest.insert(call.id.clone(), *call);
+    }
+    Ok(order
+        .into_iter()
+        .filter_map(|id| latest.remove(&id))
+        .filter(|call| !call.pending)
+        .collect())
 }
 
 /// The run's `end` report, when it has ended.

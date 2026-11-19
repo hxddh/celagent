@@ -54,6 +54,10 @@ Usage:
       List recorded runs in ~/.lenslet/runs (newest first).
   lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]
       Compare two runs (defaults to the previous finished run vs the latest).
+  lenslet check [--policy PATH | --lock PATH] [RUN] [--json] [--markdown PATH]
+      Re-check a recorded run (default: the newest finished one) against a
+      policy or lock without re-running it: each denied permission and the
+      statement that denied it. Exit {changed} if anything is denied.
   lenslet policy [--lock PATH]
       An IAM policy document granting exactly what lenslet.lock lists.
   lenslet ui
@@ -114,6 +118,7 @@ fn main() -> ExitCode {
         "last" => last(args),
         "runs" => runs_cmd(args),
         "diff" => diff_cmd(args),
+        "check" => check_cmd(args),
         "policy" => policy(args),
         "ui" => open_ui(None).map(|()| 0),
         "-V" | "--version" | "version" => {
@@ -935,6 +940,199 @@ fn diff_cmd(args: Vec<String>) -> Result<i32> {
         print!("{}", diff.render());
     }
     Ok(0)
+}
+
+const CHECK_USAGE: &str =
+    "usage: lenslet check [--policy PATH | --lock PATH] [RUN] [--json] [--markdown PATH]";
+
+/// One denied permission of one recorded call.
+#[derive(serde::Serialize)]
+struct CheckDenial {
+    id: String,
+    service: String,
+    operation: String,
+    #[serde(flatten)]
+    denial: lock::Denial,
+}
+
+/// What `lenslet check` found.
+#[derive(serde::Serialize)]
+struct CheckReport {
+    run: String,
+    /// The policy or lock checked against.
+    gate: String,
+    policy: bool,
+    calls: usize,
+    denied: Vec<CheckDenial>,
+}
+
+impl CheckReport {
+    /// Why a permission was denied: the denying statement, or that nothing
+    /// grants it.
+    fn reason(&self, denial: &lock::Denial) -> String {
+        let mut text = match (denial.decision.reason, denial.decision.by.as_deref()) {
+            (lock::Reason::ExplicitDeny, Some(statement)) => {
+                format!("denied by statement `{statement}`")
+            }
+            _ if self.policy => "no statement allows it".to_string(),
+            _ => format!("not in {}", self.gate),
+        };
+        if denial.implied {
+            text.push_str(" (implied)");
+        }
+        if denial.unverified {
+            text.push_str(" (resource unknown: request body not readable)");
+        }
+        text
+    }
+
+    fn render(&self) -> String {
+        let mut out = format!(
+            "lenslet check: run {} against {} · {} · ",
+            self.run,
+            self.gate,
+            count(self.calls, "call")
+        );
+        if self.denied.is_empty() {
+            out.push_str("all allowed\n");
+            return out;
+        }
+        out.push_str(&format!(
+            "{} denied\n",
+            count(self.denied.len(), "permission")
+        ));
+        for item in &self.denied {
+            out.push_str(&format!(
+                "  ✗ {} {}  {}  {}\n      → {}\n",
+                item.service.to_ascii_uppercase(),
+                item.operation,
+                item.denial.action,
+                item.denial.resource,
+                self.reason(&item.denial)
+            ));
+        }
+        out
+    }
+
+    fn markdown(&self) -> String {
+        let mut out = format!(
+            "### Lenslet check · run `{}` against `{}`\n\n",
+            self.run, self.gate
+        );
+        if self.denied.is_empty() {
+            out.push_str(&format!("All {} allowed.\n", count(self.calls, "call")));
+            return out;
+        }
+        out.push_str(&format!(
+            "**{} denied** across {}.\n\n| Call | Permission | Resource | Why |\n|---|---|---|---|\n",
+            count(self.denied.len(), "permission"),
+            count(self.calls, "call")
+        ));
+        for item in &self.denied {
+            out.push_str(&format!(
+                "| {} {} | `{}` | `{}` | {} |\n",
+                item.service.to_ascii_uppercase(),
+                item.operation,
+                item.denial.action,
+                item.denial.resource,
+                self.reason(&item.denial).replace('|', "\\|")
+            ));
+        }
+        out
+    }
+}
+
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// `lenslet check [--policy PATH | --lock PATH] [RUN] [--json] [--markdown PATH]`:
+/// re-evaluate a recorded run's calls against a policy or lock, deriving each
+/// call's access again from its recorded request.
+fn check_cmd(args: Vec<String>) -> Result<i32> {
+    let mut json = false;
+    let mut markdown: Option<String> = None;
+    let mut policy_path: Option<PathBuf> = None;
+    let mut lock_path: Option<PathBuf> = None;
+    let mut run: Option<String> = None;
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--markdown" => markdown = Some(it.next().context(CHECK_USAGE)?),
+            "--policy" => policy_path = Some(PathBuf::from(it.next().context(CHECK_USAGE)?)),
+            "--lock" => lock_path = Some(PathBuf::from(it.next().context(CHECK_USAGE)?)),
+            flag if flag.starts_with('-') => bail!("{CHECK_USAGE}"),
+            _ if run.is_none() => run = Some(arg),
+            _ => bail!("{CHECK_USAGE}"),
+        }
+    }
+    if policy_path.is_some() && lock_path.is_some() {
+        bail!("use --policy or --lock, not both\n{CHECK_USAGE}");
+    }
+    let cwd = std::env::current_dir().context("read the current directory")?;
+    let (gate, policy) = match policy_path {
+        Some(path) => {
+            let label = relative_to(&path, &cwd);
+            (lock::Gate::from_policy_file(&path, label)?, true)
+        }
+        None => {
+            let path = lock_path.unwrap_or_else(|| lock::path_in(&cwd));
+            let label = relative_to(&path, &cwd);
+            let Some(locked) = lock::read(&path)? else {
+                bail!("no {label}; pass --policy PATH or --lock PATH");
+            };
+            (lock::Gate::from_lock(label, locked.access), false)
+        }
+    };
+    let dir = runs::dir(&home());
+    let path = match run.as_deref() {
+        Some(spec) => runs::resolve(&dir, spec)?,
+        None => runs::list(&dir)
+            .into_iter()
+            .rev()
+            .find(|path| runs::report(path).is_some())
+            .context("no finished runs yet; try `lenslet run -- <command>`")?,
+    };
+    let calls = runs::calls(&path)?;
+    let denied = calls
+        .iter()
+        .flat_map(|call| {
+            lock::evaluate(call, Some(&gate))
+                .denied
+                .into_iter()
+                .map(|denial| CheckDenial {
+                    id: call.id.clone(),
+                    service: call.service.clone(),
+                    operation: call.operation.clone(),
+                    denial,
+                })
+        })
+        .collect();
+    let report = CheckReport {
+        run: runs::run_id(&path),
+        gate: gate.label.clone(),
+        policy,
+        calls: calls.len(),
+        denied,
+    };
+    if let Some(target) = markdown.as_deref() {
+        write_text(&report.markdown(), target)?;
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.render());
+    }
+    Ok(if report.denied.is_empty() {
+        0
+    } else {
+        EXIT_ACCESS_CHANGED
+    })
 }
 
 /// `path` relative to `dir` when it is inside it, also through symlinks
