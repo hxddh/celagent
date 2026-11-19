@@ -424,6 +424,10 @@ pub struct Report {
     /// In the lock, not exercised by this run.
     pub access_unused: Vec<Access>,
     pub regressions: Option<Regressions>,
+    /// Everything worth a look, most severe first: the one list the terminal,
+    /// the PR comment and the window lead with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<crate::findings::Finding>,
     pub trace: String,
     pub endpoint: String,
     pub upstream: String,
@@ -1114,6 +1118,7 @@ mod tests {
             implied: Vec::new(),
             new: false,
             blocked: false,
+            replay_of: None,
             request: Message::default(),
             response: Message::default(),
         }

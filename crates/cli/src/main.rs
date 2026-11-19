@@ -9,15 +9,11 @@
 //! lenslet ui                  the window (also: bare `lenslet`)
 //! ```
 
-mod access;
 mod capture;
-mod lock;
-mod problem;
 mod proxy;
-mod runs;
-mod summary;
 mod trace;
-mod wire;
+
+pub(crate) use lenslet_core::{access, lock, problem, runs, summary, wire};
 
 use std::{
     ffi::OsString,

@@ -730,7 +730,7 @@ fn iam_action_matches(pattern: &str, actual: &str) -> bool {
     glob_match(&pattern.to_ascii_lowercase(), &actual.to_ascii_lowercase())
 }
 
-pub(crate) fn arn_matches(pattern: &str, actual: &str) -> bool {
+pub fn arn_matches(pattern: &str, actual: &str) -> bool {
     iam_arn_matches(pattern, actual)
 }
 
@@ -955,6 +955,7 @@ mod tests {
             implied: Vec::new(),
             new: false,
             blocked: false,
+            replay_of: None,
             request: crate::trace::Message::default(),
             response: crate::trace::Message::default(),
         };

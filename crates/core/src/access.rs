@@ -1759,6 +1759,7 @@ mod tests {
             implied: Vec::new(),
             new: false,
             blocked: false,
+            replay_of: None,
             request: Message {
                 headers: Vec::new(),
                 content_type: Some(if body.is_some_and(|b| b.starts_with('{')) {

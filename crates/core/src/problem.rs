@@ -262,7 +262,7 @@ fn header_code(headers: &[HeaderTrace]) -> Option<String> {
 }
 
 fn reason_code(status: u16) -> String {
-    hyper::StatusCode::from_u16(status)
+    http::StatusCode::from_u16(status)
         .ok()
         .and_then(|status| status.canonical_reason())
         .map(|reason| reason.replace([' ', '-'], ""))

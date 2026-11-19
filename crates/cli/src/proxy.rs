@@ -434,17 +434,6 @@ impl Upstream {
 }
 
 /// Set a filesystem mode, ignoring platforms without POSIX permissions.
-#[cfg(unix)]
-pub fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("set permissions on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-pub fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
-}
 
 fn emulator_roots(path: &Path) -> Result<RootCertStore> {
     let pem = fs::read(path).with_context(|| {
@@ -583,6 +572,7 @@ where
         implied: Vec::new(),
         new: false,
         blocked: false,
+        replay_of: None,
         request: Message {
             headers: request_headers,
             content_type: request_content.content_type.clone(),

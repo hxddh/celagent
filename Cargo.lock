@@ -2965,12 +2965,24 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "lenslet-core",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+]
+
+[[package]]
+name = "lenslet-core"
+version = "7.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "http",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2981,6 +2993,7 @@ dependencies = [
  "flate2",
  "gpui",
  "httparse",
+ "lenslet-core",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
