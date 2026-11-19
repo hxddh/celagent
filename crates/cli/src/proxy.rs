@@ -2639,4 +2639,107 @@ mod tests {
             "Lenslet's own requests are not calls"
         );
     }
+
+    #[tokio::test]
+    async fn derivation_reads_past_max_body_with_or_without_a_gate() {
+        let (port, _upstream) = spawn_upstream().await;
+        let temp = TempDir::new("derive");
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: 64,
+            enforce: false,
+            trace: Arc::new(TraceSink::new(temp.trace(), &RunHeader::default(), None).unwrap()),
+        });
+        let payload = br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"order-padding-0000000000000000000000000000"}}}}],"secret_orders":[{"PutRequest":{"Item":{"id":{"S":"2"}}}}]}}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.BatchWriteItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(Full::new(Bytes::from_static(payload)))
+            .unwrap();
+        let response = handle(request, state.clone()).await.unwrap();
+        let _ = response.into_body().collect().await.unwrap();
+        let written = traces(&temp.trace());
+        assert!(written[0].request.body.as_ref().unwrap().truncated);
+        let resources: Vec<&str> = written[0]
+            .access
+            .iter()
+            .map(|item| item.resource.as_str())
+            .collect();
+        // The same footprint `--update` and `--check` see: no `*` for a tail
+        // the trace capture cut off.
+        assert_eq!(
+            resources,
+            [
+                "arn:aws:dynamodb:*:*:table/orders",
+                "arn:aws:dynamodb:*:*:table/secret_orders"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_body_is_enforced_against_the_wildcard_lock_line() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let cbor = |state: &Arc<State>| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("host", "127.0.0.1:9297")
+                .header(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=x",
+                )
+                .header("x-amz-target", "AmazonSQS.SendMessage")
+                .header("content-type", "application/cbor")
+                .body(Full::new(Bytes::from_static(&[0xa2, 0x00, 0xff, 0x13, 0x88])))
+                .unwrap();
+            handle(request, state.clone())
+        };
+
+        let temp = TempDir::new("unverified-blocked");
+        let state = lock_state(
+            port,
+            temp.trace(),
+            &[Access::new("sqs:SendMessage", "arn:aws:sqs:*:*:jobs")],
+            true,
+        );
+        let response = cbor(&state).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&body).contains("could not be read from the request body"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(upstream.try_recv().is_err());
+        let written = traces(&temp.trace());
+        assert_eq!(written[0].access.len(), 1);
+        assert_eq!(written[0].access[0].resource, "*");
+        assert!(written[0].access[0].unverified && written[0].access[0].new);
+
+        // Accepting the `*` line (what `--update` writes) lets it through.
+        let temp = TempDir::new("unverified-allowed");
+        let state = lock_state(
+            port,
+            temp.trace(),
+            &[Access::new("sqs:SendMessage", "*")],
+            true,
+        );
+        let response = cbor(&state).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_ok());
+        let written = traces(&temp.trace());
+        assert!(!written[0].new && written[0].access[0].unverified);
+    }
 }
