@@ -1,8 +1,10 @@
-//! Loopback-only HTTP/1.1 & HTTPS live request replayer for the Inspector.
+//! Loopback-only HTTP/1.1 & HTTPS request replayer for the Inspector.
 //!
-//! Replays a captured call directly against the active local emulator in memory
-//! (`127.0.0.1`, `localhost`, or `[::1]` ONLY — never external hosts) without
-//! appending to `~/.lenslet/runs/*.jsonl` or modifying `lenslet.lock`.
+//! While a run is live, a replay goes through the run's own proxy with
+//! `x-lenslet-replay-of: <call id>`, so the proxy records it (and gates it,
+//! under `--enforce`) like any other call. For a finished run it goes straight
+//! to the emulator and is only shown, never recorded. Targets are strictly
+//! loopback (`127.0.0.1`, `localhost`, `[::1]`).
 
 use std::{
     fs,
@@ -17,7 +19,10 @@ use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 
-use crate::trace::{Header, Trace};
+use crate::model::{Header, Trace};
+
+/// The header that tells the proxy a request replays a recorded call.
+pub const REPLAY_OF_HEADER: &str = "x-lenslet-replay-of";
 
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REPLAY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -113,16 +118,31 @@ fn parse_loopback_target(url: &str) -> Option<LoopbackTarget> {
     })
 }
 
+/// Where a replay goes and what it adds.
+#[derive(Clone, Debug)]
+pub struct ReplayTarget {
+    pub url: String,
+    /// Through the run's live proxy (adds [`REPLAY_OF_HEADER`]).
+    pub via_proxy: bool,
+}
+
 pub fn replay_call(
     trace: &Trace,
-    upstream_url: &str,
+    replay_target: &ReplayTarget,
     home: &Path,
 ) -> Result<ReplayOutcome, String> {
+    crate::fsguard::assert_io_allowed();
+    let upstream_url = replay_target.url.as_str();
+    let extra: Vec<(&str, &str)> = if replay_target.via_proxy {
+        vec![(REPLAY_OF_HEADER, trace.id.as_str())]
+    } else {
+        Vec::new()
+    };
     let target = parse_loopback_target(upstream_url).ok_or_else(|| {
         format!("Replay refused: `{upstream_url}` is not a loopback emulator endpoint")
     })?;
 
-    let req_wire = build_http_request(trace, &target)?;
+    let req_wire = build_http_request(trace, &target, &extra)?;
     let is_head = trace.method.eq_ignore_ascii_case("HEAD");
     let started = Instant::now();
 
@@ -191,7 +211,11 @@ fn build_tls_config(port: u16, home: &Path) -> Result<ClientConfig, String> {
         .with_no_client_auth())
 }
 
-fn build_http_request(trace: &Trace, target: &LoopbackTarget) -> Result<Vec<u8>, String> {
+fn build_http_request(
+    trace: &Trace,
+    target: &LoopbackTarget,
+    extra: &[(&str, &str)],
+) -> Result<Vec<u8>, String> {
     let path = if trace.path.starts_with('/') {
         trace.path.clone()
     } else if let Some((_, rest)) = trace.path.split_once("://") {
@@ -262,6 +286,12 @@ fn build_http_request(trace: &Trace, target: &LoopbackTarget) -> Result<Vec<u8>,
             if low == "host" {
                 saw_host = true;
             }
+            if extra
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(&low))
+            {
+                continue;
+            }
             let val = if decoded_wire
                 && low == "x-amz-content-sha256"
                 && h.value.trim().starts_with("STREAMING-")
@@ -282,6 +312,10 @@ fn build_http_request(trace: &Trace, target: &LoopbackTarget) -> Result<Vec<u8>,
             trace.host.replace(['\r', '\n'], "")
         };
         req.extend_from_slice(format!("Host: {host}\r\n").as_bytes());
+    }
+    for (name, value) in extra {
+        let clean = value.replace(['\r', '\n'], " ");
+        req.extend_from_slice(format!("{name}: {clean}\r\n").as_bytes());
     }
     req.extend_from_slice(format!("Content-Length: {}\r\n", body_bytes.len()).as_bytes());
     req.extend_from_slice(b"Connection: close\r\n\r\n");
@@ -528,8 +562,15 @@ fn decompress_bytes(mut reader: impl Read) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::parse_line;
+    use crate::model::parse_line;
     use std::net::TcpListener;
+
+    fn direct(url: &str) -> ReplayTarget {
+        ReplayTarget {
+            url: url.into(),
+            via_proxy: false,
+        }
+    }
 
     #[test]
     fn replays_over_loopback_and_blocks_non_loopback_targets() {
@@ -561,12 +602,19 @@ mod tests {
             &call,
             Some("https://dynamodb.us-east-1.amazonaws.com:443")
         ));
-        assert!(replay_call(&call, "https://s3.amazonaws.com:443", Path::new(".")).is_err());
+        assert!(
+            replay_call(
+                &call,
+                &direct("https://s3.amazonaws.com:443"),
+                Path::new(".")
+            )
+            .is_err()
+        );
 
         // Loopback emulator succeeds and decodes response cleanly.
         let url = format!("http://127.0.0.1:{port}");
         assert!(can_replay(&call, Some(&url)));
-        let out = replay_call(&call, &url, Path::new(".")).unwrap();
+        let out = replay_call(&call, &direct(&url), Path::new(".")).unwrap();
         assert_eq!(out.status, 200);
         assert_eq!(out.body_text.as_deref(), Some("{\"Item\":{\"ok\":1}}"));
         server.join().unwrap();
@@ -585,6 +633,10 @@ mod tests {
                 !req_text.to_ascii_lowercase().contains("expect:"),
                 "{req_text}"
             );
+            assert!(
+                req_text.contains("x-lenslet-replay-of: r2\r\n"),
+                "{req_text}"
+            );
             sock.write_all(
                 b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nx-amz-request-id: s3-put-1\r\nContent-Length: 5\r\n\r\n<ok/>",
             )
@@ -597,7 +649,11 @@ mod tests {
         .unwrap();
 
         let url = format!("http://127.0.0.1:{port}");
-        let out = replay_call(&call, &url, Path::new(".")).unwrap();
+        let target = ReplayTarget {
+            url,
+            via_proxy: true,
+        };
+        let out = replay_call(&call, &target, Path::new(".")).unwrap();
         assert_eq!(out.status, 200);
         assert_eq!(out.body_text.as_deref(), Some("<ok/>"));
         server.join().unwrap();
