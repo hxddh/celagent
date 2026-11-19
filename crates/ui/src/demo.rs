@@ -2,7 +2,7 @@
 //! script against a local emulator, recorded by `lenslet run --check` (paths
 //! scrubbed). It is only used when demo mode is explicitly requested.
 
-use crate::trace::{self, RunInfo, Trace};
+use crate::model::{self as trace, RunInfo, Trace};
 
 const RUN: &str = include_str!("demo.jsonl");
 

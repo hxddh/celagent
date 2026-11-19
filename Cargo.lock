@@ -2991,9 +2991,11 @@ version = "7.0.0"
 dependencies = [
  "anyhow",
  "flate2",
+ "futures",
  "gpui",
  "httparse",
  "lenslet-core",
+ "log",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",

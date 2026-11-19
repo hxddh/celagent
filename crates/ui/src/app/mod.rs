@@ -1,46 +1,42 @@
-//! Lenslet 6.0 Workbench: 3-zone layout (global header, mode-linked sub-toolbar,
-//! draggable split workspace with Calls / Access / Diff views), dedicated
-//! Settings modal (`⌘,`), Run Switcher popover, and on-demand body hydration.
+//! The Lenslet window: a header (run, mode, baseline, search), the active
+//! list (Calls or Access) with its inspector beside it, and the overlays
+//! (run switcher, baseline picker, context menus, command palette, settings).
+//!
+//! The root owns only chrome state. Data lives in the [`Session`] model; the
+//! lists and inspectors are child entities that re-render on their own.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, CursorStyle, Div, ElementId, FocusHandle, FontWeight,
-    KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, SharedString,
-    Stateful, UniformListScrollHandle, WeakEntity, Window, actions, div, linear_color_stop,
-    linear_gradient, prelude::*, px, rgb, rgba, uniform_list,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Corner, CursorStyle, Div,
+    DragMoveEvent, ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton, Pixels,
+    Point, Render, SharedString, Stateful, Task, Window, actions, anchored, deferred, div, point,
+    prelude::*, px, rgb,
 };
 
 mod access;
-mod chrome;
-mod diff;
+mod bodyview;
+mod calls;
 mod inspector;
 mod palette;
+mod session;
 mod settings;
-mod stream;
 mod widgets;
 
 use self::{
-    stream::{blocked_pill, new_pill},
-    widgets::*,
+    access::{AccessDetail, AccessEvent, AccessView},
+    calls::{CallsEvent, CallsList},
+    inspector::{Inspector, InspectorEvent},
+    session::{Baseline, Health, Session, SessionEvent},
 };
 use crate::{
-    demo, fonts, glyph, i18n,
-    prefs::{self, AccentColor, Density, Lang, ThemeMode, TimeFormat, UiPrefs},
-    search::SearchInput,
-    theme::{self, latency_color, status_color},
-    trace::{
-        self, AccessFilter, Body, CallFilter, Exchange, MAX_ROWS, RunInfo, ServiceFacet, Source,
-        StatusFilter, TailEvent, Tailer, Trace, format_bytes, format_latency, full_time,
-        headers_to_text, matches_search, operation_label, search_tokens, service_facets,
-        short_clock, status_is_success, status_label, status_text,
-    },
+    feed::{FeedMode, Source},
+    fonts, glyph, i18n,
+    model::{Access, StatusFilter, Trace, format_bytes, search_tokens, to_curl},
+    prefs::{self, AccentColor, Density, Lang, ThemeMode, UiPrefs},
+    search::{SearchEvent, SearchInput},
+    store::{AccessRow, policy_json, statement_json},
+    theme::{self, Ui, text},
 };
 
 actions!(
@@ -50,1549 +46,129 @@ actions!(
         FocusSearch,
         OpenSettings,
         ToggleInspector,
-        ReloadTrace,
-        ReplaySelectedAction,
-        SwitchCalls,
-        SwitchAccess,
-        SwitchDiff,
-        PrevRunAction,
-        NextRunAction,
-        FollowLatestAction,
-        CopyCurlAction,
-        ExportPolicyAction,
-        QuitApp
+        ReloadRun,
+        Replay,
+        ShowCalls,
+        ShowAccess,
+        PrevRun,
+        NextRun,
+        FollowLatest,
+        CopyCurl,
+        CopyPolicy,
+        Quit,
+        SelectNext,
+        SelectPrev,
+        SelectFirst,
+        SelectLast,
+        PageDown,
+        PageUp,
+        Confirm,
+        Cancel,
+        Copy,
+        SelectAll,
     ]
 );
 
-const START_COMMAND: &str = "lenslet run -- npm test";
-const POLL_INTERVAL: Duration = Duration::from_millis(420);
-const PROBE_EVERY: u64 = 5;
-const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const TOAST_MILLIS: u64 = 1_600;
-const MAX_BODY_DISPLAY: usize = 256 * 1024;
+const PREFS_DEBOUNCE: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TraceHealth {
-    Ok,
-    Missing,
-    Error(String),
-}
-
-/// Primary workspace mode in the center segmented switch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Pane {
+pub enum Mode {
     Calls,
     Access,
-    Diff,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum InspectorTab {
-    Exchange,
-    Headers,
-    IamMeta,
+/// Everything the window can do: palette entries and context-menu items are
+/// both lists of these.
+#[derive(Clone, Debug)]
+pub enum Cmd {
+    Mode(Mode),
+    FocusSearch,
+    OpenSettings,
+    ToggleInspector,
+    Reload,
+    Replay,
+    CopyCurl(Arc<Trace>),
+    CopyText(&'static str, String),
+    CopyPolicy,
+    FilterStatus(StatusFilter),
+    FilterService(String),
+    FilterAccess(Access),
+    ClearFilters,
+    Accept(Vec<Access>),
+    SetTestMark(Access, bool),
+    PrevRun,
+    NextRun,
+    FollowLatest,
+    PinRun(PathBuf),
+    SetBaseline(Baseline),
+    Theme(ThemeMode),
+    Accent(AccentColor),
+    Density(Density),
+    Lang(Lang),
+    Quit,
 }
 
-impl InspectorTab {
-    fn label(self) -> &'static str {
-        match self {
-            InspectorTab::Exchange => i18n::pick("Exchange", "报文详情"),
-            InspectorTab::Headers => "Headers",
-            InspectorTab::IamMeta => i18n::pick("IAM & Meta", "IAM 与元数据"),
-        }
+#[derive(Clone)]
+pub struct MenuEntry {
+    pub title: SharedString,
+    pub hint: Option<String>,
+    pub cmd: Cmd,
+}
+
+enum Overlay {
+    Runs,
+    Baseline,
+    Menu(Point<Pixels>, Vec<MenuEntry>),
+}
+
+#[derive(Clone)]
+struct SplitDrag;
+
+struct DragGhost;
+
+impl Render for DragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
     }
-
-    fn index(self) -> &'static str {
-        match self {
-            InspectorTab::Exchange => "1",
-            InspectorTab::Headers => "2",
-            InspectorTab::IamMeta => "3",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct Counts {
-    total: usize,
-    retries: usize,
-    errors: usize,
-    blocked: usize,
-    slow: usize,
-    visible: usize,
 }
 
 pub struct LensletApp {
-    rows: Rc<Vec<Arc<Trace>>>,
-    view: Rc<Vec<usize>>,
-    facets: Vec<ServiceFacet>,
-    counts: Counts,
-    selected: Option<usize>,
-    /// Cached hydrated copy of the selected row when its body was offloaded to disk.
-    hydrated_cache: Option<(String, Arc<Trace>)>,
-    selection_locked: bool,
+    session: Entity<Session>,
+    calls: Entity<CallsList>,
+    inspector: Entity<Inspector>,
+    access: Entity<AccessView>,
+    access_detail: Entity<AccessDetail>,
+    search: Entity<SearchInput>,
+    palette_input: Entity<SearchInput>,
+    root_focus: FocusHandle,
 
-    call_filter: CallFilter,
-    access_filter: AccessFilter,
-    selected_access: Option<trace::Access>,
-    diff_base: Option<PathBuf>,
-    query: String,
-
-    tab: InspectorTab,
-    pane: Pane,
-    show_all_services: bool,
-    raw_body: bool,
-    semantic_decode: bool,
-    expand_body: bool,
+    mode: Mode,
     prefs: UiPrefs,
-
-    settings_open: bool,
-    runs_popover_open: bool,
+    overlay: Option<Overlay>,
     palette_open: bool,
     palette_index: usize,
-    dragging_splitter: bool,
-    last_saved_viewport: (u32, u32),
-
-    search: gpui::Entity<SearchInput>,
-    search_focus: FocusHandle,
-    palette_input: gpui::Entity<SearchInput>,
-    root_focus: FocusHandle,
-    scroll: UniformListScrollHandle,
-
-    /// In-memory live replay states keyed by `trace.id` (never persisted to `.jsonl`).
-    replays: HashMap<String, crate::replay::ReplayState>,
-
-    paused: bool,
-    buffered: Vec<Trace>,
-    pending_replace: bool,
-
-    source: Source,
-    trace_path: Option<PathBuf>,
-    run: Option<RunInfo>,
-    probe: Probe,
-    tailer: Option<Tailer>,
-    tailer_generation: u64,
-    health: TraceHealth,
-    skipped: usize,
-    demo: bool,
-
+    palette_entries: Vec<MenuEntry>,
+    settings_open: bool,
+    storage: Option<(usize, u64)>,
     toast: Option<(String, u64)>,
     toast_seq: u64,
+    prefs_seq: u64,
+    _tasks: Vec<Task<()>>,
+    _subscriptions: Vec<gpui::Subscription>,
 }
 
-impl LensletApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let prefs = prefs::load(&home());
-        i18n::set_lang(prefs.lang);
-        theme::set_accent(prefs.accent);
-
-        let source = trace_source();
-        let demo = std::env::var_os("LENSLET_DEMO")
-            .map(|value| value.to_string_lossy() == "1")
-            .unwrap_or(false);
-        let root_focus = cx.focus_handle();
-        let search = cx.new(|cx| SearchInput::new(root_focus.clone(), cx));
-        let search_focus = search.read(cx).handle();
-        let palette_input = cx.new(|cx| SearchInput::new_palette(root_focus.clone(), cx));
-
-        let mut rows: Vec<Arc<Trace>> = Vec::new();
-        let mut tailer = None;
-        let mut health = TraceHealth::Ok;
-        let mut skipped = 0;
-        let mut trace_path = None;
-        let run: Option<trace::RunInfo>;
-
-        if demo {
-            rows = trace::merge(&[], demo::demo_rows());
-            run = Some(demo::demo_run());
-        } else {
-            let mut tail = Tailer::follow(source.clone());
-            match tail.poll() {
-                TailEvent::Replaced(found) => {
-                    rows = trace::merge(&[], found);
-                }
-                TailEvent::Missing => health = TraceHealth::Missing,
-                TailEvent::Error(error) => health = TraceHealth::Error(error),
-                _ => {}
-            }
-            skipped = tail.skipped();
-            trace_path = tail.path().map(Path::to_path_buf);
-            run = tail.run();
-            tailer = Some(tail);
-        }
-
-        let raw_body = prefs.raw_body_default;
-        let mut app = Self {
-            rows: Rc::new(rows),
-            view: Rc::new(Vec::new()),
-            facets: Vec::new(),
-            counts: Counts::default(),
-            selected: if demo { Some(0) } else { None },
-            hydrated_cache: None,
-            selection_locked: demo,
-            call_filter: CallFilter::default(),
-            access_filter: AccessFilter::default(),
-            selected_access: None,
-            diff_base: None,
-            query: String::new(),
-            tab: InspectorTab::Exchange,
-            pane: Pane::Calls,
-            show_all_services: false,
-            raw_body,
-            semantic_decode: true,
-            expand_body: false,
-            prefs,
-            settings_open: false,
-            runs_popover_open: false,
-            palette_open: false,
-            palette_index: 0,
-            dragging_splitter: false,
-            last_saved_viewport: (0, 0),
-            search,
-            search_focus,
-            palette_input,
-            root_focus,
-            scroll: UniformListScrollHandle::new(),
-            replays: HashMap::new(),
-            paused: false,
-            buffered: Vec::new(),
-            pending_replace: false,
-            source,
-            trace_path,
-            run,
-            probe: Probe::default(),
-            tailer,
-            tailer_generation: 0,
-            health,
-            skipped,
-            demo,
-            toast: None,
-            toast_seq: 0,
-        };
-        app.refresh_view();
-        if !app.demo && !app.view.is_empty() {
-            app.scroll
-                .scroll_to_item(app.view.len() - 1, ScrollStrategy::Bottom);
-        }
-
-        cx.observe(&app.search, |this, search, cx| {
-            let query = search.read(cx).query().to_string();
-            if query != this.query {
-                this.query = query;
-                this.refresh_view();
-                this.reveal_selected();
-                cx.notify();
-            }
-        })
-        .detach();
-
-        cx.observe(&app.palette_input, |this, _, cx| {
-            this.palette_index = 0;
-            cx.notify();
-        })
-        .detach();
-
-        if !app.demo {
-            app.start_polling(cx);
-        }
-
-        app
-    }
-
-    pub fn observe_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.observe_window_appearance(window, |_, _, cx| {
-            cx.notify();
-        })
-        .detach();
-        cx.observe_window_bounds(window, |this, window, _cx| {
-            let vp = window.viewport_size();
-            let w = vp.width.to_f64().round() as u32;
-            let h = vp.height.to_f64().round() as u32;
-            if (w, h) != this.last_saved_viewport && w >= 960 && h >= 640 {
-                this.last_saved_viewport = (w, h);
-                this.prefs.window_width = Some(w as f32);
-                this.prefs.window_height = Some(h as f32);
-                prefs::save(&home(), &this.prefs);
-            }
-        })
-        .detach();
-    }
-
-    pub fn root_focus(&self) -> FocusHandle {
-        self.root_focus.clone()
-    }
-
-    // -- Settings & Preferences mutators -----------------------------------
-
-    pub(super) fn set_theme_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
-        self.prefs.theme = mode;
-        prefs::save(&home(), &self.prefs);
-        cx.notify();
-    }
-
-    pub(super) fn set_accent_color(&mut self, accent: AccentColor, cx: &mut Context<Self>) {
-        self.prefs.accent = accent;
-        theme::set_accent(accent);
-        prefs::save(&home(), &self.prefs);
-        cx.notify();
-    }
-
-    pub(super) fn set_density(&mut self, density: Density, cx: &mut Context<Self>) {
-        self.prefs.density = density;
-        prefs::save(&home(), &self.prefs);
-        cx.notify();
-    }
-
-    pub(super) fn set_language(&mut self, lang: Lang, cx: &mut Context<Self>) {
-        self.prefs.lang = lang;
-        i18n::set_lang(lang);
-        prefs::save(&home(), &self.prefs);
-        cx.notify();
-    }
-
-    pub(super) fn set_time_format(&mut self, fmt: TimeFormat, cx: &mut Context<Self>) {
-        self.prefs.time_format = fmt;
-        prefs::save(&home(), &self.prefs);
-        cx.notify();
-    }
-
-    pub(super) fn set_raw_body_default(&mut self, raw: bool, cx: &mut Context<Self>) {
-        self.prefs.raw_body_default = raw;
-        self.raw_body = raw;
-        prefs::save(&home(), &self.prefs);
-        cx.notify();
-    }
-
-    pub(super) fn set_word_wrap(&mut self, wrap: bool, cx: &mut Context<Self>) {
-        self.prefs.word_wrap = wrap;
-        prefs::save(&home(), &self.prefs);
-        cx.notify();
-    }
-
-    pub(super) fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
-        self.prefs.inspector_open = !self.prefs.inspector_open;
-        prefs::save(&home(), &self.prefs);
-        cx.notify();
-    }
-
-    pub(super) fn runs_dir(&self) -> PathBuf {
-        match &self.source {
-            Source::Runs { dir, .. } => dir.clone(),
-            Source::File(p) => p
-                .parent()
-                .map_or_else(|| home().join(".lenslet/runs"), Path::to_path_buf),
-        }
-    }
-
-    pub(super) fn clear_historical_runs(&mut self, cx: &mut Context<Self>) {
-        let dir = self.runs_dir();
-        let removed = trace::clear_finished_runs(&dir, self.trace_path.as_deref());
-        let msg = if i18n::is_zh() {
-            format!("已清理 {removed} 个历史运行文件")
-        } else {
-            format!(
-                "Cleared {removed} finished {}",
-                if removed == 1 { "run" } else { "runs" }
-            )
-        };
-        self.show_toast(msg, cx);
-    }
-
-    // -- Hydrated Trace Selection ------------------------------------------
-
-    pub(super) fn selected_hydrated_trace(&mut self) -> Option<Arc<Trace>> {
-        let index = self.selected?;
-        let raw = self.rows.get(index)?;
-        let cache_key = format!("{}:{}:{}", raw.id, raw.pending, raw.status);
-        if let Some((cached_key, cached_trace)) = self.hydrated_cache.as_ref()
-            && cached_key == &cache_key
-        {
-            return Some(cached_trace.clone());
-        }
-        let hydrated = match raw.hydrated() {
-            std::borrow::Cow::Borrowed(_) => raw.clone(),
-            std::borrow::Cow::Owned(full) => Arc::new(full),
-        };
-        self.hydrated_cache = Some((cache_key, hydrated.clone()));
-        Some(hydrated)
-    }
-
-    pub(super) fn copy_selected_curl(&mut self, cx: &mut Context<Self>) {
-        let Some(trace) = self.selected_hydrated_trace() else {
-            return;
-        };
-        let endpoint = self
-            .run
-            .as_ref()
-            .map(|r| r.header.endpoint.as_str())
-            .filter(|e| !e.is_empty());
-        let Some(curl) = trace::to_curl(&trace, endpoint) else {
-            return;
-        };
-        self.copy_text("curl", curl, cx);
-    }
-
-    // -- Live Replay & Native lenslet.lock Curation ------------------------
-
-    pub(super) fn active_upstream_url(&self) -> Option<String> {
-        self.run
-            .as_ref()
-            .map(|r| r.header.upstream.trim().to_string())
-            .filter(|u| !u.is_empty())
-    }
-
-    pub(super) fn can_replay_trace(&self, trace: &Trace) -> bool {
-        if self.demo {
-            return false;
-        }
-        let upstream = self.active_upstream_url();
-        crate::replay::can_replay(trace, upstream.as_deref())
-    }
-
-    pub(super) fn can_replay_selected(&self) -> bool {
-        self.selected
-            .and_then(|idx| self.rows.get(idx))
-            .is_some_and(|row| self.can_replay_trace(row))
-    }
-
-    pub(super) fn trigger_replay_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(trace) = self.selected_hydrated_trace() else {
-            return;
-        };
-        let Some(upstream) = self.active_upstream_url() else {
-            return;
-        };
-        if !crate::replay::can_replay(&trace, Some(&upstream)) {
-            return;
-        }
-        let call_id = trace.id.clone();
-        self.replays
-            .insert(call_id.clone(), crate::replay::ReplayState::Running);
-        self.tab = InspectorTab::Exchange;
-        if !self.prefs.inspector_open {
-            self.prefs.inspector_open = true;
-        }
-        cx.notify();
-
-        let home_dir = home();
-        cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { crate::replay::replay_call(&trace, &upstream, &home_dir) })
-                .await;
-            this.update(cx, |app, cx| {
-                let state = match outcome {
-                    Ok(done) => crate::replay::ReplayState::Done(done),
-                    Err(err) => crate::replay::ReplayState::Failed(err),
-                };
-                app.replays.insert(call_id, state);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    pub(super) fn active_lock_path(&self) -> Option<PathBuf> {
-        if self.demo {
-            return None;
-        }
-        let run = self.run.as_ref()?;
-        trace::resolve_lock_path(
-            &run.header.cwd,
-            run.header.lock.as_deref(),
-            run.header.policy.as_deref(),
-        )
-    }
-
-    pub(super) fn can_edit_lock(&self) -> bool {
-        self.active_lock_path().is_some()
-    }
-
-    pub(super) fn accept_permission_into_lock(
-        &mut self,
-        access: trace::Access,
-        implied: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(lock_path) = self.active_lock_path() else {
-            return;
-        };
-        match trace::accept_into_lock(&lock_path, &[(access, implied)]) {
-            Ok(_) => {
-                let msg = i18n::pick("Saved to lenslet.lock", "已写入 lenslet.lock").to_string();
-                self.show_toast(msg, cx);
-            }
-            Err(err) => {
-                self.show_toast(format!("lock error: {err}"), cx);
-            }
-        }
-    }
-
-    pub(super) fn accept_all_new_into_lock(&mut self, cx: &mut Context<Self>) {
-        let Some(lock_path) = self.active_lock_path() else {
-            return;
-        };
-        let additions: Vec<(trace::Access, bool)> = self
-            .access_rows()
-            .into_iter()
-            .filter(|e| e.new)
-            .map(|e| {
-                (
-                    trace::Access {
-                        action: e.action,
-                        resource: e.resource,
-                    },
-                    e.implied,
-                )
-            })
-            .collect();
-        if additions.is_empty() {
-            return;
-        }
-        match trace::accept_into_lock(&lock_path, &additions) {
-            Ok(added) => {
-                let msg = if i18n::is_zh() {
-                    format!("已将 +{added} 项权限写入 lenslet.lock")
-                } else {
-                    format!("Added +{added} permissions to lenslet.lock")
-                };
-                self.show_toast(msg, cx);
-            }
-            Err(err) => {
-                self.show_toast(format!("lock error: {err}"), cx);
-            }
-        }
-    }
-
-    pub(super) fn toggle_permission_test_mark(
-        &mut self,
-        access: trace::Access,
-        implied: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(lock_path) = self.active_lock_path() else {
-            return;
-        };
-        match trace::toggle_lock_test_mark(&lock_path, &access, implied) {
-            Ok(now_test) => {
-                let msg = if now_test {
-                    i18n::pick(
-                        "Marked `# test` in lenslet.lock",
-                        "已在 lenslet.lock 标记 `# test`",
-                    )
-                } else {
-                    i18n::pick(
-                        "Removed `# test` mark in lenslet.lock",
-                        "已取消 `# test` 标记",
-                    )
-                };
-                self.show_toast(msg.to_string(), cx);
-            }
-            Err(err) => {
-                self.show_toast(format!("lock error: {err}"), cx);
-            }
-        }
-    }
-
-    // -- Data & Filtering --------------------------------------------------
-
-    fn refresh_view(&mut self) {
-        self.facets = service_facets(self.rows.iter().map(|row| row.as_ref()));
-
-        if let Some(svc) = self.call_filter.service.as_deref()
-            && !self.facets.iter().any(|facet| facet.id == svc)
-        {
-            self.call_filter.service = None;
-        }
-
-        self.counts.total = self.rows.len();
-        let report = self.run.as_ref().and_then(|run| run.report.as_ref());
-        self.counts.retries = report
-            .map(|r| r.retries)
-            .filter(|retries| *retries > 0)
-            .unwrap_or_else(|| self.rows.iter().filter(|row| row.is_retry()).count());
-        self.counts.blocked = report
-            .map(|r| r.blocked)
-            .filter(|blocked| *blocked > 0)
-            .unwrap_or_else(|| self.rows.iter().filter(|row| row.blocked).count());
-        if self.call_filter.status == StatusFilter::Blocked && self.counts.blocked == 0 {
-            self.call_filter.status = StatusFilter::All;
-        }
-        self.counts.errors = self.rows.iter().filter(|row| row.is_error()).count();
-        self.counts.slow = self
-            .rows
-            .iter()
-            .filter(|row| row.pending || row.ms >= 500)
-            .count();
-
-        let tokens = search_tokens(&self.query);
-        let run_start = self.run_start_ms();
-        let mut view = Vec::new();
-        for (index, row) in self.rows.iter().enumerate() {
-            if self.call_filter.matches_at(row, run_start) && matches_search(row, &tokens) {
-                view.push(index);
-            }
-        }
-        self.counts.visible = view.len();
-        self.view = Rc::new(view);
-
-        if !self.selection_locked {
-            self.selected = self.view.last().copied();
-        } else if let Some(selected) = self.selected
-            && !self.view.contains(&selected)
-        {
-            self.selected = self.view.last().copied();
-        }
-        if self.rows.is_empty() {
-            self.selected = None;
-        }
-    }
-
-    fn reveal_selected(&self) {
-        if let Some(selected) = self.selected
-            && let Some(position) = self.view.iter().position(|index| *index == selected)
-        {
-            self.scroll.scroll_to_item(position, ScrollStrategy::Center);
-        }
-    }
-
-    fn near_bottom(&self) -> bool {
-        let state = self.scroll.0.borrow();
-        let max = state.base_handle.max_offset().height;
-        if max <= px(1.0) {
-            return true;
-        }
-        let offset = state.base_handle.offset().y;
-        (-offset + px(36.0)) >= max
-    }
-
-    fn should_follow(&self) -> bool {
-        if self.paused {
-            return false;
-        }
-        self.near_bottom()
-            && self
-                .selected
-                .is_none_or(|selected| selected + 1 >= self.rows.len())
-    }
-
-    fn apply_rows(&mut self, incoming: Vec<Trace>, replace: bool, follow: bool) {
-        let selected_key = self
-            .selected
-            .and_then(|index| self.rows.get(index))
-            .map(|row| row.key());
-        let base: &[Arc<Trace>] = if replace { &[] } else { &self.rows };
-        self.rows = Rc::new(trace::merge(base, incoming));
-        self.hydrated_cache = None;
-        self.selected =
-            selected_key.and_then(|key| self.rows.iter().position(|row| row.key() == key));
-
-        self.refresh_view();
-        if follow && !self.view.is_empty() {
-            self.scroll
-                .scroll_to_item(self.view.len() - 1, ScrollStrategy::Bottom);
-        }
-    }
-
-    fn ingest(&mut self, incoming: Vec<Trace>, replace: bool, cx: &mut Context<Self>) {
-        if self.paused {
-            if replace {
-                self.buffered.clear();
-                self.pending_replace = true;
-            }
-            self.buffered.extend(incoming);
-            if self.buffered.len() > MAX_ROWS {
-                let dropped = self.buffered.len() - MAX_ROWS;
-                self.buffered.drain(..dropped);
-            }
-            cx.notify();
-            return;
-        }
-
-        let follow = self.should_follow();
-        self.apply_rows(incoming, replace, follow);
-        cx.notify();
-    }
-
-    fn toggle_pause(&mut self, cx: &mut Context<Self>) {
-        self.paused = !self.paused;
-        if !self.paused {
-            let follow = self.near_bottom()
-                && self
-                    .selected
-                    .is_none_or(|selected| selected + 1 >= self.rows.len());
-            let buffered = std::mem::take(&mut self.buffered);
-            let replace = std::mem::take(&mut self.pending_replace);
-            if !buffered.is_empty() || replace {
-                self.apply_rows(buffered, replace, follow);
-            }
-        }
-        cx.notify();
-    }
-
-    fn apply_tail(&mut self, event: TailEvent, cx: &mut Context<Self>) {
-        if let Some(tailer) = self.tailer.as_ref() {
-            self.skipped = tailer.skipped();
-            let path = tailer.path().map(Path::to_path_buf);
-            let run = tailer.run();
-            if path != self.trace_path || run != self.run {
-                if path != self.trace_path {
-                    self.probe = Probe::default();
-                    self.diff_base = None;
-                }
-                self.trace_path = path;
-                self.run = run;
-                self.refresh_view();
-                cx.notify();
-            }
-        }
-        match event {
-            TailEvent::Missing => {
-                if self.health != TraceHealth::Missing {
-                    self.health = TraceHealth::Missing;
-                    cx.notify();
-                }
-            }
-            TailEvent::Error(error) => {
-                if self.health != TraceHealth::Error(error.clone()) {
-                    self.health = TraceHealth::Error(error);
-                    cx.notify();
-                }
-            }
-            TailEvent::Idle => {
-                if self.health != TraceHealth::Ok {
-                    self.health = TraceHealth::Ok;
-                    cx.notify();
-                }
-            }
-            TailEvent::Appended(incoming) => {
-                self.health = TraceHealth::Ok;
-                if incoming.is_empty() {
-                    cx.notify();
-                } else {
-                    self.ingest(incoming, false, cx);
-                }
-            }
-            TailEvent::Replaced(found) => {
-                self.health = TraceHealth::Ok;
-                self.ingest(found, true, cx);
-            }
-        }
-    }
-
-    fn start_polling(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let mut tick: u64 = 0;
-            loop {
-                cx.background_executor().timer(POLL_INTERVAL).await;
-                tick += 1;
-                if tick % PROBE_EVERY == 1 {
-                    let targets = this.update(cx, |app, _| app.probe_targets());
-                    let Ok(targets) = targets else {
-                        break;
-                    };
-                    let probe = cx
-                        .background_executor()
-                        .spawn(async move { Probe::run(targets) })
-                        .await;
-                    let changed = this.update(cx, |app, cx| {
-                        if app.probe != probe {
-                            app.probe = probe;
-                            cx.notify();
-                        }
-                    });
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-
-                let payload = this.update(cx, |app, _| {
-                    app.tailer
-                        .as_ref()
-                        .map(|tailer| (app.tailer_generation, tailer.clone()))
-                });
-                let Ok(payload) = payload else {
-                    break;
-                };
-                let Some((generation, tailer)) = payload else {
-                    continue;
-                };
-
-                let (tailer, event) = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let mut tailer = tailer;
-                        let event = tailer.poll();
-                        (tailer, event)
-                    })
-                    .await;
-
-                let result = this.update(cx, |app, cx| {
-                    if app.tailer_generation == generation {
-                        app.tailer = Some(tailer);
-                        app.apply_tail(event, cx);
-                    }
-                });
-                if result.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    pub(super) fn reload_now(&mut self, cx: &mut Context<Self>) {
-        if self.demo {
-            self.show_toast(
-                i18n::pick("Demo data is static", "演示数据为静态内容").to_string(),
-                cx,
-            );
-            return;
-        }
-        self.tailer_generation += 1;
-        let mut tailer = Tailer::follow(self.source.clone());
-        let event = tailer.poll();
-        self.skipped = tailer.skipped();
-        self.tailer = Some(tailer);
-        self.apply_tail(event, cx);
-        self.show_toast(
-            i18n::pick("Reloaded trace", "已重新加载 Trace").to_string(),
-            cx,
-        );
-    }
-
-    fn set_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
-        if self.tab != tab {
-            self.tab = tab;
-            cx.notify();
-        }
-    }
-
-    fn select_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = Some(index);
-        self.selection_locked = true;
-        self.expand_body = false;
-        self.raw_body = self.prefs.raw_body_default;
-        if !self.prefs.inspector_open {
-            self.prefs.inspector_open = true;
-        }
-        window.focus(&self.root_focus);
-        cx.notify();
-    }
-
-    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.pane == Pane::Access {
-            let rows = self.filtered_access_rows();
-            if rows.is_empty() {
-                return;
-            }
-            let current = self.selected_access.as_ref().and_then(|sel| {
-                rows.iter()
-                    .position(|r| r.action == sel.action && r.resource == sel.resource)
-            });
-            let next = match current {
-                Some(pos) => (pos as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
-                None => 0,
-            };
-            self.selected_access = Some(trace::Access {
-                action: rows[next].action.clone(),
-                resource: rows[next].resource.clone(),
-            });
-            cx.notify();
-            return;
-        }
-
-        self.selection_locked = true;
-        if self.view.is_empty() {
-            self.selected = None;
-            cx.notify();
-            return;
-        }
-        let current = self
-            .selected
-            .and_then(|raw| self.view.iter().position(|index| *index == raw));
-        let next = match current {
-            Some(position) => {
-                (position as isize + delta).clamp(0, self.view.len() as isize - 1) as usize
-            }
-            None => {
-                if delta > 0 {
-                    0
-                } else {
-                    self.view.len() - 1
-                }
-            }
-        };
-        self.selected = Some(self.view[next]);
-        self.expand_body = false;
-        self.raw_body = self.prefs.raw_body_default;
-        self.scroll.scroll_to_item(next, ScrollStrategy::Center);
-        cx.notify();
-    }
-
-    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.search_focus);
-        cx.notify();
-    }
-
-    fn clear_search_and_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.call_filter = CallFilter::default();
-        self.access_filter = AccessFilter::default();
-        self.search
-            .update(cx, |search, cx| search.clear(window, cx));
-        self.query.clear();
-        self.refresh_view();
-        self.reveal_selected();
-        cx.notify();
-    }
-
-    fn copy_text(&mut self, label: &'static str, text: String, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.show_toast(i18n::copied_toast(label), cx);
-    }
-
-    fn show_toast(&mut self, message: String, cx: &mut Context<Self>) {
-        self.toast_seq += 1;
-        let sequence = self.toast_seq;
-        self.toast = Some((message, sequence));
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(TOAST_MILLIS))
-                .await;
-            this.update(cx, |app, cx| {
-                if app.toast.as_ref().map(|(_, seq)| *seq) == Some(sequence) {
-                    app.toast = None;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let search_focused = self.search_focus.is_focused(window);
-
-        if self.palette_open {
-            match keystroke.key.as_str() {
-                "escape" => {
-                    self.close_palette(window, cx);
-                    return;
-                }
-                "up" => {
-                    self.palette_index = self.palette_index.saturating_sub(1);
-                    cx.notify();
-                    return;
-                }
-                "down" => {
-                    let count = self.palette_entries(cx).len();
-                    if count > 0 {
-                        self.palette_index = (self.palette_index + 1).min(count - 1);
-                    }
-                    cx.notify();
-                    return;
-                }
-                "enter" => {
-                    let entries = self.palette_entries(cx);
-                    if let Some(entry) =
-                        entries.get(self.palette_index.min(entries.len().saturating_sub(1)))
-                    {
-                        let cmd = entry.cmd.clone();
-                        self.execute_palette_cmd(cmd, window, cx);
-                    } else {
-                        self.close_palette(window, cx);
-                    }
-                    return;
-                }
-                _ => return,
-            }
-        }
-
-        if keystroke.key == "escape" {
-            if self.settings_open {
-                self.settings_open = false;
-                cx.notify();
-                return;
-            }
-            if self.runs_popover_open {
-                self.runs_popover_open = false;
-                cx.notify();
-                return;
-            }
-            if !search_focused {
-                if self.call_filter.time_window.take().is_some()
-                    || self.call_filter.access.take().is_some()
-                    || self.call_filter.service.take().is_some()
-                {
-                    self.refresh_view();
-                    cx.notify();
-                    return;
-                }
-                if self.call_filter.status != StatusFilter::All {
-                    self.call_filter.status = StatusFilter::All;
-                    self.refresh_view();
-                    cx.notify();
-                    return;
-                }
-            }
-        }
-
-        if keystroke.modifiers.secondary() {
-            match keystroke.key.as_str() {
-                "k" => {
-                    self.open_palette(window, cx);
-                    return;
-                }
-                "f" => {
-                    self.focus_search(window, cx);
-                    return;
-                }
-                "," => {
-                    self.settings_open = !self.settings_open;
-                    self.runs_popover_open = false;
-                    cx.notify();
-                    return;
-                }
-                "b" => {
-                    self.toggle_inspector(cx);
-                    return;
-                }
-                "r" => {
-                    self.reload_now(cx);
-                    return;
-                }
-                "enter" => {
-                    self.trigger_replay_selected(cx);
-                    return;
-                }
-                "1" => {
-                    self.set_pane(Pane::Calls, cx);
-                    return;
-                }
-                "2" => {
-                    self.set_pane(Pane::Access, cx);
-                    return;
-                }
-                "3" => {
-                    self.set_pane(Pane::Diff, cx);
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        if self.settings_open {
-            return;
-        }
-
-        match keystroke.key.as_str() {
-            "/" if !search_focused && !keystroke.modifiers.modified() => {
-                self.focus_search(window, cx);
-            }
-            "a" if !search_focused && !keystroke.modifiers.modified() => {
-                let next = if self.pane == Pane::Access {
-                    Pane::Calls
-                } else {
-                    Pane::Access
-                };
-                self.set_pane(next, cx);
-            }
-            "d" if !search_focused && !keystroke.modifiers.modified() => {
-                let next = if self.pane == Pane::Diff {
-                    Pane::Calls
-                } else {
-                    Pane::Diff
-                };
-                self.set_pane(next, cx);
-            }
-            "up" if !search_focused => self.move_selection(-1, cx),
-            "down" if !search_focused => self.move_selection(1, cx),
-            "enter" if search_focused => {
-                window.focus(&self.root_focus);
-                cx.notify();
-            }
-            "space" if !search_focused => self.toggle_pause(cx),
-            "c" if !search_focused && !keystroke.modifiers.modified() => {
-                self.copy_selected_curl(cx)
-            }
-            "[" if !search_focused => self.step_run(-1, cx),
-            "]" if !search_focused => self.step_run(1, cx),
-            "1" if !search_focused && !keystroke.modifiers.modified() => {
-                self.set_tab(InspectorTab::Exchange, cx)
-            }
-            "2" if !search_focused && !keystroke.modifiers.modified() => {
-                self.set_tab(InspectorTab::Headers, cx)
-            }
-            "3" if !search_focused && !keystroke.modifiers.modified() => {
-                self.set_tab(InspectorTab::IamMeta, cx)
-            }
-            _ => {}
-        }
-    }
-
-    pub(super) fn set_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
-        if self.pane != pane {
-            self.pane = pane;
-            let access_mode = pane == Pane::Access;
-            self.search
-                .update(cx, |s, cx| s.set_access_mode(access_mode, cx));
-            if access_mode && self.selected_access.is_none() {
-                self.selected_access = self.access_rows().first().map(|e| trace::Access {
-                    action: e.action.clone(),
-                    resource: e.resource.clone(),
-                });
-            }
-            cx.notify();
-        }
-    }
-
-    pub(super) fn filter_calls_by_access(&mut self, access: trace::Access, cx: &mut Context<Self>) {
-        self.call_filter.access = Some(access);
-        self.set_pane(Pane::Calls, cx);
-        self.selection_locked = false;
-        self.refresh_view();
-        self.reveal_selected();
-        cx.notify();
-    }
-
-    fn run_position(&self) -> Option<(usize, usize)> {
-        let Source::Runs { dir, .. } = &self.source else {
-            return None;
-        };
-        let runs = trace::list_runs(dir);
-        let current = self.trace_path.as_ref()?;
-        let index = runs.iter().position(|run| run == current)?;
-        Some((index + 1, runs.len()))
-    }
-
-    pub(super) fn follow_latest_run(&mut self, cx: &mut Context<Self>) {
-        if self.demo {
-            return;
-        }
-        let Source::Runs { dir, .. } = &self.source else {
-            return;
-        };
-        self.switch_source(
-            Source::Runs {
-                dir: dir.clone(),
-                pinned: None,
-            },
-            cx,
-        );
-    }
-
-    pub(super) fn pin_run(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.demo {
-            return;
-        }
-        let Source::Runs { dir, .. } = &self.source else {
-            return;
-        };
-        self.switch_source(
-            Source::Runs {
-                dir: dir.clone(),
-                pinned: Some(path),
-            },
-            cx,
-        );
-    }
-
-    fn switch_source(&mut self, next_source: Source, cx: &mut Context<Self>) {
-        self.source = next_source;
-        self.selected = None;
-        self.hydrated_cache = None;
-        self.selection_locked = false;
-        self.expand_body = false;
-        self.call_filter = CallFilter::default();
-        self.diff_base = None;
-        self.tailer_generation += 1;
-        let mut tailer = Tailer::follow(self.source.clone());
-        let event = tailer.poll();
-        self.tailer = Some(tailer);
-        self.apply_tail(event, cx);
-        cx.notify();
-    }
-
-    fn step_run(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.demo {
-            return;
-        }
-        let Source::Runs { dir, .. } = &self.source else {
-            self.show_toast("pinned to LENSLET_TRACE".to_string(), cx);
-            return;
-        };
-        let dir = dir.clone();
-        let runs = trace::list_runs(&dir);
-        let Some(current) = self
-            .trace_path
-            .as_ref()
-            .and_then(|path| runs.iter().position(|run| run == path))
-        else {
-            return;
-        };
-        let target = (current as isize + delta).clamp(0, runs.len() as isize - 1) as usize;
-        if target == current {
-            return;
-        }
-        let pinned = (target + 1 < runs.len()).then(|| runs[target].clone());
-        self.switch_source(Source::Runs { dir, pinned }, cx);
-    }
-
-    fn access_rows(&self) -> Vec<trace::AccessEntry> {
-        let live_lock = self.run.as_ref().and_then(|run| {
-            trace::read_live_lock(
-                &run.header.cwd,
-                run.header.lock.as_deref(),
-                run.header.policy.as_deref(),
-            )
-        });
-        let has_live_lock_file = live_lock.as_ref().is_some_and(|l| l.exists);
-        let test_marks = live_lock.as_ref().map(|l| &l.test);
-
-        if let Some(report) = self.run.as_ref().and_then(|run| run.report.as_ref()) {
-            let mut rows = report.access.clone();
-            let mut seen_used = std::collections::BTreeSet::new();
-            for entry in &mut rows {
-                let key = trace::Access {
-                    action: entry.action.clone(),
-                    resource: entry.resource.clone(),
-                };
-                seen_used.insert(key.clone());
-                entry.test = test_marks.is_some_and(|m| m.contains(&key));
-                if let Some(live) = live_lock.as_ref().filter(|l| l.exists) {
-                    entry.new = !live.access.contains(&key);
-                }
-            }
-            if let Some(live) = live_lock.as_ref().filter(|l| l.exists) {
-                for locked_entry in &live.access {
-                    if !seen_used.contains(locked_entry) {
-                        rows.push(trace::AccessEntry {
-                            action: locked_entry.action.clone(),
-                            resource: locked_entry.resource.clone(),
-                            unused: true,
-                            implied: live.implied.contains(locked_entry),
-                            test: live.test.contains(locked_entry),
-                            ..trace::AccessEntry::default()
-                        });
-                    }
-                }
-            } else {
-                for unused in &report.access_unused {
-                    rows.push(trace::AccessEntry {
-                        action: unused.action.clone(),
-                        resource: unused.resource.clone(),
-                        unused: true,
-                        test: test_marks.is_some_and(|m| m.contains(unused)),
-                        ..trace::AccessEntry::default()
-                    });
-                }
-            }
-            rows.sort_by(|a, b| {
-                a.action
-                    .cmp(&b.action)
-                    .then_with(|| a.resource.cmp(&b.resource))
-            });
-            return rows;
-        }
-        let mut table: std::collections::BTreeMap<trace::Access, trace::AccessEntry> =
-            std::collections::BTreeMap::new();
-        for row in self.rows.iter().filter(|row| !row.pending) {
-            for (call_access, implied) in row.call_access() {
-                let key = call_access.key();
-                let is_new = if let Some(live) = live_lock.as_ref().filter(|_| has_live_lock_file) {
-                    !live.access.contains(&key)
-                } else {
-                    row.is_access_new(call_access)
-                };
-                let entry = table
-                    .entry(key.clone())
-                    .or_insert_with(|| trace::AccessEntry {
-                        action: key.action.clone(),
-                        resource: key.resource.clone(),
-                        implied,
-                        test: test_marks.is_some_and(|m| m.contains(&key)),
-                        ..trace::AccessEntry::default()
-                    });
-                entry.calls += 1;
-                entry.errors += usize::from(row.is_error());
-                entry.implied &= implied;
-                entry.new |= is_new;
-                let via = format!("{} {}", row.service_name(), operation_label(row));
-                if entry.via.len() < 3 && !entry.via.contains(&via) {
-                    entry.via.push(via);
-                }
-            }
-        }
-        if let Some(live) = live_lock.as_ref().filter(|l| l.exists) {
-            for locked_entry in &live.access {
-                table
-                    .entry(locked_entry.clone())
-                    .or_insert_with(|| trace::AccessEntry {
-                        action: locked_entry.action.clone(),
-                        resource: locked_entry.resource.clone(),
-                        unused: true,
-                        implied: live.implied.contains(locked_entry),
-                        test: live.test.contains(locked_entry),
-                        ..trace::AccessEntry::default()
-                    });
-            }
-        }
-        table.into_values().collect()
-    }
-
-    pub(super) fn run_start_ms(&self) -> Option<i64> {
-        self.run
-            .as_ref()
-            .and_then(|run| trace::parse_rfc3339_ms(&run.header.started))
-            .or_else(|| self.rows.first().and_then(|row| row.at_ms()))
-    }
-
-    pub(super) fn run_span_ms(&self) -> i64 {
-        if let Some(rep) = self
-            .run
-            .as_ref()
-            .and_then(|r| r.report.as_ref())
-            .filter(|r| r.duration_ms > 0)
-        {
-            return rep.duration_ms as i64;
-        }
-        let Some(start) = self.run_start_ms() else {
-            return 1;
-        };
-        let end = self
-            .rows
-            .iter()
-            .filter_map(|r| r.at_ms().map(|at| at + r.ms as i64))
-            .max()
-            .unwrap_or(start + 1);
-        (end - start).max(1)
-    }
-
-    pub(super) fn invocation_stats(&self, trace: &Trace) -> Option<(usize, u64)> {
-        let id = trace.invocation_id.as_deref()?;
-        let mut count = 0usize;
-        let mut total_ms = 0u64;
-        for row in self.rows.iter().filter(|row| !row.pending) {
-            if row.invocation_id.as_deref() == Some(id) {
-                count += 1;
-                total_ms += row.ms;
-            }
-        }
-        (count > 1).then_some((count, total_ms))
-    }
-
-    fn copy_button(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        text: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(text) = text else {
-            return div().into_any_element();
-        };
-        action_button(id, i18n::pick("Copy", "复制"))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.copy_text(label, text.clone(), cx);
-            }))
-            .into_any_element()
-    }
-
-    fn render_splitter(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let t = theme::p();
-        let dragging = self.dragging_splitter;
-        div()
-            .id("inspector-splitter")
-            .w(px(theme::SPLITTER_W))
-            .flex_shrink_0()
-            .cursor(CursorStyle::ResizeLeftRight)
-            .bg(if dragging {
-                theme::h(t.accent, 0.45)
-            } else {
-                theme::h(t.border, 1.0)
-            })
-            .hover(move |s| s.bg(theme::h(t.accent, 0.35)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.dragging_splitter = true;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-    }
-}
-
-impl Render for LensletApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        i18n::set_lang(self.prefs.lang);
-        theme::set_appearance(theme::resolve(self.prefs.theme, window.appearance()));
-        theme::set_accent(self.prefs.accent);
-        let t = theme::p();
-
-        let viewport_width = window.viewport_size().width.to_f64() as f32;
-        let compact = viewport_width < 1_180.0;
-        let show_inspector = self.prefs.inspector_open && self.pane != Pane::Diff;
-        let max_insp = (viewport_width - 420.0).clamp(320.0, 780.0);
-        let inspector_w = if show_inspector {
-            self.prefs.clamped_inspector_width().min(max_insp)
-        } else {
-            0.0
-        };
-        let splitter_w = if show_inspector {
-            theme::SPLITTER_W
-        } else {
-            0.0
-        };
-
-        let fixed_columns = theme::COL_TIME
-            + theme::COL_SERVICE
-            + theme::COL_STATUS
-            + theme::COL_LATENCY
-            + theme::COL_AUTH;
-        let op_width = (viewport_width
-            - inspector_w
-            - splitter_w
-            - theme::ROW_PAD_X * 2.0
-            - fixed_columns
-            - theme::COL_GAP * 5.0
-            - 8.0)
-            .max(60.0);
-
-        let header = self.render_header(cx);
-        let subbar = self.render_subbar(compact, cx);
-        let strip = (self.pane == Pane::Calls && self.show_all_services)
-            .then(|| self.render_service_strip(cx));
-
-        let workspace: AnyElement = if self.pane == Pane::Diff {
-            self.render_diff(cx).into_any_element()
-        } else {
-            let stream = self.render_stream(op_width, cx);
-            let mut split = div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h(px(0.0))
-                .child(stream);
-            if show_inspector {
-                let splitter = self.render_splitter(cx);
-                let inspector = self.render_inspector(inspector_w, cx);
-                split = split.child(splitter).child(inspector);
-            }
-            split.into_any_element()
-        };
-
-        let runs_popover = self.runs_popover_open.then(|| self.render_runs_popover(cx));
-        let settings_modal = self.settings_open.then(|| self.render_settings_modal(cx));
-        let palette_modal = self.palette_open.then(|| self.render_command_palette(cx));
-        let toast = self.render_floating_toast();
-
-        div()
-            .id("lenslet")
-            .relative()
+/// A child view that keeps its last frame until it notifies. It lays out as
+/// a flexible column that fills its parent's main axis.
+fn cached<V: Render>(view: &Entity<V>) -> gpui::AnyView {
+    gpui::AnyView::from(view.clone()).cached(
+        gpui::StyleRefinement::default()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
             .flex()
-            .flex_col()
-            .size_full()
-            .bg(rgb(t.canvas))
-            .text_color(rgb(t.text))
-            .font(fonts::sans_font())
-            .track_focus(&self.root_focus)
-            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
-                if this.palette_open {
-                    this.close_palette(window, cx);
-                } else {
-                    this.open_palette(window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                this.palette_open = false;
-                this.focus_search(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.settings_open = !this.settings_open;
-                this.runs_popover_open = false;
-                this.palette_open = false;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
-                this.toggle_inspector(cx);
-            }))
-            .on_action(cx.listener(|this, _: &ReloadTrace, _, cx| {
-                this.reload_now(cx);
-            }))
-            .on_action(cx.listener(|this, _: &ReplaySelectedAction, _, cx| {
-                this.trigger_replay_selected(cx);
-            }))
-            .on_action(cx.listener(|this, _: &SwitchCalls, _, cx| {
-                this.set_pane(Pane::Calls, cx);
-            }))
-            .on_action(cx.listener(|this, _: &SwitchAccess, _, cx| {
-                this.set_pane(Pane::Access, cx);
-            }))
-            .on_action(cx.listener(|this, _: &SwitchDiff, _, cx| {
-                this.set_pane(Pane::Diff, cx);
-            }))
-            .on_action(cx.listener(|this, _: &PrevRunAction, _, cx| {
-                this.step_run(-1, cx);
-            }))
-            .on_action(cx.listener(|this, _: &NextRunAction, _, cx| {
-                this.step_run(1, cx);
-            }))
-            .on_action(cx.listener(|this, _: &FollowLatestAction, _, cx| {
-                this.follow_latest_run(cx);
-            }))
-            .on_action(cx.listener(|this, _: &CopyCurlAction, _, cx| {
-                this.copy_selected_curl(cx);
-            }))
-            .on_action(cx.listener(|this, _: &ExportPolicyAction, _, cx| {
-                let json = trace::export_policy_json(&this.access_rows());
-                this.copy_text("policy JSON", json, cx);
-            }))
-            .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, _cx| {
-                    if !this.palette_open {
-                        window.focus(&this.root_focus);
-                    }
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                if this.dragging_splitter {
-                    let vw = window.viewport_size().width.to_f64() as f32;
-                    let x = event.position.x.to_f64() as f32;
-                    let max_w = (vw - 420.0).clamp(320.0, 780.0);
-                    this.prefs.inspector_width = (vw - x).clamp(320.0, max_w);
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if this.dragging_splitter {
-                        this.dragging_splitter = false;
-                        prefs::save(&home(), &this.prefs);
-                        cx.notify();
-                    }
-                }),
-            )
-            .child(header)
-            .child(subbar)
-            .children(strip)
-            .child(workspace)
-            .children(runs_popover)
-            .children(settings_modal)
-            .children(palette_modal)
-            .children(toast)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Side {
-    Request,
-    Response,
+            .flex_col(),
+    )
 }
 
 pub(crate) fn home() -> PathBuf {
@@ -1605,69 +181,1341 @@ pub(crate) fn home() -> PathBuf {
 fn trace_source() -> Source {
     match std::env::var_os("LENSLET_TRACE") {
         Some(path) => Source::File(PathBuf::from(path)),
-        None => {
-            let home = home();
-            Source::Runs {
-                dir: home.join(".lenslet/runs"),
-                pinned: None,
-            }
-        }
+        None => Source::Runs {
+            dir: lenslet_core::runs::dir(&home()),
+            pinned: None,
+        },
     }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Probe {
-    proxy: Option<bool>,
-    emulator: Option<bool>,
-}
-
-#[derive(Default)]
-struct ProbeTargets {
-    proxy: Option<String>,
-    emulator: Option<String>,
-}
-
-impl Probe {
-    fn run(targets: ProbeTargets) -> Probe {
-        Probe {
-            proxy: targets.proxy.as_deref().map(tcp_answers),
-            emulator: targets.emulator.as_deref().map(tcp_answers),
-        }
-    }
-}
-
-fn tcp_answers(address: &str) -> bool {
-    use std::net::{TcpStream, ToSocketAddrs};
-    let Ok(mut addresses) = address.to_socket_addrs() else {
-        return false;
-    };
-    addresses.any(|address| TcpStream::connect_timeout(&address, PROBE_TIMEOUT).is_ok())
 }
 
 impl LensletApp {
-    fn probe_targets(&self) -> ProbeTargets {
-        let Some(run) = self.run.as_ref() else {
-            return ProbeTargets::default();
+    pub fn new(prefs: UiPrefs, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Ui::install(cx, Ui::new(&prefs, window.appearance()));
+        let demo = std::env::var_os("LENSLET_DEMO").is_some_and(|v| v == "1");
+        let session = cx.new(|cx| Session::new(trace_source(), demo, cx));
+        let calls = cx.new(|cx| CallsList::new(session.clone(), cx));
+        let inspector = cx.new(|cx| Inspector::new(session.clone(), home(), cx));
+        let access = cx.new(|cx| AccessView::new(session.clone(), cx));
+        let access_detail = cx.new(|_| AccessDetail::new(session.clone()));
+        let search = cx.new(SearchInput::new);
+        let palette_input = cx.new(SearchInput::new_palette);
+
+        let mut subscriptions = vec![
+            cx.subscribe(&session, |this, _, event, cx| match event {
+                SessionEvent::Toast(message) => this.show_toast(message.clone(), cx),
+                SessionEvent::RunChanged | SessionEvent::Runs => cx.notify(),
+                SessionEvent::Derived => {
+                    // Header shows the baseline summary.
+                    cx.notify();
+                }
+                SessionEvent::Rows(_) => {}
+            }),
+            cx.observe(&session, |_, _, cx| cx.notify()),
+            cx.subscribe(&calls, |this, _, event, cx| match event {
+                CallsEvent::Selected(call) => {
+                    let call = call.clone();
+                    this.inspector
+                        .update(cx, |inspector, cx| inspector.set_call(call, cx));
+                }
+                CallsEvent::ContextMenu(position, call) => {
+                    let entries = this.call_menu(call.clone(), cx);
+                    this.overlay = Some(Overlay::Menu(*position, entries));
+                    cx.notify();
+                }
+                CallsEvent::Toast(message) => this.show_toast(message.clone(), cx),
+            }),
+            cx.subscribe(&inspector, |this, _, event, cx| match event {
+                InspectorEvent::OpenAccess(access) => {
+                    let access = access.clone();
+                    this.set_mode(Mode::Access, cx);
+                    this.access.update(cx, |view, cx| view.select(access, cx));
+                }
+                InspectorEvent::Select(id) => {
+                    let id = id.clone();
+                    this.calls
+                        .update(cx, |list, cx| list.select_id(Some(id), true, cx));
+                }
+                InspectorEvent::Toast(message) => this.show_toast(message.clone(), cx),
+            }),
+            cx.subscribe(&access, |this, _, event, cx| {
+                this.on_access_event(event, cx)
+            }),
+            cx.subscribe(&access_detail, |this, _, event, cx| {
+                this.on_access_event(event, cx)
+            }),
+            cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
+                SearchEvent::Exit => this.focus_list(window, cx),
+            }),
+            cx.observe(&search, |this, search, cx| {
+                let query = search.read(cx).query().to_string();
+                this.apply_query(query, cx);
+            }),
+            cx.observe(&palette_input, |this, _, cx| {
+                this.palette_index = 0;
+                this.refresh_palette(cx);
+            }),
+            cx.observe_window_appearance(window, |this, window, cx| {
+                this.restyle(window, cx);
+            }),
+        ];
+        subscriptions.push(cx.observe_window_bounds(window, |this, window, cx| {
+            let size = window.viewport_size();
+            let (w, h) = (f32::from(size.width), f32::from(size.height));
+            if w >= 960.0 && h >= 640.0 {
+                this.prefs.window_width = Some(w.round());
+                this.prefs.window_height = Some(h.round());
+                this.save_prefs(cx);
+            }
+        }));
+
+        let root_focus = cx.focus_handle();
+        let app = LensletApp {
+            session,
+            calls,
+            inspector,
+            access,
+            access_detail,
+            search,
+            palette_input,
+            root_focus,
+            mode: Mode::Calls,
+            prefs,
+            overlay: None,
+            palette_open: false,
+            palette_index: 0,
+            palette_entries: Vec::new(),
+            settings_open: false,
+            storage: None,
+            toast: None,
+            toast_seq: 0,
+            prefs_seq: 0,
+            _tasks: Vec::new(),
+            _subscriptions: subscriptions,
         };
-        ProbeTargets {
-            proxy: (!run.ended())
-                .then(|| RunInfo::address(&run.header.endpoint).map(str::to_string))
-                .flatten(),
-            emulator: RunInfo::address(&run.header.upstream).map(str::to_string),
+        // The list may have picked a call before we subscribed (demo).
+        let selected = app.calls.read(cx).selected();
+        app.inspector
+            .update(cx, |inspector, cx| inspector.set_call(selected, cx));
+        let permission = app.access.read(cx).selected();
+        app.access_detail
+            .update(cx, |detail, cx| detail.set_row(permission, cx));
+        let focus = app.calls.focus_handle(cx);
+        window.focus(&focus);
+        app
+    }
+
+    fn on_access_event(&mut self, event: &AccessEvent, cx: &mut Context<Self>) {
+        match event {
+            AccessEvent::Selected(row) => {
+                let row = row.clone();
+                self.access_detail
+                    .update(cx, |detail, cx| detail.set_row(row, cx));
+            }
+            AccessEvent::ContextMenu(position, row) => {
+                let entries = self.access_menu(row, cx);
+                self.overlay = Some(Overlay::Menu(*position, entries));
+                cx.notify();
+            }
+            AccessEvent::FilterCalls(access) => {
+                self.run_cmd_cx(Cmd::FilterAccess(access.clone()), cx);
+            }
+            AccessEvent::SelectCall(id) => {
+                let id = id.clone();
+                self.set_mode(Mode::Calls, cx);
+                self.calls
+                    .update(cx, |list, cx| list.select_id(Some(id), true, cx));
+            }
+            AccessEvent::Toast(message) => self.show_toast(message.clone(), cx),
+        }
+    }
+
+    fn apply_query(&mut self, query: String, cx: &mut Context<Self>) {
+        let tokens = search_tokens(&query);
+        self.calls
+            .update(cx, |list, cx| list.set_query(query.clone(), cx));
+        self.access
+            .update(cx, |view, cx| view.set_tokens(tokens.clone(), cx));
+        self.inspector
+            .update(cx, |inspector, cx| inspector.set_tokens(tokens, cx));
+    }
+
+    /// Appearance or accent changed: publish the new look and re-highlight.
+    fn restyle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if Ui::install(cx, Ui::new(&self.prefs, window.appearance())) {
+            self.inspector
+                .update(cx, |inspector, cx| inspector.restyle(cx));
+            cx.refresh_windows();
+        }
+    }
+
+    /// Write preferences at most every [`PREFS_DEBOUNCE`], off the main thread.
+    fn save_prefs(&mut self, cx: &mut Context<Self>) {
+        self.prefs_seq += 1;
+        let seq = self.prefs_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PREFS_DEBOUNCE).await;
+            let Ok(Some(prefs)) = this.update(cx, |app, _| {
+                (app.prefs_seq == seq).then(|| app.prefs.clone())
+            }) else {
+                return;
+            };
+            cx.background_executor()
+                .spawn(async move { prefs::save(&home(), &prefs) })
+                .await;
+        })
+        .detach();
+    }
+
+    fn update_prefs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut UiPrefs),
+    ) {
+        f(&mut self.prefs);
+        self.restyle(window, cx);
+        self.save_prefs(cx);
+        cx.notify();
+    }
+
+    fn show_toast(&mut self, message: String, cx: &mut Context<Self>) {
+        self.toast_seq += 1;
+        let seq = self.toast_seq;
+        self.toast = Some((message, seq));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(TOAST_MILLIS))
+                .await;
+            this.update(cx, |app, cx| {
+                if app.toast.as_ref().is_some_and(|(_, s)| *s == seq) {
+                    app.toast = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn copy(&mut self, label: &str, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        let lang = Ui::of(cx).lang;
+        self.show_toast(i18n::copied(label, lang), cx);
+    }
+
+    fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.search.update(cx, |search, cx| {
+                search.set_access_mode(mode == Mode::Access, cx)
+            });
+            cx.notify();
+        }
+    }
+
+    fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = match self.mode {
+            Mode::Calls => self.calls.focus_handle(cx),
+            Mode::Access => self.access.focus_handle(cx),
+        };
+        window.focus(&focus);
+    }
+
+    // -- Commands -----------------------------------------------------------
+
+    fn run_cmd_cx(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
+        // Commands that need a window are routed through `run_cmd`; the rest
+        // are handled here.
+        match cmd {
+            Cmd::FilterAccess(access) => {
+                self.set_mode(Mode::Calls, cx);
+                self.calls.update(cx, |list, cx| {
+                    let mut filter = list.filter.clone();
+                    filter.access = Some(access);
+                    list.set_filter(filter, cx);
+                });
+            }
+            Cmd::CopyText(label, text) => self.copy(label, text, cx),
+            Cmd::CopyCurl(call) => {
+                let endpoint = self.session.read(cx).header_endpoint().map(str::to_string);
+                match to_curl(&call, endpoint.as_deref()) {
+                    Some(curl) => self.copy("curl", curl, cx),
+                    None => {
+                        self.show_toast("This request's body can't be rebuilt as curl".into(), cx)
+                    }
+                }
+            }
+            Cmd::CopyPolicy => {
+                let rows = self.session.read(cx).access_rows.clone();
+                self.copy("policy JSON", policy_json(&rows), cx);
+            }
+            Cmd::FilterStatus(status) => {
+                self.set_mode(Mode::Calls, cx);
+                self.calls
+                    .update(cx, |list, cx| list.set_status(status, cx));
+            }
+            Cmd::FilterService(service) => {
+                self.set_mode(Mode::Calls, cx);
+                self.calls
+                    .update(cx, |list, cx| list.set_service(Some(service), cx));
+            }
+            Cmd::ClearFilters => {
+                self.calls.update(cx, |list, cx| {
+                    list.set_filter(crate::model::CallFilter::default(), cx)
+                });
+                self.access.update(cx, |view, cx| {
+                    view.clear_filter(cx);
+                });
+            }
+            Cmd::Accept(entries) => {
+                let entries = entries.into_iter().map(|a| (a, false)).collect();
+                self.session
+                    .update(cx, |session, cx| session.accept(entries, cx));
+            }
+            Cmd::SetTestMark(access, test) => {
+                self.session
+                    .update(cx, |session, cx| session.set_test_mark(access, test, cx));
+            }
+            Cmd::Mode(mode) => self.set_mode(mode, cx),
+            Cmd::ToggleInspector => {
+                self.prefs.inspector_open = !self.prefs.inspector_open;
+                self.save_prefs(cx);
+                cx.notify();
+            }
+            Cmd::Reload => self.reload(cx),
+            Cmd::Replay => self
+                .inspector
+                .update(cx, |inspector, cx| inspector.replay(cx)),
+            Cmd::PrevRun => self.session.update(cx, |s, cx| s.step_run(-1, cx)),
+            Cmd::NextRun => self.session.update(cx, |s, cx| s.step_run(1, cx)),
+            Cmd::FollowLatest => self.follow_latest(cx),
+            Cmd::PinRun(path) => self.pin_run(path, cx),
+            Cmd::SetBaseline(baseline) => {
+                self.session
+                    .update(cx, |session, cx| session.set_baseline(baseline, cx));
+            }
+            Cmd::Quit => cx.quit(),
+            Cmd::OpenSettings => self.open_settings(cx),
+            Cmd::FocusSearch | Cmd::Theme(_) | Cmd::Accent(_) | Cmd::Density(_) | Cmd::Lang(_) => {}
+        }
+    }
+
+    fn run_cmd(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = None;
+        match cmd {
+            Cmd::FocusSearch => {
+                let focus = self.search.read(cx).handle();
+                window.focus(&focus);
+            }
+            Cmd::Theme(mode) => self.update_prefs(window, cx, |p| p.theme = mode),
+            Cmd::Accent(accent) => self.update_prefs(window, cx, |p| p.accent = accent),
+            Cmd::Density(density) => self.update_prefs(window, cx, |p| p.density = density),
+            Cmd::Lang(lang) => self.update_prefs(window, cx, |p| p.lang = lang),
+            Cmd::Mode(mode) => {
+                self.set_mode(mode, cx);
+                self.focus_list(window, cx);
+            }
+            other => self.run_cmd_cx(other, cx),
+        }
+        cx.notify();
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.session.read(cx).demo {
+            self.show_toast("Demo data is static".into(), cx);
+            return;
+        }
+        self.session.update(cx, |session, cx| session.reload(cx));
+    }
+
+    fn follow_latest(&mut self, cx: &mut Context<Self>) {
+        let dir = self
+            .session
+            .read(cx)
+            .source
+            .runs_dir()
+            .map(|d| d.to_path_buf());
+        if let Some(dir) = dir {
+            self.session.update(cx, |session, cx| {
+                session.switch(Source::Runs { dir, pinned: None }, cx)
+            });
+        }
+    }
+
+    fn pin_run(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let dir = self
+            .session
+            .read(cx)
+            .source
+            .runs_dir()
+            .map(|d| d.to_path_buf());
+        let newest = self
+            .session
+            .read(cx)
+            .runs
+            .first()
+            .map(|run| run.path.clone());
+        if let Some(dir) = dir {
+            let pinned = (newest.as_ref() != Some(&path)).then_some(path);
+            self.session.update(cx, |session, cx| {
+                session.switch(Source::Runs { dir, pinned }, cx)
+            });
+        }
+    }
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = true;
+        self.overlay = None;
+        self.palette_open = false;
+        self.storage = None;
+        if let Some(dir) = self.session.read(cx).runs_dir() {
+            cx.spawn(async move |this, cx| {
+                let stats = cx
+                    .background_executor()
+                    .spawn(async move { crate::feed::storage_stats(&dir) })
+                    .await;
+                this.update(cx, |app, cx| {
+                    app.storage = Some(stats);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn call_menu(&self, call: Arc<Trace>, cx: &App) -> Vec<MenuEntry> {
+        let ui = Ui::of(cx);
+        let mut entries = vec![MenuEntry {
+            title: ui.t("Copy as curl", "复制为 curl").into(),
+            hint: Some(i18n::shortcut("⇧C")),
+            cmd: Cmd::CopyCurl(call.clone()),
+        }];
+        if let Some(first) = call.access.first().or(call.implied.first()) {
+            entries.push(MenuEntry {
+                title: ui.t("Copy permission", "复制权限").into(),
+                hint: None,
+                cmd: Cmd::CopyText("permission", format!("{} {}", first.action, first.resource)),
+            });
+            entries.push(MenuEntry {
+                title: ui.t("Copy resource ARN", "复制资源 ARN").into(),
+                hint: None,
+                cmd: Cmd::CopyText("ARN", first.resource.clone()),
+            });
+        }
+        entries.push(MenuEntry {
+            title: ui.t("Copy call id", "复制调用 ID").into(),
+            hint: None,
+            cmd: Cmd::CopyText("id", call.id.clone()),
+        });
+        if self.inspector.read(cx).can_replay(cx) {
+            entries.push(MenuEntry {
+                title: ui.t("Replay", "重放").into(),
+                hint: Some(i18n::shortcut("⏎")),
+                cmd: Cmd::Replay,
+            });
+        }
+        entries.push(MenuEntry {
+            title: format!("{} {}", ui.t("Only", "仅显示"), call.service_name()).into(),
+            hint: None,
+            cmd: Cmd::FilterService(call.service_key().to_string()),
+        });
+        entries
+    }
+
+    fn access_menu(&self, row: &AccessRow, cx: &App) -> Vec<MenuEntry> {
+        let ui = Ui::of(cx);
+        let editable = self.session.read(cx).can_edit_lock();
+        let mut entries = Vec::new();
+        if editable && row.used && !row.in_lock {
+            entries.push(MenuEntry {
+                title: ui.t("Accept into lock", "写入 lock").into(),
+                hint: None,
+                cmd: Cmd::Accept(vec![row.access.clone()]),
+            });
+        }
+        if editable {
+            entries.push(MenuEntry {
+                title: if row.test {
+                    ui.t("Unmark # test", "取消 # test").into()
+                } else {
+                    ui.t("Mark # test", "标记 # test").into()
+                },
+                hint: None,
+                cmd: Cmd::SetTestMark(row.access.clone(), !row.test),
+            });
+        }
+        entries.push(MenuEntry {
+            title: ui.t("Copy statement JSON", "复制 Statement JSON").into(),
+            hint: None,
+            cmd: Cmd::CopyText("statement", statement_json(&row.access)),
+        });
+        entries.push(MenuEntry {
+            title: ui.t("Copy resource ARN", "复制资源 ARN").into(),
+            hint: None,
+            cmd: Cmd::CopyText("ARN", row.access.resource.clone()),
+        });
+        if row.used {
+            entries.push(MenuEntry {
+                title: ui.t("Show calls", "查看调用").into(),
+                hint: None,
+                cmd: Cmd::FilterAccess(row.access.clone()),
+            });
+        }
+        entries
+    }
+
+    // -- Keyboard -------------------------------------------------------------
+
+    fn select(&mut self, f: impl FnOnce(SelectTarget, &mut App), cx: &mut Context<Self>) {
+        if self.settings_open {
+            return;
+        }
+        match self.mode {
+            Mode::Calls => f(SelectTarget::Calls(self.calls.clone()), cx),
+            Mode::Access => f(SelectTarget::Access(self.access.clone()), cx),
+        }
+    }
+
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.settings_open {
+            self.settings_open = false;
+            cx.notify();
+            return;
+        }
+        let inspector_focused = self.inspector.focus_handle(cx).contains_focused(window, cx)
+            || self
+                .inspector
+                .read(cx)
+                .body()
+                .focus_handle(cx)
+                .is_focused(window);
+        if inspector_focused {
+            self.focus_list(window, cx);
+            cx.notify();
+            return;
+        }
+        let cleared = match self.mode {
+            Mode::Calls => self.calls.update(cx, |list, cx| list.clear_one_filter(cx)),
+            Mode::Access => self.access.update(cx, |view, cx| view.clear_filter(cx)),
+        };
+        if !cleared && !self.search.read(cx).query().is_empty() {
+            self.search
+                .update(cx, |search, cx| search.clear(window, cx));
+            self.focus_list(window, cx);
         }
     }
 }
 
-fn display_trace_path(path: Option<&Path>) -> String {
-    let Some(path) = path else {
-        return "~/.lenslet/runs".to_string();
-    };
-    let text = path.display().to_string();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy();
-        if let Some(rest) = text.strip_prefix(home.as_ref()) {
-            return format!("~{rest}");
+enum SelectTarget {
+    Calls(Entity<CallsList>),
+    Access(Entity<AccessView>),
+}
+
+impl SelectTarget {
+    fn step(self, delta: isize, cx: &mut App) {
+        match self {
+            SelectTarget::Calls(list) => list.update(cx, |l, cx| l.move_by(delta, cx)),
+            SelectTarget::Access(view) => view.update(cx, |v, cx| v.move_by(delta, cx)),
         }
     }
-    text
+
+    fn page(self, down: bool, cx: &mut App) {
+        match self {
+            SelectTarget::Calls(list) => list.update(cx, |l, cx| l.page(down, cx)),
+            SelectTarget::Access(view) => view.update(cx, |v, cx| v.page(down, cx)),
+        }
+    }
+
+    fn edge(self, last: bool, cx: &mut App) {
+        match self {
+            SelectTarget::Calls(list) => list.update(cx, |l, cx| l.select_edge(last, cx)),
+            SelectTarget::Access(view) => view.update(cx, |v, cx| v.select_edge(last, cx)),
+        }
+    }
+}
+
+// -- Render ----------------------------------------------------------------------
+
+impl LensletApp {
+    fn render_header(&self, ui: &Ui, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = ui.p;
+        let session = self.session.read(cx);
+        let mac = cfg!(target_os = "macos");
+        let mode = self.mode;
+        let entity = cx.entity();
+        let modes = widgets::segmented(
+            ui,
+            vec![
+                widgets::Segment {
+                    id: "mode-calls",
+                    label: ui.t("Calls", "请求").into(),
+                    active: mode == Mode::Calls,
+                    tooltip: Some((
+                        ui.t("Every AWS call", "全部 AWS 调用").into(),
+                        Some(i18n::shortcut("1")),
+                    )),
+                },
+                widgets::Segment {
+                    id: "mode-access",
+                    label: ui.t("Access", "权限").into(),
+                    active: mode == Mode::Access,
+                    tooltip: Some((
+                        ui.t("IAM permissions the run needed", "本次运行所需的 IAM 权限")
+                            .into(),
+                        Some(i18n::shortcut("2")),
+                    )),
+                },
+            ],
+            move |index, window, cx| {
+                let mode = if index == 0 {
+                    Mode::Calls
+                } else {
+                    Mode::Access
+                };
+                entity.update(cx, |app, cx| app.run_cmd(Cmd::Mode(mode), window, cx));
+            },
+        );
+
+        let compact = window.viewport_size().width < px(1_180.0);
+        div()
+            .id("titlebar")
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(12.0))
+            .h(px(theme::HEADER_H))
+            .pl(px(if mac { 80.0 } else { 12.0 }))
+            .pr(px(8.0))
+            .bg(rgb(t.header))
+            .border_b_1()
+            .border_color(rgb(t.border))
+            .child(glyph::lens_mark(&t, 20.0))
+            .child(self.render_run_button(ui, session, cx))
+            .child(modes)
+            .child(div().flex_1())
+            .child(self.render_baseline_button(ui, session, cx))
+            .child(
+                div()
+                    .w(px(if compact { 200.0 } else { 300.0 }))
+                    .child(self.search.clone()),
+            )
+            .child(
+                widgets::icon_button(
+                    ui,
+                    "palette",
+                    false,
+                    glyph::search_icon(theme::h(t.text_dim, 1.0)),
+                )
+                .tooltip(widgets::tip(
+                    ui.t("Commands", "命令"),
+                    Some(i18n::shortcut("K")),
+                ))
+                .on_click(cx.listener(|app, _, window, cx| app.toggle_palette(window, cx))),
+            )
+            .child(
+                widgets::icon_button(
+                    ui,
+                    "toggle-inspector",
+                    self.prefs.inspector_open,
+                    glyph::sidebar_icon(theme::h(t.text_dim, 1.0), self.prefs.inspector_open),
+                )
+                .tooltip(widgets::tip(
+                    ui.t("Inspector", "详情栏"),
+                    Some(i18n::shortcut("B")),
+                ))
+                .on_click(
+                    cx.listener(|app, _, window, cx| app.run_cmd(Cmd::ToggleInspector, window, cx)),
+                ),
+            )
+            .child(
+                widgets::icon_button(
+                    ui,
+                    "settings",
+                    self.settings_open,
+                    glyph::gear_icon(theme::h(t.text_dim, 1.0)),
+                )
+                .tooltip(widgets::tip(
+                    ui.t("Settings", "设置"),
+                    Some(i18n::shortcut(",")),
+                ))
+                .on_click(cx.listener(|app, _, _, cx| app.open_settings(cx))),
+            )
+    }
+
+    fn render_run_button(&self, ui: &Ui, session: &Session, cx: &Context<Self>) -> Div {
+        let t = ui.p;
+        let (title, status, status_color) = match (&session.health, session.run.as_ref()) {
+            (Health::Loading, _) => (
+                ui.t("Loading…", "加载中…").to_string(),
+                String::new(),
+                t.text_muted,
+            ),
+            (Health::Missing, _) => (
+                ui.t("No runs yet", "还没有运行").to_string(),
+                String::new(),
+                t.text_muted,
+            ),
+            (Health::Error(_), _) => (
+                ui.t("Can't read run", "无法读取运行").to_string(),
+                String::new(),
+                t.red,
+            ),
+            (Health::Ready, Some(run)) => {
+                let title = if run.header.command.is_empty() {
+                    ui.t("proxy session", "代理会话").to_string()
+                } else {
+                    run.command_line()
+                };
+                match (&run.report, session.feed_mode) {
+                    (Some(report), _) => match report.exit_code {
+                        Some(0) => (title, "exit 0".into(), t.green),
+                        Some(code) => (title, format!("exit {code}"), t.red),
+                        None => (title, ui.t("ended", "已结束").into(), t.text_muted),
+                    },
+                    (None, Some(FeedMode::Push)) => (title, ui.t("live", "实时").into(), t.green),
+                    (None, Some(FeedMode::Tail)) => {
+                        (title, ui.t("live · tail", "实时 · 轮询").into(), t.amber)
+                    }
+                    (None, _) => (title, ui.t("unfinished", "未结束").into(), t.amber),
+                }
+            }
+            (Health::Ready, None) => (
+                ui.t("Demo", "演示").to_string(),
+                String::new(),
+                t.text_muted,
+            ),
+        };
+        let position = session
+            .run_position()
+            .map(|(i, n)| format!("{i}/{n}"))
+            .unwrap_or_default();
+        let open = matches!(self.overlay, Some(Overlay::Runs));
+        let button = div()
+            .id("run-switcher")
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(28.0))
+            .max_w(px(420.0))
+            .px(px(8.0))
+            .rounded(px(6.0))
+            .when(open, |el| el.bg(theme::h(t.text, 0.08)))
+            .cursor_pointer()
+            .hover(move |s| s.bg(theme::h(t.text, 0.06)))
+            .tooltip(widgets::tip(
+                ui.t("Switch run", "切换运行"),
+                Some(format!("{} / {}", i18n::shortcut("["), i18n::shortcut("]"))),
+            ))
+            .on_click(cx.listener(|app, _, _, cx| {
+                app.overlay = match app.overlay {
+                    Some(Overlay::Runs) => None,
+                    _ => {
+                        app.session.update(cx, |s, cx| s.refresh_runs(cx));
+                        Some(Overlay::Runs)
+                    }
+                };
+                cx.notify();
+            }))
+            .when(!status.is_empty(), |el| {
+                el.child(glyph::dot(theme::h(status_color, 1.0), 7.0))
+            })
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .font_family(fonts::mono())
+                    .text_size(px(text::MD))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(t.text))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(title),
+            )
+            .when(!status.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(text::SM))
+                        .text_color(rgb(status_color))
+                        .child(status),
+                )
+            })
+            .when(!position.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .font_family(fonts::mono())
+                        .text_size(px(text::XS))
+                        .text_color(rgb(t.text_muted))
+                        .child(position),
+                )
+            })
+            .child(glyph::chevron_down(theme::h(t.text_muted, 1.0)));
+        let mut wrapper = div().relative().flex_shrink().min_w(px(0.0)).child(button);
+        if open {
+            wrapper = wrapper.child(deferred(
+                anchored()
+                    .anchor(Corner::TopLeft)
+                    .offset(point(px(0.0), px(32.0)))
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(self.render_runs_popover(ui, session, cx)),
+            ));
+        }
+        wrapper
+    }
+
+    fn render_runs_popover(&self, ui: &Ui, session: &Session, cx: &Context<Self>) -> AnyElement {
+        let t = ui.p;
+        let mut card = widgets::popover_card(ui, "runs-popover", 460.0)
+            .max_h(px(420.0))
+            .overflow_y_scroll()
+            .on_mouse_down_out(cx.listener(|app, _, _, cx| {
+                app.overlay = None;
+                cx.notify();
+            }));
+        if session.source.runs_dir().is_some() {
+            card = card.child(
+                widgets::menu_item(
+                    ui,
+                    "follow-latest",
+                    ui.t("Follow the newest run", "跟随最新运行"),
+                    None,
+                    session.source.follows_latest(),
+                    false,
+                )
+                .on_click(
+                    cx.listener(|app, _, window, cx| app.run_cmd(Cmd::FollowLatest, window, cx)),
+                ),
+            );
+            card = card.child(widgets::separator(ui));
+        }
+        if session.runs.is_empty() {
+            card = card.child(
+                div()
+                    .p(px(12.0))
+                    .text_size(px(text::MD))
+                    .text_color(rgb(t.text_muted))
+                    .child(ui.t("No recorded runs", "没有运行记录")),
+            );
+        }
+        for (index, run) in session.runs.iter().take(40).enumerate() {
+            let current = session.path.as_ref() == Some(&run.path);
+            let (status, color) = match run.report.as_ref() {
+                Some(report) => match report.exit_code {
+                    Some(0) => ("pass".to_string(), t.green),
+                    Some(code) => (format!("exit {code}"), t.red),
+                    None => ("ended".into(), t.text_muted),
+                },
+                None => ("live".into(), t.amber),
+            };
+            let calls = run
+                .report
+                .as_ref()
+                .map(|r| r.calls.to_string())
+                .unwrap_or_default();
+            let path = run.path.clone();
+            card = card.child(
+                div()
+                    .id(ElementId::named_usize("run", index))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .h(px(36.0))
+                    .flex_shrink_0()
+                    .px(px(8.0))
+                    .rounded(px(5.0))
+                    .when(current, |el| el.bg(theme::h(t.accent, 0.14)))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(theme::h(t.accent, 0.10)))
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        app.run_cmd(Cmd::PinRun(path.clone()), window, cx)
+                    }))
+                    .child(glyph::dot(theme::h(color, 1.0), 6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .font_family(fonts::mono())
+                                    .text_size(px(text::MD))
+                                    .text_color(rgb(t.text))
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(run.label()),
+                            )
+                            .child(
+                                div()
+                                    .font_family(fonts::mono())
+                                    .text_size(px(text::XS))
+                                    .text_color(rgb(t.text_muted))
+                                    .child(format!(
+                                        "{} · {}",
+                                        run.id,
+                                        format_bytes(run.bytes as usize)
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(fonts::mono())
+                            .text_size(px(text::SM))
+                            .text_color(rgb(t.text_muted))
+                            .child(calls),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(48.0))
+                            .text_right()
+                            .text_size(px(text::SM))
+                            .text_color(rgb(color))
+                            .child(status),
+                    ),
+            );
+        }
+        widgets::appear(ui, "runs-popover-anim", card)
+    }
+
+    fn render_baseline_button(&self, ui: &Ui, session: &Session, cx: &Context<Self>) -> Div {
+        let t = ui.p;
+        let label: String = match (&session.baseline, session.baseline_run.as_ref()) {
+            (Baseline::Lock, _) if session.lock_path.is_some() && session.lock.is_none() => ui
+                .t("lenslet.lock (none yet)", "lenslet.lock（尚无）")
+                .into(),
+            (Baseline::Lock, _) => "lenslet.lock".into(),
+            (Baseline::Previous, Some(_)) => ui.t("previous run", "上一次运行").into(),
+            (Baseline::Previous, None) => ui.t("previous run (none)", "上一次运行（无）").into(),
+            (Baseline::Run(path), _) => lenslet_core::runs::run_id(path),
+        };
+        let summary: Option<(String, u32)> = match session.diff.as_ref() {
+            Some(diff) => {
+                let mut parts = Vec::new();
+                if !diff.new_failures.is_empty() {
+                    parts.push(format!("{} new fail", diff.new_failures.len()));
+                }
+                if !diff.fixed_failures.is_empty() {
+                    parts.push(format!("{} fixed", diff.fixed_failures.len()));
+                }
+                if !diff.access_added.is_empty() {
+                    parts.push(format!("+{} access", diff.access_added.len()));
+                }
+                if !diff.access_removed.is_empty() {
+                    parts.push(format!("−{}", diff.access_removed.len()));
+                }
+                (!parts.is_empty()).then(|| {
+                    (
+                        parts.join(" · "),
+                        if diff.new_failures.is_empty() {
+                            t.amber
+                        } else {
+                            t.red
+                        },
+                    )
+                })
+            }
+            None => {
+                let added = session
+                    .access_rows
+                    .iter()
+                    .filter(|row| row.delta == crate::store::AccessDelta::Added)
+                    .count();
+                (added > 0).then(|| (format!("+{added} not in lock"), t.amber))
+            }
+        };
+        let open = matches!(self.overlay, Some(Overlay::Baseline));
+        let button = div()
+            .id("baseline")
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(28.0))
+            .px(px(8.0))
+            .rounded(px(6.0))
+            .when(open, |el| el.bg(theme::h(t.text, 0.08)))
+            .cursor_pointer()
+            .hover(move |s| s.bg(theme::h(t.text, 0.06)))
+            .tooltip(widgets::tip(
+                ui.t(
+                    "What this run is compared with: badges, the Changed filter and Access +/−",
+                    "本次运行的对比基线：徽标、“有变化”筛选与权限 +/−",
+                ),
+                None,
+            ))
+            .on_click(cx.listener(|app, _, _, cx| {
+                app.overlay = match app.overlay {
+                    Some(Overlay::Baseline) => None,
+                    _ => Some(Overlay::Baseline),
+                };
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(text::SM))
+                    .text_color(rgb(t.text_muted))
+                    .child(ui.t("Compared with", "对比")),
+            )
+            .child(
+                div()
+                    .font_family(fonts::mono())
+                    .text_size(px(text::SM))
+                    .text_color(rgb(t.text_soft))
+                    .child(label),
+            )
+            .when_some(summary, |el, (summary, color)| {
+                el.child(
+                    div()
+                        .font_family(fonts::mono())
+                        .text_size(px(text::XS))
+                        .text_color(rgb(color))
+                        .child(summary),
+                )
+            })
+            .child(glyph::chevron_down(theme::h(t.text_muted, 1.0)));
+        let mut wrapper = div().relative().flex_shrink_0().child(button);
+        if open {
+            let mut card = widgets::popover_card(ui, "baseline-popover", 320.0)
+                .max_h(px(360.0))
+                .overflow_y_scroll()
+                .on_mouse_down_out(cx.listener(|app, _, _, cx| {
+                    app.overlay = None;
+                    cx.notify();
+                }));
+            let mut options = vec![
+                (Baseline::Lock, "lenslet.lock".to_string()),
+                (
+                    Baseline::Previous,
+                    ui.t("Previous run", "上一次运行").to_string(),
+                ),
+            ];
+            for run in session
+                .runs
+                .iter()
+                .filter(|r| r.ended() && Some(&r.path) != session.path.as_ref())
+                .take(12)
+            {
+                options.push((
+                    Baseline::Run(run.path.clone()),
+                    format!("{} · {}", run.id, run.label()),
+                ));
+            }
+            for (index, (baseline, title)) in options.into_iter().enumerate() {
+                let selected = session.baseline == baseline;
+                card = card.child(
+                    widgets::menu_item(
+                        ui,
+                        ElementId::named_usize("baseline-opt", index),
+                        title,
+                        None,
+                        selected,
+                        false,
+                    )
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        app.run_cmd(Cmd::SetBaseline(baseline.clone()), window, cx)
+                    })),
+                );
+                if index == 1 {
+                    card = card.child(widgets::separator(ui));
+                }
+            }
+            wrapper = wrapper.child(deferred(
+                anchored()
+                    .anchor(Corner::TopRight)
+                    .offset(point(px(0.0), px(32.0)))
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(widgets::appear(ui, "baseline-anim", card)),
+            ));
+        }
+        wrapper
+    }
+
+    fn render_menu(
+        &self,
+        ui: &Ui,
+        position: Point<Pixels>,
+        entries: &[MenuEntry],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut card = widgets::popover_card(ui, "context-menu", 240.0).on_mouse_down_out(
+            cx.listener(|app, _, _, cx| {
+                app.overlay = None;
+                cx.notify();
+            }),
+        );
+        for (index, entry) in entries.iter().enumerate() {
+            let cmd = entry.cmd.clone();
+            card = card.child(
+                widgets::menu_item(
+                    ui,
+                    ElementId::named_usize("menu", index),
+                    entry.title.clone(),
+                    entry.hint.clone(),
+                    false,
+                    false,
+                )
+                .on_click(
+                    cx.listener(move |app, _, window, cx| app.run_cmd(cmd.clone(), window, cx)),
+                ),
+            );
+        }
+        deferred(
+            anchored()
+                .position(position)
+                .snap_to_window_with_margin(px(8.0))
+                .child(widgets::appear(ui, "menu-anim", card)),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn render_splitter(&self, ui: &Ui, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = ui.p;
+        div()
+            .id("splitter")
+            .flex_shrink_0()
+            .w(px(theme::SPLITTER_HIT_W))
+            .h_full()
+            .flex()
+            .justify_center()
+            .cursor(CursorStyle::ResizeColumn)
+            .bg(rgb(t.panel))
+            .group("splitter")
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h_full()
+                    .bg(rgb(t.border))
+                    .group_hover("splitter", |s| s.bg(theme::h(t.accent, 0.8))),
+            )
+            .on_drag(SplitDrag, |_, _, _, cx| cx.new(|_| DragGhost))
+            .on_click(cx.listener(|app, event: &gpui::ClickEvent, _, cx| {
+                if event.click_count() >= 2 {
+                    app.prefs.inspector_width = theme::INSPECTOR_DEFAULT_W;
+                    app.save_prefs(cx);
+                    cx.notify();
+                }
+            }))
+    }
+
+    fn render_toast(&self, ui: &Ui) -> Option<AnyElement> {
+        let t = ui.p;
+        let (message, _) = self.toast.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .bottom(px(20.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(rgb(t.border))
+                        .bg(rgb(t.panel_raised))
+                        .shadow(ui.elevation())
+                        .text_size(px(text::MD))
+                        .text_color(rgb(t.text_soft))
+                        .child(message.clone()),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+impl Render for LensletApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::fsguard::report_frame();
+        crate::fsguard::milestone_once("first frame");
+        let _scope = crate::fsguard::RenderScope::enter();
+        let ui = Ui::of(cx);
+        let t = ui.p;
+        let viewport = f32::from(window.viewport_size().width);
+        let show_inspector = self.prefs.inspector_open;
+        let inspector_w = self
+            .prefs
+            .inspector_width
+            .clamp(320.0, (viewport - 440.0).max(320.0));
+
+        // Cached: a child view re-renders only when it notifies, so a live
+        // batch that only touches the list does not rebuild the inspector.
+        let (list, detail): (gpui::AnyView, gpui::AnyView) = match self.mode {
+            Mode::Calls => (cached(&self.calls), cached(&self.inspector)),
+            Mode::Access => (cached(&self.access), cached(&self.access_detail)),
+        };
+        let mut workspace = div().flex().flex_row().flex_1().min_h(px(0.0)).child(list);
+        if show_inspector {
+            workspace = workspace.child(self.render_splitter(&ui, cx)).child(
+                div()
+                    .w(px(inspector_w))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .child(detail),
+            );
+        }
+
+        let header = self.render_header(&ui, window, cx);
+        let menu = match &self.overlay {
+            Some(Overlay::Menu(position, entries)) => {
+                Some(self.render_menu(&ui, *position, &entries.clone(), cx))
+            }
+            _ => None,
+        };
+        let palette = self.palette_open.then(|| self.render_palette(&ui, cx));
+        let settings = self.settings_open.then(|| self.render_settings(&ui, cx));
+        let toast = self.render_toast(&ui);
+
+        div()
+            .id("lenslet")
+            .key_context("LensletApp")
+            .track_focus(&self.root_focus)
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(t.canvas))
+            .text_color(rgb(t.text))
+            .font(fonts::sans_font())
+            .on_action(
+                cx.listener(|app, _: &OpenPalette, window, cx| app.toggle_palette(window, cx)),
+            )
+            .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
+                app.palette_open = false;
+                app.run_cmd(Cmd::FocusSearch, window, cx)
+            }))
+            .on_action(cx.listener(|app, _: &OpenSettings, _, cx| {
+                if app.settings_open {
+                    app.settings_open = false;
+                    cx.notify();
+                } else {
+                    app.open_settings(cx);
+                }
+            }))
+            .on_action(cx.listener(|app, _: &ToggleInspector, window, cx| {
+                app.run_cmd(Cmd::ToggleInspector, window, cx)
+            }))
+            .on_action(
+                cx.listener(|app, _: &ReloadRun, window, cx| app.run_cmd(Cmd::Reload, window, cx)),
+            )
+            .on_action(
+                cx.listener(|app, _: &Replay, window, cx| app.run_cmd(Cmd::Replay, window, cx)),
+            )
+            .on_action(cx.listener(|app, _: &ShowCalls, window, cx| {
+                app.run_cmd(Cmd::Mode(Mode::Calls), window, cx)
+            }))
+            .on_action(cx.listener(|app, _: &ShowAccess, window, cx| {
+                app.run_cmd(Cmd::Mode(Mode::Access), window, cx)
+            }))
+            .on_action(
+                cx.listener(|app, _: &PrevRun, window, cx| app.run_cmd(Cmd::PrevRun, window, cx)),
+            )
+            .on_action(
+                cx.listener(|app, _: &NextRun, window, cx| app.run_cmd(Cmd::NextRun, window, cx)),
+            )
+            .on_action(cx.listener(|app, _: &FollowLatest, window, cx| {
+                app.run_cmd(Cmd::FollowLatest, window, cx)
+            }))
+            .on_action(cx.listener(|app, _: &CopyCurl, window, cx| {
+                if let Some(call) = app.inspector.read(cx).call().cloned() {
+                    app.run_cmd(Cmd::CopyCurl(call), window, cx);
+                }
+            }))
+            .on_action(cx.listener(|app, _: &CopyPolicy, window, cx| {
+                app.run_cmd(Cmd::CopyPolicy, window, cx)
+            }))
+            .on_action(cx.listener(|app, _: &SelectNext, _, cx| {
+                if app.palette_open {
+                    app.palette_step(1, cx);
+                } else {
+                    app.select(|target, cx| target.step(1, cx), cx);
+                }
+            }))
+            .on_action(cx.listener(|app, _: &SelectPrev, _, cx| {
+                if app.palette_open {
+                    app.palette_step(-1, cx);
+                } else {
+                    app.select(|target, cx| target.step(-1, cx), cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|app, _: &SelectFirst, _, cx| {
+                    app.select(|t, cx| t.edge(false, cx), cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|app, _: &SelectLast, _, cx| app.select(|t, cx| t.edge(true, cx), cx)),
+            )
+            .on_action(
+                cx.listener(|app, _: &PageDown, _, cx| app.select(|t, cx| t.page(true, cx), cx)),
+            )
+            .on_action(
+                cx.listener(|app, _: &PageUp, _, cx| app.select(|t, cx| t.page(false, cx), cx)),
+            )
+            .on_action(cx.listener(|app, _: &Confirm, window, cx| {
+                if app.palette_open {
+                    app.palette_confirm(window, cx);
+                } else if app.mode == Mode::Calls && app.prefs.inspector_open {
+                    let focus = app.inspector.read(cx).body().focus_handle(cx);
+                    window.focus(&focus);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &Cancel, window, cx| {
+                if app.palette_open {
+                    app.close_palette(window, cx);
+                } else {
+                    app.cancel(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|app, _: &Copy, _, cx| {
+                let body = app.inspector.read(cx).body().clone();
+                body.update(cx, |body, cx| body.copy(cx));
+            }))
+            .on_action(cx.listener(|app, _: &SelectAll, _, cx| {
+                let body = app.inspector.read(cx).body().clone();
+                body.update(cx, |body, cx| body.select_all(cx));
+            }))
+            .on_drag_move(
+                cx.listener(|app, event: &DragMoveEvent<SplitDrag>, window, cx| {
+                    let viewport = f32::from(window.viewport_size().width);
+                    let x = f32::from(event.event.position.x);
+                    let width = (viewport - x).clamp(320.0, (viewport - 440.0).max(320.0));
+                    if (width - app.prefs.inspector_width).abs() >= 1.0 {
+                        app.prefs.inspector_width = width;
+                        app.save_prefs(cx);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|app, _, _, cx| {
+                    if matches!(app.overlay, Some(Overlay::Menu(..))) {
+                        app.overlay = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(header)
+            .child(workspace)
+            .children(menu)
+            .children(settings)
+            .children(palette)
+            .children(toast)
+    }
 }

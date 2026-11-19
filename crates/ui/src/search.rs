@@ -13,11 +13,22 @@ use gpui::{
     UnderlineStyle, Window, div, fill, point, prelude::*, px, relative, rgb, size,
 };
 
-use crate::{fonts, glyph, i18n, theme};
+use crate::{
+    fonts, glyph,
+    theme::{self, Ui},
+};
+
+/// What the field tells its owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchEvent {
+    /// Escape on an empty field, or Enter: hand focus back to the list.
+    Exit,
+}
+
+impl gpui::EventEmitter<SearchEvent> for SearchInput {}
 
 pub struct SearchInput {
     focus: FocusHandle,
-    root_focus: FocusHandle,
     content: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -30,10 +41,9 @@ pub struct SearchInput {
 }
 
 impl SearchInput {
-    pub fn new(root_focus: FocusHandle, cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus: cx.focus_handle(),
-            root_focus,
             content: "".into(),
             selected_range: 0..0,
             selection_reversed: false,
@@ -46,8 +56,8 @@ impl SearchInput {
         }
     }
 
-    pub fn new_palette(root_focus: FocusHandle, cx: &mut Context<Self>) -> Self {
-        let mut s = Self::new(root_focus, cx);
+    pub fn new_palette(cx: &mut Context<Self>) -> Self {
+        let mut s = Self::new(cx);
         s.palette_mode = true;
         s
     }
@@ -193,8 +203,7 @@ impl SearchInput {
         match key {
             "escape" if !self.palette_mode => {
                 if self.content.is_empty() {
-                    window.focus(&self.root_focus);
-                    cx.notify();
+                    cx.emit(SearchEvent::Exit);
                 } else {
                     self.content = "".into();
                     self.selected_range = 0..0;
@@ -205,8 +214,7 @@ impl SearchInput {
                 cx.stop_propagation();
             }
             "enter" if !self.palette_mode => {
-                window.focus(&self.root_focus);
-                cx.notify();
+                cx.emit(SearchEvent::Exit);
                 cx.stop_propagation();
             }
             "backspace" => {
@@ -552,7 +560,7 @@ impl Element for SearchTextElement {
             .filter(|range| range.start < range.end);
         let style = window.text_style();
 
-        let t = theme::p();
+        let t = Ui::of(cx).p;
         let (display_text, text_color) = if content.is_empty() {
             (self.placeholder.clone(), theme::h(t.text_faint, 0.95))
         } else {
@@ -624,7 +632,7 @@ impl Element for SearchTextElement {
                             bounds.bottom() - px(1.0),
                         ),
                     ),
-                    theme::line(t.accent, 0.22),
+                    theme::h(t.accent, 0.22),
                 )),
                 None,
             )
@@ -676,30 +684,32 @@ impl Element for SearchTextElement {
 
 impl Render for SearchInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme::p();
+        let _scope = crate::fsguard::RenderScope::enter();
+        let ui = Ui::of(cx);
+        let t = ui.p;
         let focused = self.focus.is_focused(window);
         let compact = window.viewport_size().width < px(1_180.0);
         let has_query = !self.content.is_empty();
         let placeholder: SharedString = if self.palette_mode {
-            i18n::pick(
+            ui.t(
                 "Type a command, AWS service, run, or preference…",
                 "输入命令、AWS 服务、历史运行或偏好设置…",
             )
             .into()
         } else if self.access_mode {
             if compact {
-                i18n::pick("Filter Action, ARN…", "筛选 Action、ARN…").into()
+                ui.t("Filter Action, ARN…", "筛选 Action、ARN…").into()
             } else {
-                i18n::pick(
+                ui.t(
                     "Filter IAM Action, Resource ARN, caller…",
                     "筛选 IAM Action、Resource ARN 或调用方…",
                 )
                 .into()
             }
         } else if compact {
-            i18n::pick("Search calls, paths…", "搜索请求、Path…").into()
+            ui.t("Search calls, paths…", "搜索请求、Path…").into()
         } else {
-            i18n::pick(
+            ui.t(
                 "Search calls, Operation, Path, Body…",
                 "搜索请求、Operation、Path、Body…",
             )
@@ -771,6 +781,7 @@ impl Render for SearchInput {
                 .font_family(fonts::sans())
                 .text_color(rgb(t.text))
                 .track_focus(&self.focus)
+                .key_context("Palette")
                 .cursor_text()
                 .on_key_down(cx.listener(Self::on_key_down))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -801,7 +812,7 @@ impl Render for SearchInput {
             .rounded(px(6.0))
             .border_1()
             .border_color(if focused {
-                theme::line(t.accent, 0.52)
+                theme::h(t.accent, 0.52)
             } else {
                 theme::h(t.border, 1.0)
             })
@@ -815,6 +826,7 @@ impl Render for SearchInput {
             .font_family(fonts::sans())
             .text_color(rgb(t.text_soft))
             .track_focus(&self.focus)
+            .key_context("Search")
             .cursor_text()
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))

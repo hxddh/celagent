@@ -44,15 +44,15 @@ pub fn highlight_code(
     text: &str,
     kind: SyntaxKind,
     search_tokens: &[String],
+    p: &Palette,
 ) -> (Vec<(Range<usize>, HighlightStyle)>, usize) {
-    let p = theme::p();
     // Cap syntax tokenization on huge payloads (>128 KiB) to keep 120fps scrolling smooth.
     let base = if text.len() <= 128 * 1024 {
         match kind {
-            SyntaxKind::Json => highlight_json(text, &p),
-            SyntaxKind::Xml => highlight_xml(text, &p),
-            SyntaxKind::Form => highlight_form(text, &p),
-            SyntaxKind::Hex => highlight_hex(text, &p),
+            SyntaxKind::Json => highlight_json(text, p),
+            SyntaxKind::Xml => highlight_xml(text, p),
+            SyntaxKind::Form => highlight_form(text, p),
+            SyntaxKind::Hex => highlight_hex(text, p),
             SyntaxKind::Plain => Vec::new(),
         }
     } else {
@@ -64,24 +64,8 @@ pub fn highlight_code(
     if matches.is_empty() {
         return (sanitize_spans(text, base), 0);
     }
-    let merged = overlay_matches(base, &matches, &p);
+    let merged = overlay_matches(base, &matches, p);
     (sanitize_spans(text, merged), count)
-}
-
-/// Highlight only `search_tokens` inside plain/inline text (such as Header values).
-pub fn highlight_inline(
-    text: &str,
-    search_tokens: &[String],
-) -> (Vec<(Range<usize>, HighlightStyle)>, usize) {
-    let matches = find_search_matches(text, search_tokens);
-    let count = matches.len();
-    if matches.is_empty() {
-        return (Vec::new(), 0);
-    }
-    let p = theme::p();
-    let style = search_match_style(&p);
-    let spans = matches.into_iter().map(|r| (r, style)).collect();
-    (sanitize_spans(text, spans), count)
 }
 
 fn search_match_style(p: &Palette) -> HighlightStyle {
@@ -467,12 +451,17 @@ mod tests {
     fn json_xml_form_and_cjk_search_highlights_stay_disjoint_and_char_aligned() {
         let json = "{\n  \"orderId\": \"ord-42\",\n  \"note\": \"中文订单 🚀\",\n  \"amount\": 99.5,\n  \"paid\": true,\n  \"meta\": null\n}";
         let tokens = vec!["ord".to_string(), "订单".to_string(), "99".to_string()];
-        let (spans, count) = highlight_code(json, SyntaxKind::Json, &tokens);
+        let (spans, count) = highlight_code(json, SyntaxKind::Json, &tokens, &theme::DARK);
         assert_eq!(count, 4); // "ord" in orderId, "ord" in ord-42, "订单", "99"
         assert_valid_gpui_runs(json, &spans);
 
         let xml = "<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code><Message>Missing key</Message></Error>";
-        let (xml_spans, xml_cnt) = highlight_code(xml, SyntaxKind::Xml, &["nosuchkey".to_string()]);
+        let (xml_spans, xml_cnt) = highlight_code(
+            xml,
+            SyntaxKind::Xml,
+            &["nosuchkey".to_string()],
+            &theme::LIGHT,
+        );
         assert_eq!(xml_cnt, 1);
         assert_valid_gpui_runs(xml, &xml_spans);
 
@@ -481,6 +470,7 @@ mod tests {
             form,
             SyntaxKind::Form,
             &["sendmessage".to_string(), "world".to_string()],
+            &theme::DARK,
         );
         assert_eq!(form_cnt, 2);
         assert_valid_gpui_runs(form, &form_spans);
@@ -488,7 +478,12 @@ mod tests {
         // Malformed JSON with backslash immediately before multibyte UTF-8 characters
         // must never slice inside a codepoint.
         let malformed = "{\"note\":\"\\中\",\"emoji\":\"\\🚀\",\"trailing\":\"\\";
-        let (bad_spans, bad_cnt) = highlight_code(malformed, SyntaxKind::Json, &["中".to_string()]);
+        let (bad_spans, bad_cnt) = highlight_code(
+            malformed,
+            SyntaxKind::Json,
+            &["中".to_string()],
+            &theme::DARK,
+        );
         assert_eq!(bad_cnt, 1);
         assert_valid_gpui_runs(malformed, &bad_spans);
     }
