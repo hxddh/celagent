@@ -1,7 +1,8 @@
 # Lenslet run files (format 3)
 
 Each `lenslet run` writes one JSONL file: `~/.lenslet/runs/YYYYMMDD-HHMMSS-PID.jsonl`,
-or `--trace PATH`. Every line is an object with a `type`:
+or `--trace PATH` (an existing file there is replaced). Every line is an
+object with a `type`:
 
 ```text
 {"type":"run", ...}      first line: what the run is
@@ -47,10 +48,12 @@ not compatible with earlier files.
 | `pending` | `true` on a line for a call still running after 1 s (carries full request headers and captured body) |
 | `error` | proxy-side failure, e.g. the emulator was unreachable |
 | `problem` | `{code, message?, hint?}` for status ≥ 400 or a proxy failure |
-| `access` | `[{action, resource, new?}]` this call needs: usually one; one per table/parameter for batches; each item's action for a DynamoDB transaction; the source read for an S3 copy |
-| `implied` | `[{action, resource, new?}]` needed elsewhere (SSE-KMS key, passed role) |
+| `access` | `[{action, resource, new?, unverified?}]` this call needs: usually one; one per table/parameter for batches; each item's action for a DynamoDB transaction; the source read for an S3 copy |
+| `implied` | `[{action, resource, new?, unverified?}]` needed elsewhere (SSE-KMS key, passed role) |
 | `new` | at least one permission on this call is not in the lock/policy |
-| `blocked` | `true` when `--enforce` denied the call at the proxy before reaching the emulator |
+| `blocked` | `true` when `--enforce` denied the call at the proxy with an AWS `AccessDenied` reply |
+| `blocked_phase` | `request` (the call never reached the emulator) or `response` (the emulator had already run it; only its response revealed the denied permission, e.g. the SSE-KMS key of an S3 object) |
+| `replay_of` | the id of the recorded call this one re-sends (`x-lenslet-replay-of`) |
 | `request`, `response` | `{headers, content_type?, body?}` |
 
 `body` is `{text?, hex?, encoding?, bytes, truncated, binary, sha256}`. Headers,
@@ -84,6 +87,23 @@ body.
   parameters and IAM roles are preserved.
 - **Normalization**: UUIDs, runs of six or more digits, and hex segments of six
   or more characters become `*`, so generated test names do not churn the lock.
+- **Unreadable bodies**: when the body that names the resource cannot be read
+  (binary such as CBOR, or longer than the 64 MiB inspection limit), the
+  action stands on resource `*` with `unverified: true`. That line is stable
+  and can be accepted into the lock; a policy grants it only with
+  `Resource: "*"`, and any `Deny` on the action applies to it.
+- **Implied permissions** are derived only from what is on the wire: SSE-KMS
+  headers of an S3 request or response; `KmsKeyId` of Secrets Manager
+  `CreateSecret`/`UpdateSecret`; `KeyId` of SSM `PutParameter`
+  (`kms:Encrypt`, or `kms:GenerateDataKey` for the Advanced tier); the
+  `KmsMasterKeyId` attribute of SQS/SNS queue and topic creation or update
+  (`kms:GenerateDataKey`, what producers will need); DynamoDB
+  `SSESpecification.KMSMasterKeyId`; Kinesis `StartStreamEncryption`. The
+  key of an existing encrypted queue, topic or secret is not in the request
+  that uses it and is not derived. Roles passed to Lambda, Step Functions,
+  ECS, EventBridge (`PutRule`, `PutTargets` `Targets[].RoleArn`), Pipes,
+  Scheduler (`Target.RoleArn`), Firehose (every `RoleARN`) and Glue
+  (`Role`, `JobUpdate.Role`) need `iam:PassRole`.
 - A call whose operation is only an HTTP method gets no action. Lenslet does
   not guess, and reports unmapped call counts in `unmapped`.
 
@@ -103,7 +123,46 @@ summaries.
 | `access_added` | used by this run, not in the lock/policy |
 | `access_unused` | in the lock, not used by this run |
 | `regressions` | `{previous_run, previous_exit_code, previous_calls, previous_duration_ms, new_failures, fixed, new_access?}` compared with the previous run of the same command in the same directory, or `null` |
+| `findings` | `[{kind, severity, title, detail?, calls}]`, most severe first, then in call order (omitted when empty); see below |
 | `trace`, `endpoint`, `upstream` | where to look |
+
+### Findings
+
+| kind | severity | one finding per |
+| --- | --- | --- |
+| `failure` | `error` | distinct (service, operation, error code) that failed, with every call; an attempt a later retry recovered from is a `retries` finding instead |
+| `access` | `warning` | permission not in the lock/policy |
+| `n_plus_one` | `warning` | 5+ calls of one operation on one resource, each starting ≤100 ms after the previous ended, with different requests; names the batch API where one exists |
+| `leaked` | `info` | resource a successful call created that no later call deleted (S3 objects are not tracked) |
+| `retries` | `warning` if the invocation finally failed, else `info` | SDK invocation (`invocation_id`) with more than one attempt |
+
+## Live events
+
+While a run is going, the proxy also answers two requests of its own on the
+run's `endpoint`. They never reach the emulator and are never recorded.
+
+- `GET /_lenslet/health` → `200 {"run": "<run id>", "pid": <lenslet's pid>}`.
+- `GET /_lenslet/events` → `200`, `content-type: text/event-stream`: every
+  line already in the run file, in order (the `run` header first), then each
+  new line as it is written, each as one event `data: <the exact JSONL
+  line>\n\n`. No line is skipped or repeated. An idle stream gets a
+  `: keepalive\n\n` comment every 15 s. The stream ends after the `end` line.
+
+A request with `x-lenslet-replay-of: <call id>` is proxied and recorded like
+any call, with `replay_of` set; the header is removed before forwarding and
+is not recorded among the request headers.
+
+## `lenslet check`
+
+`lenslet check [--policy PATH | --lock PATH] [RUN] [--json] [--markdown PATH]`
+derives each recorded call's access again from its recorded request and
+evaluates it against the policy or lock (default `./lenslet.lock`; `RUN` as
+for `lenslet diff`, default the newest finished run). A request body the run
+file kept only in part (`--max-body`) is read as truncated. `--json` prints
+`{run, gate, policy, calls, denied: [{id, service, operation, action,
+resource, implied?, unverified?, allowed, by?, reason}]}`; `reason` is
+`explicit_deny` (with `by`, the statement's `Sid` or `Statement[i]`) or
+`no_allow`. Exit 3 when anything is denied, 2 on usage errors, else 0.
 
 ## `lenslet.lock`
 
@@ -115,9 +174,13 @@ kms:Decrypt        arn:aws:kms:*:*:key/*  # implied
 
 The file has one `action  resource` pair per line, sorted. Text after `#` is a
 comment. A comment containing the word `test` marks a line that only the tests
-need: `--check` still counts it, but `lenslet policy` leaves it out. Only
-`lenslet run --update` writes the file, only when the command succeeded, and
-it keeps the `test` marks. `--lock PATH` uses another file.
+need: `--check` still counts it, but `lenslet policy` leaves it out. A lock
+grants exactly its lines: a `*` in a line (a generated name) is not a pattern
+over other names. `lenslet run --update` writes the file, only when the
+command succeeded; the window can add lines and toggle `test` marks. Every
+write is atomic (a temporary file renamed over the lock, permissions kept)
+and canonical: it keeps the `test` marks and the full-line comments at the
+top of the file; other comments are not kept. `--lock PATH` uses another file.
 
 ## Retention
 

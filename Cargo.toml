@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/cli", "crates/ui"]
+members = ["crates/core", "crates/cli", "crates/ui"]
 
 [workspace.package]
-version = "7.0.0"
+version = "8.0.0"
 edition = "2024"
 license = "Apache-2.0"
 

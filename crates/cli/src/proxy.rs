@@ -13,7 +13,6 @@
 //! file is owner-only (0600) on Unix.
 
 use std::{
-    collections::BTreeSet,
     convert::Infallible,
     fs,
     net::{IpAddr, Ipv6Addr, SocketAddr},
@@ -33,32 +32,50 @@ use hyper::{Request, Response, StatusCode, header, server::conn::http1, service:
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
 };
 use rustls::RootCertStore;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::watch,
 };
 
 use crate::{
-    access::{self, Access},
+    access,
     capture::{self, Capture, Content, TeeBody},
-    lock::Gate,
+    lock::{Denial, Evaluation, Gate},
     problem,
-    trace::{self, Message, RunHeader, Trace, TraceSink},
+    trace::{self, BlockedPhase, Message, RunHeader, Trace, TraceSink},
     wire,
 };
 
 type Body = BoxBody<Bytes, std::io::Error>;
 type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 
-/// Upper bound on request body inspection during `--enforce` (64 MiB — 4×
-/// AWS DynamoDB's 16 MiB batch limit). Anything larger fails closed.
-const MAX_ENFORCE_INSPECT_BYTES: usize = 64 * 1024 * 1024;
+/// Upper bound on reading a request body for access derivation (64 MiB, 4×
+/// DynamoDB's 16 MiB batch limit), independent of `--max-body`, so a small
+/// trace capture never hides a resource named late in the body. Only calls
+/// whose access is read from the body get this second look.
+const MAX_INSPECT_BYTES: usize = 64 * 1024 * 1024;
+
+/// A blocked call's unread request body is drained up to this much, for up
+/// to this long, so the client reads the `AccessDenied` instead of a reset.
+const DRAIN_BYTES: usize = 1024 * 1024;
+const DRAIN_TIME: Duration = Duration::from_millis(500);
+
+/// A client must send a request's headers within this long.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A call still running after this long gets a `pending` trace line.
 const PENDING_AFTER: Duration = Duration::from_secs(1);
+
+/// A comment line on an idle live event stream, this often.
+const KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// Marks a call the window re-sends: the id of the recorded call it replays.
+/// Stripped before forwarding, and not recorded among the request headers.
+const REPLAY_HEADER: &str = "x-lenslet-replay-of";
 
 #[derive(Clone)]
 pub struct State {
@@ -81,10 +98,14 @@ struct Pending {
     advertised_operation: Option<String>,
     request_capture: Arc<Mutex<Capture>>,
     request_content: Content,
-    /// Full-body snapshot or capture for gate evaluation when `--max-body` is
-    /// smaller than [`MAX_ENFORCE_INSPECT_BYTES`].
-    enforce_full_body: Option<trace::BodyTrace>,
-    gate_capture: Option<Arc<Mutex<Capture>>>,
+    /// The complete request body, read under `--enforce`, when the trace
+    /// capture (`--max-body`) holds less.
+    full_body: Option<trace::BodyTrace>,
+    /// A second, larger capture of a body-dependent request for derivation,
+    /// when `--max-body` is smaller than [`MAX_INSPECT_BYTES`].
+    derive_capture: Option<Arc<Mutex<Capture>>>,
+    /// The gate evaluation already made for this call (under `--enforce`).
+    evaluation: Option<Evaluation>,
     response_capture: Arc<Mutex<Capture>>,
     response_content: Content,
 }
@@ -95,14 +116,14 @@ impl Pending {
         self.trace.ms = self.started.elapsed().as_millis() as u64;
         self.trace.request.body = snapshot(&self.request_capture, &self.request_content);
         self.trace.response.body = snapshot(&self.response_capture, &self.response_content);
-        let op_capture = self
-            .gate_capture
+        let operation_capture = self
+            .derive_capture
             .as_deref()
             .unwrap_or(&self.request_capture);
         resolve_operation(
             &mut self.trace,
             self.advertised_operation.as_deref(),
-            op_capture,
+            operation_capture,
             &self.request_content,
         );
         self.trace.problem = problem::from_response(
@@ -114,21 +135,37 @@ impl Pending {
                 .as_ref()
                 .and_then(|body| body.text.as_deref()),
         );
-        let eval_body = self.enforce_full_body.or_else(|| {
-            self.gate_capture
-                .as_deref()
-                .and_then(|cap| snapshot(cap, &self.request_content))
-        });
-        if let Some(full) = eval_body {
-            let mut eval_trace = self.trace.clone();
-            eval_trace.request.body = Some(full);
-            self.state
-                .trace
-                .record_evaluated(self.trace, Some(&eval_trace));
-        } else {
-            self.state.trace.record(self.trace);
-        }
+        let evaluation = match self.evaluation.take() {
+            Some(evaluation) => evaluation,
+            None => {
+                let mut full = self.full_body.take().or_else(|| {
+                    self.derive_capture
+                        .as_deref()
+                        .and_then(|capture| snapshot(capture, &self.request_content))
+                });
+                with_body(&mut self.trace, &mut full, |trace| {
+                    self.state.trace.evaluate(trace)
+                })
+            }
+        };
+        self.state.trace.record(self.trace, evaluation);
     }
+}
+
+/// Run `f` on `trace` as if its request body were `body` (the complete body,
+/// when the trace keeps only a prefix), without copying the trace.
+fn with_body<R>(
+    trace: &mut Trace,
+    body: &mut Option<trace::BodyTrace>,
+    f: impl FnOnce(&Trace) -> R,
+) -> R {
+    if body.is_none() {
+        return f(trace);
+    }
+    std::mem::swap(&mut trace.request.body, body);
+    let result = f(trace);
+    std::mem::swap(&mut trace.request.body, body);
+    result
 }
 
 /// Fill in the operation from the request body when the wire protocol only
@@ -433,19 +470,6 @@ impl Upstream {
     }
 }
 
-/// Set a filesystem mode, ignoring platforms without POSIX permissions.
-#[cfg(unix)]
-pub fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("set permissions on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-pub fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
-}
-
 fn emulator_roots(path: &Path) -> Result<RootCertStore> {
     let pem = fs::read(path).with_context(|| {
         format!(
@@ -479,33 +503,136 @@ fn client(roots: RootCertStore) -> HttpsClient {
     Client::builder(TokioExecutor::new()).build(https)
 }
 
-enum CollectedBody {
-    Complete(Bytes),
-    ExceedsLimit(Bytes),
+/// A request body read ahead for inspection.
+struct Collected {
+    data: Bytes,
+    /// The body's trailers, when it ended with some.
+    trailers: Option<hyper::HeaderMap>,
+    /// The body ended: nothing is left unread.
+    complete: bool,
 }
 
-/// Buffer up to `limit` bytes from `body`, returning `ExceedsLimit` as soon as
-/// incoming data crosses `limit` so a large or streaming upload never exhausts
-/// proxy memory under `--enforce`.
-async fn collect_bounded<B>(mut body: B, limit: usize) -> Result<CollectedBody, String>
+/// Read `body` until it ends or more than `limit` bytes have arrived, so a
+/// large or streaming upload never exhausts proxy memory. The rest stays in
+/// `body`, unread.
+async fn collect_bounded<B>(body: &mut B, limit: usize) -> Result<Collected, String>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let cap_hint = body.size_hint().lower().min(limit as u64).min(64 * 1024) as usize;
     let mut buf = Vec::with_capacity(cap_hint);
-    while let Some(frame_res) = body.frame().await {
-        let frame = frame_res.map_err(|err| err.into().to_string())?;
-        if let Ok(chunk) = frame.into_data() {
-            if buf.len().saturating_add(chunk.len()) > limit {
-                let take = limit.saturating_sub(buf.len());
-                buf.extend_from_slice(&chunk[..take]);
-                return Ok(CollectedBody::ExceedsLimit(Bytes::from(buf)));
+    let mut trailers = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|err| err.into().to_string())?;
+        match frame.into_data() {
+            Ok(chunk) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > limit {
+                    return Ok(Collected {
+                        data: Bytes::from(buf),
+                        trailers: None,
+                        complete: false,
+                    });
+                }
             }
-            buf.extend_from_slice(&chunk);
+            Err(frame) => {
+                if let Ok(map) = frame.into_trailers() {
+                    trailers = Some(map);
+                }
+            }
         }
     }
-    Ok(CollectedBody::Complete(Bytes::from(buf)))
+    Ok(Collected {
+        data: Bytes::from(buf),
+        trailers,
+        complete: true,
+    })
+}
+
+/// The bytes read ahead, then whatever of the body is still unread (or the
+/// trailers it ended with): forwards a request exactly as it arrived.
+struct ReadAhead<B> {
+    data: Option<Bytes>,
+    trailers: Option<hyper::HeaderMap>,
+    rest: Option<B>,
+}
+
+impl<B> hyper::body::Body for ReadAhead<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(data) = this.data.take().filter(|data| !data.is_empty()) {
+            return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data))));
+        }
+        if let Some(rest) = this.rest.as_mut() {
+            return std::pin::Pin::new(rest).poll_frame(cx);
+        }
+        std::task::Poll::Ready(
+            this.trailers
+                .take()
+                .map(|trailers| Ok(hyper::body::Frame::trailers(trailers))),
+        )
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.as_ref().is_none_or(Bytes::is_empty)
+            && self.trailers.is_none()
+            && self.rest.as_ref().is_none_or(|rest| rest.is_end_stream())
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let ahead = self.data.as_ref().map_or(0, Bytes::len) as u64;
+        match self.rest.as_ref() {
+            None => hyper::body::SizeHint::with_exact(ahead),
+            Some(rest) => {
+                let rest = rest.size_hint();
+                let mut hint = hyper::body::SizeHint::new();
+                hint.set_lower(ahead + rest.lower());
+                if let Some(upper) = rest.upper() {
+                    hint.set_upper(ahead + upper);
+                }
+                hint
+            }
+        }
+    }
+}
+
+/// Remove hop-by-hop headers (and any the `Connection` header names): they
+/// describe one connection, not the request or response, and are not
+/// forwarded. The trace still records them as sent.
+fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
+    let named: Vec<header::HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| header::HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
 }
 
 async fn handle<B>(req: Request<B>, state: Arc<State>) -> Result<Response<Body>, Infallible>
@@ -513,11 +640,11 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    handle_with_inspect_limit(req, state, MAX_ENFORCE_INSPECT_BYTES).await
+    handle_with_inspect_limit(req, state, MAX_INSPECT_BYTES).await
 }
 
 async fn handle_with_inspect_limit<B>(
-    req: Request<B>,
+    mut req: Request<B>,
     state: Arc<State>,
     inspect_limit: usize,
 ) -> Result<Response<Body>, Infallible>
@@ -525,7 +652,15 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    if let Some(response) = lenslet_endpoint(&req, &state) {
+        return Ok(response);
+    }
     let started = Instant::now();
+    let replay_of = req
+        .headers_mut()
+        .remove(REPLAY_HEADER)
+        .and_then(|value| value.to_str().ok().map(str::to_string))
+        .filter(|id| !id.is_empty());
     let method = req.method().clone();
     let raw_path = req
         .uri()
@@ -583,6 +718,8 @@ where
         implied: Vec::new(),
         new: false,
         blocked: false,
+        blocked_phase: None,
+        replay_of,
         request: Message {
             headers: request_headers,
             content_type: request_content.content_type.clone(),
@@ -591,7 +728,8 @@ where
         response: Message::default(),
     };
 
-    let (parts, body) = req.into_parts();
+    let (mut parts, mut body) = req.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
     let forward_path = if raw_path.starts_with('/') {
         raw_path.as_str()
     } else if raw_path == "*" {
@@ -604,138 +742,107 @@ where
         ));
     };
 
-    // Active IAM enforcement (`--enforce`): deny unauthorized calls locally
-    // before a single unauthorized write reaches the emulator. Request bodies
-    // are inspected against `MAX_ENFORCE_INSPECT_BYTES` independently of
-    // `--max-body`, so a small trace capture limit never hides trailing items.
-    let mut enforce_full_body: Option<trace::BodyTrace> = None;
-    let mut gate_capture: Option<Arc<Mutex<Capture>>> = None;
-    let upstream_body: Body = if state.enforce
-        && let Some(gate) = state.trace.gate()
-    {
-        if access::needs_request_body(
-            &service,
-            advertised_operation.as_deref(),
-            &trace.operation,
-            &raw_path,
-        ) {
-            let (collected, over_limit) = match collect_bounded(body, inspect_limit).await {
-                Ok(CollectedBody::Complete(bytes)) => (bytes, false),
-                Ok(CollectedBody::ExceedsLimit(prefix)) => (prefix, true),
-                Err(detail) => {
-                    return Ok(error_response(StatusCode::BAD_REQUEST, &detail));
-                }
+    // Does this call name its resource (or a role or key) in its body? Then
+    // derivation reads up to `inspect_limit` of it, whatever `--max-body` is.
+    let needs_body = access::needs_request_body(
+        &service,
+        advertised_operation.as_deref(),
+        &trace.operation,
+        &raw_path,
+    );
+    let mut full_body: Option<trace::BodyTrace> = None;
+    let mut derive_capture: Option<Arc<Mutex<Capture>>> = None;
+    let mut evaluation: Option<Evaluation> = None;
+    // Active IAM enforcement (`--enforce`): deny unauthorized calls locally,
+    // before they reach the emulator.
+    let enforce_gate = state.trace.gate().filter(|_| state.enforce);
+    let upstream_body: Body = if let Some(gate) = enforce_gate {
+        if needs_body {
+            let collected = match collect_bounded(&mut body, inspect_limit).await {
+                Ok(collected) => collected,
+                Err(detail) => return Ok(error_response(StatusCode::BAD_REQUEST, &detail)),
             };
-            if let Ok(mut cap) = request_capture.lock() {
-                cap.feed(&collected);
+            if let Ok(mut capture) = request_capture.lock() {
+                capture.feed(&collected.data);
             }
             trace.request.body = snapshot(&request_capture, &request_content);
-            if over_limit && let Some(ref mut b) = trace.request.body {
-                b.truncated = true;
+            let inspect = Mutex::new(Capture::with_limit(inspect_limit));
+            if let Ok(mut capture) = inspect.lock() {
+                capture.feed(&collected.data);
             }
-
-            let eval_cap = Mutex::new({
-                let mut c = Capture::with_limit(inspect_limit);
-                c.feed(&collected);
-                c
-            });
             resolve_operation(
                 &mut trace,
                 advertised_operation.as_deref(),
-                &eval_cap,
+                &inspect,
                 &request_content,
             );
-            let mut full_body = snapshot(&eval_cap, &request_content);
-            if over_limit {
-                match full_body.as_mut() {
-                    Some(b) => b.truncated = true,
-                    None => {
-                        full_body = Some(trace::BodyTrace {
-                            text: None,
-                            hex: None,
-                            encoding: request_content.wire_encoding.clone(),
-                            bytes: collected.len() as u64,
-                            truncated: true,
-                            binary: false,
-                            sha256: String::new(),
-                        });
-                    }
-                }
-            }
-            let mut eval_trace = trace.clone();
-            eval_trace.request.body = full_body.clone();
-            if over_limit {
-                let denied = first_denied(&eval_trace, gate).unwrap_or_else(|| {
-                    Access::new(
-                        format!("{}:*", trace.service),
-                        crate::lock::UNVERIFIED_RESOURCE,
-                    )
-                });
+            // A body longer than the inspection limit is read as truncated:
+            // what it names past the limit stands as `*`.
+            full_body = snapshot(&inspect, &request_content).map(|mut body| {
+                body.truncated |= !collected.complete;
+                body
+            });
+            let checked = with_body(&mut trace, &mut full_body, |trace| {
+                state.trace.evaluate(trace)
+            });
+            if let Some(denied) = checked.denied.first().cloned() {
                 state.trace.start(&trace.id);
                 return Ok(reject_blocked(
                     trace,
-                    &eval_trace,
+                    checked,
                     &denied,
                     gate,
                     &state,
                     started,
+                    BlockedPhase::Request,
                 ));
             }
-            if let Some(denied) = first_denied(&eval_trace, gate) {
-                state.trace.start(&trace.id);
-                return Ok(reject_blocked(
-                    trace,
-                    &eval_trace,
-                    &denied,
-                    gate,
-                    &state,
-                    started,
-                ));
+            evaluation = Some(checked);
+            let rest = (!collected.complete).then(|| TeeBody::new(body, request_capture.clone()));
+            ReadAhead {
+                data: Some(collected.data),
+                trailers: collected.trailers,
+                rest,
             }
-            enforce_full_body = full_body;
-            Full::new(collected).map_err(|never| match never {}).boxed()
+            .map_err(|error| std::io::Error::other(error.into()))
+            .boxed()
         } else {
-            if let Some(denied) = first_denied(&trace, gate) {
-                // Drain small bodies with a strict size cap so keep-alive clients
-                // read the 403 cleanly without trusting `size_hint` blindly.
-                let small_exact = body
-                    .size_hint()
-                    .exact()
-                    .is_some_and(|len| len <= state.max_body as u64);
-                if small_exact
-                    && let Ok(CollectedBody::Complete(bytes)) =
-                        collect_bounded(body, state.max_body.min(inspect_limit)).await
+            let checked = state.trace.evaluate(&trace);
+            if let Some(denied) = checked.denied.first().cloned() {
+                if let Ok(Ok(drained)) =
+                    tokio::time::timeout(DRAIN_TIME, collect_bounded(&mut body, DRAIN_BYTES)).await
+                    && drained.complete
                 {
-                    if let Ok(mut cap) = request_capture.lock() {
-                        cap.feed(&bytes);
+                    if let Ok(mut capture) = request_capture.lock() {
+                        capture.feed(&drained.data);
                     }
                     trace.request.body = snapshot(&request_capture, &request_content);
                 }
                 state.trace.start(&trace.id);
-                let eval_trace = trace.clone();
                 return Ok(reject_blocked(
                     trace,
-                    &eval_trace,
+                    checked,
                     &denied,
                     gate,
                     &state,
                     started,
+                    BlockedPhase::Request,
                 ));
             }
+            evaluation = Some(checked);
             TeeBody::new(body, request_capture.clone())
-                .map_err(std::io::Error::other)
+                .map_err(|error| std::io::Error::other(error.into()))
                 .boxed()
         }
-    } else if state.trace.gate().is_some() && state.max_body < inspect_limit {
-        let gate_cap = Arc::new(Mutex::new(Capture::with_limit(inspect_limit)));
-        gate_capture = Some(gate_cap.clone());
-        let inner = TeeBody::new(body, request_capture.clone());
-        TeeBody::new(inner, gate_cap)
-            .map_err(std::io::Error::other)
+    } else if needs_body && state.max_body < inspect_limit {
+        let capture = Arc::new(Mutex::new(Capture::with_limit(inspect_limit)));
+        derive_capture = Some(capture.clone());
+        TeeBody::new(TeeBody::new(body, request_capture.clone()), capture)
+            .map_err(|error| std::io::Error::other(error.into()))
             .boxed()
     } else {
         TeeBody::new(body, request_capture.clone())
-            .map_err(std::io::Error::other)
+            .map_err(|error| std::io::Error::other(error.into()))
             .boxed()
     };
 
@@ -750,8 +857,8 @@ where
             return Ok(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
         }
     };
-    // Headers (including Host and Authorization) are forwarded verbatim so
-    // SigV4 signatures remain valid.
+    // End-to-end headers (including Host and Authorization) are forwarded
+    // verbatim so SigV4 signatures remain valid.
     *upstream.headers_mut() = parts.headers;
 
     // A slow call (long poll, large transfer, a hung emulator) shows up as
@@ -779,7 +886,7 @@ where
                     &pending_capture,
                     &pending_content,
                 );
-                state.trace.record(pending);
+                state.trace.record_pending(&pending);
             }
         });
     }
@@ -787,70 +894,54 @@ where
     match state.client.request(upstream).await {
         Ok(response) => {
             let status = response.status();
-            let headers = response.headers().clone();
-            let response_headers = trace::headers(&headers);
+            let mut headers = response.headers().clone();
+            trace.status = status.as_u16();
+            trace.response = Message {
+                headers: trace::headers(&headers),
+                content_type: capture::content(&headers).content_type,
+                body: None,
+            };
             let response_content = capture::content(&headers);
+            strip_hop_by_hop(&mut headers);
 
-            // Enforce response-discovered implied permissions (such as `kms:Decrypt`
-            // on an SSE-KMS S3 `GetObject`) before returning the payload.
-            if state.enforce
-                && let Some(gate) = state.trace.gate()
+            // Only an S3 response reveals more access (the SSE-KMS key of
+            // the object read or written): check it before returning the
+            // payload. The emulator has run the call by now.
+            if let Some(gate) = enforce_gate
+                && service == "s3"
             {
-                let mut check_trace = Trace {
-                    status: status.as_u16(),
-                    response: Message {
-                        headers: response_headers.clone(),
-                        content_type: response_content.content_type.clone(),
-                        body: None,
-                    },
-                    ..trace.clone()
-                };
-                check_trace.request.body = enforce_full_body
-                    .clone()
-                    .or_else(|| snapshot(&request_capture, &request_content));
-                if enforce_full_body.is_none() {
-                    resolve_operation(
-                        &mut check_trace,
-                        advertised_operation.as_deref(),
-                        &request_capture,
-                        &request_content,
-                    );
-                }
-                if let Some(denied) = first_denied(&check_trace, gate) {
+                let checked = with_body(&mut trace, &mut full_body, |trace| {
+                    state.trace.evaluate(trace)
+                });
+                if let Some(denied) = checked.denied.first().cloned() {
                     finished.store(true, Ordering::SeqCst);
                     drop(response);
-                    let mut out_trace = check_trace.clone();
-                    out_trace.request.body = snapshot(&request_capture, &request_content);
+                    trace.request.body = snapshot(&request_capture, &request_content);
                     return Ok(reject_blocked(
-                        out_trace,
-                        &check_trace,
+                        trace,
+                        checked,
                         &denied,
                         gate,
                         &state,
                         started,
+                        BlockedPhase::Response,
                     ));
                 }
+                evaluation = Some(checked);
             }
 
             let response_capture = Arc::new(Mutex::new(Capture::with_limit(state.max_body)));
             let pending = Pending {
                 state: state.clone(),
-                trace: Trace {
-                    status: status.as_u16(),
-                    response: Message {
-                        headers: response_headers,
-                        content_type: response_content.content_type.clone(),
-                        body: None,
-                    },
-                    ..trace
-                },
+                trace,
                 started,
                 finished,
                 advertised_operation,
                 request_capture,
                 request_content,
-                enforce_full_body,
-                gate_capture,
+                full_body,
+                derive_capture,
+                evaluation,
                 response_capture: response_capture.clone(),
                 response_content,
             };
@@ -868,23 +959,141 @@ where
         Err(error) => {
             finished.store(true, Ordering::SeqCst);
             let detail = error_chain(&error);
-            let mut trace = Trace {
-                status: StatusCode::BAD_GATEWAY.as_u16(),
-                ms: started.elapsed().as_millis() as u64,
-                problem: Some(problem::unreachable(&state.upstream, &detail)),
-                error: Some(detail),
-                ..trace
-            };
+            trace.status = StatusCode::BAD_GATEWAY.as_u16();
+            trace.ms = started.elapsed().as_millis() as u64;
+            trace.problem = Some(problem::unreachable(&state.upstream, &detail));
+            trace.error = Some(detail);
             trace.request.body = snapshot(&request_capture, &request_content);
+            let operation_capture = derive_capture.as_deref().unwrap_or(&request_capture);
             resolve_operation(
                 &mut trace,
                 advertised_operation.as_deref(),
-                &request_capture,
+                operation_capture,
                 &request_content,
             );
-            state.trace.record(trace);
+            let evaluation = evaluation.unwrap_or_else(|| {
+                let mut full = derive_capture
+                    .as_deref()
+                    .and_then(|capture| snapshot(capture, &request_content));
+                with_body(&mut trace, &mut full, |trace| state.trace.evaluate(trace))
+            });
+            state.trace.record(trace, evaluation);
             Ok(error_response(StatusCode::BAD_GATEWAY, "upstream error"))
         }
+    }
+}
+
+/// `GET /_lenslet/events` and `GET /_lenslet/health`: Lenslet's own
+/// endpoints on the proxy address. They never go upstream and are never
+/// recorded.
+fn lenslet_endpoint<B>(req: &Request<B>, state: &Arc<State>) -> Option<Response<Body>> {
+    if req.method() != hyper::Method::GET {
+        return None;
+    }
+    match req.uri().path() {
+        "/_lenslet/health" => {
+            let body = serde_json::json!({
+                "run": state.trace.run(),
+                "pid": std::process::id(),
+            })
+            .to_string();
+            let mut response = Response::new(
+                Full::new(Bytes::from(body))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            );
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            Some(response)
+        }
+        "/_lenslet/events" => {
+            let (sender, receiver) = tokio::sync::mpsc::channel(64);
+            tokio::spawn(stream_events(state.trace.clone(), sender));
+            let mut response = Response::new(ChannelBody(receiver).boxed());
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/event-stream"),
+            );
+            headers.insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache"),
+            );
+            Some(response)
+        }
+        _ => None,
+    }
+}
+
+/// Server-sent events for one client: every line of the run file in order,
+/// from the first, then each new one as it is written, as `data: <line>`;
+/// the stream ends after the `end` line. The file is the one source of
+/// truth, so the backlog and the live tail can neither miss nor repeat a
+/// line: the sink signals after each write and the stream reads on from
+/// where it was.
+async fn stream_events(sink: Arc<TraceSink>, sender: tokio::sync::mpsc::Sender<Bytes>) {
+    use tokio::io::AsyncReadExt as _;
+    let mut written = sink.subscribe();
+    let Ok(mut file) = tokio::fs::File::open(sink.path()).await else {
+        return;
+    };
+    let mut partial: Vec<u8> = Vec::new();
+    loop {
+        // Mark the signal seen before reading: a write after this point
+        // wakes the wait below.
+        written.borrow_and_update();
+        if file.read_to_end(&mut partial).await.is_err() {
+            return;
+        }
+        let mut start = 0;
+        while let Some(newline) = partial[start..].iter().position(|byte| *byte == b'\n') {
+            let line = &partial[start..start + newline];
+            start += newline + 1;
+            let mut event = Vec::with_capacity(line.len() + 8);
+            event.extend_from_slice(b"data: ");
+            event.extend_from_slice(line);
+            event.extend_from_slice(b"\n\n");
+            if sender.send(Bytes::from(event)).await.is_err() {
+                return;
+            }
+            if line.starts_with(br#"{"type":"end""#) {
+                return;
+            }
+        }
+        partial.drain(..start);
+        tokio::select! {
+            changed = written.changed() => {
+                if changed.is_err() {
+                    // The sink is gone: nothing more will be written.
+                    return;
+                }
+            }
+            () = tokio::time::sleep(KEEPALIVE) => {
+                if sender.send(Bytes::from_static(b": keepalive\n\n")).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// A response body fed by a channel, one data frame per message.
+struct ChannelBody(tokio::sync::mpsc::Receiver<Bytes>);
+
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        self.get_mut()
+            .0
+            .poll_recv(cx)
+            .map(|next| next.map(|data| Ok(hyper::body::Frame::data(data))))
     }
 }
 
@@ -904,31 +1113,16 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
-/// Return the first derived permission on `trace` that `gate` does not allow.
-fn first_denied(trace: &Trace, gate: &Gate) -> Option<Access> {
-    let req_ctx = crate::lock::RequestContext::from_trace(trace);
-    let (own, implied) = access::derive_for_gate(trace, gate.is_policy());
-    if let Some(denied) = own
-        .into_iter()
-        .find(|entry| !gate.allows_in_context(entry, Some(&req_ctx)))
-    {
-        return Some(denied);
-    }
-    implied.into_iter().find(|entry| {
-        let imp_ctx = req_ctx.for_implied(&trace.service, trace.region.as_deref(), &entry.action);
-        !gate.allows_in_context(entry, Some(&imp_ctx))
-    })
-}
-
 /// Record a blocked call in the trace and return a protocol-accurate AWS
 /// `AccessDenied` / `AccessDeniedException` response.
 fn reject_blocked(
     mut trace: Trace,
-    eval_trace: &Trace,
-    denied: &Access,
+    evaluation: Evaluation,
+    denied: &Denial,
     gate: &Gate,
     state: &State,
     started: Instant,
+    phase: BlockedPhase,
 ) -> Response<Body> {
     let wire = problem::blocked(
         &trace.service,
@@ -959,6 +1153,7 @@ fn reject_blocked(
     trace.status = wire.status;
     trace.ms = started.elapsed().as_millis() as u64;
     trace.blocked = true;
+    trace.blocked_phase = Some(phase);
     trace.problem = Some(wire.problem);
     trace.response = Message {
         headers: trace::headers(&resp_headers),
@@ -979,7 +1174,7 @@ fn reject_blocked(
             sha256,
         }),
     };
-    state.trace.record_evaluated(trace, Some(eval_trace));
+    state.trace.record(trace, evaluation);
 
     let mut response = Response::new(
         Full::new(Bytes::from(wire.body))
@@ -1008,31 +1203,16 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
 pub struct Server {
     pub addr: SocketAddr,
     pub state: Arc<State>,
-    task: tokio::task::JoinHandle<()>,
-    v6_task: Option<tokio::task::JoinHandle<()>>,
+    shutdown: watch::Sender<bool>,
+    /// One accept loop per listener; each owns its connections.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Server {
-    #[allow(dead_code)]
-    pub async fn start(
-        options: &Options,
-        trace_path: PathBuf,
-        header: RunHeader,
-        locked: Option<BTreeSet<Access>>,
-    ) -> Result<Server> {
-        Self::start_with_gate(
-            options,
-            trace_path,
-            header,
-            locked.map(|set| Gate::from_lock("lenslet.lock", set)),
-        )
-        .await
-    }
-
     /// Validate everything, bind loopback (IPv4 + best-effort IPv6 so
     /// `localhost` works on either stack), write the run header, and start
     /// serving in the background.
-    pub async fn start_with_gate(
+    pub async fn start(
         options: &Options,
         trace_path: PathBuf,
         mut header: RunHeader,
@@ -1059,7 +1239,7 @@ impl Server {
             .ok();
         header.endpoint = format!("http://{addr}");
         header.upstream = options.upstream.base.clone();
-        let trace = Arc::new(TraceSink::with_gate(trace_path, &header, gate)?);
+        let trace = Arc::new(TraceSink::new(trace_path, &header, gate)?);
         let state = Arc::new(State {
             client: client(roots),
             upstream: options.upstream.base.clone(),
@@ -1067,13 +1247,16 @@ impl Server {
             enforce: options.enforce,
             trace,
         });
-        let task = tokio::spawn(serve(listener, state.clone()));
-        let v6_task = v6_listener.map(|v6| tokio::spawn(serve(v6, state.clone())));
+        let shutdown = watch::Sender::new(false);
+        let tasks = std::iter::once(listener)
+            .chain(v6_listener)
+            .map(|listener| tokio::spawn(serve(listener, state.clone(), shutdown.subscribe())))
+            .collect();
         Ok(Server {
             addr,
             state,
-            task,
-            v6_task,
+            shutdown,
+            tasks,
         })
     }
 
@@ -1082,44 +1265,90 @@ impl Server {
         format!("http://{}", self.addr)
     }
 
-    /// Stop accepting, after giving in-flight calls up to `grace` to finish.
-    pub async fn stop(self, grace: Duration) {
+    /// Give in-flight calls up to `grace` to finish, then stop accepting
+    /// connections and close idle ones. Requests already being served go on
+    /// (a call that finishes after the run is sealed is not recorded; a live
+    /// event stream ends after the `end` line).
+    pub async fn stop(&self, grace: Duration) {
         let deadline = Instant::now() + grace;
-        while self.state.trace.summary().unfinished > 0 && Instant::now() < deadline {
+        while self.state.trace.unfinished() > 0 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        self.task.abort();
-        if let Some(v6_task) = self.v6_task {
-            v6_task.abort();
+        self.shutdown.send_replace(true);
+    }
+
+    /// After [`Server::stop`]: wait up to `grace` for open connections to
+    /// finish, then drop the rest.
+    pub async fn join(self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        for mut task in self.tasks {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if tokio::time::timeout(left, &mut task).await.is_err() {
+                task.abort();
+            }
         }
     }
 }
 
-async fn serve(listener: TcpListener, state: Arc<State>) {
+/// Accept connections until shut down, then wait for the open ones (each
+/// shut down gracefully). Dropping this future drops every connection.
+async fn serve(listener: TcpListener, state: Arc<State>, mut shutdown: watch::Receiver<bool>) {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            let service = service_fn(move |req| handle(req, state.clone()));
-            if let Err(error) = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-                && !error.is_incomplete_message()
-            {
-                eprintln!("lenslet: connection error: {error}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                if let Ok((stream, _)) = accepted {
+                    connections.spawn(serve_connection(stream, state.clone(), shutdown.clone()));
+                }
             }
-        });
+            () = stopped(&mut shutdown) => break,
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
+    }
+    drop(listener);
+    while connections.join_next().await.is_some() {}
+}
+
+/// Resolves once the server is stopping (or gone).
+async fn stopped(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
+async fn serve_connection(
+    stream: TcpStream,
+    state: Arc<State>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let service = service_fn(move |req| handle(req, state.clone()));
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = connection.as_mut() => result,
+        () = stopped(&mut shutdown) => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+    };
+    if let Err(error) = result
+        && !error.is_incomplete_message()
+        && !error.is_timeout()
+    {
+        eprintln!("lenslet: connection error: {error}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::Access;
     use crate::capture::MAX_CAPTURE_BYTES;
     use http_body_util::BodyExt;
     use hyper::{HeaderMap, body::Incoming};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -1235,13 +1464,22 @@ mod tests {
                                     r#"{"ok":true,"Secret":"s3cr3t-value"}"#.to_string(),
                                 )
                             };
+                            let mut response = Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", content_type)
+                                .header("x-request-id", "upstream-1")
+                                .header("connection", "keep-alive")
+                                .header("keep-alive", "timeout=5");
+                            if path.ends_with("/kms") {
+                                response = response
+                                    .header("x-amz-server-side-encryption", "aws:kms")
+                                    .header(
+                                        "x-amz-server-side-encryption-aws-kms-key-id",
+                                        "arn:aws:kms:us-east-1:000000000000:key/vault",
+                                    );
+                            }
                             Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header("content-type", content_type)
-                                    .header("x-request-id", "upstream-1")
-                                    .body(Full::new(Bytes::from(body)))
-                                    .unwrap(),
+                                response.body(Full::new(Bytes::from(body))).unwrap(),
                             )
                         }
                     });
@@ -1751,7 +1989,12 @@ mod tests {
             max_body: MAX_CAPTURE_BYTES,
             enforce: false,
             trace: Arc::new(
-                TraceSink::new(temp.trace(), &RunHeader::default(), Some(locked)).unwrap(),
+                TraceSink::new(
+                    temp.trace(),
+                    &RunHeader::default(),
+                    Some(Gate::from_lock("lenslet.lock", locked)),
+                )
+                .unwrap(),
             ),
         });
         for request in [
@@ -1785,7 +2028,12 @@ mod tests {
             max_body: MAX_CAPTURE_BYTES,
             enforce: true,
             trace: Arc::new(
-                TraceSink::new(temp.trace(), &RunHeader::default(), Some(locked)).unwrap(),
+                TraceSink::new(
+                    temp.trace(),
+                    &RunHeader::default(),
+                    Some(Gate::from_lock("lenslet.lock", locked)),
+                )
+                .unwrap(),
             ),
         });
 
@@ -1889,8 +2137,7 @@ mod tests {
             max_body: MAX_CAPTURE_BYTES,
             enforce: true,
             trace: Arc::new(
-                TraceSink::with_gate(temp.trace(), &RunHeader::default(), Some(policy.clone()))
-                    .unwrap(),
+                TraceSink::new(temp.trace(), &RunHeader::default(), Some(policy.clone())).unwrap(),
             ),
         });
 
@@ -1982,7 +2229,12 @@ mod tests {
             max_body: 64,
             enforce: true,
             trace: Arc::new(
-                TraceSink::new(temp.trace(), &RunHeader::default(), Some(locked)).unwrap(),
+                TraceSink::new(
+                    temp.trace(),
+                    &RunHeader::default(),
+                    Some(Gate::from_lock("lenslet.lock", locked)),
+                )
+                .unwrap(),
             ),
         });
 
@@ -2046,11 +2298,16 @@ mod tests {
 
         let (port, mut upstream) = spawn_upstream().await;
         let temp = TempDir::new("enforce-bounded");
-        let admin = Gate::from_policy_str(
-            r#"{"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
-            "admin.json",
-        )
-        .unwrap();
+        // The lock grants the table the body names, not the `*` its unread
+        // tail stands for.
+        let admin = Gate::from_lock(
+            "lenslet.lock",
+            [Access::new(
+                "dynamodb:BatchWriteItem",
+                "arn:aws:dynamodb:*:*:table/orders",
+            )]
+            .into(),
+        );
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
@@ -2060,7 +2317,7 @@ mod tests {
             max_body: 64,
             enforce: true,
             trace: Arc::new(
-                TraceSink::with_gate(temp.trace(), &RunHeader::default(), Some(admin)).unwrap(),
+                TraceSink::new(temp.trace(), &RunHeader::default(), Some(admin)).unwrap(),
             ),
         });
 
@@ -2102,5 +2359,387 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    fn lock_state(upstream: u16, trace: PathBuf, locked: &[Access], enforce: bool) -> Arc<State> {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let gate = Gate::from_lock("lenslet.lock", locked.iter().cloned().collect());
+        Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{upstream}"),
+            max_body: MAX_CAPTURE_BYTES,
+            enforce,
+            trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), Some(gate)).unwrap()),
+        })
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_headers_are_recorded_but_not_forwarded() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("hop");
+        let state = state(&format!("http://127.0.0.1:{port}"), temp.trace());
+        let mut request = sdk_request("GET", "/bucket/key?x-id=GetObject", b"");
+        for (name, value) in [
+            ("connection", "keep-alive, x-per-hop"),
+            ("x-per-hop", "1"),
+            ("keep-alive", "timeout=5"),
+            ("te", "trailers"),
+            ("proxy-authorization", "Basic eA=="),
+            ("upgrade", "h2c"),
+        ] {
+            request.headers_mut().insert(
+                header::HeaderName::from_static(name),
+                header::HeaderValue::from_static(value),
+            );
+        }
+        let response = handle(request, state.clone()).await.unwrap();
+        for name in ["connection", "keep-alive"] {
+            assert!(
+                !response.headers().contains_key(name),
+                "{name} is not passed back to the client"
+            );
+        }
+        let _ = response.into_body().collect().await.unwrap();
+        let (forwarded, _) = upstream.recv().await.unwrap();
+        for name in [
+            "connection",
+            "x-per-hop",
+            "keep-alive",
+            "te",
+            "proxy-authorization",
+            "upgrade",
+        ] {
+            assert!(!forwarded.contains_key(name), "{name} is not forwarded");
+        }
+        assert!(forwarded.contains_key("authorization"));
+        let written = traces(&temp.trace());
+        let sent: Vec<&str> = written[0]
+            .request
+            .headers
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect();
+        assert!(
+            sent.contains(&"x-per-hop") && sent.contains(&"te"),
+            "{sent:?}"
+        );
+        let received: Vec<&str> = written[0]
+            .response
+            .headers
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect();
+        assert!(received.contains(&"keep-alive"), "{received:?}");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_call_is_recorded_with_what_it_replays() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("replay");
+        let state = state(&format!("http://127.0.0.1:{port}"), temp.trace());
+        let mut request = sdk_request("GET", "/bucket/key?x-id=GetObject", b"");
+        request
+            .headers_mut()
+            .insert(REPLAY_HEADER, header::HeaderValue::from_static("18f-2"));
+        let response = handle(request, state.clone()).await.unwrap();
+        let _ = response.into_body().collect().await.unwrap();
+        let (forwarded, _) = upstream.recv().await.unwrap();
+        assert!(
+            !forwarded.contains_key(REPLAY_HEADER),
+            "stripped before forwarding"
+        );
+        let written = traces(&temp.trace());
+        assert_eq!(written[0].replay_of.as_deref(), Some("18f-2"));
+        assert!(
+            !written[0]
+                .request
+                .headers
+                .iter()
+                .any(|header| header.name == REPLAY_HEADER),
+            "the marker is not one of the call's headers"
+        );
+        assert_eq!(written[0].access[0].action, "s3:GetObject");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_call_drains_its_body_and_records_the_request_phase() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("drain");
+        let state = lock_state(port, temp.trace(), &[], true);
+        let response = handle(
+            sdk_request("PUT", "/bucket/key?x-id=PutObject", b"payload"),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(upstream.try_recv().is_err());
+        let written = traces(&temp.trace());
+        assert!(written[0].blocked);
+        assert_eq!(written[0].blocked_phase, Some(BlockedPhase::Request));
+        assert_eq!(
+            written[0]
+                .request
+                .body
+                .as_ref()
+                .and_then(|body| body.text.as_deref()),
+            Some("payload"),
+            "the body was read before answering"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_only_the_response_reveals_blocks_after_the_emulator_ran() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let temp = TempDir::new("kms");
+        let state = lock_state(
+            port,
+            temp.trace(),
+            &[Access::new("s3:GetObject", "arn:aws:s3:::vault/*")],
+            true,
+        );
+        let response = handle(
+            sdk_request("GET", "/vault/kms?x-id=GetObject", b""),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = response.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_ok(), "the emulator saw the call");
+        let written = traces(&temp.trace());
+        assert!(written[0].blocked);
+        assert_eq!(written[0].blocked_phase, Some(BlockedPhase::Response));
+        assert_eq!(written[0].implied[0].action, "kms:Decrypt");
+        assert!(written[0].implied[0].new);
+        assert!(!written[0].access[0].new);
+    }
+
+    /// Send one raw HTTP/1.1 request and read until the server closes.
+    async fn raw_get(addr: SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut reply))
+            .await
+            .expect("the stream ends")
+            .unwrap();
+        String::from_utf8_lossy(&reply).into_owned()
+    }
+
+    #[tokio::test]
+    async fn live_events_replay_the_file_then_follow_it_until_the_end() {
+        let (port, _upstream) = spawn_upstream().await;
+        let temp = TempDir::new("events");
+        fs::create_dir_all(&temp.0).unwrap();
+        let mut options = Options::new(&temp.0, 0);
+        options.upstream = Upstream::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let header = RunHeader {
+            run: "20261119-120000-1".into(),
+            ..RunHeader::default()
+        };
+        let server = Server::start(&options, temp.trace(), header, None)
+            .await
+            .unwrap();
+        let addr = server.addr;
+
+        // Health answers on the proxy address, outside the trace.
+        let mut health = TcpStream::connect(addr).await.unwrap();
+        health
+            .write_all(
+                format!(
+                    "GET /_lenslet/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        health.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        let json: serde_json::Value =
+            serde_json::from_str(reply.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(json["run"], "20261119-120000-1");
+        assert_eq!(json["pid"], std::process::id());
+
+        let plain: Client<HttpConnector, Full<Bytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
+        let call = |path: &str| {
+            Request::builder()
+                .uri(format!("http://{addr}{path}"))
+                .header(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/s3/aws4_request, Signature=x",
+                )
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        };
+        let response = plain
+            .request(call("/bucket/one?x-id=GetObject"))
+            .await
+            .unwrap();
+        let _ = response.into_body().collect().await.unwrap();
+
+        // A subscriber that joins mid-run gets the backlog, then the rest.
+        let events = tokio::spawn(raw_get(addr, "/_lenslet/events"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let response = plain
+            .request(call("/bucket/two?x-id=GetObject"))
+            .await
+            .unwrap();
+        let _ = response.into_body().collect().await.unwrap();
+        // A slow call still running when the run ends is not recorded.
+        let slow = tokio::spawn(plain.request(call("/bucket/slow?x-id=GetObject")));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let state = server.state.clone();
+        server.stop(Duration::from_millis(50)).await;
+        let (summary, _) = state.trace.seal();
+        assert_eq!((summary.calls, summary.unfinished), (2, 1));
+        state.trace.end(&crate::summary::Report {
+            unfinished: summary.unfinished,
+            ..Default::default()
+        });
+        server.join(Duration::from_secs(5)).await;
+        let _ = slow.await;
+
+        let stream = events.await.unwrap();
+        assert!(stream.starts_with("HTTP/1.1 200"), "{stream}");
+        assert!(
+            stream.contains("content-type: text/event-stream"),
+            "{stream}"
+        );
+        let file = fs::read_to_string(temp.trace()).unwrap();
+        let lines: Vec<&str> = file.lines().collect();
+        let kinds: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(kinds, ["run", "call", "call", "end"], "nothing after `end`");
+        // Each line, exactly once and in order, as one event.
+        let mut at = 0;
+        for line in &lines {
+            let event = format!("data: {line}\n\n");
+            let found = stream[at..].find(&event).expect("every line is an event");
+            at += found + event.len();
+        }
+        assert_eq!(stream.matches("data: ").count(), lines.len());
+        assert!(
+            !stream.contains("/_lenslet/"),
+            "Lenslet's own requests are not calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn derivation_reads_past_max_body_with_or_without_a_gate() {
+        let (port, _upstream) = spawn_upstream().await;
+        let temp = TempDir::new("derive");
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: format!("http://127.0.0.1:{port}"),
+            max_body: 64,
+            enforce: false,
+            trace: Arc::new(TraceSink::new(temp.trace(), &RunHeader::default(), None).unwrap()),
+        });
+        let payload = br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"order-padding-0000000000000000000000000000"}}}}],"secret_orders":[{"PutRequest":{"Item":{"id":{"S":"2"}}}}]}}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.BatchWriteItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(Full::new(Bytes::from_static(payload)))
+            .unwrap();
+        let response = handle(request, state.clone()).await.unwrap();
+        let _ = response.into_body().collect().await.unwrap();
+        let written = traces(&temp.trace());
+        assert!(written[0].request.body.as_ref().unwrap().truncated);
+        let resources: Vec<&str> = written[0]
+            .access
+            .iter()
+            .map(|item| item.resource.as_str())
+            .collect();
+        // The same footprint `--update` and `--check` see: no `*` for a tail
+        // the trace capture cut off.
+        assert_eq!(
+            resources,
+            [
+                "arn:aws:dynamodb:*:*:table/orders",
+                "arn:aws:dynamodb:*:*:table/secret_orders"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_body_is_enforced_against_the_wildcard_lock_line() {
+        let (port, mut upstream) = spawn_upstream().await;
+        let cbor = |state: &Arc<State>| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("host", "127.0.0.1:9297")
+                .header(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=AKID/20261115/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=x",
+                )
+                .header("x-amz-target", "AmazonSQS.SendMessage")
+                .header("content-type", "application/cbor")
+                .body(Full::new(Bytes::from_static(&[0xa2, 0x00, 0xff, 0x13, 0x88])))
+                .unwrap();
+            handle(request, state.clone())
+        };
+
+        let temp = TempDir::new("unverified-blocked");
+        let state = lock_state(
+            port,
+            temp.trace(),
+            &[Access::new("sqs:SendMessage", "arn:aws:sqs:*:*:jobs")],
+            true,
+        );
+        let response = cbor(&state).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&body).contains("could not be read from the request body"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(upstream.try_recv().is_err());
+        let written = traces(&temp.trace());
+        assert_eq!(written[0].access.len(), 1);
+        assert_eq!(written[0].access[0].resource, "*");
+        assert!(written[0].access[0].unverified && written[0].access[0].new);
+
+        // Accepting the `*` line (what `--update` writes) lets it through.
+        let temp = TempDir::new("unverified-allowed");
+        let state = lock_state(
+            port,
+            temp.trace(),
+            &[Access::new("sqs:SendMessage", "*")],
+            true,
+        );
+        let response = cbor(&state).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.unwrap();
+        assert!(upstream.try_recv().is_ok());
+        let written = traces(&temp.trace());
+        assert!(!written[0].new && written[0].access[0].unverified);
     }
 }

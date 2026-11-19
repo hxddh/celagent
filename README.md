@@ -10,9 +10,11 @@ request widens AWS access, the PR says so, call by call, and CI fails until
 someone accepts the change.
 
 AWS Emulator does not evaluate IAM, so code that works locally can still be
-denied on AWS. Lenslet covers that gap in code review—and, with `--enforce`,
-blocks unauthorized calls live at the proxy with real AWS `AccessDenied`
-responses before they ever reach the emulator.
+denied on AWS. Lenslet covers that gap in code review. With `--enforce` it
+also blocks unauthorized calls live at the proxy with real AWS `AccessDenied`
+responses, and `lenslet check --policy role.json` tells you, without
+re-running anything, whether a recorded run would pass under a real IAM
+policy and which statement would deny it.
 
 > **Lenslet · `npm test` passed**
 >
@@ -53,7 +55,7 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   # install your test dependencies
-  - uses: hxddh/lenslet@lenslet-v7.0.0
+  - uses: hxddh/lenslet@lenslet-v8.0.0
     with:
       command: npm test
       emulator: moto_server -p 9298           # or however you start your emulator
@@ -97,18 +99,25 @@ against [examples/python](examples/python).
 ```console
 $ lenslet run --check -- npm test
 ...your tests...
-lenslet: 15 calls · 2 errors · 4 services (dynamodb, lambda, s3, sqs) · 476 ms
+lenslet: 24 calls · 2 errors · 4 services (dynamodb, lambda, s3, sqs) · 476 ms
   ✗ DYNAMODB GetItem  400  ResourceNotFoundException  Requested resource not found
       → Region mismatch: `table/orders` was created in `us-west-2` at call #2 (CreateTable), but this `GetItem` targeted `us-east-1`.
+  ! DYNAMODB GetItem ×8 in a serial burst
+      → 8 calls on table/orders, one after another in 31 ms: `BatchGetItem` does this in fewer round trips.
+  · 2 resources created and not deleted: s3://shop-receipts, SQS fulfilment
   access: 1 permission not in lenslet.lock
     + dynamodb:DeleteItem              arn:aws:dynamodb:*:*:table/orders
   unused: 1 permission in lenslet.lock not exercised by this run
     - dynamodb:GetItem                 arn:aws:dynamodb:*:*:table/orders
 ```
 
-- **Why it failed**: the AWS error code and message, plus **cross-call root-cause
-  correlation** (region mismatches against earlier `CreateTable`/`CreateQueue`
-  calls, resources deleted earlier in the same run, and common local setup gaps).
+- **Findings first**: one ranked list of what is worth a look. Failures come
+  with their cause, including cross-call correlation (a region mismatch against
+  an earlier `CreateTable`/`CreateQueue`, a resource deleted earlier in the
+  run, common local setup gaps). Serial bursts that a batch API would collapse
+  (N+1), SDK retries, and resources the run left behind are also listed.
+  The same list leads the terminal, the PR comment, the JSON report and the
+  window.
 - **What it needs**: each call becomes a verified AWS IAM action on a resource
   ARN, with account and region as `*`. The mapping covers:
   - batches: one entry per table or SSM parameter;
@@ -116,10 +125,17 @@ lenslet: 15 calls · 2 errors · 4 services (dynamodb, lambda, s3, sqs) · 476 m
   - copies & subresources: source reads, `PostObject` → `s3:PutObject`, and
     exact S3 subresource IAM action names (`s3:GetBucketPublicAccessBlock`,
     `s3:GetBucketNotification`, `s3:GetReplicationConfiguration`, …);
-  - implied permissions: `kms:Decrypt` / `kms:GenerateDataKey` / `kms:DescribeKey`
-    across S3, Secrets Manager, SSM, SQS, SNS, DynamoDB and Kinesis, plus
-    `iam:PassRole` across Lambda, Step Functions, ECS (`taskRoleArn` and
-    `executionRoleArn`), EventBridge, Scheduler, Pipes, Firehose and Glue.
+  - implied permissions, where the key or role is on the wire: KMS for S3
+    SSE-KMS (request or response headers), Secrets Manager and SSM writes that
+    name a key, SQS/SNS queues and topics created with a key, DynamoDB
+    `SSESpecification` and Kinesis stream encryption; `iam:PassRole` for
+    Lambda, Step Functions, ECS (`taskRoleArn` and `executionRoleArn`),
+    EventBridge (rules and `Targets[].RoleArn`), Scheduler, Pipes, Firehose
+    and Glue. The key of an existing encrypted queue, topic or secret is not
+    in the request that uses it, so it is not derived.
+  - a request whose body is not readable (binary such as CBOR, or over the
+    inspection limit) gets its action on `*`, marked unverified, rather than a
+    guessed resource.
 
   Generated names (UUIDs, timestamps) become `*`, so the lock stays stable.
 - **What changed**: compared with `lenslet.lock` (added, unused) and with the
@@ -140,36 +156,67 @@ s3:GetObject          arn:aws:s3:::shop-receipts/*
 
 The lock has one permission per line, sorted. `# test` marks access that only
 the tests need (fixtures creating tables or buckets). `--check` still counts
-those lines, but `lenslet policy` leaves them out. `lenslet run --update`
-rewrites the lock and keeps the marks. It only writes when the command passed.
+those lines, but `lenslet policy` leaves them out. A lock grants exactly its
+lines: a `*` that stands for a generated name is not a pattern over other
+names. `lenslet run --update` rewrites the lock, only when the command passed;
+the window can accept new lines and toggle marks. Every write is atomic and
+keeps the `test` marks and the comment block at the top of the file.
+
+### Checking a real policy
+
+```console
+$ lenslet check --policy deploy/role.json
+lenslet check: run 20261119-114534-30560 against deploy/role.json · 24 calls · 1 permission denied
+  ✗ dynamodb:DeleteItem  arn:aws:dynamodb:*:*:table/orders  (DYNAMODB DeleteItem)
+      → denied by statement `ReadOnlyOrders`
+```
+
+`lenslet check` re-evaluates a recorded run (the newest by default) against an
+IAM policy or a lock, without re-running your tests. It names the statement
+that denies each permission, or says that nothing allows it. Exit code 3
+means something was denied.
 
 ## The window
 
-`lenslet ui` (or `Lenslet.app`, with a unified macOS titlebar) opens a native
-three-zone workbench that tails the newest run live (up to 5,000 calls per run,
-with payloads > 8 KiB offloaded to disk offsets and hydrated on demand):
-
-- **Calls** (`⌘1`): interactive **Run Timeline Mini-Map** (`24px`, click any
-  bucket to slice by time) + proportional **Inline Waterfall** spans, combinable
-  status and service filters, and a resizable (`⌘B` collapsible) inspector whose
-  default **Exchange** view shows live **Replay** (`⌘⏎`), root-cause diagnostics,
-  clickable **SDK Retry Chains**, and **syntax-highlighted + search-highlighted**
-  Request & Response payloads (with **AWS Semantic Decode** for DynamoDB typed
-  JSON, AWS Query forms, and `vnd.amazon.eventstream` streams).
-- **Access** (`⌘2` / `a`): searchable permission table paired with a
-  **Permission Inspector** that lets you **accept new permissions directly into
-  `lenslet.lock`** or **toggle `# test` marks** in one click without re-running
-  your test suite, plus `Copy Policy JSON`.
-- **Diff** (`⌘3` / `d`): visual run-to-run comparison against the nearest
-  earlier baseline (`prev`) or any recorded run.
-
-Press **`⌘K`** (or `Ctrl+K`) anywhere to open the **Command Palette**, **`⌘F`**
-(or `/`) to search the stream and highlight matches inside payloads and headers,
-and **`⌘,`** to open **Settings** (System / Light / Dark appearance, 6 WCAG-AA
-accent colors, row density, English / Chinese UI labels, timestamp mode,
-formatting/wrap defaults, and storage cleanup in `~/.lenslet/ui.json`).
+`lenslet ui` (or `Lenslet.app`) opens the window. It follows the newest run
+live: while the run is going it subscribes to the proxy's event stream, so a
+call shows up as it happens, and it reads the run file when the run is over.
+Everything it shows comes from the same core as the CLI, so the window, the
+terminal and the PR comment always agree.
 
 ![A run in the Lenslet window](docs/lenslet.png)
+
+One header, two views, one inspector:
+
+- **Header**: the run (switch runs with `⌘[` / `⌘]`, or pick one), **Calls |
+  Access**, **Compared with ▾** (`lenslet.lock`, the previous run, or any
+  recorded run, with a one-line summary of what changed), and search.
+- **Calls** (`⌘1`): filter chips (errors, changed vs the baseline, services),
+  the **Findings** of the run at the top (click one to jump to its calls), a
+  timeline of the run, and the call table with durations drawn to scale.
+- **Access** (`⌘2`): every permission the run used, marked not in the lock,
+  unused, implied or `# test`. **Accept into lock** and **Mark `# test`**
+  edit `lenslet.lock` in place (the same atomic write as
+  `lenslet run --update`); **Copy policy** gives the IAM policy.
+- **Inspector** (`⌘B`): why a call failed, its SDK retries, and the request
+  and response bodies, decoded (DynamoDB typed JSON, AWS Query forms, event
+  streams, embedded JSON) or raw. Bodies of any size scroll instantly; select
+  lines and `⌘C`. **Replay** (`⌘⏎`) re-sends the call through the live proxy,
+  so the replay is recorded, checked against the lock, and marked as a
+  replay; it is never counted as a retry.
+
+![The Access view](docs/access.png)
+
+Right-click a call or a permission for its actions (copy as curl, copy the
+ARN or statement, replay, accept, mark `# test`). `⌘K` opens the command
+palette, where every command is, and `⌘F` or `/` searches calls, headers and
+bodies. `j`/`k` or the arrow keys move, `Enter` goes into the inspector and
+`Esc` backs out. On Linux every `⌘` shortcut is `Ctrl`. `⌘,` opens Settings:
+appearance (System / Light / Dark), accent, density, English or 中文, and
+the space recorded runs take (with a button to clear finished ones).
+
+The window never reads the disk while drawing: runs load, search and decode
+in the background, and a 5,000-call run is on screen in well under 150 ms.
 
 ## For agents
 
@@ -184,9 +231,15 @@ Every run ends with one JSON report, the same object in three places:
 | exit code | meaning |
 | --- | --- |
 | the command's | the command failed |
-| `3` | the command passed, but `--check` found access not in the lock (or, with `--strict`, unused) |
+| `3` | the command passed, but `--check` found access not in the lock (or, with `--strict`, unused); or `lenslet check` found a denied permission |
 | `2` | Lenslet could not run |
 | `0` | otherwise |
+
+While a run is going, its proxy streams the run file live:
+`GET <endpoint>/_lenslet/events` is a server-sent event stream of every line
+(backlog first, then each new line, ending after the report), and
+`GET <endpoint>/_lenslet/health` says which run it is. The window uses the
+same stream.
 
 The format is in [docs/trace.md](docs/trace.md).
 
@@ -200,6 +253,8 @@ lenslet last [--json]                          the newest run's report
 lenslet runs [--json] [--limit N]              list recorded runs newest-first
 lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]
                                                compare two runs (default: previous vs newest)
+lenslet check [--policy PATH | --lock PATH] [RUN] [--json] [--markdown PATH]
+                                               would a recorded run pass under this policy/lock?
 lenslet policy [--lock PATH]                   an IAM policy from the lock (without `# test` lines)
 lenslet ui                                     the window
 
@@ -265,8 +320,10 @@ cargo test --workspace
 ```
 
 ```text
-crates/cli     lenslet: proxy, error and access derivation, lock, reports, init
-crates/ui      lenslet-ui: the GPUI window (reads run files; no IAM logic)
+crates/core    lenslet-core: the facts — run-file schema, access derivation, lock
+               and policy gate, failure causes, findings, reports, run diffs
+crates/cli     lenslet: the proxy, the run file and live events, commands
+crates/ui      lenslet-ui: the GPUI window, on lenslet-core
 action.yml     the GitHub Action
 install.sh     the installer
 examples/      a project the action is tested against
@@ -275,6 +332,10 @@ examples/      a project the action is tested against
 ## Limits
 
 - Between the SDK and the proxy: HTTP/1.1 only, loopback only.
+- `--enforce` stops a call before it reaches the emulator, except when the
+  denied permission only shows in the response (the SSE-KMS key of an S3
+  bucket's default encryption): the emulator has then already run the call,
+  and the trace marks it `blocked_phase: "response"`.
 - Capture keeps the first 1 MiB of each body by default (`--max-body` or
   `--max-body unlimited` to change), unframing `aws-chunked` and
   `application/vnd.amazon.eventstream` streams and decompressing `gzip` and
@@ -293,7 +354,8 @@ examples/      a project the action is tested against
   keys (such as `aws:PrincipalOrgID`).
 - No Windows build. The macOS app is not notarized.
 
-Earlier versions: [lenslet-v6.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v6.0.0),
+Earlier versions: [lenslet-v7.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v7.0.0),
+[lenslet-v6.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v6.0.0),
 [lenslet-v5.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v5.0.0),
 [lenslet-v4.1.0](https://github.com/hxddh/lenslet/tree/lenslet-v4.1.0).
 This repository used to be `celagent`; that project is at

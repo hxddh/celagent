@@ -179,6 +179,11 @@ fn run_explains_failures_keeps_the_exit_code_and_writes_one_run_file() {
         serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
     assert_eq!(report["exit_code"], 4);
     assert_eq!(report["failures"][0]["code"], "QueueDoesNotExist");
+    assert_eq!(report["findings"][0]["kind"], "failure");
+    assert_eq!(
+        report["findings"][0]["title"],
+        "SQS GetQueueUrl → QueueDoesNotExist"
+    );
     assert_eq!(report["access"][0]["action"], "sqs:GetQueueUrl");
     assert_eq!(report["access"][0]["resource"], "arn:aws:sqs:*:*:jobs");
 
@@ -631,4 +636,75 @@ fn enforce_and_policy_gate_live_calls_end_to_end() {
         serde_json::from_slice(&alias_diff_out.stdout).unwrap();
     assert_eq!(alias_diff_json["base_run"], diff_json["base_run"]);
     assert_eq!(alias_diff_json["target_run"], diff_json["target_run"]);
+}
+
+#[test]
+fn check_re_evaluates_a_recorded_run_and_names_the_denying_statement() {
+    if !has_curl() {
+        eprintln!("skipping: curl is not installed");
+        return;
+    }
+    let env = Env::new();
+    let output = env.run(&["--update"], &["SendMessage", "ReceiveMessage"], 0);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let stdout = |output: &Output| String::from_utf8_lossy(&output.stdout).into_owned();
+
+    // Against the lock it wrote: nothing denied.
+    let ok = env.lenslet(&["check"]);
+    assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
+    assert!(
+        stdout(&ok).contains("2 calls · all allowed"),
+        "{}",
+        stdout(&ok)
+    );
+
+    std::fs::write(
+        env.work.join("iam.json"),
+        r#"{"Statement":[
+            {"Sid":"Queues","Effect":"Allow","Action":"sqs:*","Resource":"*"},
+            {"Sid":"NoSend","Effect":"Deny","Action":"sqs:SendMessage","Resource":"arn:aws:sqs:*:*:jobs"}
+        ]}"#,
+    )
+    .unwrap();
+    let denied = env.lenslet(&["check", "--policy", "iam.json"]);
+    assert_eq!(denied.status.code(), Some(3), "{}", stderr(&denied));
+    let text = stdout(&denied);
+    assert!(text.contains("1 permission denied"), "{text}");
+    assert!(
+        text.contains("✗ sqs:SendMessage  arn:aws:sqs:us-east-1:*:jobs  (SQS SendMessage)"),
+        "{text}"
+    );
+    assert!(text.contains("→ denied by statement `NoSend`"), "{text}");
+
+    let json = env.lenslet(&["check", "--policy", "iam.json", "--json", "latest"]);
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["calls"], 2);
+    assert_eq!(report["denied"][0]["by"], "NoSend");
+    assert_eq!(report["denied"][0]["reason"], "explicit_deny");
+    assert_eq!(report["denied"][0]["operation"], "SendMessage");
+
+    std::fs::write(env.work.join("empty.lock"), "# nothing yet\n").unwrap();
+    let markdown = env.home.join("check.md");
+    let missing = env.lenslet(&[
+        "check",
+        "--lock",
+        "empty.lock",
+        "--markdown",
+        markdown.to_str().unwrap(),
+    ]);
+    assert_eq!(missing.status.code(), Some(3));
+    assert!(
+        stdout(&missing).contains("→ not in empty.lock"),
+        "{}",
+        stdout(&missing)
+    );
+    let md = std::fs::read_to_string(&markdown).unwrap();
+    assert!(
+        md.contains("**2 permissions denied** across 2 calls."),
+        "{md}"
+    );
+
+    let usage = env.lenslet(&["check", "--policy", "iam.json", "--lock", "empty.lock"]);
+    assert_eq!(usage.status.code(), Some(2));
+    assert_eq!(env.lenslet(&["check", "--nope"]).status.code(), Some(2));
 }

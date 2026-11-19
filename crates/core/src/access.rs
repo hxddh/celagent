@@ -37,18 +37,13 @@ pub struct CallAccess {
     pub resource: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new: bool,
+    /// The resource could not be read because the request body was not
+    /// readable (binary or truncated): `resource` is `*`, standing for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unverified: bool,
 }
 
 impl CallAccess {
-    pub fn from_gate(access: Access, gate: Option<&crate::lock::Gate>) -> Self {
-        let new = gate.is_some_and(|gate| !gate.allows(&access));
-        CallAccess {
-            action: access.action,
-            resource: access.resource,
-            new,
-        }
-    }
-
     pub fn key(&self) -> Access {
         Access {
             action: self.action.clone(),
@@ -63,6 +58,7 @@ impl From<Access> for CallAccess {
             action: access.action,
             resource: access.resource,
             new: false,
+            unverified: false,
         }
     }
 }
@@ -111,95 +107,159 @@ pub fn is_unmapped(trace: &Trace) -> bool {
         && !(trace.service == "sts" && trace.operation == "GetCallerIdentity")
 }
 
+/// Everything one call needs from IAM, derived once from its request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Derived {
+    /// Normalized footprint: what `lenslet.lock` and reports record.
+    pub own: Vec<Access>,
+    pub implied: Vec<Access>,
+    /// Exact request ARNs: what an IAM policy is evaluated against.
+    pub concrete_own: Vec<Access>,
+    pub concrete_implied: Vec<Access>,
+    /// Entries (footprint and concrete alike) whose resource stands as `*`
+    /// because the request body that names it could not be read.
+    pub unverified: Vec<Access>,
+}
+
 /// The normalized footprint access one call needs (for `lenslet.lock` and reports).
 pub fn derive(trace: &Trace) -> (Vec<Access>, Vec<Access>) {
-    derive_inner(trace, Mode::Footprint, false)
+    let derived = derive_call(trace);
+    (derived.own, derived.implied)
 }
 
-/// Derive permissions for checking or actively enforcing against a [`crate::lock::Gate`].
+/// Footprint and concrete access for one call, parsing its body once.
 ///
-/// When `concrete` is true (`--policy`), exact request ARNs (S3 object keys,
-/// signing region, concrete names) are preserved so path-scoped `Allow` and
-/// `Deny` rules evaluate accurately. When a body-dependent request was
-/// truncated or unreadable, a fail-closed sentinel permission is included so an
-/// uninspected body tail can never slip past `--enforce` or `--check`.
-pub fn derive_for_gate(trace: &Trace, concrete: bool) -> (Vec<Access>, Vec<Access>) {
-    let mode = if concrete {
-        Mode::Concrete
-    } else {
-        Mode::Footprint
-    };
-    derive_inner(trace, mode, true)
+/// When the body that names the resource cannot be read (binary such as
+/// CBOR, or truncated), the call still gets its action, on resource `*`, and
+/// the entry is listed in [`Derived::unverified`]. A `*` is stable across
+/// runs, so it can be accepted into the lock; a policy grants it only with
+/// `Resource: "*"`, while any `Deny` on the action applies to it.
+pub fn derive_call(trace: &Trace) -> Derived {
+    if !mapped_operation(trace) {
+        return Derived::default();
+    }
+    let body = Body::parse(trace);
+    let (own, implied, unverified) = derive_inner(trace, Mode::Footprint, &body);
+    let (concrete_own, concrete_implied, _) = derive_inner(trace, Mode::Concrete, &body);
+    Derived {
+        own,
+        implied,
+        concrete_own,
+        concrete_implied,
+        unverified,
+    }
 }
 
-fn derive_inner(trace: &Trace, mode: Mode, fail_closed_body: bool) -> (Vec<Access>, Vec<Access>) {
+/// An operation Lenslet can name (not just an HTTP method).
+fn mapped_operation(trace: &Trace) -> bool {
     let operation = trace.operation.as_str();
-    if operation.is_empty()
+    !(operation.is_empty()
         || operation == trace.method
         || trace.service == "aws"
-        || !operation.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    {
-        if fail_closed_body
-            && trace.service != "aws"
-            && trace
-                .request
-                .body
-                .as_ref()
-                .is_some_and(|b| b.truncated || b.binary)
-        {
-            return (
-                vec![Access::new(
-                    format!("{}:*", iam_prefix(&trace.service)),
-                    crate::lock::UNVERIFIED_RESOURCE,
-                )],
-                Vec::new(),
-            );
-        }
-        return (Vec::new(), Vec::new());
-    }
-    let prefix = iam_prefix(&trace.service);
-    let body = Body::parse(trace);
-    let body_incomplete = fail_closed_body
-        && needs_request_body(&trace.service, None, operation, &trace.path)
-        && trace
-            .request
-            .body
-            .as_ref()
-            .is_some_and(|b| b.truncated || b.binary);
+        || !operation.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
 
-    let implied = implied(mode, prefix, operation, trace, &body);
-    if prefix == "dynamodb" && operation.starts_with("Transact") {
-        let mut own = transaction(mode, trace, &body);
-        if fail_closed_body && (body_incomplete || own.is_empty()) {
-            own.push(Access::new(
-                format!("dynamodb:{operation}"),
-                crate::lock::UNVERIFIED_RESOURCE,
-            ));
+/// The request body was captured but cannot be read in full.
+fn body_unreadable(trace: &Trace) -> bool {
+    trace
+        .request
+        .body
+        .as_ref()
+        .is_some_and(|body| body.truncated || body.binary || body.text.is_none())
+}
+
+/// Whether this call's resource (or a role it passes) is named in its body.
+fn resource_in_body(prefix: &str, operation: &str, trace: &Trace) -> bool {
+    match prefix {
+        "sqs" | "sns" | "secretsmanager" | "ssm" | "logs" | "kinesis" | "kms" | "sts" | "iam"
+        | "events" | "states" | "cognito-idp" | "ecr" | "firehose" | "scheduler" | "rds-data"
+        | "dynamodb" | "pipes" | "glue" => true,
+        "lambda" => {
+            lambda_function(&trace.path).is_none()
+                || matches!(operation, "CreateFunction" | "UpdateFunctionConfiguration")
         }
-        return (own, implied);
+        "bedrock" => bedrock_model(&trace.path).is_none(),
+        _ => false,
     }
-    let Some(action) = action_name(prefix, operation) else {
-        return (Vec::new(), Vec::new());
+}
+
+/// Operations that always pass a role: a role hidden in an unreadable body
+/// still needs `iam:PassRole`.
+fn always_passes_role(prefix: &str, operation: &str) -> bool {
+    matches!(
+        (prefix, operation),
+        ("lambda", "CreateFunction")
+            | ("states", "CreateStateMachine")
+            | ("pipes", "CreatePipe")
+            | ("scheduler", "CreateSchedule")
+            | ("glue", "CreateJob")
+    )
+}
+
+/// Own permissions, implied permissions, and the `*` stand-ins among them.
+type Derivation = (Vec<Access>, Vec<Access>, Vec<Access>);
+
+fn derive_inner(trace: &Trace, mode: Mode, body: &Body) -> Derivation {
+    let operation = trace.operation.as_str();
+    let prefix = iam_prefix(&trace.service);
+    let unreadable = body_unreadable(trace) && resource_in_body(prefix, operation, trace);
+    let mut implied = implied(mode, prefix, operation, trace, body);
+    let mut unverified = Vec::new();
+    if unreadable && always_passes_role(prefix, operation) {
+        let fallback = Access::new("iam:PassRole", "*");
+        if !implied.contains(&fallback) {
+            implied.push(fallback.clone());
+        }
+        unverified.push(fallback);
+    }
+    let mut own = if prefix == "dynamodb" && operation.starts_with("Transact") {
+        transaction(mode, trace, body)
+    } else if prefix == "dynamodb" && is_partiql(operation) {
+        partiql(mode, trace, body)
+    } else {
+        let actions = action_names(prefix, operation, trace);
+        let resources = resources(mode, prefix, operation, trace, body);
+        let mut own: Vec<Access> = actions
+            .iter()
+            .flat_map(|action| {
+                resources
+                    .iter()
+                    .map(move |resource| Access::new(action.clone(), resource.clone()))
+            })
+            .collect();
+        if prefix == "s3"
+            && let Some(source) = copy_source(mode, trace)
+        {
+            own.push(Access::new(source_read_action(trace), source));
+        }
+        own
     };
-    let mut own: Vec<Access> = resources(mode, prefix, operation, trace, &body)
-        .into_iter()
-        .map(|resource| Access::new(action.clone(), resource))
-        .collect();
-    if prefix == "s3"
-        && let Some(source) = copy_source(mode, trace)
-    {
-        own.push(Access::new("s3:GetObject", source));
+    if unreadable {
+        for action in unreadable_actions(prefix, operation, trace) {
+            let fallback = Access::new(action, "*");
+            if !own.contains(&fallback) {
+                own.push(fallback.clone());
+            }
+            unverified.push(fallback);
+        }
     }
-    if body_incomplete
-        || (fail_closed_body
-            && mode == Mode::Concrete
-            && prefix == "s3"
-            && operation == "DeleteObjects"
-            && own.is_empty())
-    {
-        own.push(Access::new(action, crate::lock::UNVERIFIED_RESOURCE));
+    (own, implied, unverified)
+}
+
+/// The actions whose resources an unreadable body hides.
+fn unreadable_actions(prefix: &str, operation: &str, trace: &Trace) -> Vec<String> {
+    match (prefix, operation) {
+        ("dynamodb", "TransactWriteItems") => {
+            ["PutItem", "UpdateItem", "DeleteItem", "ConditionCheckItem"]
+                .iter()
+                .map(|action| format!("dynamodb:{action}"))
+                .collect()
+        }
+        ("dynamodb", "TransactGetItems") => vec!["dynamodb:GetItem".to_string()],
+        // The statement, and so the action, is in the unreadable body too.
+        ("dynamodb", op) if is_partiql(op) => Vec::new(),
+        _ => action_names(prefix, operation, trace),
     }
-    (own, implied)
 }
 
 /// `TransactWriteItems` / `TransactGetItems` are not IAM actions: each item
@@ -373,13 +433,34 @@ fn iam_prefix(service: &str) -> &str {
     }
 }
 
-/// The IAM action for an operation; `None` when the call needs no permission.
-fn action_name(prefix: &str, operation: &str) -> Option<String> {
+/// The IAM actions for an operation: usually one; none when the call needs no
+/// permission.
+fn action_names(prefix: &str, operation: &str, trace: &Trace) -> Vec<String> {
+    if prefix == "s3" && wire::query_param(&trace.path, "versionId").is_some() {
+        // A request for one object version needs the `*Version*` action.
+        let versioned: &[&str] = match operation {
+            "GetObject" | "HeadObject" => &["GetObjectVersion"],
+            "DeleteObject" => &["DeleteObjectVersion"],
+            "GetObjectTagging" => &["GetObjectVersionTagging"],
+            "PutObjectTagging" => &["PutObjectVersionTagging"],
+            "DeleteObjectTagging" => &["DeleteObjectVersionTagging"],
+            "GetObjectAcl" => &["GetObjectVersionAcl"],
+            "PutObjectAcl" => &["PutObjectVersionAcl"],
+            "GetObjectAttributes" => &["GetObjectVersion", "GetObjectVersionAttributes"],
+            _ => &[],
+        };
+        if !versioned.is_empty() {
+            return versioned.iter().map(|name| format!("s3:{name}")).collect();
+        }
+    }
     let mapped = match (prefix, operation) {
-        ("sts", "GetCallerIdentity") => return None,
+        ("sts", "GetCallerIdentity") => return Vec::new(),
+        ("s3", "GetObjectAttributes") => {
+            return vec!["s3:GetObject".into(), "s3:GetObjectAttributes".into()];
+        }
         ("s3", "ListObjects" | "ListObjectsV2" | "HeadBucket") => "ListBucket",
         ("s3", "ListBuckets") => "ListAllMyBuckets",
-        ("s3", "HeadObject" | "GetObjectAttributes" | "SelectObjectContent") => "GetObject",
+        ("s3", "HeadObject" | "SelectObjectContent") => "GetObject",
         (
             "s3",
             "PostObject"
@@ -395,10 +476,16 @@ fn action_name(prefix: &str, operation: &str) -> Option<String> {
         ("s3", "ListParts") => "ListMultipartUploadParts",
         ("s3", "GetBucketCors") => "GetBucketCORS",
         ("s3", "PutBucketCors" | "DeleteBucketCors") => "PutBucketCORS",
-        ("s3", "GetBucketLifecycleConfiguration") => "GetLifecycleConfiguration",
-        ("s3", "PutBucketLifecycleConfiguration" | "DeleteBucketLifecycleConfiguration") => {
-            "PutLifecycleConfiguration"
+        ("s3", "GetBucketLifecycleConfiguration" | "GetBucketLifecycle") => {
+            "GetLifecycleConfiguration"
         }
+        (
+            "s3",
+            "PutBucketLifecycleConfiguration"
+            | "PutBucketLifecycle"
+            | "DeleteBucketLifecycleConfiguration"
+            | "DeleteBucketLifecycle",
+        ) => "PutLifecycleConfiguration",
         ("s3", "GetBucketEncryption") => "GetEncryptionConfiguration",
         ("s3", "PutBucketEncryption" | "DeleteBucketEncryption") => "PutEncryptionConfiguration",
         ("s3", "GetBucketNotificationConfiguration") => "GetBucketNotification",
@@ -411,16 +498,185 @@ fn action_name(prefix: &str, operation: &str) -> Option<String> {
         ("s3", "PutObjectLockConfiguration") => "PutBucketObjectLockConfiguration",
         ("s3", "GetBucketAccelerateConfiguration") => "GetAccelerateConfiguration",
         ("s3", "PutBucketAccelerateConfiguration") => "PutAccelerateConfiguration",
+        ("s3", "GetBucketAnalyticsConfiguration" | "ListBucketAnalyticsConfigurations") => {
+            "GetAnalyticsConfiguration"
+        }
+        ("s3", "PutBucketAnalyticsConfiguration" | "DeleteBucketAnalyticsConfiguration") => {
+            "PutAnalyticsConfiguration"
+        }
+        ("s3", "GetBucketInventoryConfiguration" | "ListBucketInventoryConfigurations") => {
+            "GetInventoryConfiguration"
+        }
+        ("s3", "PutBucketInventoryConfiguration" | "DeleteBucketInventoryConfiguration") => {
+            "PutInventoryConfiguration"
+        }
+        ("s3", "GetBucketMetricsConfiguration" | "ListBucketMetricsConfigurations") => {
+            "GetMetricsConfiguration"
+        }
+        ("s3", "PutBucketMetricsConfiguration" | "DeleteBucketMetricsConfiguration") => {
+            "PutMetricsConfiguration"
+        }
+        (
+            "s3",
+            "GetBucketIntelligentTieringConfiguration"
+            | "ListBucketIntelligentTieringConfigurations",
+        ) => "GetIntelligentTieringConfiguration",
+        (
+            "s3",
+            "PutBucketIntelligentTieringConfiguration"
+            | "DeleteBucketIntelligentTieringConfiguration",
+        ) => "PutIntelligentTieringConfiguration",
         ("s3", "DeleteBucketTagging") => "PutBucketTagging",
         ("s3", "DeleteBucketOwnershipControls") => "PutBucketOwnershipControls",
-        ("s3", "DeleteObjectTagging") => "DeleteObjectTagging",
+        // Batch APIs are authorized as the single-entry action.
+        ("sqs", "SendMessageBatch") => "SendMessage",
+        ("sqs", "DeleteMessageBatch") => "DeleteMessage",
+        ("sqs", "ChangeMessageVisibilityBatch") => "ChangeMessageVisibility",
+        ("sns", "PublishBatch") => "Publish",
         ("lambda", "Invoke" | "InvokeAsync" | "InvokeWithResponseStream") => "InvokeFunction",
-        ("lambda", "GetFunction") => "GetFunction",
         ("bedrock", "Converse") => "InvokeModel",
         ("bedrock", "ConverseStream") => "InvokeModelWithResponseStream",
         _ => operation,
     };
-    Some(format!("{prefix}:{mapped}"))
+    vec![format!("{prefix}:{mapped}")]
+}
+
+/// The read a copy needs on its source: a specific version needs
+/// `s3:GetObjectVersion`.
+fn source_read_action(trace: &Trace) -> &'static str {
+    let versioned = trace
+        .request
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("x-amz-copy-source"))
+        .and_then(|header| header.value.split_once('?'))
+        .is_some_and(|(_, query)| {
+            query
+                .split('&')
+                .any(|pair| pair.split('=').next() == Some("versionId"))
+        });
+    if versioned {
+        "s3:GetObjectVersion"
+    } else {
+        "s3:GetObject"
+    }
+}
+
+/// DynamoDB PartiQL operations: not IAM actions themselves.
+fn is_partiql(operation: &str) -> bool {
+    matches!(
+        operation,
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction"
+    )
+}
+
+/// PartiQL is authorized per statement verb (`dynamodb:PartiQLSelect`,
+/// `PartiQLInsert`, `PartiQLUpdate`, `PartiQLDelete`) on the table it names.
+fn partiql(mode: Mode, trace: &Trace, body: &Body) -> Vec<Access> {
+    let Body::Json(value) = body else {
+        return Vec::new();
+    };
+    let statements: Vec<&str> = match trace.operation.as_str() {
+        "ExecuteStatement" => value
+            .get("Statement")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
+        list => {
+            let key = if list == "BatchExecuteStatement" {
+                "Statements"
+            } else {
+                "TransactStatements"
+            };
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("Statement").and_then(Value::as_str))
+                .collect()
+        }
+    };
+    let mut out: Vec<Access> = statements
+        .into_iter()
+        .filter_map(|statement| {
+            let (action, target) = partiql_statement(statement)?;
+            let resource = match target {
+                Some((table, index)) => {
+                    let table = norm(mode, &table);
+                    let rest = match index {
+                        Some(index) => format!("table/{table}/index/{}", norm(mode, &index)),
+                        None => format!("table/{table}"),
+                    };
+                    arn_for(mode, trace, "dynamodb", &rest)
+                }
+                None => "*".to_string(),
+            };
+            Some(Access::new(format!("dynamodb:{action}"), resource))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The IAM action and target (table, index) of one PartiQL statement.
+#[allow(clippy::type_complexity)]
+fn partiql_statement(statement: &str) -> Option<(&'static str, Option<(String, Option<String>)>)> {
+    let mut words = statement.split_whitespace();
+    let verb = words.next()?.to_ascii_uppercase();
+    let (action, keyword) = match verb.as_str() {
+        "SELECT" => ("PartiQLSelect", Some("FROM")),
+        "INSERT" => ("PartiQLInsert", Some("INTO")),
+        "UPDATE" => ("PartiQLUpdate", None),
+        "DELETE" => ("PartiQLDelete", Some("FROM")),
+        _ => return None,
+    };
+    let target_start = match keyword {
+        None => statement.trim_start()[verb.len()..].trim_start(),
+        Some(keyword) => after_keyword(statement, keyword)?,
+    };
+    Some((action, partiql_target(target_start)))
+}
+
+/// The text after the first whitespace-delimited `keyword` (ASCII, any case).
+fn after_keyword<'a>(statement: &'a str, keyword: &str) -> Option<&'a str> {
+    let upper = statement.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let mut from = 0;
+    while let Some(found) = upper[from..].find(keyword) {
+        let at = from + found;
+        let end = at + keyword.len();
+        if at > 0
+            && bytes[at - 1].is_ascii_whitespace()
+            && bytes.get(end).is_some_and(u8::is_ascii_whitespace)
+        {
+            return Some(statement[end..].trim_start());
+        }
+        from = end;
+    }
+    None
+}
+
+/// `"orders"."byUser"` or `orders` at the start of `text`.
+fn partiql_target(text: &str) -> Option<(String, Option<String>)> {
+    fn ident(text: &str) -> Option<(String, &str)> {
+        if let Some(rest) = text.strip_prefix('"') {
+            let end = rest.find('"')?;
+            Some((rest[..end].to_string(), &rest[end + 1..]))
+        } else {
+            let end = text
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+                .unwrap_or(text.len());
+            (end > 0).then(|| (text[..end].to_string(), &text[end..]))
+        }
+    }
+    let (table, rest) = ident(text)?;
+    let index = rest
+        .strip_prefix('.')
+        .and_then(ident)
+        .map(|(index, _)| index);
+    Some((table, index))
 }
 
 /// The request body, parsed once: JSON fields, truncated JSON, or form fields.
@@ -475,6 +731,93 @@ impl Body {
                 .find(|(key, _)| key == name)
                 .map(|(_, value)| value.clone()),
             Body::None => None,
+        }
+    }
+
+    /// String values at a JSON path; a `[]` segment steps into every element
+    /// of an array, e.g. `["Targets", "[]", "RoleArn"]`.
+    fn at(&self, path: &[&str]) -> Vec<String> {
+        fn walk(value: &Value, path: &[&str], out: &mut Vec<String>) {
+            match path.split_first() {
+                None => out.extend(value.as_str().map(str::to_string)),
+                Some((&"[]", rest)) => value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .for_each(|item| walk(item, rest, out)),
+                Some((key, rest)) => {
+                    if let Some(item) = value.get(*key) {
+                        walk(item, rest, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Body::Json(value) = self {
+            walk(value, path, &mut out);
+        }
+        out
+    }
+
+    /// Every string value of `key` at any depth of a JSON body.
+    fn anywhere(&self, key: &str) -> Vec<String> {
+        fn walk(value: &Value, key: &str, out: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    for (name, item) in map {
+                        if name == key
+                            && let Some(text) = item.as_str()
+                        {
+                            out.push(text.to_string());
+                        }
+                        walk(item, key, out);
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(|item| walk(item, key, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        if let Body::Json(value) = self {
+            walk(value, key, &mut out);
+        }
+        out
+    }
+
+    /// A queue or topic attribute: JSON `Attributes.{name}`, or the Query
+    /// forms `Attribute.N.Name/Value` (SQS), `Attributes.entry.N.key/value`
+    /// (SNS `CreateTopic`) and `AttributeName`/`AttributeValue` (SNS
+    /// `SetTopicAttributes`).
+    fn attribute(&self, name: &str) -> Option<String> {
+        match self {
+            Body::Json(value) => value
+                .get("Attributes")?
+                .get(name)?
+                .as_str()
+                .map(str::to_string),
+            Body::Form(fields) => {
+                let get = |key: &str| {
+                    fields
+                        .iter()
+                        .find(|(field, _)| field == key)
+                        .map(|(_, value)| value.as_str())
+                };
+                if get("AttributeName") == Some(name) {
+                    return get("AttributeValue").map(str::to_string);
+                }
+                fields.iter().find_map(|(field, value)| {
+                    if value != name {
+                        return None;
+                    }
+                    let value_key = if let Some(stem) = field.strip_suffix(".Name") {
+                        format!("{stem}.Value")
+                    } else {
+                        format!("{}.value", field.strip_suffix(".key")?)
+                    };
+                    get(&value_key).map(str::to_string)
+                })
+            }
+            _ => None,
         }
     }
 
@@ -1374,6 +1717,7 @@ fn s3_resources(mode: Mode, operation: &str, trace: &Trace) -> Vec<String> {
                     .request
                     .body
                     .as_ref()
+                    .filter(|b| !b.truncated)
                     .and_then(|b| b.text.as_deref())
                     .unwrap_or("");
                 match parse_s3_delete_keys(xml) {
@@ -1381,9 +1725,11 @@ fn s3_resources(mode: Mode, operation: &str, trace: &Trace) -> Vec<String> {
                         .into_iter()
                         .map(|key| format!("arn:aws:s3:::{bucket}/{key}"))
                         .collect(),
-                    // Returning empty causes `derive_inner` to emit `UNVERIFIED_RESOURCE`,
-                    // failing closed on malformed XML, DTD/entity declarations, or unknown refs.
-                    Err(()) => Vec::new(),
+                    // Keys that cannot be read (truncated or malformed XML,
+                    // DTD/entity declarations, unknown references) stand as
+                    // any key in the bucket: a policy must allow all of them,
+                    // and a Deny on any key in the bucket applies.
+                    Err(()) => vec![format!("arn:aws:s3:::{bucket}/*")],
                 }
             }
         };
@@ -1630,6 +1976,11 @@ fn valid_xml_char(code: u32) -> Result<char, ()> {
 }
 
 /// Permissions a call needs on resources it does not name in its target.
+///
+/// Only keys and roles visible in this request (or, for S3, its response
+/// headers) are derived. A key that lives on the resource itself, such as an
+/// encrypted queue's key on `SendMessage` or a secret's key on
+/// `GetSecretValue`, is not on the wire and is not guessed.
 fn implied(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Body) -> Vec<Access> {
     let mut out = Vec::new();
     if prefix == "s3" {
@@ -1657,8 +2008,10 @@ fn implied(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Body
                 .map(|key| kms_key(mode, trace, &key))
                 .unwrap_or_else(|| "*".to_string());
             let action = match operation {
-                "GetObject" | "HeadObject" | "CopyObject" => Some("kms:Decrypt"),
+                "GetObject" | "HeadObject" => Some("kms:Decrypt"),
+                // A copy's headers describe its destination, which it writes.
                 "PutObject"
+                | "CopyObject"
                 | "CreateMultipartUpload"
                 | "UploadPart"
                 | "CompleteMultipartUpload" => Some("kms:GenerateDataKey"),
@@ -1668,67 +2021,69 @@ fn implied(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Body
                 out.push(Access::new(action, key));
             }
         }
-    } else if let Some(key) = body
-        .field("KmsKeyId")
-        .or_else(|| body.field("KMSMasterKeyId"))
-        .or_else(|| body.field("KmsMasterKeyId"))
-        .or_else(|| {
-            body.field("KeyId")
-                .filter(|_| matches!(prefix, "ssm" | "kinesis"))
-        })
-    {
-        let kms_action = match (prefix, operation) {
-            ("secretsmanager", "GetSecretValue") => Some("kms:Decrypt"),
-            ("secretsmanager", "CreateSecret" | "PutSecretValue" | "UpdateSecret") => {
-                Some("kms:GenerateDataKey")
-            }
-            ("ssm", "PutParameter") => Some("kms:GenerateDataKey"),
-            ("sns", "Publish" | "PublishBatch" | "CreateTopic" | "SetTopicAttributes")
-            | ("sqs", "SendMessage" | "SendMessageBatch" | "CreateQueue" | "SetQueueAttributes") => {
-                Some("kms:GenerateDataKey")
-            }
-            ("dynamodb", "CreateTable" | "UpdateTable") => Some("kms:DescribeKey"),
-            ("kinesis", "StartStreamEncryption") => Some("kms:GenerateDataKey"),
-            _ => None,
-        };
-        if let Some(action) = kms_action {
-            out.push(Access::new(action, kms_key(mode, trace, &key)));
-        }
+    } else if let Some((action, key)) = kms_in_body(prefix, operation, body) {
+        out.push(Access::new(action, kms_key(mode, trace, &key)));
     }
     // Passing one or more IAM roles to an AWS service requires `iam:PassRole` on each role.
-    let mut passed_roles: Vec<String> = Vec::new();
-    match (prefix, operation) {
-        ("lambda", "CreateFunction" | "UpdateFunctionConfiguration") => {
-            passed_roles.extend(body.field("Role"));
-        }
-        ("states", "CreateStateMachine" | "UpdateStateMachine") => {
-            passed_roles.extend(body.field("roleArn"));
-        }
+    let passed_roles: Vec<String> = match (prefix, operation) {
+        ("lambda", "CreateFunction" | "UpdateFunctionConfiguration") => body.at(&["Role"]),
+        ("states", "CreateStateMachine" | "UpdateStateMachine") => body.at(&["roleArn"]),
         ("ecs", "RegisterTaskDefinition") => {
-            passed_roles.extend(body.field("taskRoleArn"));
-            passed_roles.extend(body.field("executionRoleArn"));
+            let mut roles = body.at(&["taskRoleArn"]);
+            roles.extend(body.at(&["executionRoleArn"]));
+            roles
         }
-        ("events", "PutRule" | "PutTargets") | ("pipes", "CreatePipe" | "UpdatePipe") => {
-            passed_roles.extend(body.field("RoleArn"));
-        }
-        ("scheduler", "CreateSchedule" | "UpdateSchedule") => {
-            passed_roles.extend(body.field("RoleArn"));
-        }
-        ("firehose", "CreateDeliveryStream") => {
-            passed_roles.extend(body.field("RoleARN"));
-        }
-        ("glue", "CreateJob" | "UpdateJob") => {
-            passed_roles.extend(body.field("Role"));
-        }
-        _ => {}
-    }
-    for role in passed_roles {
-        let access = Access::new("iam:PassRole", iam_entity(mode, "role", &role));
+        ("events", "PutRule") | ("pipes", "CreatePipe" | "UpdatePipe") => body.at(&["RoleArn"]),
+        ("events", "PutTargets") => body.at(&["Targets", "[]", "RoleArn"]),
+        ("scheduler", "CreateSchedule" | "UpdateSchedule") => body.at(&["Target", "RoleArn"]),
+        // Every destination, backup and source configuration names its role.
+        ("firehose", "CreateDeliveryStream" | "UpdateDestination") => body.anywhere("RoleARN"),
+        ("glue", "CreateJob") => body.at(&["Role"]),
+        ("glue", "UpdateJob") => body.at(&["JobUpdate", "Role"]),
+        _ => Vec::new(),
+    };
+    for role in passed_roles.iter().filter(|role| !role.is_empty()) {
+        let access = Access::new("iam:PassRole", iam_entity(mode, "role", role));
         if !out.contains(&access) {
             out.push(access);
         }
     }
     out
+}
+
+/// The KMS action and key a request names in its body.
+///
+/// SQS and SNS record the key their producers will need
+/// (`kms:GenerateDataKey`) when a queue or topic is configured with one.
+fn kms_in_body(prefix: &str, operation: &str, body: &Body) -> Option<(&'static str, String)> {
+    match (prefix, operation) {
+        ("secretsmanager", "CreateSecret" | "UpdateSecret") => {
+            Some(("kms:GenerateDataKey", body.field("KmsKeyId")?))
+        }
+        // Standard parameters are encrypted directly; advanced ones with a data key.
+        ("ssm", "PutParameter") => {
+            let key = body.field("KeyId")?;
+            let action = if body.field("Tier").as_deref() == Some("Advanced") {
+                "kms:GenerateDataKey"
+            } else {
+                "kms:Encrypt"
+            };
+            Some((action, key))
+        }
+        ("sqs", "CreateQueue" | "SetQueueAttributes")
+        | ("sns", "CreateTopic" | "SetTopicAttributes") => {
+            Some(("kms:GenerateDataKey", body.attribute("KmsMasterKeyId")?))
+        }
+        ("dynamodb", "CreateTable" | "UpdateTable") => Some((
+            "kms:DescribeKey",
+            body.at(&["SSESpecification", "KMSMasterKeyId"])
+                .into_iter()
+                .next()?,
+        )),
+        ("kinesis", "StartStreamEncryption") => Some(("kms:GenerateDataKey", body.field("KeyId")?)),
+        _ => None,
+    }
+    .filter(|(_, key)| !key.is_empty())
 }
 
 #[cfg(test)]
@@ -1759,6 +2114,8 @@ mod tests {
             implied: Vec::new(),
             new: false,
             blocked: false,
+            replay_of: None,
+            blocked_phase: None,
             request: Message {
                 headers: Vec::new(),
                 content_type: Some(if body.is_some_and(|b| b.starts_with('{')) {
@@ -1994,13 +2351,16 @@ mod tests {
                     "arn:aws:s3:::archive/*".to_string()
                 ),
                 (
-                    "s3:GetObject".to_string(),
+                    "s3:GetObjectVersion".to_string(),
                     "arn:aws:s3:::uploads/*".to_string()
                 ),
             ]
         );
         copy.request.headers[0].value = "/uploads/a.png".into();
-        assert_eq!(all(&copy)[1].1, "arn:aws:s3:::uploads/*");
+        assert_eq!(
+            all(&copy)[1],
+            pair("s3:GetObject", "arn:aws:s3:::uploads/*")
+        );
     }
 
     #[test]
@@ -2224,8 +2584,10 @@ mod tests {
             ),
         );
         batch.request.body.as_mut().unwrap().truncated = true;
+        // The tables read so far, and `*` for whatever the cut-off tail names.
+        let derived = derive_call(&batch);
         assert_eq!(
-            derive(&batch).0,
+            derived.own,
             vec![
                 Access::new(
                     "dynamodb:BatchWriteItem",
@@ -2235,8 +2597,14 @@ mod tests {
                     "dynamodb:BatchWriteItem",
                     "arn:aws:dynamodb:*:*:table/orders"
                 ),
+                Access::new("dynamodb:BatchWriteItem", "*"),
             ]
         );
+        assert_eq!(
+            derived.unverified,
+            vec![Access::new("dynamodb:BatchWriteItem", "*")]
+        );
+        assert_eq!(derived.concrete_own.last(), derived.own.last());
 
         let mut tx = call(
             "dynamodb",
@@ -2248,10 +2616,13 @@ mod tests {
         tx.request.body.as_mut().unwrap().truncated = true;
         assert_eq!(
             derive(&tx).0,
-            vec![Access::new(
-                "dynamodb:PutItem",
-                "arn:aws:dynamodb:*:*:table/orders"
-            )]
+            vec![
+                Access::new("dynamodb:PutItem", "arn:aws:dynamodb:*:*:table/orders"),
+                Access::new("dynamodb:PutItem", "*"),
+                Access::new("dynamodb:UpdateItem", "*"),
+                Access::new("dynamodb:DeleteItem", "*"),
+                Access::new("dynamodb:ConditionCheckItem", "*"),
+            ]
         );
     }
 
@@ -2263,7 +2634,7 @@ mod tests {
             vec![Access::new("s3:GetObject", "arn:aws:s3:::bucket/*")]
         );
         assert_eq!(
-            derive_for_gate(&get, true).0,
+            derive_call(&get).concrete_own,
             vec![Access::new(
                 "s3:GetObject",
                 "arn:aws:s3:::bucket/public/a+b.txt"
@@ -2278,7 +2649,7 @@ mod tests {
         ] {
             let weird = call("s3", "GetObject", "GET", path, None);
             assert_eq!(
-                derive_for_gate(&weird, true).0,
+                derive_call(&weird).concrete_own,
                 vec![Access::new("s3:GetObject", expected_arn)]
             );
         }
@@ -2291,10 +2662,10 @@ mod tests {
             value: "assets/public%3Fsecret?versionId=v1".into(),
         }];
         assert_eq!(
-            derive_for_gate(&copy, true).0,
+            derive_call(&copy).concrete_own,
             vec![
                 Access::new("s3:PutObject", "arn:aws:s3:::dest/out.txt"),
-                Access::new("s3:GetObject", "arn:aws:s3:::assets/public?secret"),
+                Access::new("s3:GetObjectVersion", "arn:aws:s3:::assets/public?secret"),
             ]
         );
 
@@ -2308,7 +2679,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            derive_for_gate(&del, true).0,
+            derive_call(&del).concrete_own,
             vec![
                 Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/public/a.txt"),
                 Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/private/dec/hex"),
@@ -2323,7 +2694,8 @@ mod tests {
             ]
         );
 
-        // DTD / ENTITY declarations, unknown entities, and malformed XML fail closed.
+        // DTD / ENTITY declarations, unknown entities, and malformed XML stand
+        // for any key in the bucket.
         for bad_xml in [
             r#"<!DOCTYPE Delete [<!ENTITY p "private">]><Delete><Object><Key>&p;/file</Key></Object></Delete>"#,
             r#"<Delete><Object><Key>&unknown;/file</Key></Object></Delete>"#,
@@ -2337,12 +2709,9 @@ mod tests {
                 Some(bad_xml),
             );
             assert_eq!(
-                derive_for_gate(&bad, true).0,
-                vec![Access::new(
-                    "s3:DeleteObject",
-                    crate::lock::UNVERIFIED_RESOURCE
-                )],
-                "bad XML must fail closed: {bad_xml}"
+                derive_call(&bad).concrete_own,
+                vec![Access::new("s3:DeleteObject", "arn:aws:s3:::bucket/*")],
+                "bad XML stands for every key: {bad_xml}"
             );
         }
 
@@ -2355,11 +2724,10 @@ mod tests {
         );
         truncated.request.body.as_mut().unwrap().truncated = true;
         assert!(
-            derive_for_gate(&truncated, false).0.contains(&Access::new(
-                "dynamodb:BatchWriteItem",
-                crate::lock::UNVERIFIED_RESOURCE
-            )),
-            "truncated body-dependent call emits fail-closed sentinel"
+            derive(&truncated)
+                .0
+                .contains(&Access::new("dynamodb:BatchWriteItem", "*")),
+            "a truncated body-dependent call stands as `*`"
         );
 
         // EventBridge PutEvents extracts every target bus under Entries[], defaulting omitted entries to `default`.
@@ -2478,5 +2846,306 @@ mod tests {
                 Access::new("iam:PassRole", "arn:aws:iam::*:role/ecs-exec"),
             ]
         );
+    }
+
+    fn implied_of(trace: &Trace) -> Vec<(String, String)> {
+        derive(trace)
+            .1
+            .into_iter()
+            .map(|access| (access.action, access.resource))
+            .collect()
+    }
+
+    fn pair(action: &str, resource: &str) -> (String, String) {
+        (action.to_string(), resource.to_string())
+    }
+
+    #[test]
+    fn implied_kms_reads_nested_queue_topic_and_table_keys() {
+        let key = "arn:aws:kms:us-east-1:000000000000:key/app-key";
+        let queue = call(
+            "sqs",
+            "CreateQueue",
+            "POST",
+            "/",
+            Some(&format!(
+                r#"{{"QueueName":"jobs","Attributes":{{"KmsMasterKeyId":"{key}"}}}}"#
+            )),
+        );
+        assert_eq!(
+            implied_of(&queue),
+            vec![pair("kms:GenerateDataKey", "arn:aws:kms:*:*:key/app-key")]
+        );
+        let query_queue = call(
+            "sqs",
+            "SetQueueAttributes",
+            "POST",
+            "/",
+            Some(
+                "Action=SetQueueAttributes&QueueUrl=http%3A%2F%2Fh%2F0%2Fjobs&Attribute.1.Name=KmsMasterKeyId&Attribute.1.Value=alias%2Fjobs",
+            ),
+        );
+        assert_eq!(
+            implied_of(&query_queue),
+            vec![pair("kms:GenerateDataKey", "arn:aws:kms:*:*:alias/jobs")]
+        );
+        let topic = call(
+            "sns",
+            "CreateTopic",
+            "POST",
+            "/",
+            Some(
+                "Action=CreateTopic&Name=alerts&Attributes.entry.1.key=KmsMasterKeyId&Attributes.entry.1.value=alias%2Falerts",
+            ),
+        );
+        assert_eq!(
+            implied_of(&topic),
+            vec![pair("kms:GenerateDataKey", "arn:aws:kms:*:*:alias/alerts")]
+        );
+        let set_topic = call(
+            "sns",
+            "SetTopicAttributes",
+            "POST",
+            "/",
+            Some(
+                "Action=SetTopicAttributes&TopicArn=arn%3Aaws%3Asns%3Aus-east-1%3A0%3Aalerts&AttributeName=KmsMasterKeyId&AttributeValue=alias%2Falerts",
+            ),
+        );
+        assert_eq!(
+            implied_of(&set_topic),
+            vec![pair("kms:GenerateDataKey", "arn:aws:kms:*:*:alias/alerts")]
+        );
+        let table = call(
+            "dynamodb",
+            "CreateTable",
+            "POST",
+            "/",
+            Some(&format!(
+                r#"{{"TableName":"orders","SSESpecification":{{"Enabled":true,"SSEType":"KMS","KMSMasterKeyId":"{key}"}}}}"#
+            )),
+        );
+        assert_eq!(
+            implied_of(&table),
+            vec![pair("kms:DescribeKey", "arn:aws:kms:*:*:key/app-key")]
+        );
+        // The key of an encrypted queue or secret is not on the wire when it is used.
+        for (service, operation, body) in [
+            (
+                "sqs",
+                "SendMessage",
+                r#"{"QueueUrl":"http://h/0/jobs","MessageBody":"x"}"#,
+            ),
+            ("secretsmanager", "GetSecretValue", r#"{"SecretId":"db"}"#),
+        ] {
+            assert!(implied_of(&call(service, operation, "POST", "/", Some(body))).is_empty());
+        }
+        // Standard SecureString parameters are encrypted directly.
+        let parameter = call(
+            "ssm",
+            "PutParameter",
+            "POST",
+            "/",
+            Some(r#"{"Name":"/app/db","Type":"SecureString","KeyId":"alias/app"}"#),
+        );
+        assert_eq!(
+            implied_of(&parameter),
+            vec![pair("kms:Encrypt", "arn:aws:kms:*:*:alias/app")]
+        );
+    }
+
+    #[test]
+    fn pass_role_reads_nested_target_destination_and_job_roles() {
+        let role = |name: &str| pair("iam:PassRole", &format!("arn:aws:iam::*:role/{name}"));
+        let targets = call(
+            "events",
+            "PutTargets",
+            "POST",
+            "/",
+            Some(
+                r#"{"Rule":"r","Targets":[{"Id":"1","Arn":"arn:aws:sqs:us-east-1:0:q"},{"Id":"2","Arn":"arn:aws:states:us-east-1:0:stateMachine:m","RoleArn":"arn:aws:iam::0:role/events-to-sfn"}]}"#,
+            ),
+        );
+        assert_eq!(implied_of(&targets), vec![role("events-to-sfn")]);
+        let schedule = call(
+            "scheduler",
+            "CreateSchedule",
+            "POST",
+            "/schedules/nightly",
+            Some(
+                r#"{"Name":"nightly","Target":{"Arn":"arn:aws:lambda:us-east-1:0:function:f","RoleArn":"arn:aws:iam::0:role/scheduler-invoke"}}"#,
+            ),
+        );
+        assert_eq!(implied_of(&schedule), vec![role("scheduler-invoke")]);
+        let firehose = call(
+            "firehose",
+            "CreateDeliveryStream",
+            "POST",
+            "/",
+            Some(
+                r#"{"DeliveryStreamName":"logs","KinesisStreamSourceConfiguration":{"KinesisStreamARN":"arn:aws:kinesis:us-east-1:0:stream/s","RoleARN":"arn:aws:iam::0:role/firehose-source"},"ExtendedS3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::logs","RoleARN":"arn:aws:iam::0:role/firehose-s3","S3BackupConfiguration":{"RoleARN":"arn:aws:iam::0:role/firehose-s3"}}}"#,
+            ),
+        );
+        assert_eq!(
+            implied_of(&firehose),
+            vec![role("firehose-source"), role("firehose-s3")]
+        );
+        let job = call(
+            "glue",
+            "UpdateJob",
+            "POST",
+            "/",
+            Some(
+                r#"{"JobName":"etl","JobUpdate":{"Role":"arn:aws:iam::0:role/glue-etl","Command":{}}}"#,
+            ),
+        );
+        assert_eq!(implied_of(&job), vec![role("glue-etl")]);
+    }
+
+    #[test]
+    fn batch_and_version_requests_use_the_iam_action_names() {
+        for (service, operation, expected) in [
+            ("sqs", "SendMessageBatch", "sqs:SendMessage"),
+            ("sqs", "DeleteMessageBatch", "sqs:DeleteMessage"),
+            (
+                "sqs",
+                "ChangeMessageVisibilityBatch",
+                "sqs:ChangeMessageVisibility",
+            ),
+            ("sns", "PublishBatch", "sns:Publish"),
+        ] {
+            let batch = call(service, operation, "POST", "/", Some(r#"{"QueueUrl":"q"}"#));
+            assert_eq!(access(&batch).0, expected, "{operation}");
+        }
+        for (operation, method, expected) in [
+            ("GetObject", "GET", vec!["s3:GetObjectVersion"]),
+            ("HeadObject", "HEAD", vec!["s3:GetObjectVersion"]),
+            ("DeleteObject", "DELETE", vec!["s3:DeleteObjectVersion"]),
+            (
+                "GetObjectTagging",
+                "GET",
+                vec!["s3:GetObjectVersionTagging"],
+            ),
+            (
+                "PutObjectTagging",
+                "PUT",
+                vec!["s3:PutObjectVersionTagging"],
+            ),
+            ("GetObjectAcl", "GET", vec!["s3:GetObjectVersionAcl"]),
+            ("PutObjectAcl", "PUT", vec!["s3:PutObjectVersionAcl"]),
+            (
+                "GetObjectAttributes",
+                "GET",
+                vec!["s3:GetObjectVersion", "s3:GetObjectVersionAttributes"],
+            ),
+        ] {
+            let versioned = call("s3", operation, method, "/b/k?versionId=3", None);
+            let actions: Vec<String> = all(&versioned).into_iter().map(|(a, _)| a).collect();
+            assert_eq!(actions, expected, "{operation}");
+        }
+        let attributes = call("s3", "GetObjectAttributes", "GET", "/b/k?attributes", None);
+        assert_eq!(
+            all(&attributes),
+            vec![
+                pair("s3:GetObject", "arn:aws:s3:::b/*"),
+                pair("s3:GetObjectAttributes", "arn:aws:s3:::b/*"),
+            ]
+        );
+        let mut copy = call("s3", "CopyObject", "PUT", "/dest/k", None);
+        copy.request.headers = vec![HeaderTrace {
+            name: "x-amz-copy-source".into(),
+            value: "src/k?versionId=7".into(),
+        }];
+        assert_eq!(
+            all(&copy)[1],
+            pair("s3:GetObjectVersion", "arn:aws:s3:::src/*")
+        );
+        let lifecycle = call(
+            "s3",
+            "DeleteBucketLifecycle",
+            "DELETE",
+            "/b?lifecycle",
+            None,
+        );
+        assert_eq!(access(&lifecycle).0, "s3:PutLifecycleConfiguration");
+    }
+
+    #[test]
+    fn partiql_statements_need_their_verb_action_on_their_table() {
+        let select = call(
+            "dynamodb",
+            "ExecuteStatement",
+            "POST",
+            "/",
+            Some(r#"{"Statement":"SELECT * FROM \"orders\".\"byUser\" WHERE pk = ?"}"#),
+        );
+        assert_eq!(
+            access(&select),
+            pair(
+                "dynamodb:PartiQLSelect",
+                "arn:aws:dynamodb:*:*:table/orders/index/byUser"
+            )
+        );
+        let batch = call(
+            "dynamodb",
+            "BatchExecuteStatement",
+            "POST",
+            "/",
+            Some(
+                r#"{"Statements":[{"Statement":"INSERT INTO orders VALUE {'pk': ?}"},{"Statement":"update \"carts\" SET n = 1 WHERE pk = ?"},{"Statement":"DELETE\nFROM audit WHERE pk = ?"}]}"#,
+            ),
+        );
+        assert_eq!(
+            all(&batch),
+            vec![
+                pair("dynamodb:PartiQLDelete", "arn:aws:dynamodb:*:*:table/audit"),
+                pair(
+                    "dynamodb:PartiQLInsert",
+                    "arn:aws:dynamodb:*:*:table/orders"
+                ),
+                pair("dynamodb:PartiQLUpdate", "arn:aws:dynamodb:*:*:table/carts"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_bodies_stand_as_a_flagged_wildcard() {
+        let mut cbor = call("sqs", "SendMessage", "POST", "/", None);
+        cbor.request.body = Some(BodyTrace {
+            text: None,
+            hex: Some("a1".into()),
+            encoding: None,
+            bytes: 40,
+            truncated: false,
+            binary: true,
+            sha256: String::new(),
+        });
+        let derived = derive_call(&cbor);
+        assert_eq!(derived.own, vec![Access::new("sqs:SendMessage", "*")]);
+        assert_eq!(derived.concrete_own, derived.own);
+        assert_eq!(derived.unverified, derived.own);
+        // The same call derives the same `*` every run: it can be locked.
+        assert_eq!(derive_call(&cbor), derived);
+
+        // A role a create call must pass is still needed when it cannot be read.
+        let mut create = call(
+            "lambda",
+            "CreateFunction",
+            "POST",
+            "/2015-03-31/functions",
+            None,
+        );
+        create.request.body = cbor.request.body.clone();
+        let derived = derive_call(&create);
+        assert_eq!(derived.implied, vec![Access::new("iam:PassRole", "*")]);
+        assert!(
+            derived
+                .unverified
+                .contains(&Access::new("iam:PassRole", "*"))
+        );
+
+        // A binary S3 upload names its resource in the path: nothing is unknown.
+        let mut put = call("s3", "PutObject", "PUT", "/b/k", None);
+        put.request.body = cbor.request.body.clone();
+        assert!(derive_call(&put).unverified.is_empty());
     }
 }

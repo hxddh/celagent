@@ -4,6 +4,7 @@
 //! kept; a run that is still going is never deleted.
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -13,14 +14,26 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 
 use crate::{
-    proxy::set_mode,
     summary::Report,
-    trace::{Record, RunHeader},
+    trace::{Record, RunHeader, Trace},
 };
 
 pub const KEEP_RUNS: usize = 20;
 /// The `end` report is one line; this bounds how far back we look for it.
 const MAX_LAST_LINE: u64 = 16 << 20;
+
+/// Set Unix permission bits (no-op off Unix).
+#[cfg(unix)]
+pub fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("set permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
 
 pub fn dir(home: &Path) -> PathBuf {
     home.join(".lenslet/runs")
@@ -138,6 +151,30 @@ pub fn header(path: &Path) -> Option<RunHeader> {
         Record::Run(header) => Some(header),
         _ => None,
     }
+}
+
+/// A run's finished calls in arrival order: the last line of each call id
+/// (a final line replaces its `pending` one). Calls still pending when the
+/// run ended are left out.
+pub fn calls(path: &Path) -> Result<Vec<Trace>> {
+    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: HashMap<String, Trace> = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let Ok(Record::Call(call)) = serde_json::from_str::<Record>(&line) else {
+            continue;
+        };
+        if !latest.contains_key(&call.id) {
+            order.push(call.id.clone());
+        }
+        latest.insert(call.id.clone(), *call);
+    }
+    Ok(order
+        .into_iter()
+        .filter_map(|id| latest.remove(&id))
+        .filter(|call| !call.pending)
+        .collect())
 }
 
 /// The run's `end` report, when it has ended.

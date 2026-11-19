@@ -12,7 +12,7 @@
 //! Operation fidelity therefore varies by protocol: services that advertise
 //! nothing end up with the HTTP method (or a path heuristic) as the operation.
 
-use hyper::HeaderMap;
+use http::HeaderMap;
 
 /// What a request advertises about itself on the wire.
 #[derive(Clone, Debug)]
@@ -395,7 +395,7 @@ pub fn strip_port(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::header::HeaderValue;
+    use http::header::HeaderValue;
 
     fn headers(auth: &str, target: Option<&str>) -> HeaderMap {
         let mut map = HeaderMap::new();

@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     access::{self, Access},
-    trace::{Trace, trace_access},
+    findings::{Finding, FindingKind, LEAKED_SUFFIX, Severity},
+    trace::Trace,
 };
 
 /// Failed calls listed in the human summary; the report keeps all of them.
@@ -39,15 +40,20 @@ pub struct CausalTracker {
 }
 
 impl CausalTracker {
-    /// Inspect `trace` (using `eval_source` for body-derived concrete ARNs) and
-    /// enrich `trace.problem.hint` if a prior call in this run explains the failure,
-    /// then update lifecycle state on successful create/delete calls.
-    pub fn observe_and_enrich(&mut self, trace: &mut Trace, eval_source: &Trace, call_no: usize) {
+    /// Enrich `trace.problem.hint` when a prior call in this run explains the
+    /// failure, then update lifecycle state on successful create/delete calls.
+    /// `concrete_own` is the call's concrete own access (body-derived ARNs).
+    /// Returns whether the hint changed.
+    pub fn observe_and_enrich(
+        &mut self,
+        trace: &mut Trace,
+        concrete_own: &[Access],
+        call_no: usize,
+    ) -> bool {
         if trace.pending {
-            return;
+            return false;
         }
-        let (concrete_own, _) = access::derive_for_gate(eval_source, true);
-        let lookup_keys = causal_keys(&trace.service, &trace.operation, &concrete_own, true);
+        let lookup_keys = causal_keys(concrete_own, true);
 
         if trace.status >= 400
             && !trace.blocked
@@ -61,7 +67,7 @@ impl CausalTracker {
                             "`{stem}` was deleted earlier in this run at call #{del_call} ({del_op}) before this `{}` ran.",
                             trace.operation
                         ));
-                        return;
+                        return true;
                     }
                     if !matches!(svc.as_str(), "s3" | "iam")
                         && let Some((cr_call, cr_op, Some(cr_reg))) = hist.created.as_ref()
@@ -72,14 +78,14 @@ impl CausalTracker {
                             "Region mismatch: `{stem}` was created in `{cr_reg}` at call #{cr_call} ({cr_op}), but this `{}` targeted `{req_reg}`.",
                             trace.operation
                         ));
-                        return;
+                        return true;
                     }
                 }
             }
         }
 
         if trace.status < 400 {
-            let mutate_keys = causal_keys(&trace.service, &trace.operation, &concrete_own, false);
+            let mutate_keys = causal_keys(concrete_own, false);
             if is_create_operation(&trace.operation) {
                 for key in mutate_keys {
                     let entry = self.resources.entry(key).or_default();
@@ -93,6 +99,7 @@ impl CausalTracker {
                 }
             }
         }
+        false
     }
 }
 
@@ -117,7 +124,7 @@ fn is_missing_resource_code(code: &str, status: u16) -> bool {
         )
 }
 
-fn is_create_operation(op: &str) -> bool {
+pub(crate) fn is_create_operation(op: &str) -> bool {
     matches!(
         op,
         "CreateBucket"
@@ -141,7 +148,7 @@ fn is_create_operation(op: &str) -> bool {
     )
 }
 
-fn is_delete_operation(op: &str) -> bool {
+pub(crate) fn is_delete_operation(op: &str) -> bool {
     matches!(
         op,
         "DeleteBucket"
@@ -165,16 +172,16 @@ fn is_delete_operation(op: &str) -> bool {
     )
 }
 
-fn causal_keys(
-    service: &str,
-    operation: &str,
+/// The resources a call names, as `(service, name)` keys: `("s3",
+/// "s3://bucket/key")`, `("dynamodb", "table/orders")`, `("sqs", "jobs")`.
+pub(crate) fn causal_keys(
     concrete_own: &[Access],
     include_parent_bucket: bool,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for acc in concrete_own {
         let res = acc.resource.as_str();
-        if res == "*" || res == crate::lock::UNVERIFIED_RESOURCE {
+        if res == "*" {
             continue;
         }
         if let Some(s3_rest) = res.strip_prefix("arn:aws:s3:::") {
@@ -218,7 +225,6 @@ fn causal_keys(
         if !out.contains(&key) {
             out.push(key);
         }
-        let _ = (service, operation);
     }
     out
 }
@@ -273,6 +279,10 @@ pub struct AccessUse {
     /// The calls that needed it, e.g. `DYNAMODB DeleteItem` (first few).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub via: Vec<String>,
+    /// A `*` that stands for a resource some call's request body did not let
+    /// Lenslet read (binary or truncated).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unverified: bool,
 }
 
 /// Distinct calls kept per permission in `via`.
@@ -297,10 +307,12 @@ impl Summary {
         self.pending.remove(&trace.id);
         self.unfinished = self.pending.len();
         self.calls += 1;
-        let seen_invocation = trace
-            .invocation_id
-            .as_ref()
-            .is_some_and(|id| !self.invocations.insert(id.clone()));
+        // A replay re-sends its call's invocation id; it is not an SDK retry.
+        let seen_invocation = trace.replay_of.is_none()
+            && trace
+                .invocation_id
+                .as_ref()
+                .is_some_and(|id| !self.invocations.insert(id.clone()));
         let retried = trace.attempt.is_some_and(|attempt| attempt > 1) || seen_invocation;
         if retried {
             self.retries += 1;
@@ -318,8 +330,9 @@ impl Summary {
                 self.denied_footprints.insert(item.key());
             }
         }
-        for (index, access) in trace_access(trace).enumerate() {
-            let entry = self.access.entry(access).or_default();
+        for (index, item) in trace.access.iter().chain(trace.implied.iter()).enumerate() {
+            let entry = self.access.entry(item.key()).or_default();
+            entry.unverified |= item.unverified;
             entry.calls += 1;
             entry.errors += usize::from(failed);
             // Own permissions come first, then implied ones. An entry is
@@ -424,6 +437,10 @@ pub struct Report {
     /// In the lock, not exercised by this run.
     pub access_unused: Vec<Access>,
     pub regressions: Option<Regressions>,
+    /// Everything worth a look, most severe first: the one list the terminal,
+    /// the PR comment and the window lead with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<crate::findings::Finding>,
     pub trace: String,
     pub endpoint: String,
     pub upstream: String,
@@ -446,13 +463,6 @@ impl Report {
             .iter()
             .map(|entry| Access::new(entry.action.clone(), entry.resource.clone()))
             .collect()
-    }
-
-    /// Fill in the access table and the comparison with a lock file.
-    #[allow(dead_code)]
-    pub fn set_access(&mut self, summary: &Summary, locked: Option<&BTreeSet<Access>>) {
-        let gate = locked.map(|set| crate::lock::Gate::from_lock("lenslet.lock", set.clone()));
-        self.set_access_with_gate(summary, gate.as_ref());
     }
 
     /// Fill in the access table and compare against either a lock file or an IAM policy gate.
@@ -538,30 +548,46 @@ impl Report {
             services,
             seconds(self.duration_ms),
         ));
-        for failure in self.failures.iter().take(LISTED_FAILURES) {
-            let attempt = attempt_label(failure.attempt, failure.max_attempts);
-            let blocked_tag = if failure.blocked { " [blocked]" } else { "" };
-            out.push_str(&format!(
-                "  ✗ {} {}  {}  {}{attempt}{blocked_tag}",
-                failure.service.to_ascii_uppercase(),
-                failure.operation,
-                failure.status,
-                failure.code
-            ));
-            if let Some(message) = failure.message.as_deref() {
-                out.push_str("  ");
-                out.push_str(&one_line(message, 120));
+        if self.findings.is_empty() {
+            // A report written before findings existed.
+            for failure in self.failures.iter().take(LISTED_FAILURES) {
+                out.push_str(&failure_lines(failure, 1));
             }
-            out.push('\n');
-            if let Some(hint) = failure.hint.as_deref() {
-                out.push_str(&format!("      → {hint}\n"));
+            if self.failures.len() > LISTED_FAILURES {
+                out.push_str(&format!(
+                    "  … and {} more\n",
+                    self.failures.len() - LISTED_FAILURES
+                ));
             }
         }
-        if self.failures.len() > LISTED_FAILURES {
+        // Access findings are the `access:` list below; the rest lead.
+        let listed: Vec<&Finding> = self.listed_findings().collect();
+        for finding in listed.iter().take(LISTED_FAILURES) {
+            match (finding.kind, self.failure_of(finding)) {
+                (FindingKind::Failure, Some(failure)) => {
+                    out.push_str(&failure_lines(failure, finding.calls.len()));
+                }
+                _ => {
+                    let glyph = match finding.severity {
+                        Severity::Error => '✗',
+                        Severity::Warning => '!',
+                        Severity::Info => '·',
+                    };
+                    out.push_str(&format!("  {glyph} {}\n", finding.title));
+                    if let Some(detail) = finding.detail.as_deref() {
+                        out.push_str(&format!("      → {detail}\n"));
+                    }
+                }
+            }
+        }
+        if listed.len() > LISTED_FAILURES {
             out.push_str(&format!(
                 "  … and {} more\n",
-                self.failures.len() - LISTED_FAILURES
+                listed.len() - LISTED_FAILURES
             ));
+        }
+        if let Some(line) = self.leaked_line() {
+            out.push_str(&format!("  · {line}\n"));
         }
         if let Some(regressions) = self.regressions.as_ref()
             && (!regressions.new_failures.is_empty()
@@ -606,8 +632,14 @@ impl Report {
                 ));
                 for access in self.access_added.iter().take(LISTED_ACCESS) {
                     out.push_str(&format!(
-                        "    + {:<32} {}\n",
-                        access.action, access.resource
+                        "    + {:<32} {}{}\n",
+                        access.action,
+                        access.resource,
+                        if self.unverified(access) {
+                            "  (resource unknown: request body not readable)"
+                        } else {
+                            ""
+                        }
                     ));
                 }
                 if self.access_added.len() > LISTED_ACCESS {
@@ -676,8 +708,62 @@ impl Report {
 }
 
 impl Report {
+    /// Findings shown in their own list: all but access findings, which the
+    /// access section lists with the calls behind them.
+    fn listed_findings(&self) -> impl Iterator<Item = &Finding> {
+        self.findings
+            .iter()
+            .filter(|finding| !matches!(finding.kind, FindingKind::Access | FindingKind::Leaked))
+    }
+
+    /// Resources the run created and left behind, as one line: test fixtures
+    /// usually do this on purpose, so they are a note, not a list.
+    fn leaked_line(&self) -> Option<String> {
+        let names: Vec<&str> = self
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::Leaked)
+            .map(|finding| {
+                finding
+                    .title
+                    .strip_suffix(LEAKED_SUFFIX)
+                    .unwrap_or(&finding.title)
+            })
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        let shown = names.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+        let more = if names.len() > 4 {
+            format!(" and {} more", names.len() - 4)
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{} created and not deleted: {shown}{more}",
+            plural(names.len(), "resource")
+        ))
+    }
+
+    /// The latest failed call of a failure finding: the one shown for it.
+    fn failure_of(&self, finding: &Finding) -> Option<&Failure> {
+        let last = finding.calls.last()?;
+        self.failures.iter().find(|failure| &failure.id == last)
+    }
+
+    /// Whether this permission's resource is a `*` standing for one that a
+    /// request body did not let Lenslet read.
+    fn unverified(&self, access: &Access) -> bool {
+        self.access.iter().any(|entry| {
+            entry.used.unverified
+                && entry.action == access.action
+                && entry.resource == access.resource
+        })
+    }
+
     /// The report as GitHub-flavored Markdown: what a PR comment or a CI job
-    /// summary shows. Access changes come first, each with the calls behind it.
+    /// summary shows. Findings lead, then access changes, each with the calls
+    /// behind it.
     pub fn markdown(&self) -> String {
         let mut out = String::new();
         let command = if self.command.is_empty() {
@@ -703,6 +789,7 @@ impl Report {
             plural(self.errors, "error"),
             plural(self.services.len(), "service")
         ));
+        self.markdown_findings(&mut out);
 
         let via = |access: &crate::access::Access| {
             self.access
@@ -712,6 +799,9 @@ impl Report {
                     let mut text = entry.used.via.join(", ");
                     if entry.used.implied {
                         text.push_str(" (implied)");
+                    }
+                    if entry.used.unverified {
+                        text.push_str(" (resource unknown: request body not readable)");
                     }
                     text
                 })
@@ -810,7 +900,7 @@ impl Report {
                 if total == 1 { "is" } else { "are" }
             ));
         }
-        if !self.failures.is_empty() {
+        if !self.failures.is_empty() && self.findings.is_empty() {
             let new: BTreeSet<FailureKind> = self
                 .regressions
                 .as_ref()
@@ -852,6 +942,106 @@ impl Report {
         ));
         out
     }
+}
+
+impl Report {
+    /// The findings table at the top of the Markdown report.
+    fn markdown_findings(&self, out: &mut String) {
+        let listed: Vec<&Finding> = self.listed_findings().collect();
+        let leaked = self.leaked_line();
+        if listed.is_empty() {
+            if let Some(line) = leaked {
+                out.push_str(&format!("{line}.\n\n"));
+            }
+            return;
+        }
+        let new: BTreeSet<FailureKind> = self
+            .regressions
+            .as_ref()
+            .map(|regressions| regressions.new_failures.iter().cloned().collect())
+            .unwrap_or_default();
+        out.push_str("| | Finding | Detail |\n|---|---|---|\n");
+        for finding in listed.iter().take(LISTED_FAILURES * 2) {
+            let glyph = match finding.severity {
+                Severity::Error => "✗",
+                Severity::Warning => "!",
+                Severity::Info => "·",
+            };
+            let failure = self
+                .failure_of(finding)
+                .filter(|_| finding.kind == FindingKind::Failure);
+            let marker = match failure {
+                Some(failure) if failure.blocked => " **blocked**",
+                Some(failure)
+                    if new.contains(&FailureKind {
+                        service: failure.service.clone(),
+                        operation: failure.operation.clone(),
+                        code: failure.code.clone(),
+                    }) =>
+                {
+                    " **new**"
+                }
+                _ => "",
+            };
+            // A failure shows its message and its likely cause.
+            let detail = match failure {
+                Some(failure) => [
+                    failure
+                        .message
+                        .as_deref()
+                        .map(|message| one_line(message, 100)),
+                    failure.hint.clone(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" — "),
+                None => finding.detail.clone().unwrap_or_default(),
+            };
+            out.push_str(&format!(
+                "| {glyph} | {}{marker} | {} |\n",
+                finding.title.replace('|', "\\|"),
+                detail.replace('|', "\\|")
+            ));
+        }
+        if listed.len() > LISTED_FAILURES * 2 {
+            out.push_str(&format!(
+                "\n_… and {} more in the JSON report._\n",
+                listed.len() - LISTED_FAILURES * 2
+            ));
+        }
+        out.push('\n');
+        if let Some(line) = leaked {
+            out.push_str(&format!("{line}.\n\n"));
+        }
+    }
+}
+
+/// `  ✗ SQS SendMessage  400  Code ×2 (attempt 2/3)  message` and its cause.
+fn failure_lines(failure: &Failure, count: usize) -> String {
+    let attempt = attempt_label(failure.attempt, failure.max_attempts);
+    let blocked_tag = if failure.blocked { " [blocked]" } else { "" };
+    let times = if count > 1 {
+        format!(" ×{count}")
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "  ✗ {} {}  {}  {}{times}{attempt}{blocked_tag}",
+        failure.service.to_ascii_uppercase(),
+        failure.operation,
+        failure.status,
+        failure.code
+    );
+    if let Some(message) = failure.message.as_deref() {
+        out.push_str("  ");
+        out.push_str(&one_line(message, 120));
+    }
+    out.push('\n');
+    if let Some(hint) = failure.hint.as_deref() {
+        out.push_str(&format!("      → {hint}\n"));
+    }
+    out
 }
 
 fn plural(count: usize, noun: &str) -> String {
@@ -1110,10 +1300,13 @@ mod tests {
                 action: format!("{service}:SendMessage"),
                 resource: format!("arn:aws:{service}:*:*:jobs"),
                 new: false,
+                unverified: false,
             }],
             implied: Vec::new(),
             new: false,
             blocked: false,
+            replay_of: None,
+            blocked_phase: None,
             request: Message::default(),
             response: Message::default(),
         }
@@ -1124,6 +1317,10 @@ mod tests {
             action: action.into(),
             resource: resource.into(),
         }
+    }
+
+    fn lock_gate(locked: &BTreeSet<Access>) -> crate::lock::Gate {
+        crate::lock::Gate::from_lock("lenslet.lock", locked.clone())
     }
 
     fn report(summary: &Summary) -> Report {
@@ -1169,7 +1366,7 @@ mod tests {
         ]
         .into();
         report.lock = Some("lenslet.lock".into());
-        report.set_access(&summary, Some(&locked));
+        report.set_access_with_gate(&summary, Some(&lock_gate(&locked)));
         assert_eq!(
             report.access_added,
             vec![access("s3:SendMessage", "arn:aws:s3:*:*:jobs")]
@@ -1231,7 +1428,7 @@ mod tests {
         let mut summary = Summary::default();
         summary.observe(&trace("a", "sqs", 200, None));
         let mut report = report(&summary);
-        report.set_access(&summary, None);
+        report.set_access_with_gate(&summary, None);
         assert!(report.render("t").contains("--update"));
     }
 
@@ -1254,7 +1451,7 @@ mod tests {
             access("sqs:DeleteMessage", "arn:aws:sqs:*:*:jobs"),
         ]
         .into();
-        report.set_access(&summary, Some(&locked));
+        report.set_access_with_gate(&summary, Some(&lock_gate(&locked)));
         assert_eq!(
             summary.access[&access("s3:SendMessage", "arn:aws:s3:*:*:jobs")].via,
             ["S3 SendMessage"]
@@ -1337,7 +1534,7 @@ mod tests {
             binary: false,
             sha256: String::new(),
         });
-        let snap1 = create_tbl.clone();
+        let snap1 = access::derive_call(&create_tbl).concrete_own;
         tracker.observe_and_enrich(&mut create_tbl, &snap1, 1);
 
         // Call #2: GetItem on `orders` in `us-east-1` fails with ResourceNotFoundException.
@@ -1350,7 +1547,7 @@ mod tests {
         get_wrong_reg.operation = "GetItem".into();
         get_wrong_reg.region = Some("us-east-1".into());
         get_wrong_reg.request.body = create_tbl.request.body.clone();
-        let snap2 = get_wrong_reg.clone();
+        let snap2 = access::derive_call(&get_wrong_reg).concrete_own;
         tracker.observe_and_enrich(&mut get_wrong_reg, &snap2, 2);
         let hint = get_wrong_reg
             .problem
@@ -1369,7 +1566,7 @@ mod tests {
         let mut del_bucket = trace("c3", "s3", 204, None);
         del_bucket.operation = "DeleteBucket".into();
         del_bucket.path = "/receipts".into();
-        let snap3 = del_bucket.clone();
+        let snap3 = access::derive_call(&del_bucket).concrete_own;
         tracker.observe_and_enrich(&mut del_bucket, &snap3, 3);
 
         let mut put_after_del = trace(
@@ -1380,7 +1577,7 @@ mod tests {
         );
         put_after_del.operation = "PutObject".into();
         put_after_del.path = "/receipts/a.txt".into();
-        let snap4 = put_after_del.clone();
+        let snap4 = access::derive_call(&put_after_del).concrete_own;
         tracker.observe_and_enrich(&mut put_after_del, &snap4, 4);
         let del_hint = put_after_del
             .problem
@@ -1392,6 +1589,61 @@ mod tests {
                 && del_hint.contains("deleted earlier")
                 && del_hint.contains("call #3"),
             "unexpected hint: {del_hint}"
+        );
+    }
+
+    #[test]
+    fn findings_lead_the_summary_and_the_pr_comment_without_repeats() {
+        use crate::findings::analyze;
+        let mut summary = Summary::default();
+        let mut calls = Vec::new();
+        for id in ["a", "b"] {
+            let mut failed = trace(
+                id,
+                "sqs",
+                400,
+                Some(r#"{"__type":"QueueDoesNotExist","message":"no queue"}"#),
+            );
+            failed.access[0].new = true;
+            failed.access[0].unverified = true;
+            failed.access[0].resource = "*".into();
+            summary.observe(&failed);
+            calls.push(failed);
+        }
+        let mut report = report(&summary);
+        report.command = vec!["npm".into(), "test".into()];
+        report.exit_code = Some(1);
+        report.lock = Some("lenslet.lock".into());
+        report.findings = analyze(&calls);
+        report.set_access_with_gate(&summary, Some(&lock_gate(&BTreeSet::new())));
+        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+
+        let text = report.render("t");
+        assert!(
+            text.contains("✗ SQS SendMessage  400  QueueDoesNotExist ×2  no queue"),
+            "{text}"
+        );
+        assert_eq!(text.matches("QueueDoesNotExist").count(), 1, "{text}");
+        assert!(
+            text.contains("+ sqs:SendMessage                  *  (resource unknown: request body not readable)"),
+            "{text}"
+        );
+        assert_eq!(text.matches("sqs:SendMessage").count(), 1, "{text}");
+
+        let md = report.markdown();
+        let findings_at = md.find("| | Finding | Detail |").expect(&md);
+        assert!(
+            findings_at < md.find("not in `lenslet.lock`").unwrap(),
+            "{md}"
+        );
+        assert!(
+            md.contains("| ✗ | SQS SendMessage → QueueDoesNotExist ×2 | no queue — The resource"),
+            "{md}"
+        );
+        assert!(!md.contains("failed call"), "no second failure table: {md}");
+        assert!(
+            md.contains("(resource unknown: request body not readable)"),
+            "{md}"
         );
     }
 }

@@ -2,19 +2,36 @@
 //!
 //! One permission per line, `action  resource`, sorted, so a pull request
 //! that widens access shows up as an added line in review. Comments start
-//! with `#`. The file is only ever written by `lenslet run --update`.
+//! with `#`. The file is written by `lenslet run --update` and by
+//! [`accept`] / [`set_test_mark`] (the window), always atomically and always
+//! in the canonical [`render`] format.
+//!
+//! What a rewrite keeps: every `test` mark, and the full-line comments at the
+//! top of the file (they replace the generated header). Other comments, and
+//! blank lines, are not kept: the entries are re-rendered.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-use crate::{access::Access, summary::AccessUse};
+use crate::{
+    access::{self, Access, CallAccess},
+    summary::AccessUse,
+    trace::Trace,
+};
 
 pub const FILE_NAME: &str = "lenslet.lock";
+
+/// The header a new lock file gets.
+const DEFAULT_HEADER: &str = "# AWS access observed by `lenslet run`: action, resource.\n\
+     # Regenerate with `lenslet run --update -- <tests>`; review changes like code.\n\
+     # Mark a line `# test` when only the tests need it; `lenslet policy` leaves it out.\n";
 
 /// `lenslet.lock` in `dir`.
 pub fn path_in(dir: &Path) -> PathBuf {
@@ -28,6 +45,10 @@ pub struct Lock {
     /// Lines marked `# test`: needed by the tests themselves (fixtures that
     /// create tables or buckets), kept for `--check`, left out of `policy`.
     pub test: BTreeSet<Access>,
+    /// Lines marked `# implied`: needed by another call (KMS, PassRole).
+    pub implied: BTreeSet<Access>,
+    /// The full-line comments before the first entry, kept on rewrite.
+    pub header: Vec<String>,
 }
 
 /// The lock, or `None` when there is no lock file.
@@ -42,21 +63,29 @@ pub fn read(path: &Path) -> Result<Option<Lock>> {
 
 pub fn parse(text: &str) -> Lock {
     let mut lock = Lock::default();
+    let mut in_header = true;
     for line in text.lines() {
         let (entry, comment) = line.split_once('#').unwrap_or((line, ""));
         let mut fields = entry.split_whitespace();
         let Some(action) = fields.next() else {
+            if in_header && line.trim_start().starts_with('#') {
+                lock.header.push(line.trim_end().to_string());
+            }
             continue;
         };
+        in_header = false;
         let access = Access {
             action: action.to_string(),
             resource: fields.next().unwrap_or("*").to_string(),
         };
-        if comment
+        let words: Vec<&str> = comment
             .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|word| word == "test")
-        {
+            .collect();
+        if words.contains(&"test") {
             lock.test.insert(access.clone());
+        }
+        if words.contains(&"implied") {
+            lock.implied.insert(access.clone());
         }
         lock.access.insert(access);
     }
@@ -65,23 +94,54 @@ pub fn parse(text: &str) -> Lock {
 
 /// The lock file text. `test` marks carry over from the previous lock.
 pub fn render(access: &BTreeMap<Access, AccessUse>, test: &BTreeSet<Access>) -> String {
-    let width = access
-        .keys()
-        .map(|access| access.action.len())
+    render_entries(
+        DEFAULT_HEADER,
+        access
+            .iter()
+            .map(|(access, used)| (access, test.contains(access), used.implied)),
+    )
+}
+
+/// The canonical text of a parsed lock, with its own header comments.
+fn render_lock(lock: &Lock) -> String {
+    render_entries(
+        &header_text(&lock.header),
+        lock.access.iter().map(|access| {
+            (
+                access,
+                lock.test.contains(access),
+                lock.implied.contains(access),
+            )
+        }),
+    )
+}
+
+fn header_text(header: &[String]) -> String {
+    if header.is_empty() {
+        DEFAULT_HEADER.to_string()
+    } else {
+        header.iter().map(|line| format!("{line}\n")).collect()
+    }
+}
+
+/// One aligned `action  resource  # notes` line per entry, in order.
+fn render_entries<'a>(
+    header: &str,
+    entries: impl Iterator<Item = (&'a Access, bool, bool)> + Clone,
+) -> String {
+    let width = entries
+        .clone()
+        .map(|(access, _, _)| access.action.len())
         .max()
         .unwrap_or(0);
-    let mut out = String::from(
-        "# AWS access observed by `lenslet run`: action, resource.\n\
-         # Regenerate with `lenslet run --update -- <tests>`; review changes like code.\n\
-         # Mark a line `# test` when only the tests need it; `lenslet policy` leaves it out.\n",
-    );
-    for (access, used) in access {
+    let mut out = header.to_string();
+    for (access, test, implied) in entries {
         out.push_str(&format!("{:<width$}  {}", access.action, access.resource));
         let mut notes = Vec::new();
-        if test.contains(access) {
+        if test {
             notes.push("test");
         }
-        if used.implied {
+        if implied {
             notes.push("implied");
         }
         if !notes.is_empty() {
@@ -92,12 +152,95 @@ pub fn render(access: &BTreeMap<Access, AccessUse>, test: &BTreeSet<Access>) -> 
     out
 }
 
+/// Write the lock from a run's access (`lenslet run --update`). The caller
+/// passes the `test` marks to keep; the file's header comments are kept.
 pub fn write(
     path: &Path,
     access: &BTreeMap<Access, AccessUse>,
     test: &BTreeSet<Access>,
 ) -> Result<()> {
-    fs::write(path, render(access, test)).with_context(|| format!("write {}", path.display()))
+    let header = read(path)?.map(|lock| lock.header).unwrap_or_default();
+    let text = render_entries(
+        &header_text(&header),
+        access
+            .iter()
+            .map(|(access, used)| (access, test.contains(access), used.implied)),
+    );
+    write_atomic(path, &text)
+}
+
+/// Add permissions to the lock (creating it if needed), each with its `test`
+/// mark. Lines already in the lock are left as they are. Returns how many
+/// lines were added; the file is only rewritten when that is not zero.
+pub fn accept(path: &Path, additions: &[(Access, bool)]) -> Result<usize> {
+    let mut lock = read(path)?.unwrap_or_default();
+    let mut added = 0;
+    for (access, test) in additions {
+        if lock.access.insert(access.clone()) {
+            added += 1;
+            if *test {
+                lock.test.insert(access.clone());
+            }
+        }
+    }
+    if added > 0 {
+        write_atomic(path, &render_lock(&lock))?;
+    }
+    Ok(added)
+}
+
+/// Mark (or unmark) a lock line `# test`. Returns whether the file changed:
+/// `false` when the line is not in the lock or already marked that way.
+pub fn set_test_mark(path: &Path, access: &Access, test: bool) -> Result<bool> {
+    let Some(mut lock) = read(path)? else {
+        return Ok(false);
+    };
+    if !lock.access.contains(access) || lock.test.contains(access) == test {
+        return Ok(false);
+    }
+    if test {
+        lock.test.insert(access.clone());
+    } else {
+        lock.test.remove(access);
+    }
+    write_atomic(path, &render_lock(&lock))?;
+    Ok(true)
+}
+
+/// Replace `path` with `text` atomically: a temporary file in the same
+/// directory, synced, given the old file's permissions, then renamed over it.
+/// A symlinked lock is written through to its target.
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| FILE_NAME.to_string());
+    let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let permissions = fs::metadata(&target).ok().map(|meta| meta.permissions());
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        if let Some(permissions) = permissions {
+            fs::set_permissions(&temp, permissions)?;
+        }
+        fs::rename(&temp, &target)?;
+        // Make the rename itself durable (best effort; not every platform
+        // can open a directory).
+        if let Ok(dir) = fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.with_context(|| format!("write {}", path.display()))
 }
 
 /// An IAM policy document granting the locked access, without `test` lines.
@@ -139,6 +282,8 @@ enum GateKind {
 
 #[derive(Clone, Debug)]
 struct Statement {
+    /// `Sid`, or `Statement[i]` (0-based) when the statement has none.
+    label: String,
     allow: bool,
     actions: Vec<String>,
     not_actions: Vec<String>,
@@ -147,6 +292,38 @@ struct Statement {
     conditions: Vec<ConditionClause>,
 }
 
+/// Why a permission was allowed or denied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    Allowed,
+    /// A `Deny` statement matched.
+    ExplicitDeny,
+    /// No `Allow` statement (or lock line) grants it.
+    NoAllow,
+}
+
+/// A gate's verdict on one permission, and the statement that decided it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decision {
+    pub allowed: bool,
+    /// The deciding statement's `Sid`, or `Statement[i]` (0-based) without
+    /// one: the denying statement, or the first allowing one. `None` for a
+    /// lock, and when no statement matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    pub reason: Reason,
+}
+
+impl Decision {
+    fn no_allow() -> Self {
+        Decision {
+            allowed: false,
+            by: None,
+            reason: Reason::NoAllow,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SetQuantifier {
     Single,
@@ -328,10 +505,6 @@ impl RequestContext {
     }
 }
 
-/// Sentinel resource emitted when a request body needed for permission
-/// derivation was truncated or unreadable: every gate rejects it (fail closed).
-pub const UNVERIFIED_RESOURCE: &str = "<unverified-request-body>";
-
 impl Gate {
     pub fn from_lock(label: impl Into<String>, access: BTreeSet<Access>) -> Self {
         Gate {
@@ -359,7 +532,7 @@ impl Gate {
             _ => anyhow::bail!("IAM policy must contain a `Statement` array or object"),
         };
         let mut statements = Vec::with_capacity(raw_statements.len());
-        for item in raw_statements {
+        for (index, item) in raw_statements.into_iter().enumerate() {
             let Some(obj) = item.as_object() else {
                 anyhow::bail!("each IAM Statement must be a JSON object");
             };
@@ -418,7 +591,14 @@ impl Gate {
             if resources.is_empty() && not_resources.is_empty() {
                 anyhow::bail!("IAM Statement must specify `Resource` or `NotResource`");
             }
+            let label = obj
+                .get("Sid")
+                .and_then(|sid| sid.as_str())
+                .filter(|sid| !sid.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Statement[{index}]"));
             statements.push(Statement {
+                label,
                 allow,
                 actions,
                 not_actions,
@@ -442,34 +622,56 @@ impl Gate {
 
     /// Whether `access` is permitted by this lock or IAM policy without request context.
     pub fn allows(&self, access: &Access) -> bool {
-        self.allows_in_context(access, None)
+        self.decide(access, None).allowed
     }
 
     /// Whether `access` is permitted under optional wire `ctx`.
     pub fn allows_in_context(&self, access: &Access, ctx: Option<&RequestContext>) -> bool {
-        if access.resource == UNVERIFIED_RESOURCE {
-            return false;
-        }
+        self.decide(access, ctx).allowed
+    }
+
+    /// The verdict on `access`, and which statement decided it.
+    ///
+    /// A lock grants exactly the lines it lists: its entries are normalized
+    /// footprints compared with normalized footprints, so a `*` in a lock line
+    /// (a generated name) is not a pattern over other names.
+    ///
+    /// A policy follows IAM: any matching `Deny` wins, else any matching
+    /// `Allow` grants. A `*` in a derived resource is an unknown part (a name
+    /// that could not be read): an `Allow` grants it only when it matches
+    /// every resource the `*` could stand for, while a `Deny` applies when it
+    /// matches any of them.
+    pub fn decide(&self, access: &Access, ctx: Option<&RequestContext>) -> Decision {
         match &self.kind {
-            GateKind::Lock(entries) => {
-                entries.contains(access)
-                    || entries.iter().any(|rule| {
-                        iam_action_matches(&rule.action, &access.action)
-                            && iam_arn_matches(&rule.resource, &access.resource)
-                    })
-            }
+            GateKind::Lock(entries) if entries.contains(access) => Decision {
+                allowed: true,
+                by: None,
+                reason: Reason::Allowed,
+            },
+            GateKind::Lock(_) => Decision::no_allow(),
             GateKind::Policy(statements) => {
-                let mut allowed = false;
-                for stmt in statements {
-                    if !stmt.matches(access, ctx) {
+                let mut allowed_by = None;
+                for statement in statements {
+                    if !statement.matches(access, ctx) {
                         continue;
                     }
-                    if !stmt.allow {
-                        return false;
+                    if !statement.allow {
+                        return Decision {
+                            allowed: false,
+                            by: Some(statement.label.clone()),
+                            reason: Reason::ExplicitDeny,
+                        };
                     }
-                    allowed = true;
+                    allowed_by.get_or_insert_with(|| statement.label.clone());
                 }
-                allowed
+                match allowed_by {
+                    Some(by) => Decision {
+                        allowed: true,
+                        by: Some(by),
+                        reason: Reason::Allowed,
+                    },
+                    None => Decision::no_allow(),
+                }
             }
         }
     }
@@ -492,15 +694,19 @@ impl Statement {
         if !action_ok {
             return false;
         }
+        // An Allow must hold for every resource an unknown part could be; a
+        // Deny applies if it could hold for any of them.
+        type Matcher = fn(&str, &str) -> bool;
+        let (covers, overlaps): (Matcher, Matcher) = (arn_covers, arn_overlaps);
         let resource_ok = if !self.resources.is_empty() {
-            self.resources
-                .iter()
-                .any(|p| iam_arn_matches(p, &access.resource))
+            let matches = if self.allow { covers } else { overlaps };
+            self.resources.iter().any(|p| matches(p, &access.resource))
         } else if !self.not_resources.is_empty() {
+            let excluded = if self.allow { overlaps } else { covers };
             !self
                 .not_resources
                 .iter()
-                .any(|p| iam_arn_matches(p, &access.resource))
+                .any(|p| excluded(p, &access.resource))
         } else {
             false
         };
@@ -519,6 +725,100 @@ impl Statement {
     }
 }
 
+/// A denied permission of one call, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Denial {
+    pub action: String,
+    pub resource: String,
+    /// Needed elsewhere (a KMS key, a passed role) rather than by the call itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub implied: bool,
+    /// The resource is `*` because the request body could not be read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unverified: bool,
+    #[serde(flatten)]
+    pub decision: Decision,
+}
+
+impl Denial {
+    pub fn key(&self) -> Access {
+        Access::new(self.action.clone(), self.resource.clone())
+    }
+}
+
+/// One call checked against a gate, derived once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Evaluation {
+    /// The footprint, each entry marked `new` when the gate denies it.
+    pub access: Vec<CallAccess>,
+    pub implied: Vec<CallAccess>,
+    /// What the gate denied: concrete permissions for a policy, footprint
+    /// entries for a lock; own permissions first, then implied ones.
+    pub denied: Vec<Denial>,
+    /// Concrete own permissions, for cross-call diagnostics.
+    pub concrete_own: Vec<Access>,
+}
+
+/// Derive what `trace` needs and check it against `gate`. Without a gate
+/// nothing is denied and nothing is new.
+pub fn evaluate(trace: &Trace, gate: Option<&Gate>) -> Evaluation {
+    let derived = access::derive_call(trace);
+    let flag = |entry: &Access| derived.unverified.contains(entry);
+    let mut denied = Vec::new();
+    if let Some(gate) = gate {
+        let (own, implied) = if gate.is_policy() {
+            (&derived.concrete_own, &derived.concrete_implied)
+        } else {
+            (&derived.own, &derived.implied)
+        };
+        let ctx = gate.is_policy().then(|| RequestContext::from_trace(trace));
+        for (entry, is_implied) in own
+            .iter()
+            .map(|entry| (entry, false))
+            .chain(implied.iter().map(|entry| (entry, true)))
+        {
+            let entry_ctx = ctx.as_ref().map(|ctx| {
+                if is_implied {
+                    ctx.for_implied(&trace.service, trace.region.as_deref(), &entry.action)
+                } else {
+                    ctx.clone()
+                }
+            });
+            let decision = gate.decide(entry, entry_ctx.as_ref());
+            if !decision.allowed {
+                denied.push(Denial {
+                    action: entry.action.clone(),
+                    resource: entry.resource.clone(),
+                    implied: is_implied,
+                    unverified: flag(entry),
+                    decision,
+                });
+            }
+        }
+    }
+    // A footprint entry is new when a denied permission falls under it.
+    let mark = |entries: &[Access], is_implied: bool| -> Vec<CallAccess> {
+        entries
+            .iter()
+            .map(|entry| CallAccess {
+                new: denied.iter().any(|denial| {
+                    denial.implied == is_implied
+                        && denial.action == entry.action
+                        && arn_covers(&entry.resource, &denial.resource)
+                }),
+                unverified: flag(entry),
+                action: entry.action.clone(),
+                resource: entry.resource.clone(),
+            })
+            .collect()
+    };
+    Evaluation {
+        access: mark(&derived.own, false),
+        implied: mark(&derived.implied, true),
+        concrete_own: derived.concrete_own.clone(),
+        denied,
+    }
+}
 fn parse_conditions(value: &serde_json::Value) -> Result<Vec<ConditionClause>> {
     let Some(ops_map) = value.as_object() else {
         anyhow::bail!("IAM Statement `Condition` must be a JSON object");
@@ -681,8 +981,8 @@ impl ConditionClause {
             BaseOp::StringNotLike => self.values.iter().all(|p| !glob_match(p, actual)),
             BaseOp::ArnEquals => self.values.iter().any(|p| actual == p),
             BaseOp::ArnNotEquals => self.values.iter().all(|p| actual != p),
-            BaseOp::ArnLike => self.values.iter().any(|p| iam_arn_matches(p, actual)),
-            BaseOp::ArnNotLike => self.values.iter().all(|p| !iam_arn_matches(p, actual)),
+            BaseOp::ArnLike => self.values.iter().any(|p| arn_covers(p, actual)),
+            BaseOp::ArnNotLike => self.values.iter().all(|p| !arn_covers(p, actual)),
             BaseOp::Bool => {
                 let Some(act_bool) = parse_bool_str(actual) else {
                     return false;
@@ -730,25 +1030,35 @@ fn iam_action_matches(pattern: &str, actual: &str) -> bool {
     glob_match(&pattern.to_ascii_lowercase(), &actual.to_ascii_lowercase())
 }
 
-pub(crate) fn arn_matches(pattern: &str, actual: &str) -> bool {
-    iam_arn_matches(pattern, actual)
+/// Whether IAM ARN pattern `pattern` matches every resource `actual` can
+/// stand for. A `*` in `actual` is an unknown part, so only a `*` in the
+/// pattern covers it.
+pub fn arn_covers(pattern: &str, actual: &str) -> bool {
+    arn_compare(pattern, actual, glob)
 }
 
-fn iam_arn_matches(pattern: &str, actual: &str) -> bool {
+/// Whether IAM ARN pattern `pattern` matches at least one resource `actual`
+/// can stand for (a `*` in `actual` is an unknown part).
+pub fn arn_overlaps(pattern: &str, actual: &str) -> bool {
+    arn_compare(pattern, actual, globs_intersect)
+}
+
+/// Compare ARNs part by part. Lenslet normalizes region and account to `*`
+/// (and the account is never known locally), so a concrete region, account or
+/// partition in a production policy still matches local ARNs.
+fn arn_compare(pattern: &str, actual: &str, matches: impl Fn(&str, &str) -> bool) -> bool {
     if pattern == "*" {
         return true;
     }
     if let (Some(p), Some(a)) = (split_arn(pattern), split_arn(actual)) {
-        let partition_ok = p[0] == "*" || a[0] == "*" || glob_match(p[0], a[0]);
-        let service_ok = glob_match(&p[1].to_ascii_lowercase(), &a[1].to_ascii_lowercase());
-        // Lenslet normalizes region and account to `*`; concrete values in a
-        // production IAM policy should still match local normalized ARNs.
-        let region_ok = a[2] == "*" || p[2] == "*" || glob_match(p[2], a[2]);
-        let account_ok = a[3] == "*" || p[3] == "*" || glob_match(p[3], a[3]);
-        let resource_ok = glob_match(p[4], a[4]);
-        return partition_ok && service_ok && region_ok && account_ok && resource_ok;
+        let relaxed = |p: &str, a: &str| p == "*" || a == "*" || glob(p, a);
+        return relaxed(p[0], a[0])
+            && matches(&p[1].to_ascii_lowercase(), &a[1].to_ascii_lowercase())
+            && relaxed(p[2], a[2])
+            && relaxed(p[3], a[3])
+            && matches(p[4], a[4]);
     }
-    glob_match(pattern, actual)
+    matches(pattern, actual)
 }
 
 fn split_arn(arn: &str) -> Option<[&str; 5]> {
@@ -760,20 +1070,34 @@ fn split_arn(arn: &str) -> Option<[&str; 5]> {
     Some([partition, service, region, account, resource])
 }
 
-/// Standard IAM wildcard matching (`*` matches 0+ chars, `?` matches 1 char).
+/// IAM wildcard matching of a resource. A `*` in `text` is an unknown run of
+/// characters: only a pattern `*` absorbs it.
+fn glob(pattern: &str, text: &str) -> bool {
+    wildcard_match(pattern, text, true)
+}
+
+/// Standard IAM wildcard matching (`*` matches 0+ chars, `?` matches 1 char)
+/// of a concrete value (an action, a condition value).
 fn glob_match(pattern: &str, text: &str) -> bool {
+    wildcard_match(pattern, text, false)
+}
+
+fn wildcard_match(pattern: &str, text: &str, star_is_unknown: bool) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star_pi, mut star_ti) = (None, 0usize);
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        if pi < p.len() && p[pi] == '*' {
             star_pi = Some(pi);
             pi += 1;
             star_ti = ti;
+        } else if pi < p.len()
+            && !(star_is_unknown && t[ti] == '*')
+            && (p[pi] == '?' || p[pi] == t[ti])
+        {
+            pi += 1;
+            ti += 1;
         } else if let Some(sp) = star_pi {
             pi = sp + 1;
             star_ti += 1;
@@ -788,6 +1112,45 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// Whether two IAM wildcard patterns match at least one common string: a
+/// search over the product of their automata, O(len(a) × len(b)).
+fn globs_intersect(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let width = b.len() + 1;
+    let mut seen = vec![false; (a.len() + 1) * width];
+    let mut stack = vec![(0usize, 0usize)];
+    while let Some((i, j)) = stack.pop() {
+        if std::mem::replace(&mut seen[i * width + j], true) {
+            continue;
+        }
+        if i == a.len() && j == b.len() {
+            return true;
+        }
+        let star_a = a.get(i) == Some(&'*');
+        let star_b = b.get(j) == Some(&'*');
+        // A `*` may match nothing.
+        if star_a {
+            stack.push((i + 1, j));
+        }
+        if star_b {
+            stack.push((i, j + 1));
+        }
+        // Both consume one common character.
+        if let (Some(&x), Some(&y)) = (a.get(i), b.get(j)) {
+            let any_x = x == '*' || x == '?';
+            let any_y = y == '*' || y == '?';
+            if any_x || any_y || x == y {
+                let next_i = if star_a { i } else { i + 1 };
+                let next_j = if star_b { j } else { j + 1 };
+                if (next_i, next_j) != (i, j) {
+                    stack.push((next_i, next_j));
+                }
+            }
+        }
+    }
+    false
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,6 +1318,8 @@ mod tests {
             implied: Vec::new(),
             new: false,
             blocked: false,
+            replay_of: None,
+            blocked_phase: None,
             request: crate::trace::Message::default(),
             response: crate::trace::Message::default(),
         };
@@ -1159,8 +1524,288 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !admin.allows(&access("dynamodb:BatchWriteItem", UNVERIFIED_RESOURCE)),
-            "unverified request bodies always fail closed"
+            admin.allows(&access("dynamodb:BatchWriteItem", "*")),
+            "`Resource: *` grants a resource that could not be read"
         );
+    }
+
+    fn policy_gate(json: &str) -> Gate {
+        Gate::from_policy_str(json, "policy.json").unwrap()
+    }
+
+    #[test]
+    fn an_unknown_resource_fails_closed_for_deny_and_open_only_for_allow_star() {
+        let gate = policy_gate(
+            r#"{"Statement":[
+                {"Effect":"Allow","Action":"dynamodb:*","Resource":"*"},
+                {"Sid":"KeepAudit","Effect":"Deny","Action":"dynamodb:DeleteItem","Resource":"arn:aws:dynamodb:*:*:table/audit"}
+            ]}"#,
+        );
+        // The table could be `audit`: the Deny applies.
+        let unknown = access("dynamodb:DeleteItem", "*");
+        assert_eq!(
+            gate.decide(&unknown, None),
+            Decision {
+                allowed: false,
+                by: Some("KeepAudit".into()),
+                reason: Reason::ExplicitDeny,
+            }
+        );
+        // A name that is partly unknown (`orders-*`) cannot be `audit`.
+        assert!(gate.allows(&access(
+            "dynamodb:DeleteItem",
+            "arn:aws:dynamodb:us-east-1:*:table/orders-*"
+        )));
+        assert!(!gate.allows(&access(
+            "dynamodb:DeleteItem",
+            "arn:aws:dynamodb:us-east-1:*:table/aud*"
+        )));
+
+        // An Allow on one table does not grant an unknown one; it must cover
+        // every name the `*` could be.
+        let scoped = policy_gate(
+            r#"{"Statement":[{"Effect":"Allow","Action":"dynamodb:GetItem","Resource":[
+                "arn:aws:dynamodb:*:*:table/orders",
+                "arn:aws:dynamodb:*:*:table/carts-*"
+            ]}]}"#,
+        );
+        assert!(!scoped.allows(&access("dynamodb:GetItem", "*")));
+        assert!(!scoped.allows(&access(
+            "dynamodb:GetItem",
+            "arn:aws:dynamodb:*:*:table/orders*"
+        )));
+        assert!(scoped.allows(&access(
+            "dynamodb:GetItem",
+            "arn:aws:dynamodb:*:*:table/carts-*"
+        )));
+        assert!(!scoped.allows(&access(
+            "dynamodb:GetItem",
+            "arn:aws:dynamodb:*:*:table/cart*"
+        )));
+
+        // NotResource: an Allow must exclude every possibility, a Deny applies
+        // unless every possibility is excluded.
+        let not_resource = policy_gate(
+            r#"{"Statement":[
+                {"Effect":"Allow","Action":"s3:GetObject","NotResource":"arn:aws:s3:::vault/*"},
+                {"Effect":"Deny","Action":"s3:GetObject","NotResource":"arn:aws:s3:::public/*"}
+            ]}"#,
+        );
+        assert_eq!(
+            not_resource.decide(&access("s3:GetObject", "*"), None),
+            Decision {
+                allowed: false,
+                by: Some("Statement[1]".into()),
+                reason: Reason::ExplicitDeny,
+            }
+        );
+        assert!(not_resource.allows(&access("s3:GetObject", "arn:aws:s3:::public/a")));
+        assert_eq!(
+            not_resource
+                .decide(&access("s3:PutObject", "arn:aws:s3:::public/a"), None)
+                .reason,
+            Reason::NoAllow
+        );
+    }
+
+    #[test]
+    fn wildcard_patterns_compare_as_sets() {
+        assert!(arn_overlaps("table/a*", "table/*b"));
+        assert!(!arn_overlaps("table/a?", "table/abc*"));
+        assert!(arn_overlaps("table/a?", "table/a*"));
+        assert!(!arn_covers("table/a?", "table/a*"));
+        assert!(arn_covers("table/*", "table/a*"));
+        assert!(arn_covers("*a", "*ba"));
+        assert!(!arn_covers("*b", "*"));
+        // Concrete values still match the way IAM matches them.
+        assert!(arn_covers("arn:aws:s3:::b/?", "arn:aws:s3:::b/x"));
+        assert!(glob_match("s3:Get*", "s3:GetObject"));
+    }
+
+    #[test]
+    fn a_lock_grants_exactly_its_lines() {
+        let gate = Gate::from_lock(
+            "lenslet.lock",
+            [
+                access("dynamodb:PutItem", "arn:aws:dynamodb:*:*:table/orders-*"),
+                access("sqs:SendMessage", "*"),
+            ]
+            .into(),
+        );
+        assert!(gate.allows(&access(
+            "dynamodb:PutItem",
+            "arn:aws:dynamodb:*:*:table/orders-*"
+        )));
+        // A generated-name `*` is not a pattern over other tables.
+        assert!(!gate.allows(&access(
+            "dynamodb:PutItem",
+            "arn:aws:dynamodb:*:*:table/orders-archive"
+        )));
+        // An unreadable resource is accepted by its own `*` line only.
+        assert!(gate.allows(&access("sqs:SendMessage", "*")));
+        assert!(!gate.allows(&access("sqs:SendMessage", "arn:aws:sqs:*:*:jobs")));
+        assert_eq!(
+            gate.decide(&access("sqs:DeleteQueue", "*"), None),
+            Decision {
+                allowed: false,
+                by: None,
+                reason: Reason::NoAllow,
+            }
+        );
+    }
+
+    fn temp_lock(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lenslet-lock-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(FILE_NAME)
+    }
+
+    #[test]
+    fn accept_and_test_marks_rewrite_atomically_in_the_canonical_format() {
+        let path = temp_lock("accept");
+        // A new lock gets the default header.
+        let orders = access("dynamodb:PutItem", "arn:aws:dynamodb:*:*:table/orders");
+        assert_eq!(accept(&path, &[(orders.clone(), false)]).unwrap(), 1);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(DEFAULT_HEADER), "{text}");
+        assert!(text.ends_with("dynamodb:PutItem  arn:aws:dynamodb:*:*:table/orders\n"));
+
+        // The user's own header comments, `test` and `implied` notes survive;
+        // other comments are not kept.
+        fs::write(
+            &path,
+            "# Owned by the payments team.\n\
+             # Review with #infra.\n\
+             \n\
+             kms:Decrypt  arn:aws:kms:*:*:key/*  # implied\n\
+             # stray note\n\
+             dynamodb:PutItem  arn:aws:dynamodb:*:*:table/orders  # why: checkout\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let table = access("dynamodb:CreateTable", "arn:aws:dynamodb:*:*:table/orders");
+        assert_eq!(
+            accept(&path, &[(table.clone(), true), (orders.clone(), true)]).unwrap(),
+            1,
+            "a line already in the lock is left as it is"
+        );
+        let expected = "# Owned by the payments team.\n\
+             # Review with #infra.\n\
+             dynamodb:CreateTable  arn:aws:dynamodb:*:*:table/orders  # test\n\
+             dynamodb:PutItem      arn:aws:dynamodb:*:*:table/orders\n\
+             kms:Decrypt           arn:aws:kms:*:*:key/*  # implied\n";
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "the rewrite keeps the file's permissions");
+        }
+        assert_eq!(accept(&path, &[(orders.clone(), false)]).unwrap(), 0);
+
+        assert!(set_test_mark(&path, &orders, true).unwrap());
+        assert!(
+            !set_test_mark(&path, &orders, true).unwrap(),
+            "already marked"
+        );
+        assert!(set_test_mark(&path, &table, false).unwrap());
+        assert!(!set_test_mark(&path, &access("s3:GetObject", "*"), true).unwrap());
+        let lock = read(&path).unwrap().unwrap();
+        assert_eq!(lock.test, [orders.clone()].into());
+        assert_eq!(lock.header.len(), 2);
+
+        // `--update` rewrites the entries but keeps the header.
+        let mut used = BTreeMap::new();
+        used.insert(orders.clone(), AccessUse::default());
+        write(&path, &used, &lock.test).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Owned by the payments team.\n\
+             # Review with #infra.\n\
+             dynamodb:PutItem  arn:aws:dynamodb:*:*:table/orders  # test\n"
+        );
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != FILE_NAME)
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary files are left behind");
+        assert!(!set_test_mark(&temp_lock("missing"), &orders, true).unwrap());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn evaluation_marks_new_footprints_and_names_the_deciding_statement() {
+        let trace = crate::trace::Trace {
+            id: "1".into(),
+            method: "POST".into(),
+            path: "/".into(),
+            service: "dynamodb".into(),
+            operation: "DeleteItem".into(),
+            region: Some("us-east-1".into()),
+            request: crate::trace::Message {
+                headers: Vec::new(),
+                content_type: Some("application/x-amz-json-1.0".into()),
+                body: Some(crate::trace::BodyTrace {
+                    text: Some(r#"{"TableName":"audit-20261119","Key":{}}"#.into()),
+                    bytes: 40,
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        };
+        let gate = policy_gate(
+            r#"{"Statement":[
+                {"Sid":"All","Effect":"Allow","Action":"dynamodb:*","Resource":"*"},
+                {"Sid":"KeepAudit","Effect":"Deny","Action":"dynamodb:DeleteItem","Resource":"arn:aws:dynamodb:*:*:table/audit-*"}
+            ]}"#,
+        );
+        let evaluation = evaluate(&trace, Some(&gate));
+        assert_eq!(
+            evaluation.denied,
+            vec![Denial {
+                action: "dynamodb:DeleteItem".into(),
+                resource: "arn:aws:dynamodb:us-east-1:*:table/audit-20261119".into(),
+                implied: false,
+                unverified: false,
+                decision: Decision {
+                    allowed: false,
+                    by: Some("KeepAudit".into()),
+                    reason: Reason::ExplicitDeny,
+                },
+            }]
+        );
+        assert_eq!(
+            evaluation.access,
+            vec![CallAccess {
+                action: "dynamodb:DeleteItem".into(),
+                resource: "arn:aws:dynamodb:*:*:table/audit-*".into(),
+                new: true,
+                unverified: false,
+            }]
+        );
+        // Without a gate nothing is denied; a lock compares footprints.
+        assert!(evaluate(&trace, None).denied.is_empty());
+        let lock = Gate::from_lock(
+            "lenslet.lock",
+            [access(
+                "dynamodb:DeleteItem",
+                "arn:aws:dynamodb:*:*:table/audit-*",
+            )]
+            .into(),
+        );
+        let evaluation = evaluate(&trace, Some(&lock));
+        assert!(evaluation.denied.is_empty() && !evaluation.access[0].new);
     }
 }

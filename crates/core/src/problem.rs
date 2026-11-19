@@ -66,18 +66,18 @@ pub fn blocked(
     service: &str,
     request_headers: &[HeaderTrace],
     request_content_type: Option<&str>,
-    denied: &crate::access::Access,
+    denied: &crate::lock::Denial,
     gate_label: &str,
     request_id: &str,
 ) -> BlockedWire {
-    let (message, hint) = if denied.resource == crate::lock::UNVERIFIED_RESOURCE {
+    let (message, hint) = if denied.unverified {
         (
             format!(
-                "Request body for {} could not be completely inspected and was blocked fail-closed by Lenslet --enforce against {gate_label}",
+                "User is not authorized to perform: {} on resource: * (the resource could not be read from the request body; blocked by Lenslet --enforce against {gate_label})",
                 denied.action
             ),
             format!(
-                "Blocked fail-closed by `lenslet run --enforce`: the request body for `{}` was unreadable or exceeded the inspection ceiling.",
+                "Blocked locally by `lenslet run --enforce`: the request body was not readable (binary or truncated), so `{}` stands on `*`, which `{gate_label}` does not permit.",
                 denied.action
             ),
         )
@@ -87,10 +87,16 @@ pub fn blocked(
                 "User is not authorized to perform: {} on resource: {} (blocked by Lenslet --enforce against {gate_label})",
                 denied.action, denied.resource
             ),
-            format!(
-                "Blocked locally by `lenslet run --enforce`: `{}` on `{}` is not permitted by `{gate_label}`. Run `lenslet run --update` if intended.",
-                denied.action, denied.resource
-            ),
+            match denied.decision.by.as_deref() {
+                Some(statement) => format!(
+                    "Blocked locally by `lenslet run --enforce`: `{}` on `{}` is denied by statement `{statement}` of `{gate_label}`.",
+                    denied.action, denied.resource
+                ),
+                None => format!(
+                    "Blocked locally by `lenslet run --enforce`: `{}` on `{}` is not permitted by `{gate_label}`. Run `lenslet run --update` if intended.",
+                    denied.action, denied.resource
+                ),
+            },
         )
     };
 
@@ -262,7 +268,7 @@ fn header_code(headers: &[HeaderTrace]) -> Option<String> {
 }
 
 fn reason_code(status: u16) -> String {
-    hyper::StatusCode::from_u16(status)
+    http::StatusCode::from_u16(status)
         .ok()
         .and_then(|status| status.canonical_reason())
         .map(|reason| reason.replace([' ', '-'], ""))

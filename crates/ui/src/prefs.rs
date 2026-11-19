@@ -36,13 +36,12 @@ pub enum AccentColor {
 }
 
 impl AccentColor {
-    pub const ALL: [AccentColor; 6] = [
+    /// The accents Settings offers (older files may name Violet or Rose).
+    pub const ALL: [AccentColor; 4] = [
         AccentColor::Sky,
         AccentColor::Indigo,
-        AccentColor::Violet,
         AccentColor::Emerald,
         AccentColor::Amber,
-        AccentColor::Rose,
     ];
 }
 
@@ -52,14 +51,6 @@ pub enum Density {
     #[default]
     Comfortable,
     Compact,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TimeFormat {
-    #[default]
-    Relative,
-    Clock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +71,7 @@ fn default_true() -> bool {
 }
 
 fn default_inspector_width() -> f32 {
-    476.0
+    crate::theme::INSPECTOR_DEFAULT_W
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -92,13 +83,10 @@ pub struct UiPrefs {
     #[serde(default)]
     pub density: Density,
     #[serde(default)]
-    pub time_format: TimeFormat,
-    #[serde(default)]
     pub lang: Lang,
-    #[serde(default)]
-    pub raw_body_default: bool,
-    #[serde(default = "default_true")]
-    pub word_wrap: bool,
+    /// Skip popover/palette animations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reduce_motion: bool,
     #[serde(default = "default_inspector_width")]
     pub inspector_width: f32,
     #[serde(default = "default_true")]
@@ -115,10 +103,8 @@ impl Default for UiPrefs {
             theme: ThemeMode::default(),
             accent: AccentColor::default(),
             density: Density::default(),
-            time_format: TimeFormat::default(),
             lang: Lang::default(),
-            raw_body_default: false,
-            word_wrap: true,
+            reduce_motion: false,
             inspector_width: default_inspector_width(),
             inspector_open: true,
             window_width: None,
@@ -138,6 +124,7 @@ pub fn path(home: &Path) -> PathBuf {
 }
 
 pub fn load(home: &Path) -> UiPrefs {
+    crate::fsguard::assert_io_allowed();
     let mut prefs = fs::read_to_string(path(home))
         .ok()
         .and_then(|text| serde_json::from_str::<UiPrefs>(&text).ok())
@@ -152,7 +139,10 @@ pub fn load(home: &Path) -> UiPrefs {
     prefs
 }
 
+/// Write the preferences. Blocking IO: the window calls it from the
+/// background executor, debounced.
 pub fn save(home: &Path, prefs: &UiPrefs) {
+    crate::fsguard::assert_io_allowed();
     let target = path(home);
     if let Some(parent) = target.parent() {
         let _ = fs::create_dir_all(parent);
@@ -219,10 +209,8 @@ mod tests {
             theme: ThemeMode::Light,
             accent: AccentColor::Indigo,
             density: Density::Compact,
-            time_format: TimeFormat::Clock,
             lang: Lang::Zh,
-            raw_body_default: true,
-            word_wrap: false,
+            reduce_motion: true,
             inspector_width: 520.0,
             inspector_open: false,
             window_width: Some(1440.0),
