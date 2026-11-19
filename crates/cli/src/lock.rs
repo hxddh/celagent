@@ -207,6 +207,8 @@ pub struct RequestContext {
 
 const SUPPORTED_CONDITION_KEYS: &[&str] = &[
     "aws:requestedregion",
+    "iam:passedtoservice",
+    "kms:viaservice",
     "s3:prefix",
     "s3:delimiter",
     "s3:max-keys",
@@ -288,6 +290,41 @@ impl RequestContext {
         self.values
             .get(&key.to_ascii_lowercase())
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// Derive the request context seen by an implied permission (`iam:PassRole`
+    /// receives `iam:PassedToService`, and implied `kms:*` receives `kms:ViaService`).
+    pub fn for_implied(
+        &self,
+        parent_service: &str,
+        region: Option<&str>,
+        implied_action: &str,
+    ) -> Self {
+        let mut next = self.clone();
+        if implied_action.eq_ignore_ascii_case("iam:PassRole") {
+            let principal = match parent_service {
+                "ecs" => "ecs-tasks.amazonaws.com".to_string(),
+                "monitoring" => "cloudwatch.amazonaws.com".to_string(),
+                "email" | "sesv2" => "ses.amazonaws.com".to_string(),
+                "bedrock-runtime" => "bedrock.amazonaws.com".to_string(),
+                other => format!("{other}.amazonaws.com"),
+            };
+            next.values
+                .insert("iam:passedtoservice".into(), vec![principal]);
+        } else if implied_action.to_ascii_lowercase().starts_with("kms:")
+            && let Some(reg) = region.filter(|r| !r.is_empty())
+        {
+            let via_svc = match parent_service {
+                "streams.dynamodb" | "dynamodbstreams" => "dynamodb",
+                "email" | "sesv2" => "ses",
+                other => other,
+            };
+            next.values.insert(
+                "kms:viaservice".into(),
+                vec![format!("{via_svc}.{reg}.amazonaws.com")],
+            );
+        }
+        next
     }
 }
 
@@ -1055,6 +1092,51 @@ mod tests {
             ),
             "matching aws:kms header satisfies guardrail"
         );
+
+        // Implied `iam:PassRole` and `kms:*` receive `iam:PassedToService` and `kms:ViaService`.
+        let implied_gate = Gate::from_policy_str(
+            r#"{
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "iam:PassRole",
+                        "Resource": "arn:aws:iam::*:role/fn-role",
+                        "Condition": {
+                            "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" }
+                        }
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": "kms:GenerateDataKey",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": { "kms:ViaService": "s3.us-east-1.amazonaws.com" }
+                        }
+                    }
+                ]
+            }"#,
+            "implied.json",
+        )
+        .unwrap();
+        let base_ctx = RequestContext::from_trace(&base_put);
+        let pass_role = access("iam:PassRole", "arn:aws:iam::*:role/fn-role");
+        assert!(implied_gate.allows_in_context(
+            &pass_role,
+            Some(&base_ctx.for_implied("lambda", Some("us-east-1"), "iam:PassRole"))
+        ));
+        assert!(!implied_gate.allows_in_context(
+            &pass_role,
+            Some(&base_ctx.for_implied("ecs", Some("us-east-1"), "iam:PassRole"))
+        ));
+        let kms_gdk = access("kms:GenerateDataKey", "arn:aws:kms:us-east-1:*:key/k1");
+        assert!(implied_gate.allows_in_context(
+            &kms_gdk,
+            Some(&base_ctx.for_implied("s3", Some("us-east-1"), "kms:GenerateDataKey"))
+        ));
+        assert!(!implied_gate.allows_in_context(
+            &kms_gdk,
+            Some(&base_ctx.for_implied("sqs", Some("us-east-1"), "kms:GenerateDataKey"))
+        ));
 
         let principal_scoped = r#"{
             "Version": "2012-10-17",

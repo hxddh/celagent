@@ -1119,20 +1119,30 @@ pub enum StatusFilter {
     Slow,
 }
 
-/// Combinable call-stream filter: status facet AND service facet AND optional IAM permission.
+/// Combinable call-stream filter: status facet AND service facet AND optional IAM permission
+/// AND optional timeline slice `(start_offset_ms, end_offset_ms)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallFilter {
     pub status: StatusFilter,
     pub service: Option<String>,
     pub access: Option<Access>,
+    pub time_window: Option<(i64, i64)>,
 }
 
 impl CallFilter {
     pub fn is_active(&self) -> bool {
-        self.status != StatusFilter::All || self.service.is_some() || self.access.is_some()
+        self.status != StatusFilter::All
+            || self.service.is_some()
+            || self.access.is_some()
+            || self.time_window.is_some()
     }
 
+    #[cfg(test)]
     pub fn matches(&self, trace: &Trace) -> bool {
+        self.matches_at(trace, None)
+    }
+
+    pub fn matches_at(&self, trace: &Trace, run_start_ms: Option<i64>) -> bool {
         let status_ok = match self.status {
             StatusFilter::All => true,
             StatusFilter::Errors => trace.is_error(),
@@ -1152,6 +1162,15 @@ impl CallFilter {
             && !trace.uses(access)
         {
             return false;
+        }
+        if let (Some((win_start, win_end)), Some(run_start), Some(call_at)) =
+            (self.time_window, run_start_ms, trace.at_ms())
+        {
+            let rel_start = (call_at - run_start).max(0);
+            let rel_end = rel_start + trace.ms as i64;
+            if rel_end < win_start || rel_start > win_end {
+                return false;
+            }
         }
         true
     }
@@ -1450,7 +1469,12 @@ fn posix_single_quote(text: &str) -> String {
 /// payload cannot be reconstructed from the trace.
 pub fn to_curl(trace: &Trace, endpoint: Option<&str>) -> Option<String> {
     if let Some(body) = trace.request.as_ref().and_then(|req| req.body.as_ref())
-        && (body.truncated || (body.bytes > 0 && body.text.is_none()))
+        && (body.truncated
+            || (body.bytes > 0 && body.text.is_none())
+            || body
+                .encoding
+                .as_deref()
+                .is_some_and(|e| e.contains("aws-eventstream")))
     {
         return None;
     }
@@ -1667,38 +1691,409 @@ pub fn format_offset(delta_ms: i64) -> String {
     }
 }
 
-/// Read `# test` marks from a lock file on disk, when reachable.
-pub fn read_test_marks(cwd: &str, lock: &str) -> std::collections::BTreeSet<Access> {
-    let lock_path = Path::new(lock);
-    let resolved = if lock_path.is_absolute() || cwd.is_empty() {
-        lock_path.to_path_buf()
-    } else {
-        Path::new(cwd).join(lock_path)
+/// Live `lenslet.lock` state read directly from disk so UI edits take effect immediately.
+#[derive(Clone, Debug, Default)]
+pub struct LiveLock {
+    pub exists: bool,
+    pub access: std::collections::BTreeSet<Access>,
+    pub test: std::collections::BTreeSet<Access>,
+    pub implied: std::collections::BTreeSet<Access>,
+}
+
+pub fn resolve_lock_path(
+    cwd: &str,
+    header_lock: Option<&str>,
+    header_policy: Option<&str>,
+) -> Option<PathBuf> {
+    if header_policy.is_some() {
+        return None;
+    }
+    if let Some(lock) = header_lock.filter(|s| !s.is_empty()) {
+        let p = Path::new(lock);
+        return Some(if p.is_absolute() || cwd.is_empty() {
+            p.to_path_buf()
+        } else {
+            Path::new(cwd).join(p)
+        });
+    }
+    (!cwd.is_empty()).then(|| Path::new(cwd).join("lenslet.lock"))
+}
+
+pub fn read_live_lock(
+    cwd: &str,
+    header_lock: Option<&str>,
+    header_policy: Option<&str>,
+) -> Option<LiveLock> {
+    let path = resolve_lock_path(cwd, header_lock, header_policy)?;
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Some(LiveLock {
+            exists: false,
+            ..Default::default()
+        });
     };
-    let Ok(text) = fs::read_to_string(resolved) else {
-        return std::collections::BTreeSet::new();
+    let mut live = LiveLock {
+        exists: true,
+        ..Default::default()
     };
-    let mut out = std::collections::BTreeSet::new();
     for line in text.lines() {
-        let Some((entry, comment)) = line.split_once('#') else {
-            continue;
-        };
-        if !comment
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|word| word == "test")
-        {
-            continue;
-        }
+        let (entry, comment) = line.split_once('#').unwrap_or((line, ""));
         let mut fields = entry.split_whitespace();
         let Some(action) = fields.next() else {
             continue;
         };
-        out.insert(Access {
+        let acc = Access {
             action: action.to_string(),
             resource: fields.next().unwrap_or("*").to_string(),
-        });
+        };
+        let words: Vec<&str> = comment
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        if words.contains(&"test") {
+            live.test.insert(acc.clone());
+        }
+        if words.contains(&"implied") {
+            live.implied.insert(acc.clone());
+        }
+        live.access.insert(acc);
     }
-    out
+    Some(live)
+}
+
+fn write_canonical_lock(
+    path: &Path,
+    access: &std::collections::BTreeSet<Access>,
+    test: &std::collections::BTreeSet<Access>,
+    implied: &std::collections::BTreeSet<Access>,
+) -> std::io::Result<()> {
+    let width = access.iter().map(|a| a.action.len()).max().unwrap_or(0);
+    let mut out = String::from(
+        "# AWS access observed by `lenslet run`: action, resource.\n\
+         # Regenerate with `lenslet run --update -- <tests>`; review changes like code.\n\
+         # Mark a line `# test` when only the tests need it; `lenslet policy` leaves it out.\n",
+    );
+    for entry in access {
+        let _ = write!(out, "{:<width$}  {}", entry.action, entry.resource);
+        let mut notes = Vec::new();
+        if test.contains(entry) {
+            notes.push("test");
+        }
+        if implied.contains(entry) {
+            notes.push("implied");
+        }
+        if !notes.is_empty() {
+            let _ = write!(out, "  # {}", notes.join(", "));
+        }
+        out.push('\n');
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("lock.tmp");
+    fs::write(&tmp, out)?;
+    fs::rename(&tmp, path)
+}
+
+/// Add `(Access, implied)` entries to `lenslet.lock` on disk, returning how many new entries were added.
+pub fn accept_into_lock(path: &Path, additions: &[(Access, bool)]) -> std::io::Result<usize> {
+    let mut live = read_live_lock("", path.to_str(), None).unwrap_or_default();
+    let mut added = 0usize;
+    for (acc, is_implied) in additions {
+        if live.access.insert(acc.clone()) {
+            added += 1;
+        }
+        if *is_implied {
+            live.implied.insert(acc.clone());
+        }
+    }
+    write_canonical_lock(path, &live.access, &live.test, &live.implied)?;
+    Ok(added)
+}
+
+/// Toggle `# test` on `target` inside `lenslet.lock` (adding `target` first if not yet in lock).
+/// Returns `true` if `target` is now marked `# test`, `false` if unmarked.
+pub fn toggle_lock_test_mark(
+    path: &Path,
+    target: &Access,
+    is_implied: bool,
+) -> std::io::Result<bool> {
+    let mut live = read_live_lock("", path.to_str(), None).unwrap_or_default();
+    live.access.insert(target.clone());
+    if is_implied {
+        live.implied.insert(target.clone());
+    }
+    let now_test = if live.test.remove(target) {
+        false
+    } else {
+        live.test.insert(target.clone());
+        true
+    };
+    write_canonical_lock(path, &live.access, &live.test, &live.implied)?;
+    Ok(now_test)
+}
+
+/// Smart AWS protocol semantic decoding for the Inspector (`Decoded` mode):
+/// - Unwraps DynamoDB AttributeValue wrappers (`{"S": "x", "N": "42"}`) into native JSON;
+/// - Decodes `application/x-www-form-urlencoded` AWS Query requests (`Action=...`) with
+///   pretty-printed nested JSON values (`MessageBody`, `PolicyDocument`, `Message`, `Detail`);
+/// - Pretty-prints `aws-eventstream` newline-delimited event JSON frames;
+/// - Unwraps embedded JSON strings (`MessageBody`, `Detail`, `input`, `output`, `Policy`).
+///
+/// Returns `Some((mode_badge_label, decoded_text, is_form_syntax))` when a richer semantic
+/// projection exists beyond standard `pretty_body`.
+pub fn decode_aws_semantic(
+    text: &str,
+    content_type: &str,
+    encoding: Option<&str>,
+) -> Option<(&'static str, String, bool)> {
+    let ct_low = content_type.to_ascii_lowercase();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. AWS EventStream JSONL (`{"event":"...","data":...}` per line).
+    if encoding.is_some_and(|e| e.contains("aws-eventstream")) {
+        let mut frames = Vec::new();
+        for line in trimmed.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                frames.push(val);
+            }
+        }
+        if !frames.is_empty() {
+            let pretty = serde_json::to_string_pretty(&frames).ok()?;
+            return Some(("EventStream", pretty, false));
+        }
+    }
+
+    // 2. AWS Query `x-www-form-urlencoded` (`Action=SendMessage&...`).
+    if (ct_low.contains("x-www-form-urlencoded")
+        || (!trimmed.starts_with('{')
+            && !trimmed.starts_with('<')
+            && trimmed.starts_with("Action=")))
+        && let Some(decoded_form) = format_query_form(trimmed)
+    {
+        return Some(("Query Params", decoded_form, true));
+    }
+
+    // 3. JSON payloads: DynamoDB AttributeValue unwrapping or embedded JSON string unwrapping.
+    if (ct_low.contains("json") || trimmed.starts_with('{'))
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        let mut ddb_hits = 0usize;
+        let unwrapped = unwrap_ddb_and_embedded(&val, false, &mut ddb_hits);
+        if ddb_hits > 0 {
+            let out = serde_json::to_string_pretty(&unwrapped).ok()?;
+            return Some(("DynamoDB Unwrapped", out, false));
+        }
+        let mut embedded_hits = 0usize;
+        let emb = unwrap_embedded_json_strings(&val, &mut embedded_hits);
+        if embedded_hits > 0 {
+            let out = serde_json::to_string_pretty(&emb).ok()?;
+            return Some(("Decoded JSON", out, false));
+        }
+    }
+
+    None
+}
+
+fn format_query_form(raw: &str) -> Option<String> {
+    let mut pairs = Vec::new();
+    for part in raw.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = part.split_once('=').unwrap_or((part, ""));
+        let key = percent_decode_form(k);
+        let val = percent_decode_form(v);
+        pairs.push((key, val));
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (k, v) in pairs {
+        let v_trim = v.trim();
+        if ((v_trim.starts_with('{') && v_trim.ends_with('}'))
+            || (v_trim.starts_with('[') && v_trim.ends_with(']')))
+            && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(v_trim)
+            && let Ok(pretty) = serde_json::to_string_pretty(&json_val)
+        {
+            let _ = writeln!(out, "{k} =");
+            for line in pretty.lines() {
+                let _ = writeln!(out, "  {line}");
+            }
+            continue;
+        }
+        let _ = writeln!(out, "{k} = {v}");
+    }
+    Some(out.trim_end().to_string())
+}
+
+fn percent_decode_form(input: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn unwrap_ddb_and_embedded(
+    val: &serde_json::Value,
+    in_ddb_container: bool,
+    ddb_hits: &mut usize,
+) -> serde_json::Value {
+    const DDB_CONTAINERS: &[&str] = &[
+        "Item",
+        "Items",
+        "Key",
+        "Keys",
+        "Attributes",
+        "ExpressionAttributeValues",
+        "LastEvaluatedKey",
+        "ExclusiveStartKey",
+        "Responses",
+        "RequestItems",
+        "TransactItems",
+    ];
+
+    match val {
+        serde_json::Value::Object(map) => {
+            if in_ddb_container
+                && map.len() == 1
+                && let Some((tag, inner)) = map.iter().next()
+            {
+                match (tag.as_str(), inner) {
+                    ("S" | "B", serde_json::Value::String(s)) => {
+                        *ddb_hits += 1;
+                        return serde_json::Value::String(s.clone());
+                    }
+                    ("N", serde_json::Value::String(n)) => {
+                        *ddb_hits += 1;
+                        if let Ok(i) = n.parse::<i64>() {
+                            return serde_json::Value::Number(i.into());
+                        }
+                        if let Ok(f) = n.parse::<f64>()
+                            && let Some(num) = serde_json::Number::from_f64(f)
+                        {
+                            return serde_json::Value::Number(num);
+                        }
+                        return serde_json::Value::String(n.clone());
+                    }
+                    ("BOOL", serde_json::Value::Bool(b)) => {
+                        *ddb_hits += 1;
+                        return serde_json::Value::Bool(*b);
+                    }
+                    ("NULL", serde_json::Value::Bool(true)) => {
+                        *ddb_hits += 1;
+                        return serde_json::Value::Null;
+                    }
+                    ("SS" | "BS", serde_json::Value::Array(arr)) => {
+                        *ddb_hits += 1;
+                        return serde_json::Value::Array(arr.clone());
+                    }
+                    ("NS", serde_json::Value::Array(arr)) => {
+                        *ddb_hits += 1;
+                        let nums = arr
+                            .iter()
+                            .map(|v| {
+                                v.as_str()
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                    .and_then(serde_json::Number::from_f64)
+                                    .map_or_else(|| v.clone(), serde_json::Value::Number)
+                            })
+                            .collect();
+                        return serde_json::Value::Array(nums);
+                    }
+                    ("L", serde_json::Value::Array(arr)) => {
+                        *ddb_hits += 1;
+                        return serde_json::Value::Array(
+                            arr.iter()
+                                .map(|item| unwrap_ddb_and_embedded(item, true, ddb_hits))
+                                .collect(),
+                        );
+                    }
+                    ("M", serde_json::Value::Object(sub)) => {
+                        *ddb_hits += 1;
+                        let mut out = serde_json::Map::new();
+                        for (k, v) in sub {
+                            out.insert(k.clone(), unwrap_ddb_and_embedded(v, true, ddb_hits));
+                        }
+                        return serde_json::Value::Object(out);
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                let child_in_ddb = in_ddb_container || DDB_CONTAINERS.contains(&k.as_str());
+                out.insert(
+                    k.clone(),
+                    unwrap_ddb_and_embedded(v, child_in_ddb, ddb_hits),
+                );
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|v| unwrap_ddb_and_embedded(v, in_ddb_container, ddb_hits))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn unwrap_embedded_json_strings(val: &serde_json::Value, hits: &mut usize) -> serde_json::Value {
+    const JSON_STRING_FIELDS: &[&str] = &[
+        "MessageBody",
+        "Body",
+        "Message",
+        "Detail",
+        "Policy",
+        "PolicyDocument",
+        "AssumeRolePolicyDocument",
+        "input",
+        "output",
+    ];
+    match val {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if JSON_STRING_FIELDS.contains(&k.as_str())
+                    && let serde_json::Value::String(s) = v
+                {
+                    let st = s.trim();
+                    if ((st.starts_with('{') && st.ends_with('}'))
+                        || (st.starts_with('[') && st.ends_with(']')))
+                        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(st)
+                    {
+                        *hits += 1;
+                        out.insert(k.clone(), unwrap_embedded_json_strings(&parsed, hits));
+                        continue;
+                    }
+                }
+                out.insert(k.clone(), unwrap_embedded_json_strings(v, hits));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|v| unwrap_embedded_json_strings(v, hits))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Summary of one recorded run file for the Run Switcher popover and Diff view.
@@ -2859,9 +3254,9 @@ mod tests {
              dynamodb:PutItem      arn:aws:dynamodb:*:*:table/orders\n",
         )
         .unwrap();
-        let marks = read_test_marks("", lock_file.to_str().unwrap());
-        assert_eq!(marks.len(), 1);
-        assert!(marks.contains(&Access {
+        let live = read_live_lock("", Some(lock_file.to_str().unwrap()), None).unwrap();
+        assert_eq!(live.test.len(), 1);
+        assert!(live.test.contains(&Access {
             action: "dynamodb:CreateTable".into(),
             resource: "arn:aws:dynamodb:*:*:table/orders".into(),
         }));
@@ -3126,6 +3521,7 @@ mod tests {
             status: StatusFilter::Blocked,
             service: Some("kms".into()),
             access: None,
+            time_window: None,
         };
         assert!(!filter.matches(&rows[0]));
         assert!(filter.matches(&rows[1]));
@@ -3189,5 +3585,71 @@ mod tests {
         assert!(live_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_decoding_lock_curation_and_time_slice_filters_work() {
+        let ddb_raw = r#"{"Item":{"orderId":{"S":"ord-7"},"amount":{"N":"42.5"},"active":{"BOOL":true},"tags":{"L":[{"S":"vip"}]}}}"#;
+        let (lbl, unwrapped, is_form) =
+            decode_aws_semantic(ddb_raw, "application/x-amz-json-1.0", None).unwrap();
+        assert_eq!(lbl, "DynamoDB Unwrapped");
+        assert!(!is_form);
+        let parsed: serde_json::Value = serde_json::from_str(&unwrapped).unwrap();
+        assert_eq!(parsed["Item"]["orderId"], "ord-7");
+        assert_eq!(parsed["Item"]["amount"], 42.5);
+        assert_eq!(parsed["Item"]["active"], true);
+        assert_eq!(parsed["Item"]["tags"][0], "vip");
+
+        let form_raw = "Action=SendMessage&QueueUrl=http%3A%2F%2F127.0.0.1%3A4566%2F0%2Fjobs&MessageBody=%7B%22task%22%3A%22sync%22%7D";
+        let (flbl, ftext, f_is_form) =
+            decode_aws_semantic(form_raw, "application/x-www-form-urlencoded", None).unwrap();
+        assert_eq!(flbl, "Query Params");
+        assert!(f_is_form);
+        assert!(ftext.contains("Action = SendMessage"), "{ftext}");
+        assert!(ftext.contains("\"task\": \"sync\""), "{ftext}");
+
+        let ev_call = parse_line(
+            r#"{"type":"call","id":"ev1","at":"2026-11-19T00:00:01Z","method":"POST","path":"/","host":"127.0.0.1:9297","service":"bedrock","operation":"InvokeModelWithResponseStream","status":200,"ms":15,"request":{"body":{"text":"{\"event\":\"chunk\"}","encoding":"aws-eventstream","bytes":64,"truncated":false,"binary":false}}}"#,
+        )
+        .unwrap();
+        assert!(to_curl(&ev_call, None).is_none());
+
+        let lock_path = temp_trace("curate.lock");
+        let _ = fs::remove_file(&lock_path);
+        let p1 = Access {
+            action: "dynamodb:CreateTable".into(),
+            resource: "arn:aws:dynamodb:*:*:table/orders".into(),
+        };
+        let p2 = Access {
+            action: "kms:Decrypt".into(),
+            resource: "arn:aws:kms:*:*:key/*".into(),
+        };
+        let added =
+            accept_into_lock(&lock_path, &[(p1.clone(), false), (p2.clone(), true)]).unwrap();
+        assert_eq!(added, 2);
+        let now_test = toggle_lock_test_mark(&lock_path, &p1, false).unwrap();
+        assert!(now_test);
+        let live = read_live_lock("", Some(lock_path.to_str().unwrap()), None).unwrap();
+        assert!(live.exists);
+        assert!(live.access.contains(&p1) && live.access.contains(&p2));
+        assert!(live.test.contains(&p1));
+        assert!(live.implied.contains(&p2));
+        let now_unmarked = toggle_lock_test_mark(&lock_path, &p1, false).unwrap();
+        assert!(!now_unmarked);
+        let _ = fs::remove_file(&lock_path);
+
+        let run_start = parse_rfc3339_ms("2026-11-19T00:00:00Z").unwrap();
+        let slice_filter = CallFilter {
+            status: StatusFilter::All,
+            service: None,
+            access: None,
+            time_window: Some((900, 1200)),
+        };
+        assert!(slice_filter.matches_at(&ev_call, Some(run_start)));
+        let early_slice = CallFilter {
+            time_window: Some((0, 500)),
+            ..slice_filter
+        };
+        assert!(!early_slice.matches_at(&ev_call, Some(run_start)));
     }
 }

@@ -211,6 +211,55 @@ pub fn chevron_down(color: Hsla) -> impl IntoElement {
         )
 }
 
+/// Replay refresh glyph (`↻`).
+pub fn replay_icon(color: Hsla) -> impl IntoElement {
+    div()
+        .relative()
+        .flex_shrink_0()
+        .w(px(11.0))
+        .h(px(11.0))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let cx = bounds.left().to_f64() as f32 + 5.5;
+                    let cy = bounds.top().to_f64() as f32 + 5.5;
+                    let r = 3.8_f32;
+                    let steps = 10;
+                    for i in 0..steps {
+                        let a0 = -PI * 0.75 + (i as f32 / steps as f32) * (PI * 1.55);
+                        let a1 = -PI * 0.75 + ((i + 1) as f32 / steps as f32) * (PI * 1.55);
+                        paint_line(
+                            window,
+                            (cx + r * a0.cos(), cy + r * a0.sin()),
+                            (cx + r * a1.cos(), cy + r * a1.sin()),
+                            1.25,
+                            color,
+                        );
+                    }
+                    let tip_x = cx + r * (-PI * 0.75).cos();
+                    let tip_y = cy + r * (-PI * 0.75).sin();
+                    paint_line(
+                        window,
+                        (tip_x, tip_y),
+                        (tip_x + 2.5, tip_y - 0.3),
+                        1.25,
+                        color,
+                    );
+                    paint_line(
+                        window,
+                        (tip_x, tip_y),
+                        (tip_x + 0.4, tip_y + 2.5),
+                        1.25,
+                        color,
+                    );
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+}
+
 /// A tiny key silhouettes whether SigV4 authorization was present.
 pub fn auth_mark(present: bool) -> impl IntoElement {
     let t = theme::p();

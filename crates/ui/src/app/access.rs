@@ -207,7 +207,24 @@ impl LensletApp {
         };
         let stmt_json = trace::statement_json(entry);
         let stmt_copy = stmt_json.clone();
-        let lock_line = format!("{:<30} {}", entry.action, entry.resource);
+        let mut lock_line = format!("{:<30} {}", entry.action, entry.resource);
+        let mut lock_notes = Vec::new();
+        if entry.test {
+            lock_notes.push("test");
+        }
+        if entry.implied {
+            lock_notes.push("implied");
+        }
+        if !lock_notes.is_empty() {
+            lock_line.push_str(&format!("  # {}", lock_notes.join(", ")));
+        }
+        let can_edit_lock = self.can_edit_lock();
+        let entry_is_new = entry.new;
+        let entry_is_test = entry.test;
+        let entry_is_implied = entry.implied;
+        let accept_key = key.clone();
+        let toggle_key = key.clone();
+        let search_toks = search_tokens(&self.query);
 
         let matching_calls: Vec<(usize, Arc<Trace>)> = self
             .rows
@@ -404,14 +421,67 @@ impl LensletApp {
                         }))
                         .into_any_element(),
                 ),
-                code_block("acc-stmt-code", stmt_json, 180.0, self.prefs.word_wrap),
+                syntax_code_block(
+                    "acc-stmt-code",
+                    stmt_json,
+                    crate::syntax::SyntaxKind::Json,
+                    &search_toks,
+                    180.0,
+                    self.prefs.word_wrap,
+                    true,
+                )
+                .0,
             ))
-            .child(section_with_action(
-                "LENSLET.LOCK ENTRY",
-                None,
-                Some(self.copy_button("copy-lock-line", "lock line", Some(lock_line.clone()), cx)),
-                code_block("acc-lock-code", lock_line, 64.0, self.prefs.word_wrap),
-            ))
+            .child({
+                let mut lock_actions = div().flex().items_center().gap(px(5.0));
+                if can_edit_lock {
+                    if entry_is_new {
+                        lock_actions = lock_actions.child(
+                            action_button(
+                                "accept-one-lock",
+                                i18n::pick("Accept into Lock", "写入 Lock"),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.accept_permission_into_lock(
+                                        accept_key.clone(),
+                                        entry_is_implied,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        );
+                    }
+                    let test_btn_label = if entry_is_test {
+                        i18n::pick("Unmark # test", "取消 # test")
+                    } else {
+                        i18n::pick("Mark # test", "标记 # test")
+                    };
+                    lock_actions = lock_actions.child(
+                        action_button("toggle-lock-test", test_btn_label).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.toggle_permission_test_mark(
+                                    toggle_key.clone(),
+                                    entry_is_implied,
+                                    cx,
+                                );
+                            },
+                        )),
+                    );
+                }
+                lock_actions = lock_actions.child(self.copy_button(
+                    "copy-lock-line",
+                    "lock line",
+                    Some(lock_line.clone()),
+                    cx,
+                ));
+                section_with_action(
+                    "LENSLET.LOCK ENTRY",
+                    None,
+                    Some(lock_actions.into_any_element()),
+                    code_block("acc-lock-code", lock_line, 64.0, self.prefs.word_wrap),
+                )
+            })
             .child(section(
                 i18n::pick("TRIGGERING CALLS", "触发该权限的请求"),
                 call_list,

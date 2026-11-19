@@ -33,8 +33,173 @@ impl LensletApp {
             .flex_1()
             .min_w(px(0.0))
             .bg(rgb(t.panel))
+            .when(!self.rows.is_empty(), |col| {
+                col.child(self.render_timeline_strip(cx))
+            })
             .child(self.render_table_head(op_width))
             .child(body)
+    }
+
+    /// Compact `24px` interactive Run Timeline Mini-Map (Option A): plots call
+    /// concurrency, errors, blocked calls, and retries across the run's wall span.
+    /// Click any bucket to filter the stream to that time slice (`ESC` resets).
+    fn render_timeline_strip(&self, cx: &mut Context<Self>) -> Div {
+        const BUCKETS: usize = 44;
+        let t = theme::p();
+        let (Some(start_ms), span_ms) = (self.run_start_ms(), self.run_span_ms().max(1)) else {
+            return div();
+        };
+
+        let mut counts = [0u16; BUCKETS];
+        let mut severity = [0u8; BUCKETS]; // 0=ok, 1=retry/slow, 2=error, 3=blocked
+        for row in self.rows.iter() {
+            let Some(at) = row.at_ms() else {
+                continue;
+            };
+            let rel_s = (at - start_ms).max(0);
+            let rel_e = (rel_s + row.ms as i64).max(rel_s + 1);
+            let b0 = ((rel_s as f64 / span_ms as f64) * BUCKETS as f64).floor() as usize;
+            let b1 = ((rel_e as f64 / span_ms as f64) * BUCKETS as f64).floor() as usize;
+            let sev = if row.blocked {
+                3
+            } else if row.is_error() {
+                2
+            } else if row.is_retry() || row.pending || row.ms >= 500 {
+                1
+            } else {
+                0
+            };
+            for idx in b0.min(BUCKETS - 1)..=b1.min(BUCKETS - 1) {
+                counts[idx] = counts[idx].saturating_add(1);
+                severity[idx] = severity[idx].max(sev);
+            }
+        }
+        let max_cnt = counts.into_iter().max().unwrap_or(1).max(1) as f32;
+        let active_win = self.call_filter.time_window;
+
+        let mut bars = div()
+            .flex()
+            .items_end()
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(14.0))
+            .gap(px(2.0));
+        for idx in 0..BUCKETS {
+            let bucket_w = (span_ms as f64 / BUCKETS as f64).max(1.0);
+            let win_s = (idx as f64 * bucket_w).floor() as i64;
+            let win_e = (((idx + 1) as f64 * bucket_w).ceil() as i64).max(win_s + 1);
+            let selected_bucket = active_win.is_some_and(|(s, e)| win_s >= s && win_e <= e + 1);
+            let dimmed = active_win.is_some() && !selected_bucket;
+            let cnt = counts[idx];
+            let frac = if cnt == 0 {
+                0.0
+            } else {
+                (cnt as f32 / max_cnt).sqrt().clamp(0.24, 1.0)
+            };
+            let bar_h = if cnt == 0 {
+                2.0
+            } else {
+                (frac * 14.0).max(3.5)
+            };
+            let hex = match severity[idx] {
+                3 => t.purple,
+                2 => t.red,
+                1 => t.amber,
+                _ => t.accent,
+            };
+            let alpha = if cnt == 0 {
+                0.10
+            } else if selected_bucket {
+                1.0
+            } else if dimmed {
+                0.24
+            } else {
+                0.72
+            };
+            bars = bars.child(
+                div()
+                    .id(ElementId::named_usize("tl-bucket", idx))
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_end()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let next = Some((win_s, win_e));
+                        if this.call_filter.time_window == next {
+                            this.call_filter.time_window = None;
+                        } else {
+                            this.call_filter.time_window = next;
+                        }
+                        this.refresh_view();
+                        this.reveal_selected();
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(bar_h))
+                            .rounded(px(1.5))
+                            .bg(theme::h(hex, alpha)),
+                    ),
+            );
+        }
+
+        let mut strip = div()
+            .flex()
+            .items_center()
+            .h(px(theme::TIMELINE_H))
+            .px(px(theme::ROW_PAD_X))
+            .gap(px(8.0))
+            .bg(rgb(t.strip))
+            .border_b_1()
+            .border_color(rgb(t.border_subtle))
+            .child(
+                div()
+                    .font_family(fonts::mono())
+                    .text_size(px(9.5))
+                    .text_color(rgb(t.text_faint))
+                    .child("0ms"),
+            )
+            .child(bars)
+            .child(
+                div()
+                    .font_family(fonts::mono())
+                    .text_size(px(9.5))
+                    .text_color(rgb(t.text_faint))
+                    .child(format_latency(span_ms as u64)),
+            );
+
+        if let Some((ws, we)) = active_win {
+            strip = strip.child(
+                div()
+                    .id("reset-time-slice")
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h(px(17.0))
+                    .px(px(6.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(rgb(t.accent))
+                    .bg(theme::h(t.accent, 0.12))
+                    .font_family(fonts::mono())
+                    .text_size(px(9.5))
+                    .text_color(rgb(t.accent))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.call_filter.time_window = None;
+                        this.refresh_view();
+                        cx.notify();
+                    }))
+                    .child(format!(
+                        "{}–{} ×",
+                        trace::format_offset(ws),
+                        trace::format_offset(we)
+                    )),
+            );
+        }
+        strip
     }
 
     pub(super) fn render_table_head(&self, op_width: f32) -> Div {
@@ -79,7 +244,7 @@ impl LensletApp {
                 div()
                     .w(px(theme::COL_LATENCY))
                     .text_right()
-                    .child(micro_label(i18n::pick("LATENCY", "耗时"))),
+                    .child(micro_label(i18n::pick("WATERFALL / MS", "瀑布流 / 耗时"))),
             )
             .child(
                 div()
@@ -95,6 +260,7 @@ impl LensletApp {
         let view = self.view.clone();
         let selected = self.selected;
         let run_start_ms = self.run_start_ms();
+        let run_span_ms = self.run_span_ms().max(1);
         let density = self.prefs.density;
         let time_format = self.prefs.time_format;
         let this = cx.entity().downgrade();
@@ -113,6 +279,7 @@ impl LensletApp {
                         selected == Some(raw),
                         op_width,
                         run_start_ms,
+                        run_span_ms,
                         prev_end_ms,
                         density,
                         time_format,
@@ -295,6 +462,7 @@ pub(super) fn trace_row(
     selected: bool,
     op_width: f32,
     run_start_ms: Option<i64>,
+    run_span_ms: i64,
     prev_end_ms: Option<i64>,
     density: Density,
     time_format: TimeFormat,
@@ -482,24 +650,71 @@ pub(super) fn trace_row(
                         }),
                 ),
         )
-        .child(
+        .child({
+            const TRACK_W: f32 = 46.0;
+            let (wf_left, wf_w) = match (trace.at_ms(), run_start_ms) {
+                (Some(at), Some(start)) if run_span_ms > 0 => {
+                    let s_frac = ((at - start).max(0) as f32 / run_span_ms as f32).clamp(0.0, 0.96);
+                    let d_frac = (trace.ms.max(1) as f32 / run_span_ms as f32).clamp(0.06, 1.0);
+                    let left = (s_frac * TRACK_W).min(TRACK_W - 3.0);
+                    let width = (d_frac * TRACK_W).clamp(3.0, TRACK_W - left);
+                    (left, width)
+                }
+                _ => (0.0, 6.0),
+            };
+            let wf_color = if trace.blocked {
+                theme::h(t.purple, 0.90)
+            } else if trace.is_error() {
+                theme::h(t.red, 0.90)
+            } else if trace.pending || trace.ms >= 500 {
+                theme::h(t.amber, 0.90)
+            } else {
+                theme::tint(service_color, 0.78)
+            };
             div()
                 .w(px(theme::COL_LATENCY))
                 .flex_shrink_0()
-                .text_right()
-                .font_family(fonts::mono())
-                .text_size(px(11.5))
-                .text_color(if trace.pending {
-                    rgb(t.amber)
-                } else {
-                    latency_color(trace.ms)
-                })
-                .child(if trace.pending {
-                    "pending".to_string()
-                } else {
-                    format_latency(trace.ms)
-                }),
-        )
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .relative()
+                        .w(px(TRACK_W))
+                        .h(px(4.5))
+                        .rounded(px(2.0))
+                        .bg(theme::h(t.text, 0.06))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(wf_left))
+                                .w(px(wf_w))
+                                .rounded(px(2.0))
+                                .bg(wf_color),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_right()
+                        .font_family(fonts::mono())
+                        .text_size(px(11.5))
+                        .text_color(if trace.pending {
+                            rgb(t.amber)
+                        } else {
+                            latency_color(trace.ms)
+                        })
+                        .child(if trace.pending {
+                            "pending".to_string()
+                        } else {
+                            format_latency(trace.ms)
+                        }),
+                )
+        })
         .child(
             div()
                 .w(px(theme::COL_AUTH))

@@ -26,6 +26,7 @@ pub struct SearchInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     access_mode: bool,
+    palette_mode: bool,
 }
 
 impl SearchInput {
@@ -41,7 +42,14 @@ impl SearchInput {
             last_bounds: None,
             is_selecting: false,
             access_mode: false,
+            palette_mode: false,
         }
+    }
+
+    pub fn new_palette(root_focus: FocusHandle, cx: &mut Context<Self>) -> Self {
+        let mut s = Self::new(root_focus, cx);
+        s.palette_mode = true;
+        s
     }
 
     pub fn set_access_mode(&mut self, access_mode: bool, cx: &mut Context<Self>) {
@@ -183,7 +191,7 @@ impl SearchInput {
 
         let shift = keystroke.modifiers.shift;
         match key {
-            "escape" => {
+            "escape" if !self.palette_mode => {
                 if self.content.is_empty() {
                     window.focus(&self.root_focus);
                     cx.notify();
@@ -196,7 +204,7 @@ impl SearchInput {
                 }
                 cx.stop_propagation();
             }
-            "enter" => {
+            "enter" if !self.palette_mode => {
                 window.focus(&self.root_focus);
                 cx.notify();
                 cx.stop_propagation();
@@ -672,7 +680,13 @@ impl Render for SearchInput {
         let focused = self.focus.is_focused(window);
         let compact = window.viewport_size().width < px(1_180.0);
         let has_query = !self.content.is_empty();
-        let placeholder: SharedString = if self.access_mode {
+        let placeholder: SharedString = if self.palette_mode {
+            i18n::pick(
+                "Type a command, AWS service, run, or preference…",
+                "输入命令、AWS 服务、历史运行或偏好设置…",
+            )
+            .into()
+        } else if self.access_mode {
             if compact {
                 i18n::pick("Filter Action, ARN…", "筛选 Action、ARN…").into()
             } else {
@@ -711,7 +725,20 @@ impl Render for SearchInput {
             .child("×")
             .on_click(cx.listener(|this, _, window, cx| this.clear(window, cx)));
 
-        let trailing: gpui::AnyElement = if has_query {
+        let trailing: gpui::AnyElement = if self.palette_mode {
+            div()
+                .flex_shrink_0()
+                .font_family(fonts::mono())
+                .text_size(px(10.0))
+                .px(px(5.0))
+                .py(px(1.5))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(rgb(t.border))
+                .text_color(rgb(t.text_muted))
+                .child("ESC")
+                .into_any_element()
+        } else if has_query {
             clear.into_any_element()
         } else {
             div()
@@ -721,12 +748,48 @@ impl Render for SearchInput {
                 .line_height(px(14.0))
                 .text_color(rgb(t.text_faint))
                 .child(if cfg!(target_os = "macos") {
-                    "⌘K"
+                    "⌘F"
                 } else {
-                    "Ctrl K"
+                    "Ctrl F"
                 })
                 .into_any_element()
         };
+
+        if self.palette_mode {
+            return div()
+                .w_full()
+                .h(px(40.0))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .px(px(14.0))
+                .border_b_1()
+                .border_color(rgb(t.border_subtle))
+                .bg(rgb(t.panel))
+                .text_size(px(13.0))
+                .line_height(px(18.0))
+                .font_family(fonts::sans())
+                .text_color(rgb(t.text))
+                .track_focus(&self.focus)
+                .cursor_text()
+                .on_key_down(cx.listener(Self::on_key_down))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .child(glyph::search_icon(theme::h(t.accent, 0.9)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(SearchTextElement {
+                            input: cx.entity(),
+                            placeholder: placeholder.clone(),
+                        }),
+                )
+                .child(trailing);
+        }
 
         div()
             .w_full()

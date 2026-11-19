@@ -3,6 +3,7 @@
 //! Settings modal (`⌘,`), Run Switcher popover, and on-demand body hydration.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -10,7 +11,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, CursorStyle, Div, ElementId, FocusHandle, FontWeight,
+    AnyElement, App, ClipboardItem, Context, CursorStyle, Div, ElementId, FocusHandle, FontWeight,
     KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, SharedString,
     Stateful, UniformListScrollHandle, WeakEntity, Window, actions, div, linear_color_stop,
     linear_gradient, prelude::*, px, rgb, rgba, uniform_list,
@@ -20,6 +21,7 @@ mod access;
 mod chrome;
 mod diff;
 mod inspector;
+mod palette;
 mod settings;
 mod stream;
 mod widgets;
@@ -43,7 +45,23 @@ use crate::{
 
 actions!(
     lenslet,
-    [OpenSettings, ToggleInspector, ReloadTrace, QuitApp]
+    [
+        OpenPalette,
+        FocusSearch,
+        OpenSettings,
+        ToggleInspector,
+        ReloadTrace,
+        ReplaySelectedAction,
+        SwitchCalls,
+        SwitchAccess,
+        SwitchDiff,
+        PrevRunAction,
+        NextRunAction,
+        FollowLatestAction,
+        CopyCurlAction,
+        ExportPolicyAction,
+        QuitApp
+    ]
 );
 
 const START_COMMAND: &str = "lenslet run -- npm test";
@@ -61,7 +79,7 @@ enum TraceHealth {
 }
 
 /// Primary workspace mode in the center segmented switch.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pane {
     Calls,
     Access,
@@ -123,18 +141,25 @@ pub struct LensletApp {
     pane: Pane,
     show_all_services: bool,
     raw_body: bool,
+    semantic_decode: bool,
     expand_body: bool,
     prefs: UiPrefs,
 
     settings_open: bool,
     runs_popover_open: bool,
+    palette_open: bool,
+    palette_index: usize,
     dragging_splitter: bool,
     last_saved_viewport: (u32, u32),
 
     search: gpui::Entity<SearchInput>,
     search_focus: FocusHandle,
+    palette_input: gpui::Entity<SearchInput>,
     root_focus: FocusHandle,
     scroll: UniformListScrollHandle,
+
+    /// In-memory live replay states keyed by `trace.id` (never persisted to `.jsonl`).
+    replays: HashMap<String, crate::replay::ReplayState>,
 
     paused: bool,
     buffered: Vec<Trace>,
@@ -167,6 +192,7 @@ impl LensletApp {
         let root_focus = cx.focus_handle();
         let search = cx.new(|cx| SearchInput::new(root_focus.clone(), cx));
         let search_focus = search.read(cx).handle();
+        let palette_input = cx.new(|cx| SearchInput::new_palette(root_focus.clone(), cx));
 
         let mut rows: Vec<Arc<Trace>> = Vec::new();
         let mut tailer = None;
@@ -212,16 +238,21 @@ impl LensletApp {
             pane: Pane::Calls,
             show_all_services: false,
             raw_body,
+            semantic_decode: true,
             expand_body: false,
             prefs,
             settings_open: false,
             runs_popover_open: false,
+            palette_open: false,
+            palette_index: 0,
             dragging_splitter: false,
             last_saved_viewport: (0, 0),
             search,
             search_focus,
+            palette_input,
             root_focus,
             scroll: UniformListScrollHandle::new(),
+            replays: HashMap::new(),
             paused: false,
             buffered: Vec::new(),
             pending_replace: false,
@@ -251,6 +282,12 @@ impl LensletApp {
                 this.reveal_selected();
                 cx.notify();
             }
+        })
+        .detach();
+
+        cx.observe(&app.palette_input, |this, _, cx| {
+            this.palette_index = 0;
+            cx.notify();
         })
         .detach();
 
@@ -394,6 +431,169 @@ impl LensletApp {
         self.copy_text("curl", curl, cx);
     }
 
+    // -- Live Replay & Native lenslet.lock Curation ------------------------
+
+    pub(super) fn active_upstream_url(&self) -> Option<String> {
+        self.run
+            .as_ref()
+            .map(|r| r.header.upstream.trim().to_string())
+            .filter(|u| !u.is_empty())
+    }
+
+    pub(super) fn can_replay_trace(&self, trace: &Trace) -> bool {
+        if self.demo {
+            return false;
+        }
+        let upstream = self.active_upstream_url();
+        crate::replay::can_replay(trace, upstream.as_deref())
+    }
+
+    pub(super) fn can_replay_selected(&self) -> bool {
+        self.selected
+            .and_then(|idx| self.rows.get(idx))
+            .is_some_and(|row| self.can_replay_trace(row))
+    }
+
+    pub(super) fn trigger_replay_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(trace) = self.selected_hydrated_trace() else {
+            return;
+        };
+        let Some(upstream) = self.active_upstream_url() else {
+            return;
+        };
+        if !crate::replay::can_replay(&trace, Some(&upstream)) {
+            return;
+        }
+        let call_id = trace.id.clone();
+        self.replays
+            .insert(call_id.clone(), crate::replay::ReplayState::Running);
+        self.tab = InspectorTab::Exchange;
+        if !self.prefs.inspector_open {
+            self.prefs.inspector_open = true;
+        }
+        cx.notify();
+
+        let home_dir = home();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { crate::replay::replay_call(&trace, &upstream, &home_dir) })
+                .await;
+            this.update(cx, |app, cx| {
+                let state = match outcome {
+                    Ok(done) => crate::replay::ReplayState::Done(done),
+                    Err(err) => crate::replay::ReplayState::Failed(err),
+                };
+                app.replays.insert(call_id, state);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn active_lock_path(&self) -> Option<PathBuf> {
+        if self.demo {
+            return None;
+        }
+        let run = self.run.as_ref()?;
+        trace::resolve_lock_path(
+            &run.header.cwd,
+            run.header.lock.as_deref(),
+            run.header.policy.as_deref(),
+        )
+    }
+
+    pub(super) fn can_edit_lock(&self) -> bool {
+        self.active_lock_path().is_some()
+    }
+
+    pub(super) fn accept_permission_into_lock(
+        &mut self,
+        access: trace::Access,
+        implied: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(lock_path) = self.active_lock_path() else {
+            return;
+        };
+        match trace::accept_into_lock(&lock_path, &[(access, implied)]) {
+            Ok(_) => {
+                let msg = i18n::pick("Saved to lenslet.lock", "已写入 lenslet.lock").to_string();
+                self.show_toast(msg, cx);
+            }
+            Err(err) => {
+                self.show_toast(format!("lock error: {err}"), cx);
+            }
+        }
+    }
+
+    pub(super) fn accept_all_new_into_lock(&mut self, cx: &mut Context<Self>) {
+        let Some(lock_path) = self.active_lock_path() else {
+            return;
+        };
+        let additions: Vec<(trace::Access, bool)> = self
+            .access_rows()
+            .into_iter()
+            .filter(|e| e.new)
+            .map(|e| {
+                (
+                    trace::Access {
+                        action: e.action,
+                        resource: e.resource,
+                    },
+                    e.implied,
+                )
+            })
+            .collect();
+        if additions.is_empty() {
+            return;
+        }
+        match trace::accept_into_lock(&lock_path, &additions) {
+            Ok(added) => {
+                let msg = if i18n::is_zh() {
+                    format!("已将 +{added} 项权限写入 lenslet.lock")
+                } else {
+                    format!("Added +{added} permissions to lenslet.lock")
+                };
+                self.show_toast(msg, cx);
+            }
+            Err(err) => {
+                self.show_toast(format!("lock error: {err}"), cx);
+            }
+        }
+    }
+
+    pub(super) fn toggle_permission_test_mark(
+        &mut self,
+        access: trace::Access,
+        implied: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(lock_path) = self.active_lock_path() else {
+            return;
+        };
+        match trace::toggle_lock_test_mark(&lock_path, &access, implied) {
+            Ok(now_test) => {
+                let msg = if now_test {
+                    i18n::pick(
+                        "Marked `# test` in lenslet.lock",
+                        "已在 lenslet.lock 标记 `# test`",
+                    )
+                } else {
+                    i18n::pick(
+                        "Removed `# test` mark in lenslet.lock",
+                        "已取消 `# test` 标记",
+                    )
+                };
+                self.show_toast(msg.to_string(), cx);
+            }
+            Err(err) => {
+                self.show_toast(format!("lock error: {err}"), cx);
+            }
+        }
+    }
+
     // -- Data & Filtering --------------------------------------------------
 
     fn refresh_view(&mut self) {
@@ -426,9 +626,10 @@ impl LensletApp {
             .count();
 
         let tokens = search_tokens(&self.query);
+        let run_start = self.run_start_ms();
         let mut view = Vec::new();
         for (index, row) in self.rows.iter().enumerate() {
-            if self.call_filter.matches(row) && matches_search(row, &tokens) {
+            if self.call_filter.matches_at(row, run_start) && matches_search(row, &tokens) {
                 view.push(index);
             }
         }
@@ -774,6 +975,41 @@ impl LensletApp {
         let keystroke = &event.keystroke;
         let search_focused = self.search_focus.is_focused(window);
 
+        if self.palette_open {
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.close_palette(window, cx);
+                    return;
+                }
+                "up" => {
+                    self.palette_index = self.palette_index.saturating_sub(1);
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    let count = self.palette_entries(cx).len();
+                    if count > 0 {
+                        self.palette_index = (self.palette_index + 1).min(count - 1);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "enter" => {
+                    let entries = self.palette_entries(cx);
+                    if let Some(entry) =
+                        entries.get(self.palette_index.min(entries.len().saturating_sub(1)))
+                    {
+                        let cmd = entry.cmd.clone();
+                        self.execute_palette_cmd(cmd, window, cx);
+                    } else {
+                        self.close_palette(window, cx);
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+
         if keystroke.key == "escape" {
             if self.settings_open {
                 self.settings_open = false;
@@ -785,11 +1021,31 @@ impl LensletApp {
                 cx.notify();
                 return;
             }
+            if !search_focused {
+                if self.call_filter.time_window.take().is_some()
+                    || self.call_filter.access.take().is_some()
+                    || self.call_filter.service.take().is_some()
+                {
+                    self.refresh_view();
+                    cx.notify();
+                    return;
+                }
+                if self.call_filter.status != StatusFilter::All {
+                    self.call_filter.status = StatusFilter::All;
+                    self.refresh_view();
+                    cx.notify();
+                    return;
+                }
+            }
         }
 
         if keystroke.modifiers.secondary() {
             match keystroke.key.as_str() {
                 "k" => {
+                    self.open_palette(window, cx);
+                    return;
+                }
+                "f" => {
                     self.focus_search(window, cx);
                     return;
                 }
@@ -807,6 +1063,22 @@ impl LensletApp {
                     self.reload_now(cx);
                     return;
                 }
+                "enter" => {
+                    self.trigger_replay_selected(cx);
+                    return;
+                }
+                "1" => {
+                    self.set_pane(Pane::Calls, cx);
+                    return;
+                }
+                "2" => {
+                    self.set_pane(Pane::Access, cx);
+                    return;
+                }
+                "3" => {
+                    self.set_pane(Pane::Diff, cx);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -816,6 +1088,25 @@ impl LensletApp {
         }
 
         match keystroke.key.as_str() {
+            "/" if !search_focused && !keystroke.modifiers.modified() => {
+                self.focus_search(window, cx);
+            }
+            "a" if !search_focused && !keystroke.modifiers.modified() => {
+                let next = if self.pane == Pane::Access {
+                    Pane::Calls
+                } else {
+                    Pane::Access
+                };
+                self.set_pane(next, cx);
+            }
+            "d" if !search_focused && !keystroke.modifiers.modified() => {
+                let next = if self.pane == Pane::Diff {
+                    Pane::Calls
+                } else {
+                    Pane::Diff
+                };
+                self.set_pane(next, cx);
+            }
             "up" if !search_focused => self.move_selection(-1, cx),
             "down" if !search_focused => self.move_selection(1, cx),
             "enter" if search_focused => {
@@ -950,32 +1241,53 @@ impl LensletApp {
     }
 
     fn access_rows(&self) -> Vec<trace::AccessEntry> {
-        let test_marks = self
-            .run
-            .as_ref()
-            .and_then(|run| {
-                let lock = run.header.lock.as_deref()?;
-                Some(trace::read_test_marks(&run.header.cwd, lock))
-            })
-            .unwrap_or_default();
+        let live_lock = self.run.as_ref().and_then(|run| {
+            trace::read_live_lock(
+                &run.header.cwd,
+                run.header.lock.as_deref(),
+                run.header.policy.as_deref(),
+            )
+        });
+        let has_live_lock_file = live_lock.as_ref().is_some_and(|l| l.exists);
+        let test_marks = live_lock.as_ref().map(|l| &l.test);
 
         if let Some(report) = self.run.as_ref().and_then(|run| run.report.as_ref()) {
             let mut rows = report.access.clone();
+            let mut seen_used = std::collections::BTreeSet::new();
             for entry in &mut rows {
                 let key = trace::Access {
                     action: entry.action.clone(),
                     resource: entry.resource.clone(),
                 };
-                entry.test = test_marks.contains(&key);
+                seen_used.insert(key.clone());
+                entry.test = test_marks.is_some_and(|m| m.contains(&key));
+                if let Some(live) = live_lock.as_ref().filter(|l| l.exists) {
+                    entry.new = !live.access.contains(&key);
+                }
             }
-            for unused in &report.access_unused {
-                rows.push(trace::AccessEntry {
-                    action: unused.action.clone(),
-                    resource: unused.resource.clone(),
-                    unused: true,
-                    test: test_marks.contains(unused),
-                    ..trace::AccessEntry::default()
-                });
+            if let Some(live) = live_lock.as_ref().filter(|l| l.exists) {
+                for locked_entry in &live.access {
+                    if !seen_used.contains(locked_entry) {
+                        rows.push(trace::AccessEntry {
+                            action: locked_entry.action.clone(),
+                            resource: locked_entry.resource.clone(),
+                            unused: true,
+                            implied: live.implied.contains(locked_entry),
+                            test: live.test.contains(locked_entry),
+                            ..trace::AccessEntry::default()
+                        });
+                    }
+                }
+            } else {
+                for unused in &report.access_unused {
+                    rows.push(trace::AccessEntry {
+                        action: unused.action.clone(),
+                        resource: unused.resource.clone(),
+                        unused: true,
+                        test: test_marks.is_some_and(|m| m.contains(unused)),
+                        ..trace::AccessEntry::default()
+                    });
+                }
             }
             rows.sort_by(|a, b| {
                 a.action
@@ -989,14 +1301,18 @@ impl LensletApp {
         for row in self.rows.iter().filter(|row| !row.pending) {
             for (call_access, implied) in row.call_access() {
                 let key = call_access.key();
-                let is_new = row.is_access_new(call_access);
+                let is_new = if let Some(live) = live_lock.as_ref().filter(|_| has_live_lock_file) {
+                    !live.access.contains(&key)
+                } else {
+                    row.is_access_new(call_access)
+                };
                 let entry = table
                     .entry(key.clone())
                     .or_insert_with(|| trace::AccessEntry {
                         action: key.action.clone(),
                         resource: key.resource.clone(),
                         implied,
-                        test: test_marks.contains(&key),
+                        test: test_marks.is_some_and(|m| m.contains(&key)),
                         ..trace::AccessEntry::default()
                     });
                 entry.calls += 1;
@@ -1009,6 +1325,20 @@ impl LensletApp {
                 }
             }
         }
+        if let Some(live) = live_lock.as_ref().filter(|l| l.exists) {
+            for locked_entry in &live.access {
+                table
+                    .entry(locked_entry.clone())
+                    .or_insert_with(|| trace::AccessEntry {
+                        action: locked_entry.action.clone(),
+                        resource: locked_entry.resource.clone(),
+                        unused: true,
+                        implied: live.implied.contains(locked_entry),
+                        test: live.test.contains(locked_entry),
+                        ..trace::AccessEntry::default()
+                    });
+            }
+        }
         table.into_values().collect()
     }
 
@@ -1017,6 +1347,27 @@ impl LensletApp {
             .as_ref()
             .and_then(|run| trace::parse_rfc3339_ms(&run.header.started))
             .or_else(|| self.rows.first().and_then(|row| row.at_ms()))
+    }
+
+    pub(super) fn run_span_ms(&self) -> i64 {
+        if let Some(rep) = self
+            .run
+            .as_ref()
+            .and_then(|r| r.report.as_ref())
+            .filter(|r| r.duration_ms > 0)
+        {
+            return rep.duration_ms as i64;
+        }
+        let Some(start) = self.run_start_ms() else {
+            return 1;
+        };
+        let end = self
+            .rows
+            .iter()
+            .filter_map(|r| r.at_ms().map(|at| at + r.ms as i64))
+            .max()
+            .unwrap_or(start + 1);
+        (end - start).max(1)
     }
 
     pub(super) fn invocation_stats(&self, trace: &Trace) -> Option<(usize, u64)> {
@@ -1135,6 +1486,7 @@ impl Render for LensletApp {
 
         let runs_popover = self.runs_popover_open.then(|| self.render_runs_popover(cx));
         let settings_modal = self.settings_open.then(|| self.render_settings_modal(cx));
+        let palette_modal = self.palette_open.then(|| self.render_command_palette(cx));
         let toast = self.render_floating_toast();
 
         div()
@@ -1147,9 +1499,21 @@ impl Render for LensletApp {
             .text_color(rgb(t.text))
             .font(fonts::sans_font())
             .track_focus(&self.root_focus)
+            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+                if this.palette_open {
+                    this.close_palette(window, cx);
+                } else {
+                    this.open_palette(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                this.palette_open = false;
+                this.focus_search(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 this.settings_open = !this.settings_open;
                 this.runs_popover_open = false;
+                this.palette_open = false;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
@@ -1158,11 +1522,41 @@ impl Render for LensletApp {
             .on_action(cx.listener(|this, _: &ReloadTrace, _, cx| {
                 this.reload_now(cx);
             }))
+            .on_action(cx.listener(|this, _: &ReplaySelectedAction, _, cx| {
+                this.trigger_replay_selected(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchCalls, _, cx| {
+                this.set_pane(Pane::Calls, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccess, _, cx| {
+                this.set_pane(Pane::Access, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchDiff, _, cx| {
+                this.set_pane(Pane::Diff, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevRunAction, _, cx| {
+                this.step_run(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextRunAction, _, cx| {
+                this.step_run(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FollowLatestAction, _, cx| {
+                this.follow_latest_run(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyCurlAction, _, cx| {
+                this.copy_selected_curl(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportPolicyAction, _, cx| {
+                let json = trace::export_policy_json(&this.access_rows());
+                this.copy_text("policy JSON", json, cx);
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, _cx| {
-                    window.focus(&this.root_focus);
+                    if !this.palette_open {
+                        window.focus(&this.root_focus);
+                    }
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -1190,6 +1584,7 @@ impl Render for LensletApp {
             .child(workspace)
             .children(runs_popover)
             .children(settings_modal)
+            .children(palette_modal)
             .children(toast)
     }
 }

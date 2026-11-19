@@ -193,7 +193,28 @@ impl LensletApp {
             "Ctrl+"
         };
         let shortcuts = [
-            (format!("{cmd}K"), i18n::pick("Focus search", "聚焦搜索框")),
+            (
+                format!("{cmd}K"),
+                i18n::pick("Command Palette", "打开极速命令面板"),
+            ),
+            (
+                format!("{cmd}F  /  /"),
+                i18n::pick(
+                    "Search stream & highlight payloads",
+                    "搜索过滤并高亮报文命中词",
+                ),
+            ),
+            (
+                format!("{cmd}⏎"),
+                i18n::pick(
+                    "Replay selected call against emulator",
+                    "向模拟器重放当前请求",
+                ),
+            ),
+            (
+                format!("{cmd}1  {cmd}2  {cmd}3"),
+                i18n::pick("Switch Calls / Access / Diff", "切换请求流 / 权限 / 对比"),
+            ),
             (
                 format!("{cmd},"),
                 i18n::pick("Open Settings", "打开设置面板"),
@@ -201,10 +222,6 @@ impl LensletApp {
             (
                 format!("{cmd}B"),
                 i18n::pick("Toggle Inspector", "展开/收起详情栏"),
-            ),
-            (
-                format!("{cmd}R"),
-                i18n::pick("Reload trace", "重新加载 Trace"),
             ),
             (
                 "Space".to_string(),
@@ -264,6 +281,7 @@ impl LensletApp {
             .border_1()
             .border_color(rgb(t.border_strong))
             .bg(rgb(t.panel))
+            .shadow(theme::elevation_shadow())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()

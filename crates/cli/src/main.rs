@@ -307,7 +307,7 @@ fn child_env(
 async fn run(args: Vec<String>) -> Result<i32> {
     let home = home();
     let RunArgs {
-        options,
+        mut options,
         command,
         json,
         markdown,
@@ -320,6 +320,21 @@ async fn run(args: Vec<String>) -> Result<i32> {
         lock,
         policy,
     } = parse_run(args, &home)?;
+    if !options.upstream_given {
+        let env_ep = std::env::var("AWS_ENDPOINT_URL").ok();
+        if let Some((discovered, source_label)) =
+            proxy::Upstream::auto_discover(env_ep.as_deref(), options.listen).await
+        {
+            if !quiet {
+                eprintln!(
+                    "lenslet: auto-selected upstream {} ({source_label})",
+                    discovered.base
+                );
+            }
+            options.upstream = discovered;
+            options.validate()?;
+        }
+    }
     let cwd = std::env::current_dir().context("read the current directory")?;
     let lock_path = lock.unwrap_or_else(|| lock::path_in(&cwd));
     // How the lock is named in reports: relative to the run's directory.
@@ -616,12 +631,16 @@ fn render_workflow(
 /// an enforced lock in one step.
 async fn init(args: Vec<String>) -> Result<i32> {
     let mut upstream = "9298".to_string();
+    let mut upstream_given = false;
     let mut force = false;
     let mut command = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--upstream" => upstream = it.next().context("--upstream requires a value")?,
+            "--upstream" => {
+                upstream = it.next().context("--upstream requires a value")?;
+                upstream_given = true;
+            }
             "--force" => force = true,
             "--" => {
                 command.extend(it.by_ref());
@@ -642,7 +661,14 @@ async fn init(args: Vec<String>) -> Result<i32> {
             "usage: lenslet init [--upstream ADDRESS] -- <test command>, e.g. `lenslet init -- npm test`"
         );
     }
-    let target = proxy::Upstream::parse(&upstream)?;
+    let mut target = proxy::Upstream::parse(&upstream)?;
+    if !upstream_given {
+        let env_ep = std::env::var("AWS_ENDPOINT_URL").ok();
+        if let Some((discovered, _)) = proxy::Upstream::auto_discover(env_ep.as_deref(), 0).await {
+            upstream = discovered.base.clone();
+            target = discovered;
+        }
+    }
     eprintln!("lenslet: 1/3 emulator at {}", target.base);
     if !target.reachable().await {
         bail!(

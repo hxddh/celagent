@@ -56,10 +56,11 @@ not compatible with earlier files.
 `body` is `{text?, hex?, encoding?, bytes, truncated, binary, sha256}`. Headers,
 query strings and bodies are preserved verbatim with **zero redaction**. `text`
 holds up to 1 MiB by default (`--max-body` to change) of decoded text (`identity`,
-`aws-chunked`, `gzip` or `deflate` unframed/decompressed for reading, including
-readable UTF-8 payloads without an explicit text `content-type`; wire bytes are
-forwarded untouched). Binary payloads record `hex` (first 512 bytes) alongside
-`bytes` and `sha256` over the whole wire body.
+`aws-chunked`, `application/vnd.amazon.eventstream`, `gzip` or `deflate`
+unframed/decompressed for reading, including readable UTF-8 payloads without an
+explicit text `content-type`; wire bytes are forwarded untouched). Binary payloads
+record `hex` (first 512 bytes) alongside `bytes` and `sha256` over the whole wire
+body.
 
 ### Access derivation
 

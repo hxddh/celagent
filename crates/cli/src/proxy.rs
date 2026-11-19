@@ -184,6 +184,8 @@ pub struct Options {
     /// Loopback port for SDK clients; `0` picks a free one.
     pub listen: u16,
     pub upstream: Upstream,
+    /// Whether `--upstream` was explicitly passed on the command line.
+    pub upstream_given: bool,
     /// CA that signs the emulator's certificate; derived from the upstream
     /// port when not given (`~/.aws/emulator/PORT/ca.pem`).
     pub emulator_ca: Option<PathBuf>,
@@ -201,6 +203,7 @@ impl Options {
         Options {
             listen,
             upstream: Upstream::parse("9298").expect("default upstream"),
+            upstream_given: false,
             emulator_ca: None,
             trace: None,
             max_body: capture::MAX_CAPTURE_BYTES,
@@ -218,7 +221,10 @@ impl Options {
                     .parse::<u16>()
                     .with_context(|| format!("--listen expects a port number, got `{raw}`"))?;
             }
-            "--upstream" => self.upstream = Upstream::parse(&value()?)?,
+            "--upstream" => {
+                self.upstream = Upstream::parse(&value()?)?;
+                self.upstream_given = true;
+            }
             "--emulator-ca" => self.emulator_ca = Some(PathBuf::from(value()?)),
             "--trace" => self.trace = Some(PathBuf::from(value()?)),
             "--max-body" => self.max_body = capture::parse_size(&value()?)?,
@@ -299,8 +305,79 @@ impl Upstream {
         })
     }
 
-    fn is_loopback(&self) -> bool {
+    pub fn is_loopback(&self) -> bool {
         matches!(self.host.as_str(), "127.0.0.1" | "localhost" | "::1")
+    }
+
+    /// Auto-resolve a local emulator when `--upstream` was omitted:
+    /// 1. Inherit a loopback `AWS_ENDPOINT_URL` from the parent environment so
+    ///    Lenslet transparently interposes itself in front of `.env` / Compose setups.
+    /// 2. If default `:9298` is not listening, probe LocalStack (`:4566`) and Moto
+    ///    (`:5000`) with protocol fingerprint verification (avoiding false positives
+    ///    on unrelated local HTTP servers such as AirPlay or Flask).
+    pub async fn auto_discover(
+        env_endpoint: Option<&str>,
+        listen_port: u16,
+    ) -> Option<(Upstream, &'static str)> {
+        if let Some(raw) = env_endpoint.map(str::trim).filter(|s| !s.is_empty())
+            && let Ok(parsed) = Upstream::parse(raw)
+            && parsed.is_loopback()
+            && (listen_port == 0 || parsed.port != listen_port)
+        {
+            return Some((parsed, "AWS_ENDPOINT_URL"));
+        }
+
+        let default_emu = Upstream::parse("9298").ok()?;
+        if default_emu.reachable().await {
+            return None;
+        }
+
+        for (url, path, label) in [
+            ("http://127.0.0.1:4566", "/_localstack/health", "LocalStack"),
+            ("http://127.0.0.1:5000", "/moto-api/", "Moto"),
+        ] {
+            let Ok(candidate) = Upstream::parse(url) else {
+                continue;
+            };
+            if listen_port != 0 && candidate.port == listen_port {
+                continue;
+            }
+            if candidate.verify_emulator_signature(path).await {
+                return Some((candidate, label));
+            }
+        }
+        None
+    }
+
+    async fn verify_emulator_signature(&self, probe_path: &str) -> bool {
+        let probe = async {
+            let mut stream = TcpStream::connect((self.host.as_str(), self.port))
+                .await
+                .ok()?;
+            let req = format!(
+                "GET {probe_path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                self.port
+            );
+            stream.write_all(req.as_bytes()).await.ok()?;
+            let mut buf = vec![0u8; 2048];
+            let n = stream.read(&mut buf).await.ok()?;
+            Some(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase())
+        };
+        let Some(reply) = tokio::time::timeout(Duration::from_millis(120), probe)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        if reply.contains("airtunes") || reply.contains("airplay") {
+            return false;
+        }
+        reply.contains("localstack")
+            || reply.contains("\"services\"")
+            || reply.contains("moto")
+            || reply.contains("x-amzn-requestid")
+            || reply.contains("<errorresponse")
     }
 
     /// Whether something accepts TCP connections at the upstream address
@@ -831,9 +908,16 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 fn first_denied(trace: &Trace, gate: &Gate) -> Option<Access> {
     let req_ctx = crate::lock::RequestContext::from_trace(trace);
     let (own, implied) = access::derive_for_gate(trace, gate.is_policy());
-    own.into_iter()
-        .chain(implied)
+    if let Some(denied) = own
+        .into_iter()
         .find(|entry| !gate.allows_in_context(entry, Some(&req_ctx)))
+    {
+        return Some(denied);
+    }
+    implied.into_iter().find(|entry| {
+        let imp_ctx = req_ctx.for_implied(&trace.service, trace.region.as_deref(), &entry.action);
+        !gate.allows_in_context(entry, Some(&imp_ctx))
+    })
 }
 
 /// Record a blocked call in the trace and return a protocol-accurate AWS

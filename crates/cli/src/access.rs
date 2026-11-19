@@ -364,6 +364,8 @@ fn iam_prefix(service: &str) -> &str {
         "bedrock-runtime" => "bedrock",
         "streams.dynamodb" | "dynamodbstreams" => "dynamodb",
         "appconfigdata" => "appconfig",
+        "cognito-idp" => "cognito-idp",
+        "rds-data" => "rds-data",
         "logs" => "logs",
         "execute-api" => "execute-api",
         "s3-object-lambda" => "s3-object-lambda",
@@ -377,22 +379,40 @@ fn action_name(prefix: &str, operation: &str) -> Option<String> {
         ("sts", "GetCallerIdentity") => return None,
         ("s3", "ListObjects" | "ListObjectsV2" | "HeadBucket") => "ListBucket",
         ("s3", "ListBuckets") => "ListAllMyBuckets",
-        ("s3", "HeadObject" | "GetObjectAttributes") => "GetObject",
-        ("s3", "CopyObject" | "UploadPart" | "UploadPartCopy" | "CreateMultipartUpload") => {
-            "PutObject"
-        }
-        ("s3", "CompleteMultipartUpload") => "PutObject",
+        ("s3", "HeadObject" | "GetObjectAttributes" | "SelectObjectContent") => "GetObject",
+        (
+            "s3",
+            "PostObject"
+            | "CopyObject"
+            | "UploadPart"
+            | "UploadPartCopy"
+            | "CreateMultipartUpload"
+            | "CompleteMultipartUpload",
+        ) => "PutObject",
         ("s3", "DeleteObjects") => "DeleteObject",
         ("s3", "ListObjectVersions") => "ListBucketVersions",
         ("s3", "ListMultipartUploads") => "ListBucketMultipartUploads",
         ("s3", "ListParts") => "ListMultipartUploadParts",
         ("s3", "GetBucketCors") => "GetBucketCORS",
-        ("s3", "PutBucketCors") => "PutBucketCORS",
-        ("s3", "DeleteBucketCors") => "PutBucketCORS",
+        ("s3", "PutBucketCors" | "DeleteBucketCors") => "PutBucketCORS",
         ("s3", "GetBucketLifecycleConfiguration") => "GetLifecycleConfiguration",
-        ("s3", "PutBucketLifecycleConfiguration") => "PutLifecycleConfiguration",
+        ("s3", "PutBucketLifecycleConfiguration" | "DeleteBucketLifecycleConfiguration") => {
+            "PutLifecycleConfiguration"
+        }
         ("s3", "GetBucketEncryption") => "GetEncryptionConfiguration",
-        ("s3", "PutBucketEncryption") => "PutEncryptionConfiguration",
+        ("s3", "PutBucketEncryption" | "DeleteBucketEncryption") => "PutEncryptionConfiguration",
+        ("s3", "GetBucketNotificationConfiguration") => "GetBucketNotification",
+        ("s3", "PutBucketNotificationConfiguration") => "PutBucketNotification",
+        ("s3", "GetBucketReplication") => "GetReplicationConfiguration",
+        ("s3", "PutBucketReplication" | "DeleteBucketReplication") => "PutReplicationConfiguration",
+        ("s3", "GetPublicAccessBlock") => "GetBucketPublicAccessBlock",
+        ("s3", "PutPublicAccessBlock" | "DeletePublicAccessBlock") => "PutBucketPublicAccessBlock",
+        ("s3", "GetObjectLockConfiguration") => "GetBucketObjectLockConfiguration",
+        ("s3", "PutObjectLockConfiguration") => "PutBucketObjectLockConfiguration",
+        ("s3", "GetBucketAccelerateConfiguration") => "GetAccelerateConfiguration",
+        ("s3", "PutBucketAccelerateConfiguration") => "PutAccelerateConfiguration",
+        ("s3", "DeleteBucketTagging") => "PutBucketTagging",
+        ("s3", "DeleteBucketOwnershipControls") => "PutBucketOwnershipControls",
         ("s3", "DeleteObjectTagging") => "DeleteObjectTagging",
         ("lambda", "Invoke" | "InvokeAsync" | "InvokeWithResponseStream") => "InvokeFunction",
         ("lambda", "GetFunction") => "GetFunction",
@@ -1033,6 +1053,68 @@ fn resource(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Bod
                     })
             })
             .unwrap_or_else(|| "*".to_string()),
+        "cognito-idp" => body
+            .field("UserPoolId")
+            .map(|pool| {
+                arn_for(
+                    mode,
+                    trace,
+                    "cognito-idp",
+                    &format!("userpool/{}", norm(mode, last_segment(&pool))),
+                )
+            })
+            .unwrap_or_else(|| "*".to_string()),
+        "ecr" => body
+            .field("repositoryName")
+            .map(|repo| {
+                arn_for(
+                    mode,
+                    trace,
+                    "ecr",
+                    &format!("repository/{}", norm_path(mode, &repo)),
+                )
+            })
+            .unwrap_or_else(|| "*".to_string()),
+        "firehose" => body
+            .field("DeliveryStreamName")
+            .map(|stream| {
+                arn_for(
+                    mode,
+                    trace,
+                    "firehose",
+                    &format!("deliverystream/{}", norm(mode, &stream)),
+                )
+            })
+            .unwrap_or_else(|| "*".to_string()),
+        "scheduler" => body
+            .field("Name")
+            .map(|name| {
+                let group = body
+                    .field("GroupName")
+                    .unwrap_or_else(|| "default".to_string());
+                arn_for(
+                    mode,
+                    trace,
+                    "scheduler",
+                    &format!("schedule/{}/{}", norm(mode, &group), norm(mode, &name)),
+                )
+            })
+            .unwrap_or_else(|| "*".to_string()),
+        "rds-data" => body
+            .field("resourceArn")
+            .map(|arn| {
+                if mode == Mode::Concrete && arn.starts_with("arn:") {
+                    arn
+                } else {
+                    arn_for(
+                        mode,
+                        trace,
+                        "rds",
+                        &format!("cluster:{}", norm(mode, last_segment(&arn))),
+                    )
+                }
+            })
+            .unwrap_or_else(|| "*".to_string()),
         _ => "*".to_string(),
     }
 }
@@ -1590,7 +1672,10 @@ fn implied(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Body
         .field("KmsKeyId")
         .or_else(|| body.field("KMSMasterKeyId"))
         .or_else(|| body.field("KmsMasterKeyId"))
-        .or_else(|| body.field("KeyId").filter(|_| prefix == "ssm"))
+        .or_else(|| {
+            body.field("KeyId")
+                .filter(|_| matches!(prefix, "ssm" | "kinesis"))
+        })
     {
         let kms_action = match (prefix, operation) {
             ("secretsmanager", "GetSecretValue") => Some("kms:Decrypt"),
@@ -1598,27 +1683,50 @@ fn implied(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Body
                 Some("kms:GenerateDataKey")
             }
             ("ssm", "PutParameter") => Some("kms:GenerateDataKey"),
-            ("sns", "Publish" | "PublishBatch") | ("sqs", "SendMessage" | "SendMessageBatch") => {
+            ("sns", "Publish" | "PublishBatch" | "CreateTopic" | "SetTopicAttributes")
+            | ("sqs", "SendMessage" | "SendMessageBatch" | "CreateQueue" | "SetQueueAttributes") => {
                 Some("kms:GenerateDataKey")
             }
+            ("dynamodb", "CreateTable" | "UpdateTable") => Some("kms:DescribeKey"),
+            ("kinesis", "StartStreamEncryption") => Some("kms:GenerateDataKey"),
             _ => None,
         };
         if let Some(action) = kms_action {
             out.push(Access::new(action, kms_key(mode, trace, &key)));
         }
     }
-    // Passing a role to a service needs iam:PassRole on that role.
-    let passed_role = match (prefix, operation) {
-        ("lambda", "CreateFunction" | "UpdateFunctionConfiguration") => body.field("Role"),
-        ("states", "CreateStateMachine" | "UpdateStateMachine") => body.field("roleArn"),
-        ("ecs", "RegisterTaskDefinition") => body
-            .field("taskRoleArn")
-            .or_else(|| body.field("executionRoleArn")),
-        ("events", "PutRule" | "PutTargets") => body.field("RoleArn"),
-        _ => None,
-    };
-    if let Some(role) = passed_role {
-        out.push(Access::new("iam:PassRole", iam_entity(mode, "role", &role)));
+    // Passing one or more IAM roles to an AWS service requires `iam:PassRole` on each role.
+    let mut passed_roles: Vec<String> = Vec::new();
+    match (prefix, operation) {
+        ("lambda", "CreateFunction" | "UpdateFunctionConfiguration") => {
+            passed_roles.extend(body.field("Role"));
+        }
+        ("states", "CreateStateMachine" | "UpdateStateMachine") => {
+            passed_roles.extend(body.field("roleArn"));
+        }
+        ("ecs", "RegisterTaskDefinition") => {
+            passed_roles.extend(body.field("taskRoleArn"));
+            passed_roles.extend(body.field("executionRoleArn"));
+        }
+        ("events", "PutRule" | "PutTargets") | ("pipes", "CreatePipe" | "UpdatePipe") => {
+            passed_roles.extend(body.field("RoleArn"));
+        }
+        ("scheduler", "CreateSchedule" | "UpdateSchedule") => {
+            passed_roles.extend(body.field("RoleArn"));
+        }
+        ("firehose", "CreateDeliveryStream") => {
+            passed_roles.extend(body.field("RoleARN"));
+        }
+        ("glue", "CreateJob" | "UpdateJob") => {
+            passed_roles.extend(body.field("Role"));
+        }
+        _ => {}
+    }
+    for role in passed_roles {
+        let access = Access::new("iam:PassRole", iam_entity(mode, "role", &role));
+        if !out.contains(&access) {
+            out.push(access);
+        }
     }
     out
 }
@@ -2304,6 +2412,71 @@ mod tests {
                 "dynamodb:DescribeStream",
                 "arn:aws:dynamodb:*:*:table/orders/stream/*"
             )]
+        );
+
+        // S3 subresources map to canonical AWS IAM actions, and ECS RegisterTaskDefinition
+        // emits implied `iam:PassRole` for both `taskRoleArn` and `executionRoleArn`.
+        for (op, path, expected_action, expected_res) in [
+            (
+                "PostObject",
+                "/uploads",
+                "s3:PutObject",
+                "arn:aws:s3:::uploads",
+            ),
+            (
+                "SelectObjectContent",
+                "/uploads/data.csv?select&select-type=2",
+                "s3:GetObject",
+                "arn:aws:s3:::uploads/*",
+            ),
+            (
+                "GetPublicAccessBlock",
+                "/uploads?publicAccessBlock",
+                "s3:GetBucketPublicAccessBlock",
+                "arn:aws:s3:::uploads",
+            ),
+            (
+                "DeletePublicAccessBlock",
+                "/uploads?publicAccessBlock",
+                "s3:PutBucketPublicAccessBlock",
+                "arn:aws:s3:::uploads",
+            ),
+            (
+                "GetBucketNotificationConfiguration",
+                "/uploads?notification",
+                "s3:GetBucketNotification",
+                "arn:aws:s3:::uploads",
+            ),
+            (
+                "GetBucketReplication",
+                "/uploads?replication",
+                "s3:GetReplicationConfiguration",
+                "arn:aws:s3:::uploads",
+            ),
+        ] {
+            let s3_sub = call("s3", op, "GET", path, None);
+            assert_eq!(
+                derive(&s3_sub).0,
+                vec![Access::new(expected_action, expected_res)],
+                "failed for {op}"
+            );
+        }
+
+        let ecs_call = call(
+            "ecs",
+            "RegisterTaskDefinition",
+            "POST",
+            "/",
+            Some(
+                r#"{"family":"worker","taskRoleArn":"arn:aws:iam::123456789012:role/app-task","executionRoleArn":"arn:aws:iam::123456789012:role/ecs-exec"}"#,
+            ),
+        );
+        assert_eq!(
+            derive(&ecs_call).1,
+            vec![
+                Access::new("iam:PassRole", "arn:aws:iam::*:role/app-task"),
+                Access::new("iam:PassRole", "arn:aws:iam::*:role/ecs-exec"),
+            ]
         );
     }
 }

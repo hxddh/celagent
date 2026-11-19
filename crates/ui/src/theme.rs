@@ -225,6 +225,7 @@ pub fn p() -> Palette {
 // Workbench 3-zone layout rhythm.
 pub const HEADER_H: f32 = 44.0;
 pub const SUBBAR_H: f32 = 38.0;
+pub const TIMELINE_H: f32 = 24.0;
 pub const TABLE_HEAD_H: f32 = 28.0;
 pub const SPLITTER_W: f32 = 5.0;
 
@@ -240,9 +241,28 @@ pub const ROW_PAD_X: f32 = 14.0;
 pub const COL_TIME: f32 = 88.0;
 pub const COL_SERVICE: f32 = 88.0;
 pub const COL_STATUS: f32 = 52.0;
-pub const COL_LATENCY: f32 = 66.0;
+pub const COL_LATENCY: f32 = 114.0;
 pub const COL_AUTH: f32 = 30.0;
 pub const COL_GAP: f32 = 10.0;
+
+/// Multi-layer native elevation shadow for floating popovers, modals, and toasts.
+pub fn elevation_shadow() -> Vec<gpui::BoxShadow> {
+    let dark = matches!(appearance(), Appearance::Dark);
+    vec![
+        gpui::BoxShadow {
+            color: h(0x000000, if dark { 0.52 } else { 0.14 }),
+            offset: gpui::point(gpui::px(0.0), gpui::px(14.0)),
+            blur_radius: gpui::px(32.0),
+            spread_radius: gpui::px(-4.0),
+        },
+        gpui::BoxShadow {
+            color: h(0x000000, if dark { 0.34 } else { 0.08 }),
+            offset: gpui::point(gpui::px(0.0), gpui::px(3.0)),
+            blur_radius: gpui::px(8.0),
+            spread_radius: gpui::px(0.0),
+        },
+    ]
+}
 
 pub fn h(hex: u32, alpha: f32) -> Hsla {
     let mut color: Hsla = rgb(hex).into();
