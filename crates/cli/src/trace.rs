@@ -302,7 +302,14 @@ impl TraceSink {
                     .collect();
                 let imp_denied: Vec<Access> = c_implied
                     .into_iter()
-                    .filter(|entry| !gate.allows_in_context(entry, Some(&req_ctx)))
+                    .filter(|entry| {
+                        let imp_ctx = req_ctx.for_implied(
+                            &source.service,
+                            source.region.as_deref(),
+                            &entry.action,
+                        );
+                        !gate.allows_in_context(entry, Some(&imp_ctx))
+                    })
                     .collect();
                 let matches_denied = |fp: &Access, denied: &[Access]| -> bool {
                     denied.iter().any(|d| {
@@ -370,6 +377,18 @@ impl TraceSink {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if trace.pending && !state.summary.in_flight(&trace.id) {
             return;
+        }
+        if !trace.pending {
+            let next_call_no = state.summary.calls + 1;
+            let eval_ref = eval_trace.cloned();
+            let causal_src = eval_ref.as_ref().unwrap_or(&trace);
+            // Enrich cross-call root-cause hints before writing both the `.jsonl`
+            // call record and `summary.failures`, keeping them 100% identical.
+            let snap = causal_src.clone();
+            state
+                .summary
+                .causal
+                .observe_and_enrich(&mut trace, &snap, next_call_no);
         }
         if gate.is_some() && !trace.pending {
             state.summary.gate_evaluated = true;

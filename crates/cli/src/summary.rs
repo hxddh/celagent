@@ -26,6 +26,204 @@ fn is_zero(value: &usize) -> bool {
 }
 
 #[derive(Clone, Debug, Default)]
+struct ResourceHistory {
+    created: Option<(usize, String, Option<String>)>,
+    deleted: Option<(usize, String)>,
+}
+
+/// Tracks resource creation, deletion, and region placement across calls in one
+/// run so missing-resource errors explain exact cross-call root causes.
+#[derive(Clone, Debug, Default)]
+pub struct CausalTracker {
+    resources: BTreeMap<(String, String), ResourceHistory>,
+}
+
+impl CausalTracker {
+    /// Inspect `trace` (using `eval_source` for body-derived concrete ARNs) and
+    /// enrich `trace.problem.hint` if a prior call in this run explains the failure,
+    /// then update lifecycle state on successful create/delete calls.
+    pub fn observe_and_enrich(&mut self, trace: &mut Trace, eval_source: &Trace, call_no: usize) {
+        if trace.pending {
+            return;
+        }
+        let (concrete_own, _) = access::derive_for_gate(eval_source, true);
+        let lookup_keys = causal_keys(&trace.service, &trace.operation, &concrete_own, true);
+
+        if trace.status >= 400
+            && !trace.blocked
+            && let Some(problem) = trace.problem.as_mut()
+            && is_missing_resource_code(&problem.code, trace.status)
+        {
+            for (svc, stem) in &lookup_keys {
+                if let Some(hist) = self.resources.get(&(svc.clone(), stem.clone())) {
+                    if let Some((del_call, del_op)) = hist.deleted.as_ref() {
+                        problem.hint = Some(format!(
+                            "`{stem}` was deleted earlier in this run at call #{del_call} ({del_op}) before this `{}` ran.",
+                            trace.operation
+                        ));
+                        return;
+                    }
+                    if !matches!(svc.as_str(), "s3" | "iam")
+                        && let Some((cr_call, cr_op, Some(cr_reg))) = hist.created.as_ref()
+                        && let Some(req_reg) = trace.region.as_deref().filter(|r| !r.is_empty())
+                        && cr_reg != req_reg
+                    {
+                        problem.hint = Some(format!(
+                            "Region mismatch: `{stem}` was created in `{cr_reg}` at call #{cr_call} ({cr_op}), but this `{}` targeted `{req_reg}`.",
+                            trace.operation
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+
+        if trace.status < 400 {
+            let mutate_keys = causal_keys(&trace.service, &trace.operation, &concrete_own, false);
+            if is_create_operation(&trace.operation) {
+                for key in mutate_keys {
+                    let entry = self.resources.entry(key).or_default();
+                    entry.created = Some((call_no, trace.operation.clone(), trace.region.clone()));
+                    entry.deleted = None;
+                }
+            } else if is_delete_operation(&trace.operation) {
+                for key in mutate_keys {
+                    let entry = self.resources.entry(key).or_default();
+                    entry.deleted = Some((call_no, trace.operation.clone()));
+                }
+            }
+        }
+    }
+}
+
+fn is_missing_resource_code(code: &str, status: u16) -> bool {
+    status == 404
+        || matches!(
+            code,
+            "NoSuchBucket"
+                | "NoSuchKey"
+                | "NotFound"
+                | "NotFoundException"
+                | "ResourceNotFoundException"
+                | "QueueDoesNotExist"
+                | "NonExistentQueue"
+                | "AWS.SimpleQueueService.NonExistentQueue"
+                | "TopicDoesNotExist"
+                | "ParameterNotFound"
+                | "StateMachineDoesNotExist"
+                | "ExecutionDoesNotExist"
+                | "RepositoryNotFoundException"
+                | "UserPoolAddOnNotEnabledException"
+        )
+}
+
+fn is_create_operation(op: &str) -> bool {
+    matches!(
+        op,
+        "CreateBucket"
+            | "PutObject"
+            | "CopyObject"
+            | "CompleteMultipartUpload"
+            | "CreateTable"
+            | "CreateQueue"
+            | "CreateTopic"
+            | "CreateFunction"
+            | "CreateSecret"
+            | "PutParameter"
+            | "CreateLogGroup"
+            | "CreateStream"
+            | "CreateDeliveryStream"
+            | "CreateEventBus"
+            | "CreateStateMachine"
+            | "CreateRepository"
+            | "CreateUserPool"
+            | "CreateSchedule"
+    )
+}
+
+fn is_delete_operation(op: &str) -> bool {
+    matches!(
+        op,
+        "DeleteBucket"
+            | "DeleteObject"
+            | "DeleteObjects"
+            | "DeleteTable"
+            | "DeleteQueue"
+            | "DeleteTopic"
+            | "DeleteFunction"
+            | "DeleteSecret"
+            | "DeleteParameter"
+            | "DeleteParameters"
+            | "DeleteLogGroup"
+            | "DeleteStream"
+            | "DeleteDeliveryStream"
+            | "DeleteEventBus"
+            | "DeleteStateMachine"
+            | "DeleteRepository"
+            | "DeleteUserPool"
+            | "DeleteSchedule"
+    )
+}
+
+fn causal_keys(
+    service: &str,
+    operation: &str,
+    concrete_own: &[Access],
+    include_parent_bucket: bool,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for acc in concrete_own {
+        let res = acc.resource.as_str();
+        if res == "*" || res == crate::lock::UNVERIFIED_RESOURCE {
+            continue;
+        }
+        if let Some(s3_rest) = res.strip_prefix("arn:aws:s3:::") {
+            if let Some((bucket, key)) = s3_rest.split_once('/') {
+                if !key.is_empty() && key != "*" {
+                    out.push(("s3".into(), format!("s3://{bucket}/{key}")));
+                }
+                if include_parent_bucket {
+                    out.push(("s3".into(), format!("s3://{bucket}")));
+                }
+            } else if !s3_rest.is_empty() {
+                out.push(("s3".into(), format!("s3://{s3_rest}")));
+            }
+            continue;
+        }
+        let mut parts = res.splitn(6, ':');
+        let (Some("arn"), Some(_), Some(arn_svc), Some(_), Some(_), Some(rest)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            continue;
+        };
+        let stem = if arn_svc == "dynamodb" {
+            if let Some((tbl, _)) = rest.split_once("/index/") {
+                tbl.to_string()
+            } else if let Some((tbl, _)) = rest.split_once("/stream/") {
+                tbl.to_string()
+            } else {
+                rest.to_string()
+            }
+        } else if arn_svc == "secretsmanager" {
+            rest.strip_suffix("-*").unwrap_or(rest).to_string()
+        } else {
+            rest.to_string()
+        };
+        let key = (arn_svc.to_string(), stem);
+        if !out.contains(&key) {
+            out.push(key);
+        }
+        let _ = (service, operation);
+    }
+    out
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Summary {
     pub calls: usize,
     pub retries: usize,
@@ -41,6 +239,7 @@ pub struct Summary {
     /// Footprint keys that had at least one call rejected by the active gate.
     pub denied_footprints: BTreeSet<Access>,
     pub gate_evaluated: bool,
+    pub causal: CausalTracker,
     pending: HashSet<String>,
     invocations: HashSet<String>,
 }
@@ -1119,5 +1318,80 @@ mod tests {
         assert!(md.contains("3 AWS calls (1 retry)"), "{md}");
         assert!(md.contains("(attempt 2/3)"), "{md}");
         assert!(md.contains("`custom-svc`"), "{md}");
+    }
+
+    #[test]
+    fn causal_tracker_explains_region_mismatch_and_prior_deletion() {
+        let mut tracker = CausalTracker::default();
+
+        // Call #1: CreateTable `orders` in `us-west-2` succeeds.
+        let mut create_tbl = trace("c1", "dynamodb", 200, None);
+        create_tbl.operation = "CreateTable".into();
+        create_tbl.region = Some("us-west-2".into());
+        create_tbl.request.body = Some(crate::trace::BodyTrace {
+            text: Some(r#"{"TableName":"orders"}"#.into()),
+            hex: None,
+            encoding: None,
+            bytes: 22,
+            truncated: false,
+            binary: false,
+            sha256: String::new(),
+        });
+        let snap1 = create_tbl.clone();
+        tracker.observe_and_enrich(&mut create_tbl, &snap1, 1);
+
+        // Call #2: GetItem on `orders` in `us-east-1` fails with ResourceNotFoundException.
+        let mut get_wrong_reg = trace(
+            "c2",
+            "dynamodb",
+            400,
+            Some(r#"{"__type":"ResourceNotFoundException","message":"not found"}"#),
+        );
+        get_wrong_reg.operation = "GetItem".into();
+        get_wrong_reg.region = Some("us-east-1".into());
+        get_wrong_reg.request.body = create_tbl.request.body.clone();
+        let snap2 = get_wrong_reg.clone();
+        tracker.observe_and_enrich(&mut get_wrong_reg, &snap2, 2);
+        let hint = get_wrong_reg
+            .problem
+            .as_ref()
+            .and_then(|p| p.hint.as_deref())
+            .unwrap_or("");
+        assert!(
+            hint.contains("Region mismatch")
+                && hint.contains("us-west-2")
+                && hint.contains("us-east-1")
+                && hint.contains("call #1"),
+            "unexpected hint: {hint}"
+        );
+
+        // Call #3: DeleteBucket `receipts`, followed by Call #4 PutObject `/receipts/a.txt` → 404 NoSuchBucket.
+        let mut del_bucket = trace("c3", "s3", 204, None);
+        del_bucket.operation = "DeleteBucket".into();
+        del_bucket.path = "/receipts".into();
+        let snap3 = del_bucket.clone();
+        tracker.observe_and_enrich(&mut del_bucket, &snap3, 3);
+
+        let mut put_after_del = trace(
+            "c4",
+            "s3",
+            404,
+            Some("<Error><Code>NoSuchBucket</Code><Message>gone</Message></Error>"),
+        );
+        put_after_del.operation = "PutObject".into();
+        put_after_del.path = "/receipts/a.txt".into();
+        let snap4 = put_after_del.clone();
+        tracker.observe_and_enrich(&mut put_after_del, &snap4, 4);
+        let del_hint = put_after_del
+            .problem
+            .as_ref()
+            .and_then(|p| p.hint.as_deref())
+            .unwrap_or("");
+        assert!(
+            del_hint.contains("s3://receipts")
+                && del_hint.contains("deleted earlier")
+                && del_hint.contains("call #3"),
+            "unexpected hint: {del_hint}"
+        );
     }
 }

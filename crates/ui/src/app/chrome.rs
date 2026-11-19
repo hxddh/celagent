@@ -10,10 +10,12 @@ impl LensletApp {
     pub(super) fn render_header(&self, cx: &mut Context<Self>) -> Div {
         let t = theme::p();
 
+        let mac_inset = if cfg!(target_os = "macos") { 72.0 } else { 0.0 };
         let left = div()
             .flex()
             .items_center()
             .gap(px(9.0))
+            .pl(px(mac_inset))
             .min_w(px(0.0))
             .child(glyph::lens_mark(23.0))
             .child(self.render_run_switcher_button(cx));
@@ -84,10 +86,39 @@ impl LensletApp {
             i18n::pick("Pause", "暂停").to_string()
         };
 
+        let cmd_badge = if cfg!(target_os = "macos") {
+            "⌘K"
+        } else {
+            "Ctrl K"
+        };
         let right = div()
             .flex()
             .items_center()
             .gap(px(6.0))
+            .child(
+                div()
+                    .id("open-palette-btn")
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .h(px(26.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if self.palette_open {
+                        theme::h(t.accent, 1.0)
+                    } else {
+                        theme::h(t.border, 1.0)
+                    })
+                    .bg(theme::h(t.text, 0.02))
+                    .font_family(fonts::mono())
+                    .text_size(px(10.5))
+                    .text_color(rgb(t.text_muted))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(theme::h(t.text, 0.06)).text_color(rgb(t.text)))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
+                    .child(cmd_badge),
+            )
             .child(
                 div()
                     .id("pause-button")
@@ -156,6 +187,7 @@ impl LensletApp {
             );
 
         div()
+            .window_control_area(gpui::WindowControlArea::Drag)
             .flex()
             .items_center()
             .justify_between()
@@ -537,6 +569,32 @@ impl LensletApp {
         }
 
         row = row.child(div().flex_1());
+        if new_cnt > 0 && self.can_edit_lock() {
+            let accept_label = if i18n::is_zh() {
+                format!("采纳 +{new_cnt} 项至 Lock")
+            } else {
+                format!("Accept +{new_cnt} into Lock")
+            };
+            row = row.child(
+                div()
+                    .id("accept-all-lock")
+                    .flex()
+                    .items_center()
+                    .h(px(23.0))
+                    .px(px(8.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(theme::line(t.amber, 0.50))
+                    .bg(theme::h(t.amber, 0.11))
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(t.amber))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(theme::h(t.amber, 0.18)))
+                    .on_click(cx.listener(|this, _, _, cx| this.accept_all_new_into_lock(cx)))
+                    .child(accept_label),
+            );
+        }
         if all_rows.iter().any(|r| !r.unused && !r.test) {
             row = row.child(
                 action_button(
@@ -918,16 +976,22 @@ impl LensletApp {
             }
         }
 
+        let popover_left = if cfg!(target_os = "macos") {
+            86.0
+        } else {
+            14.0
+        };
         let card = div()
             .id("runs-popover-card")
             .absolute()
             .top(px(theme::HEADER_H + 4.0))
-            .left(px(14.0))
+            .left(px(popover_left))
             .w(px(440.0))
             .rounded(px(8.0))
             .border_1()
             .border_color(rgb(t.border_strong))
             .bg(rgb(t.panel))
+            .shadow(theme::elevation_shadow())
             .overflow_hidden()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(list);
@@ -954,6 +1018,7 @@ impl LensletApp {
                 .absolute()
                 .bottom(px(14.0))
                 .right(px(16.0))
+                .shadow(theme::elevation_shadow())
                 .flex()
                 .items_center()
                 .gap(px(7.0))

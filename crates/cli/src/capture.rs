@@ -51,6 +51,8 @@ pub struct Content {
     pub sniff_utf8: bool,
     /// Whether the wire body is framed with AWS SigV4/trailer `aws-chunked` chunks.
     pub aws_chunked: bool,
+    /// Whether the wire body uses `application/vnd.amazon.eventstream` binary framing.
+    pub event_stream: bool,
     /// Supported compression layer (after unframing `aws-chunked`, when present).
     pub encoding: Option<Encoding>,
     /// Non-identity wire encoding label for trace metadata, e.g. `aws-chunked` or `gzip`.
@@ -148,13 +150,21 @@ pub fn content(headers: &HeaderMap) -> Content {
         }
     }
 
-    let wire_encoding = match (&raw_encoding, aws_chunked) {
-        (Some(raw), _) => Some(raw.clone()),
-        (None, true) => Some("aws-chunked".to_string()),
-        (None, false) => None,
+    let event_stream = media.as_deref().is_some_and(|m| {
+        m == "application/vnd.amazon.eventstream"
+            || m.starts_with("application/vnd.amazon.eventstream+")
+    });
+
+    let wire_encoding = match (&raw_encoding, aws_chunked, event_stream) {
+        (Some(raw), _, true) => Some(format!("aws-eventstream,{raw}")),
+        (None, true, true) => Some("aws-chunked,aws-eventstream".to_string()),
+        (None, false, true) => Some("aws-eventstream".to_string()),
+        (Some(raw), _, false) => Some(raw.clone()),
+        (None, true, false) => Some("aws-chunked".to_string()),
+        (None, false, false) => None,
     };
 
-    let known_text = media.as_deref().is_some_and(is_text);
+    let known_text = media.as_deref().is_some_and(is_text) || event_stream;
     let untyped_or_octet = matches!(
         media.as_deref(),
         None | Some("application/octet-stream" | "binary/octet-stream")
@@ -165,6 +175,7 @@ pub fn content(headers: &HeaderMap) -> Content {
         text: known_text && compression.is_some(),
         sniff_utf8: untyped_or_octet && compression.is_some(),
         aws_chunked,
+        event_stream,
         encoding: compression,
         wire_encoding,
     }
@@ -228,7 +239,10 @@ impl Capture {
         if self.limit == 0 || self.prefix.is_empty() {
             return Cow::Borrowed(&[]);
         }
-        if !content.aws_chunked && matches!(content.encoding, Some(Encoding::Identity) | None) {
+        if !content.aws_chunked
+            && !content.event_stream
+            && matches!(content.encoding, Some(Encoding::Identity) | None)
+        {
             return Cow::Borrowed(&self.prefix);
         }
         decode_payload(&self.prefix, content, self.limit)
@@ -321,7 +335,7 @@ impl Capture {
     }
 }
 
-/// Unframe `aws-chunked` (when present) and decompress `gzip`/`deflate` up to `limit`.
+/// Unframe `aws-chunked` / `vnd.amazon.eventstream` and decompress `gzip`/`deflate` up to `limit`.
 fn decode_payload(prefix: &[u8], content: &Content, limit: usize) -> Option<(Vec<u8>, bool)> {
     let encoding = content.encoding?;
     let (unframed, chunk_capped): (Cow<'_, [u8]>, bool) = if content.aws_chunked {
@@ -330,11 +344,186 @@ fn decode_payload(prefix: &[u8], content: &Content, limit: usize) -> Option<(Vec
     } else {
         (Cow::Borrowed(prefix), false)
     };
-    match encoding {
-        Encoding::Identity => Some((unframed.into_owned(), chunk_capped)),
-        other => decode_compressed(&unframed, other, limit)
-            .map(|(bytes, comp_capped)| (bytes, chunk_capped || comp_capped)),
+    let (decompressed, comp_capped): (Cow<'_, [u8]>, bool) = match encoding {
+        Encoding::Identity => (unframed, chunk_capped),
+        other => {
+            let (bytes, capped) = decode_compressed(&unframed, other, limit)?;
+            (Cow::Owned(bytes), chunk_capped || capped)
+        }
+    };
+    if content.event_stream {
+        let (events, ev_capped) = decode_eventstream(&decompressed, limit)?;
+        return Some((events, comp_capped || ev_capped));
     }
+    Some((decompressed.into_owned(), comp_capped))
+}
+
+/// Unframe AWS `application/vnd.amazon.eventstream` binary messages into readable
+/// newline-delimited JSON objects (used by Bedrock `ConverseStream` /
+/// `InvokeModelWithResponseStream`, S3 `SelectObjectContent`, Lambda response streams).
+fn decode_eventstream(input: &[u8], limit: usize) -> Option<(Vec<u8>, bool)> {
+    let mut pos = 0usize;
+    let mut out = Vec::new();
+    let mut capped = false;
+    let mut frames = 0usize;
+
+    while pos < input.len() {
+        let rem = &input[pos..];
+        if rem.len() < 16 {
+            return (frames > 0).then_some((out, true));
+        }
+        let total_len = u32::from_be_bytes([rem[0], rem[1], rem[2], rem[3]]) as usize;
+        let headers_len = u32::from_be_bytes([rem[4], rem[5], rem[6], rem[7]]) as usize;
+        let Some(min_total) = 12usize
+            .checked_add(headers_len)
+            .and_then(|n| n.checked_add(4))
+        else {
+            return (frames > 0).then_some((out, true));
+        };
+        if total_len < min_total {
+            return (frames > 0).then_some((out, true));
+        }
+        if rem.len() < total_len {
+            return (frames > 0).then_some((out, true));
+        }
+
+        let headers_buf = &rem[12..12 + headers_len];
+        let payload_buf = &rem[12 + headers_len..total_len - 4];
+        let (event_type, message_type, exception_type) = parse_eventstream_headers(headers_buf)?;
+
+        let label = exception_type
+            .or(event_type)
+            .or(message_type)
+            .unwrap_or_else(|| "event".to_string());
+        let line_json = format_eventstream_frame(&label, payload_buf);
+        let line_bytes = line_json.as_bytes();
+        let needed = line_bytes.len() + usize::from(!out.is_empty());
+        if out.len().saturating_add(needed) > limit {
+            capped = true;
+            break;
+        }
+        if !out.is_empty() {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(line_bytes);
+        frames += 1;
+        pos += total_len;
+    }
+
+    (frames > 0).then_some((out, capped))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_eventstream_headers(
+    buf: &[u8],
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let mut pos = 0usize;
+    let mut event_type = None;
+    let mut message_type = None;
+    let mut exception_type = None;
+
+    while pos < buf.len() {
+        let name_len = *buf.get(pos)? as usize;
+        pos += 1;
+        let name = std::str::from_utf8(buf.get(pos..pos.checked_add(name_len)?)?).ok()?;
+        pos += name_len;
+        let val_type = *buf.get(pos)?;
+        pos += 1;
+        match val_type {
+            0 | 1 => {}
+            2 => pos = pos.checked_add(1)?,
+            3 => pos = pos.checked_add(2)?,
+            4 => pos = pos.checked_add(4)?,
+            5 | 8 => pos = pos.checked_add(8)?,
+            6 => {
+                let b_len = u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize;
+                pos = pos.checked_add(2)?.checked_add(b_len)?;
+            }
+            7 => {
+                let s_len = u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize;
+                pos += 2;
+                let val = std::str::from_utf8(buf.get(pos..pos.checked_add(s_len)?)?)
+                    .ok()?
+                    .to_string();
+                pos += s_len;
+                match name {
+                    ":event-type" => event_type = Some(val),
+                    ":message-type" => message_type = Some(val),
+                    ":exception-type" | ":error-code" => exception_type = Some(val),
+                    _ => {}
+                }
+            }
+            9 => pos = pos.checked_add(16)?,
+            _ => return None,
+        }
+        if pos > buf.len() {
+            return None;
+        }
+    }
+    Some((event_type, message_type, exception_type))
+}
+
+fn format_eventstream_frame(event: &str, payload: &[u8]) -> String {
+    if payload.is_empty() {
+        return serde_json::json!({ "event": event }).to_string();
+    }
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(payload) {
+        // Bedrock `InvokeModelWithResponseStream` wraps provider JSON in `{"bytes":"<base64>"}`.
+        if let Some(b64) = val.get("bytes").and_then(|v| v.as_str())
+            && let Some(decoded) = decode_base64(b64)
+        {
+            if let Ok(inner_json) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+                return serde_json::json!({ "event": event, "data": inner_json }).to_string();
+            }
+            if let Ok(inner_str) = std::str::from_utf8(&decoded) {
+                return serde_json::json!({ "event": event, "text": inner_str }).to_string();
+            }
+        }
+        return serde_json::json!({ "event": event, "data": val }).to_string();
+    }
+    if let Ok(text) = std::str::from_utf8(payload) {
+        return serde_json::json!({ "event": event, "text": text }).to_string();
+    }
+    serde_json::json!({ "event": event, "bytes": payload.len() }).to_string()
+}
+
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        match chunk {
+            [a, b, c, d] => {
+                let (a, b, c, d) = (val(*a)?, val(*b)?, val(*c)?, val(*d)?);
+                out.push((a << 2) | (b >> 4));
+                out.push((b << 4) | (c >> 2));
+                out.push((c << 6) | d);
+            }
+            [a, b, c] => {
+                let (a, b, c) = (val(*a)?, val(*b)?, val(*c)?);
+                out.push((a << 2) | (b >> 4));
+                out.push((b << 4) | (c >> 2));
+            }
+            [a, b] => {
+                let (a, b) = (val(*a)?, val(*b)?);
+                out.push((a << 2) | (b >> 4));
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Strip AWS `aws-chunked` chunk headers (`<hex-size>[;chunk-signature=...]\r\n<data>\r\n`)
@@ -827,5 +1016,48 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let capture = capture.lock().unwrap();
         assert!(capture.body(&text_content()).is_none());
+    }
+
+    #[test]
+    fn unframes_aws_eventstream_messages_and_bedrock_base64_chunks() {
+        fn build_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+            let hdr_name = b":event-type";
+            let val_bytes = event_type.as_bytes();
+            let mut hdr = Vec::new();
+            hdr.push(hdr_name.len() as u8);
+            hdr.extend_from_slice(hdr_name);
+            hdr.push(7u8); // string header value
+            hdr.extend_from_slice(&(val_bytes.len() as u16).to_be_bytes());
+            hdr.extend_from_slice(val_bytes);
+
+            let total_len = 12 + hdr.len() + payload.len() + 4;
+            let mut frame = Vec::with_capacity(total_len);
+            frame.extend_from_slice(&(total_len as u32).to_be_bytes());
+            frame.extend_from_slice(&(hdr.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&0u32.to_be_bytes());
+            frame.extend_from_slice(&hdr);
+            frame.extend_from_slice(payload);
+            frame.extend_from_slice(&0u32.to_be_bytes());
+            frame
+        }
+
+        // `{"delta":{"text":"hi"}}` in base64 = `eyJkZWx0YSI6eyJ0ZXh0IjoiaGkifX0=`
+        let mut wire_bytes =
+            build_frame("chunk", br#"{"bytes":"eyJkZWx0YSI6eyJ0ZXh0IjoiaGkifX0="}"#);
+        wire_bytes.extend_from_slice(&build_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+
+        let mut cap = Capture::new(true);
+        cap.feed(&wire_bytes);
+        let body = cap
+            .body(&content(&headers(&[(
+                "content-type",
+                "application/vnd.amazon.eventstream",
+            )])))
+            .unwrap();
+        assert!(!body.binary);
+        assert_eq!(body.encoding.as_deref(), Some("aws-eventstream"));
+        let text = body.text.unwrap();
+        assert!(text.contains(r#""text":"hi""#), "{text}");
+        assert!(text.contains(r#""event":"messageStop""#), "{text}");
     }
 }

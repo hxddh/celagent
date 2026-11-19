@@ -103,6 +103,40 @@ impl LensletApp {
             top = top.child(badge(retry, t.accent));
         }
         top = top.child(div().flex_1());
+        if self.can_replay_trace(trace) {
+            let is_replaying = matches!(
+                self.replays.get(&trace.id),
+                Some(crate::replay::ReplayState::Running)
+            );
+            let replay_label = if is_replaying {
+                i18n::pick("Replaying…", "重放中…")
+            } else {
+                i18n::pick("Replay", "重放")
+            };
+            top = top.child(
+                div()
+                    .id("replay-call")
+                    .flex()
+                    .items_center()
+                    .gap(px(4.5))
+                    .h(px(21.0))
+                    .px(px(7.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(theme::line(t.accent, 0.42))
+                    .bg(theme::h(t.accent, 0.09))
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(t.accent))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(theme::h(t.accent, 0.16)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.trigger_replay_selected(cx);
+                    }))
+                    .child(glyph::replay_icon(theme::h(t.accent, 0.95)))
+                    .child(replay_label),
+            );
+        }
         if let Some(curl_cmd) = curl_cmd {
             top = top.child(
                 action_button("copy-curl", i18n::pick("Copy curl", "复制 curl")).on_click(
@@ -361,16 +395,246 @@ impl LensletApp {
             .child(div().p(px(14.0)).w_full().child(content))
     }
 
-    /// Option A Default Tab (`Exchange`): Root-cause failure card (if any) +
+    /// Option A Default Tab (`Exchange`): Replay comparison (if triggered) +
+    /// Root-cause failure card (if any) + SDK Retry Chain (if retried) +
     /// Request Payload + Response Payload directly on one scrollable page.
     fn render_exchange_combined(&self, trace: &Trace, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .flex_col()
             .gap(px(14.0))
+            .children(self.render_replay_panel(trace, cx))
             .children(problem_panel(trace))
+            .children(self.render_retry_chain(trace, cx))
             .child(self.render_payload_section(trace.request.as_ref(), Side::Request, cx))
             .child(self.render_payload_section(trace.response.as_ref(), Side::Response, cx))
+    }
+
+    fn render_replay_panel(&self, trace: &Trace, cx: &mut Context<Self>) -> Option<Div> {
+        let t = theme::p();
+        let state = self.replays.get(&trace.id)?;
+        let trace_id = trace.id.clone();
+
+        match state {
+            crate::replay::ReplayState::Running => Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .p(px(10.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme::line(t.accent, 0.40))
+                    .bg(theme::h(t.accent, 0.07))
+                    .text_size(px(11.5))
+                    .text_color(rgb(t.accent))
+                    .child(glyph::replay_icon(theme::h(t.accent, 0.95)))
+                    .child(i18n::pick(
+                        "Replaying request live against local emulator…",
+                        "正在向本地模拟器实时重放该请求…",
+                    )),
+            ),
+            crate::replay::ReplayState::Failed(err) => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .p(px(10.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme::line(t.red, 0.40))
+                    .bg(theme::h(t.red, 0.06))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(micro_label(i18n::pick("REPLAY FAILED", "重放失败")))
+                            .child(
+                                action_button("dismiss-replay", i18n::pick("Dismiss", "关闭"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.replays.remove(&trace_id);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(note_text(err.clone())),
+            ),
+            crate::replay::ReplayState::Done(out) => {
+                let ok = out.status < 400;
+                let border_hex = if ok { t.green } else { t.red };
+                let search_toks = search_tokens(&self.query);
+                let mut card = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .p(px(10.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme::line(border_hex, 0.42))
+                    .bg(theme::h(border_hex, 0.06))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(micro_label(i18n::pick(
+                                "LIVE REPLAY RESULT (IN-MEMORY)",
+                                "实时重放结果（仅内存对比，未写入运行记录）",
+                            )))
+                            .child(badge(
+                                format!(
+                                    "{} {} · {}",
+                                    out.status,
+                                    status_text(out.status),
+                                    format_latency(out.ms)
+                                ),
+                                border_hex,
+                            ))
+                            .child(
+                                div()
+                                    .font_family(fonts::mono())
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(t.text_muted))
+                                    .child(format!(
+                                        "{} · {} hdrs · was {} ({})",
+                                        format_bytes(out.body_bytes),
+                                        out.headers.len(),
+                                        trace.status,
+                                        format_latency(trace.ms)
+                                    )),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                action_button("dismiss-replay", i18n::pick("Dismiss", "关闭"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.replays.remove(&trace_id);
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+                if let Some(body_txt) = out.body_text.as_deref().filter(|s| !s.is_empty()) {
+                    let ct = out.content_type.as_deref().unwrap_or("");
+                    let shown =
+                        trace::pretty_body(body_txt, ct).unwrap_or_else(|| body_txt.to_string());
+                    let kind = crate::syntax::SyntaxKind::detect(&shown, ct, false, false);
+                    card = card.child(
+                        syntax_code_block(
+                            "replay-res-body",
+                            shown,
+                            kind,
+                            &search_toks,
+                            200.0,
+                            self.prefs.word_wrap,
+                            true,
+                        )
+                        .0,
+                    );
+                }
+                Some(card)
+            }
+        }
+    }
+
+    /// Interactive SDK Retry Chain strip when `amz-sdk-invocation-id` spans ≥2 attempts.
+    fn render_retry_chain(&self, trace: &Trace, cx: &mut Context<Self>) -> Option<Div> {
+        let inv = trace.invocation_id.as_deref().filter(|s| !s.is_empty())?;
+        let peers: Vec<(usize, Arc<Trace>)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.invocation_id.as_deref() == Some(inv))
+            .map(|(i, r)| (i, r.clone()))
+            .collect();
+        if peers.len() < 2 {
+            return None;
+        }
+        let t = theme::p();
+        let mut chain = div().flex().flex_wrap().items_center().gap(px(5.0));
+        let mut prev_end: Option<i64> = None;
+
+        for (pos, (raw_idx, item)) in peers.iter().enumerate() {
+            if pos > 0 {
+                let gap_txt = match (prev_end, item.at_ms()) {
+                    (Some(pe), Some(at)) if at > pe => {
+                        format!("── +{} ──▶", format_latency((at - pe) as u64))
+                    }
+                    _ => "──▶".to_string(),
+                };
+                chain = chain.child(
+                    div()
+                        .font_family(fonts::mono())
+                        .text_size(px(9.5))
+                        .text_color(rgb(t.text_faint))
+                        .child(gap_txt),
+                );
+            }
+            prev_end = item.at_ms().map(|at| at + item.ms as i64);
+            let is_current = item.id == trace.id;
+            let att_no = item.attempt.unwrap_or((pos + 1) as u32);
+            let hex = if item.blocked {
+                t.purple
+            } else if item.is_error() {
+                t.red
+            } else {
+                t.green
+            };
+            let target_idx = *raw_idx;
+            chain = chain.child(
+                div()
+                    .id(ElementId::named_usize("retry-hop", pos))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .h(px(22.0))
+                    .px(px(7.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(if is_current {
+                        theme::h(t.accent, 1.0)
+                    } else {
+                        theme::line(hex, 0.40)
+                    })
+                    .bg(if is_current {
+                        theme::h(t.accent, 0.14)
+                    } else {
+                        theme::h(hex, 0.08)
+                    })
+                    .font_family(fonts::mono())
+                    .text_size(px(10.5))
+                    .text_color(rgb(hex))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_row(target_idx, window, cx);
+                    }))
+                    .child(format!(
+                        "#{att_no} {} ({})",
+                        if item.pending {
+                            "…".to_string()
+                        } else {
+                            status_label(item.status)
+                        },
+                        format_latency(item.ms)
+                    )),
+            );
+        }
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .p(px(9.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(rgb(t.border_subtle))
+                .bg(theme::h(t.text, 0.02))
+                .child(micro_label(i18n::pick(
+                    "SDK RETRY TIMELINE (CLICK ATTEMPT TO JUMP)",
+                    "SDK 重试调用链（点击任意尝试可跳转）",
+                )))
+                .child(chain),
+        )
     }
 
     fn render_payload_section(
@@ -472,6 +736,7 @@ impl LensletApp {
         let all_text = headers_to_text(headers);
         let copy_all = self.copy_button(copy_all_id, "headers", Some(all_text), cx);
         let wrap = self.prefs.word_wrap;
+        let search_toks = search_tokens(&self.query);
 
         let table = div()
             .rounded(px(6.0))
@@ -483,6 +748,12 @@ impl LensletApp {
             .flex_col()
             .children(headers.iter().enumerate().map(|(i, h)| {
                 let val_copy = h.value.clone();
+                let (val_spans, _) = crate::syntax::highlight_inline(&h.value, &search_toks);
+                let styled_val = if val_spans.is_empty() {
+                    gpui::StyledText::new(h.value.clone())
+                } else {
+                    gpui::StyledText::new(h.value.clone()).with_highlights(val_spans)
+                };
                 let row = div()
                     .id(ElementId::Name(format!("{row_prefix}-{i}").into()))
                     .flex()
@@ -516,7 +787,7 @@ impl LensletApp {
                             .flex_1()
                             .min_w(px(0.0))
                             .text_color(rgb(t.text_body))
-                            .child(h.value.clone()),
+                            .child(styled_val),
                     )
                 } else {
                     row.child(
@@ -527,7 +798,7 @@ impl LensletApp {
                             .whitespace_nowrap()
                             .text_ellipsis()
                             .overflow_hidden()
-                            .child(h.value.clone()),
+                            .child(styled_val),
                     )
                 }
             }));
@@ -687,9 +958,34 @@ impl LensletApp {
         let mut any = false;
 
         if let Some(text) = body.text.as_deref().filter(|t| !t.is_empty()) {
-            let can_pretty =
-                trace::pretty_body(text, content_type.as_deref().unwrap_or("")).is_some();
-            if can_pretty {
+            let ct_str = content_type.as_deref().unwrap_or("");
+            let has_semantic =
+                trace::decode_aws_semantic(text, ct_str, body.encoding.as_deref()).is_some();
+            let can_pretty = trace::pretty_body(text, ct_str).is_some();
+
+            if has_semantic {
+                let dec_id = match side {
+                    Side::Request => "toggle-req-decoded",
+                    Side::Response => "toggle-res-decoded",
+                };
+                let dec_label = if self.semantic_decode && !self.raw_body {
+                    i18n::pick("Wire JSON", "标准格式")
+                } else {
+                    i18n::pick("AWS Decoded", "AWS 语义解码")
+                };
+                row = row.child(action_button(dec_id, dec_label).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        if this.raw_body {
+                            this.raw_body = false;
+                            this.semantic_decode = true;
+                        } else {
+                            this.semantic_decode = !this.semantic_decode;
+                        }
+                        cx.notify();
+                    },
+                )));
+            }
+            if can_pretty || has_semantic {
                 let toggle_label = if self.raw_body {
                     i18n::pick("Formatted", "格式化")
                 } else {
@@ -766,11 +1062,21 @@ impl LensletApp {
             return empty_note(i18n::pick("Empty · 0 B", "无内容 · 0 B"));
         };
 
+        let search_toks = search_tokens(&self.query);
         if body.binary {
             let mut block = div().flex().flex_col().gap(px(6.0));
             if let Some(hex_str) = body.hex.as_deref().filter(|h| !h.is_empty()) {
                 let dump = trace::format_hex_dump(hex_str);
-                block = block.child(code_block(code_id, dump, 240.0, false));
+                let (elem, _) = syntax_code_block(
+                    code_id,
+                    dump,
+                    crate::syntax::SyntaxKind::Hex,
+                    &search_toks,
+                    240.0,
+                    false,
+                    false,
+                );
+                block = block.child(elem);
             } else {
                 block = block.child(empty_note(&format!(
                     "Binary body · {}",
@@ -805,25 +1111,60 @@ impl LensletApp {
             return empty_note(i18n::pick("Empty · 0 B", "无内容 · 0 B"));
         }
 
-        let pretty = if self.raw_body {
-            None
+        let ct_str = content_type.as_deref().unwrap_or("");
+        let semantic = if !self.raw_body && self.semantic_decode {
+            trace::decode_aws_semantic(text, ct_str, body.encoding.as_deref())
         } else {
-            trace::pretty_body(text, content_type.as_deref().unwrap_or(""))
+            None
         };
-        let display = pretty.as_deref().unwrap_or(text);
+        let (semantic_badge, display_owned, is_form_syntax) =
+            if let Some((lbl, dec, is_form)) = semantic {
+                (Some(lbl), dec, is_form)
+            } else if self.raw_body {
+                (None, text.to_string(), false)
+            } else {
+                (
+                    None,
+                    trace::pretty_body(text, ct_str).unwrap_or_else(|| text.to_string()),
+                    false,
+                )
+            };
+        let display = display_owned.as_str();
         let clipped = !self.expand_body && display.len() > MAX_BODY_DISPLAY;
         let shown = if clipped {
             trace::clip_utf8(display, MAX_BODY_DISPLAY)
         } else {
             display
         };
-        let mut block = div().flex().flex_col().gap(px(5.0));
-        block = block.child(code_block(
+        let kind = crate::syntax::SyntaxKind::detect(shown, ct_str, false, is_form_syntax);
+        let (code_elem, match_count) = syntax_code_block(
             code_id,
             shown.to_string(),
+            kind,
+            &search_toks,
             if self.expand_body { 560.0 } else { 290.0 },
             self.prefs.word_wrap,
-        ));
+            true,
+        );
+        let mut block = div().flex().flex_col().gap(px(5.0));
+        if semantic_badge.is_some() || match_count > 0 {
+            let mut info_row = div().flex().items_center().gap(px(6.0));
+            if let Some(lbl) = semantic_badge {
+                info_row = info_row.child(badge(lbl, t.purple));
+            }
+            if match_count > 0 {
+                let m_txt = if i18n::is_zh() {
+                    format!("{match_count} 处搜索命中")
+                } else if match_count == 1 {
+                    "1 search match".to_string()
+                } else {
+                    format!("{match_count} search matches")
+                };
+                info_row = info_row.child(badge(m_txt, t.accent));
+            }
+            block = block.child(info_row);
+        }
+        block = block.child(code_elem);
         let mut notes = Vec::new();
         if clipped {
             notes.push(if i18n::is_zh() {

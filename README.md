@@ -53,7 +53,7 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   # install your test dependencies
-  - uses: hxddh/lenslet@lenslet-v6.0.0
+  - uses: hxddh/lenslet@lenslet-v7.0.0
     with:
       command: npm test
       emulator: moto_server -p 9298           # or however you start your emulator
@@ -98,23 +98,28 @@ against [examples/python](examples/python).
 $ lenslet run --check -- npm test
 ...your tests...
 lenslet: 15 calls · 2 errors · 4 services (dynamodb, lambda, s3, sqs) · 476 ms
-  ✗ S3 GetObject  404  NoSuchKey  The specified key does not exist.
-      → The resource does not exist in the emulator. Was it created in this run, in the same region?
+  ✗ DYNAMODB GetItem  400  ResourceNotFoundException  Requested resource not found
+      → Region mismatch: `table/orders` was created in `us-west-2` at call #2 (CreateTable), but this `GetItem` targeted `us-east-1`.
   access: 1 permission not in lenslet.lock
     + dynamodb:DeleteItem              arn:aws:dynamodb:*:*:table/orders
   unused: 1 permission in lenslet.lock not exercised by this run
     - dynamodb:GetItem                 arn:aws:dynamodb:*:*:table/orders
 ```
 
-- **Why it failed**: the AWS error code and message, plus a one-line likely
-  cause for common local failures.
-- **What it needs**: each call becomes an IAM action on a resource ARN, with
-  account and region as `*`. The mapping covers:
-  - batches: one entry per table;
+- **Why it failed**: the AWS error code and message, plus **cross-call root-cause
+  correlation** (region mismatches against earlier `CreateTable`/`CreateQueue`
+  calls, resources deleted earlier in the same run, and common local setup gaps).
+- **What it needs**: each call becomes a verified AWS IAM action on a resource
+  ARN, with account and region as `*`. The mapping covers:
+  - batches: one entry per table or SSM parameter;
   - transactions: each item's own action;
-  - copies: the source as well as the destination;
-  - implied permissions: `kms:Decrypt` behind SSE-KMS, `iam:PassRole` for
-    roles passed to Lambda.
+  - copies & subresources: source reads, `PostObject` → `s3:PutObject`, and
+    exact S3 subresource IAM action names (`s3:GetBucketPublicAccessBlock`,
+    `s3:GetBucketNotification`, `s3:GetReplicationConfiguration`, …);
+  - implied permissions: `kms:Decrypt` / `kms:GenerateDataKey` / `kms:DescribeKey`
+    across S3, Secrets Manager, SSM, SQS, SNS, DynamoDB and Kinesis, plus
+    `iam:PassRole` across Lambda, Step Functions, ECS (`taskRoleArn` and
+    `executionRoleArn`), EventBridge, Scheduler, Pipes, Firehose and Glue.
 
   Generated names (UUIDs, timestamps) become `*`, so the lock stays stable.
 - **What changed**: compared with `lenslet.lock` (added, unused) and with the
@@ -140,30 +145,29 @@ rewrites the lock and keeps the marks. It only writes when the command passed.
 
 ## The window
 
-`lenslet ui` (or `Lenslet.app`) opens a three-zone workbench that tails the
-newest run live (up to 5,000 calls per run, with payloads > 8 KiB offloaded to
-disk offsets and hydrated on demand):
+`lenslet ui` (or `Lenslet.app`, with a unified macOS titlebar) opens a native
+three-zone workbench that tails the newest run live (up to 5,000 calls per run,
+with payloads > 8 KiB offloaded to disk offsets and hydrated on demand):
 
-- **Calls** (`1`): combinable status (`All` / `Errors` / `Blocked` / `New IAM` /
-  `Pending`) and service filters, plus a resizable (`⌘B` collapsible) inspector
-  whose default **Exchange** view shows the root-cause failure/blocked card,
-  Request Body, and Response Body together without tab switching, alongside
-  structured **Headers** and **IAM & Meta** tabs and one-key `Copy curl` (`c`).
-- **Access** (`2` / `a`): searchable permission table (`All` / `New` /
-  `Implied` / `Unused` / `# test`) paired with a **Permission Inspector**
-  showing the IAM Statement JSON, `lenslet.lock` line, one-click `Export Policy`,
-  and every call that exercised that permission.
-- **Diff** (`3` / `d`): visual run-to-run comparison against any recorded base
-  run—highlighting new and fixed failures, IAM permission additions/removals,
-  and per-service call deltas.
+- **Calls** (`⌘1`): interactive **Run Timeline Mini-Map** (`24px`, click any
+  bucket to slice by time) + proportional **Inline Waterfall** spans, combinable
+  status and service filters, and a resizable (`⌘B` collapsible) inspector whose
+  default **Exchange** view shows live **Replay** (`⌘⏎`), root-cause diagnostics,
+  clickable **SDK Retry Chains**, and **syntax-highlighted + search-highlighted**
+  Request & Response payloads (with **AWS Semantic Decode** for DynamoDB typed
+  JSON, AWS Query forms, and `vnd.amazon.eventstream` streams).
+- **Access** (`⌘2` / `a`): searchable permission table paired with a
+  **Permission Inspector** that lets you **accept new permissions directly into
+  `lenslet.lock`** or **toggle `# test` marks** in one click without re-running
+  your test suite, plus `Copy Policy JSON`.
+- **Diff** (`⌘3` / `d`): visual run-to-run comparison against the nearest
+  earlier baseline (`prev`) or any recorded run.
 
-Use the header **Run Switcher** (or `[` and `]`) to pin any historical run or
-follow the live stream. Open **Settings** (`⌘,` or the `⚙` button) to configure
-System / Light / Dark appearance, 6 WCAG-calibrated accent colors (`Sky`,
-`Indigo`, `Violet`, `Emerald`, `Amber`, `Rose`), Comfortable / Compact row
-density, English / Chinese UI labels (keeping AWS, IAM, and HTTP technical terms
-canonical), relative `+ms` vs wall-clock timestamps, payload formatting/wrap
-defaults, and local run storage cleanup (`~/.lenslet/ui.json`).
+Press **`⌘K`** (or `Ctrl+K`) anywhere to open the **Command Palette**, **`⌘F`**
+(or `/`) to search the stream and highlight matches inside payloads and headers,
+and **`⌘,`** to open **Settings** (System / Light / Dark appearance, 6 WCAG-AA
+accent colors, row density, English / Chinese UI labels, timestamp mode,
+formatting/wrap defaults, and storage cleanup in `~/.lenslet/ui.json`).
 
 ![A run in the Lenslet window](docs/lenslet.png)
 
@@ -204,7 +208,11 @@ run: --enforce  --check  --strict  --update  --lock PATH  --policy PATH
      --listen PORT  --upstream ADDRESS  --emulator-ca PATH  --trace PATH
 ```
 
-`lenslet run` sets the following for the child process:
+`lenslet run` also auto-discovers your local emulator when `--upstream` is
+omitted: if `AWS_ENDPOINT_URL` is already set to a loopback URL in your shell,
+Lenslet transparently interposes itself in front of it; otherwise, if port `9298`
+is not listening, it probes LocalStack (`:4566`) and Moto (`:5000`) automatically.
+For the child process, `lenslet run` sets:
 
 - `AWS_ENDPOINT_URL`;
 - the emulator's credentials and config, when you have not set your own;
@@ -268,23 +276,25 @@ examples/      a project the action is tested against
 
 - Between the SDK and the proxy: HTTP/1.1 only, loopback only.
 - Capture keeps the first 1 MiB of each body by default (`--max-body` or
-  `--max-body unlimited` to change), unframing `aws-chunked` streams and
-  decompressing `gzip` and `deflate` for inspection while forwarding wire bytes
-  untouched and unredacted.
+  `--max-body unlimited` to change), unframing `aws-chunked` and
+  `application/vnd.amazon.eventstream` streams and decompressing `gzip` and
+  `deflate` for inspection while forwarding wire bytes untouched and unredacted.
 - Resources are read for S3, DynamoDB (tables, indexes, and Streams), SQS, SNS,
   Lambda, SSM Parameter Store, CloudWatch Logs, Kinesis, Bedrock, Secrets
   Manager, KMS, STS, IAM, EventBridge (including per-entry `PutEvents` bus
-  names), and Step Functions (`stateMachine` and `execution` ARNs). Other
-  services get `*`. Calls with unrecognized operations are reported as unmapped
-  rather than guessed.
+  names), Step Functions (`stateMachine` and `execution` ARNs), Cognito IDP,
+  ECR, Firehose, EventBridge Scheduler, and RDS Data API. Other services get `*`.
+  Calls with unrecognized operations are reported as unmapped rather than guessed.
 - `--policy` evaluates wire-observable IAM `Condition` keys (`aws:RequestedRegion`,
-  `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:versionid`, `s3:x-amz-*`)
-  across `String*`, `Arn*`, `Numeric*`, `Bool`, `Null`, `ForAnyValue:`,
-  `ForAllValues:`, and `...IfExists`, and fails closed on policy variables
-  (`${...}`) or cloud-only runtime context keys (such as `aws:PrincipalOrgID`).
+  `iam:PassedToService`, `kms:ViaService`, `s3:prefix`, `s3:delimiter`,
+  `s3:max-keys`, `s3:versionid`, `s3:x-amz-*`) across `String*`, `Arn*`,
+  `Numeric*`, `Bool`, `Null`, `ForAnyValue:`, `ForAllValues:`, and `...IfExists`,
+  and fails closed on policy variables (`${...}`) or cloud-only runtime context
+  keys (such as `aws:PrincipalOrgID`).
 - No Windows build. The macOS app is not notarized.
 
-Earlier versions: [lenslet-v5.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v5.0.0),
+Earlier versions: [lenslet-v6.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v6.0.0),
+[lenslet-v5.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v5.0.0),
 [lenslet-v4.1.0](https://github.com/hxddh/lenslet/tree/lenslet-v4.1.0).
 This repository used to be `celagent`; that project is at
 [v4.1.0](https://github.com/hxddh/lenslet/tree/v4.1.0).

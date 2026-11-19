@@ -302,6 +302,9 @@ fn s3_operation(method: &str, path: &str, headers: &HeaderMap) -> Option<String>
     if !object && method == "GET" && has("versions") {
         return name("ListObjectVersions", "");
     }
+    if object && method == "POST" && has("select") {
+        return name("SelectObjectContent", "");
+    }
     // Subresources: GET /b?policy → GetBucketPolicy, PUT /b/k?tagging → PutObjectTagging.
     const BUCKET: &[(&str, &str)] = &[
         ("acl", "BucketAcl"),
@@ -316,6 +319,8 @@ fn s3_operation(method: &str, path: &str, headers: &HeaderMap) -> Option<String>
         ("encryption", "BucketEncryption"),
         ("logging", "BucketLogging"),
         ("replication", "BucketReplication"),
+        ("accelerate", "BucketAccelerateConfiguration"),
+        ("requestPayment", "BucketRequestPayment"),
         ("ownershipControls", "BucketOwnershipControls"),
         ("publicAccessBlock", "PublicAccessBlock"),
         ("object-lock", "ObjectLockConfiguration"),

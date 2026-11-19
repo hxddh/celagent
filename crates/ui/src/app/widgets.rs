@@ -157,11 +157,42 @@ pub(super) fn code_block(
     max_height: f32,
     wrap: bool,
 ) -> Stateful<Div> {
+    syntax_code_block(
+        id,
+        text,
+        crate::syntax::SyntaxKind::Plain,
+        &[],
+        max_height,
+        wrap,
+        false,
+    )
+    .0
+}
+
+/// GPU-accelerated syntax-highlighted & search-highlighted code viewer with an
+/// optional line-number gutter. Returns `(element, search_match_count)`.
+pub(super) fn syntax_code_block(
+    id: &'static str,
+    text: String,
+    kind: crate::syntax::SyntaxKind,
+    search_tokens: &[String],
+    max_height: f32,
+    wrap: bool,
+    line_numbers: bool,
+) -> (Stateful<Div>, usize) {
     let t = theme::p();
+    let (spans, match_count) = crate::syntax::highlight_code(&text, kind, search_tokens);
+    let line_count = text.lines().count().max(1);
+    let show_gutter = line_numbers && !wrap && line_count > 1 && line_count <= 2_500;
+    let styled = if spans.is_empty() {
+        gpui::StyledText::new(text)
+    } else {
+        gpui::StyledText::new(text).with_highlights(spans)
+    };
+
     let base = div()
         .id(id)
         .w_full()
-        .p(px(9.0))
         .max_h(px(max_height))
         .rounded(px(6.0))
         .border_1()
@@ -169,14 +200,53 @@ pub(super) fn code_block(
         .bg(rgb(t.code))
         .font_family(fonts::mono())
         .text_size(px(11.5))
-        .line_height(px(16.5))
+        .line_height(px(17.0))
         .text_color(rgb(t.text_body));
-    if wrap {
-        base.overflow_y_scroll()
+
+    let elem = if wrap {
+        base.p(px(9.0))
+            .overflow_y_scroll()
             .scrollbar_width(px(5.0))
-            .child(div().w_full().min_w(px(0.0)).child(text))
-    } else {
+            .child(div().w_full().min_w(px(0.0)).child(styled))
+    } else if show_gutter {
+        let mut nums = String::with_capacity(line_count * 4);
+        for i in 1..=line_count {
+            use std::fmt::Write as _;
+            if i > 1 {
+                nums.push('\n');
+            }
+            let _ = write!(nums, "{i:>3}");
+        }
         base.overflow_scroll()
+            .scrollbar_width(px(5.0))
+            .flex()
+            .items_start()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .py(px(9.0))
+                    .px(px(8.0))
+                    .border_r_1()
+                    .border_color(rgb(t.border_subtle))
+                    .bg(theme::h(t.text, 0.015))
+                    .text_color(rgb(t.text_faint))
+                    .whitespace_nowrap()
+                    .child(nums),
+            )
+            .child(
+                div()
+                    .py(px(9.0))
+                    .px(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .child(styled),
+            )
+    } else {
+        base.p(px(9.0))
+            .overflow_scroll()
             .scrollbar_width(px(5.0))
             .flex()
             .items_start()
@@ -187,9 +257,10 @@ pub(super) fn code_block(
                     .items_start()
                     .flex_shrink_0()
                     .whitespace_nowrap()
-                    .child(text),
+                    .child(styled),
             )
-    }
+    };
+    (elem, match_count)
 }
 
 /// Outlined pill badge in a semantic color.
