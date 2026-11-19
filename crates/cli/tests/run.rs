@@ -179,6 +179,11 @@ fn run_explains_failures_keeps_the_exit_code_and_writes_one_run_file() {
         serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
     assert_eq!(report["exit_code"], 4);
     assert_eq!(report["failures"][0]["code"], "QueueDoesNotExist");
+    assert_eq!(report["findings"][0]["kind"], "failure");
+    assert_eq!(
+        report["findings"][0]["title"],
+        "SQS GetQueueUrl → QueueDoesNotExist"
+    );
     assert_eq!(report["access"][0]["action"], "sqs:GetQueueUrl");
     assert_eq!(report["access"][0]["resource"], "arn:aws:sqs:*:*:jobs");
 

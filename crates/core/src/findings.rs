@@ -496,3 +496,306 @@ fn retries(calls: &[&Trace], found: &mut Found) {
         ));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{access::CallAccess, problem::Problem};
+
+    /// A finished call starting `start_ms` into the run and taking `ms`.
+    fn call(id: &str, service: &str, operation: &str, start_ms: u64, ms: u64) -> Trace {
+        let at = chrono::DateTime::from_timestamp_millis(1_790_000_000_000 + start_ms as i64)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        Trace {
+            id: id.into(),
+            at,
+            method: "POST".into(),
+            path: "/".into(),
+            host: "127.0.0.1:9297".into(),
+            service: service.into(),
+            operation: operation.into(),
+            status: 200,
+            ms,
+            region: Some("us-east-1".into()),
+            ..Default::default()
+        }
+    }
+
+    fn failing(mut trace: Trace, status: u16, code: &str, hint: Option<&str>) -> Trace {
+        trace.status = status;
+        trace.problem = Some(Problem {
+            code: code.into(),
+            message: Some(format!("{code} message")),
+            hint: hint.map(str::to_string),
+        });
+        trace
+    }
+
+    fn with_body(mut trace: Trace, body: &str) -> Trace {
+        trace.request.content_type = Some("application/x-amz-json-1.0".into());
+        trace.request.body = Some(BodyTrace {
+            text: Some(body.into()),
+            bytes: body.len() as u64,
+            sha256: format!(
+                "{:x}",
+                body.len() * 7919 + body.bytes().map(usize::from).sum::<usize>()
+            ),
+            ..Default::default()
+        });
+        trace
+    }
+
+    fn on(mut trace: Trace, action: &str, resource: &str, new: bool) -> Trace {
+        trace.access.push(CallAccess {
+            action: action.into(),
+            resource: resource.into(),
+            new,
+            unverified: false,
+        });
+        trace
+    }
+
+    fn kinds(findings: &[Finding]) -> Vec<(FindingKind, Severity)> {
+        findings.iter().map(|f| (f.kind, f.severity)).collect()
+    }
+
+    #[test]
+    fn failures_group_by_kind_and_recovered_attempts_are_retries() {
+        let mut first = failing(
+            call("r1", "sqs", "SendMessage", 0, 5),
+            500,
+            "InternalError",
+            None,
+        );
+        first.invocation_id = Some("inv".into());
+        let mut second = call("r2", "sqs", "SendMessage", 10, 5);
+        second.invocation_id = Some("inv".into());
+        second.attempt = Some(2);
+        let calls = vec![
+            first,
+            failing(
+                call("a1", "dynamodb", "GetItem", 20, 1),
+                400,
+                "ResourceNotFoundException",
+                None,
+            ),
+            second,
+            failing(call("s1", "s3", "GetObject", 30, 1), 404, "NoSuchKey", None),
+            failing(
+                call("a2", "dynamodb", "GetItem", 40, 1),
+                400,
+                "ResourceNotFoundException",
+                Some("Region mismatch: created in us-west-2."),
+            ),
+        ];
+        let findings = analyze(&calls);
+        assert_eq!(
+            kinds(&findings),
+            [
+                (FindingKind::Failure, Severity::Error),
+                (FindingKind::Failure, Severity::Error),
+                (FindingKind::Retries, Severity::Info),
+            ]
+        );
+        assert_eq!(
+            findings[0].title,
+            "DYNAMODB GetItem → ResourceNotFoundException ×2"
+        );
+        assert_eq!(findings[0].calls, ["a1", "a2"]);
+        assert_eq!(
+            findings[0].detail.as_deref(),
+            Some("Region mismatch: created in us-west-2."),
+            "the cause one call found explains the group"
+        );
+        assert_eq!(findings[1].title, "S3 GetObject → NoSuchKey");
+        assert_eq!(findings[1].detail.as_deref(), Some("NoSuchKey message"));
+        assert_eq!(findings[2].title, "SQS SendMessage retried ×2 → succeeded");
+        assert_eq!(
+            findings[2].detail.as_deref(),
+            Some("Succeeded on attempt 2 after InternalError.")
+        );
+        assert_eq!(findings[2].calls, ["r1", "r2"]);
+    }
+
+    #[test]
+    fn retries_that_give_up_are_warnings() {
+        let attempts: Vec<Trace> = (1..=3)
+            .map(|n| {
+                let mut trace = failing(
+                    call(&format!("t{n}"), "dynamodb", "PutItem", n * 10, 1),
+                    400,
+                    "ThrottlingException",
+                    None,
+                );
+                trace.invocation_id = Some("inv".into());
+                trace.attempt = (n > 1).then_some(n as u32);
+                trace
+            })
+            .collect();
+        let findings = analyze(&attempts);
+        assert_eq!(findings[0].calls, ["t1", "t2", "t3"]);
+        assert_eq!(findings[0].kind, FindingKind::Failure);
+        let retries = findings
+            .iter()
+            .find(|finding| finding.kind == FindingKind::Retries)
+            .unwrap();
+        assert_eq!(retries.severity, Severity::Warning);
+        assert_eq!(
+            retries.title,
+            "DYNAMODB PutItem retried ×3 → ThrottlingException"
+        );
+    }
+
+    #[test]
+    fn each_new_permission_is_one_access_finding() {
+        let table = "arn:aws:dynamodb:*:*:table/orders";
+        let calls = vec![
+            on(
+                call("d1", "dynamodb", "DeleteItem", 0, 1),
+                "dynamodb:DeleteItem",
+                table,
+                true,
+            ),
+            on(
+                call("g1", "dynamodb", "GetItem", 5, 1),
+                "dynamodb:GetItem",
+                table,
+                false,
+            ),
+            on(
+                call("d2", "dynamodb", "DeleteItem", 10, 1),
+                "dynamodb:DeleteItem",
+                table,
+                true,
+            ),
+        ];
+        let findings = analyze_against(&calls, "infra/aws.lock");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].title,
+            "dynamodb:DeleteItem on table/orders not in infra/aws.lock"
+        );
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].calls, ["d1", "d2"]);
+        assert_eq!(
+            findings[0].detail.as_deref(),
+            Some("Needed by DYNAMODB DeleteItem.")
+        );
+    }
+
+    #[test]
+    fn a_serial_burst_of_reads_suggests_the_batch_api() {
+        let table = "arn:aws:dynamodb:*:*:table/orders";
+        let get = |n: u64, start: u64| {
+            on(
+                with_body(
+                    call(&format!("g{n}"), "dynamodb", "GetItem", start, 3),
+                    &format!(r#"{{"TableName":"orders","Key":{{"id":{{"S":"{n}"}}}}}}"#),
+                ),
+                "dynamodb:GetItem",
+                table,
+                false,
+            )
+        };
+        // Six one after another (an unrelated call in between), each 1 ms
+        // after the previous one ended.
+        let mut calls: Vec<Trace> = (0..6).map(|n| get(n, n * 4)).collect();
+        calls.insert(3, call("other", "sqs", "ReceiveMessage", 9, 1));
+        let findings = analyze(&calls);
+        let burst = findings
+            .iter()
+            .find(|finding| finding.kind == FindingKind::NPlusOne)
+            .expect("a burst");
+        assert_eq!(burst.title, "DYNAMODB GetItem ×6 in a serial burst");
+        assert_eq!(burst.calls, ["g0", "g1", "g2", "g3", "g4", "g5"]);
+        assert_eq!(
+            burst.detail.as_deref(),
+            Some(
+                "6 calls on table/orders, one after another in 23 ms: `BatchGetItem` does this in fewer round trips."
+            )
+        );
+
+        // Concurrent calls are not a serial burst; neither is polling the
+        // same request.
+        let parallel: Vec<Trace> = (0..6).map(|n| get(n, n)).collect();
+        assert!(analyze(&parallel).is_empty());
+        let polling: Vec<Trace> = (0..6)
+            .map(|n| {
+                let mut trace = get(0, n * 4);
+                trace.id = format!("p{n}");
+                trace
+            })
+            .collect();
+        assert!(analyze(&polling).is_empty());
+        // Fewer than five is not worth a finding.
+        assert!(analyze(&calls[..4]).is_empty());
+    }
+
+    #[test]
+    fn resources_created_and_never_deleted_are_leaks() {
+        let calls = vec![
+            with_body(
+                call("c1", "dynamodb", "CreateTable", 0, 1),
+                r#"{"TableName":"orders"}"#,
+            ),
+            with_body(
+                call("c2", "sqs", "CreateQueue", 5, 1),
+                r#"{"QueueName":"jobs"}"#,
+            ),
+            failing(
+                with_body(
+                    call("c3", "sqs", "CreateQueue", 7, 1),
+                    r#"{"QueueName":"dupe"}"#,
+                ),
+                400,
+                "QueueAlreadyExists",
+                None,
+            ),
+            with_body(
+                call("c4", "sqs", "DeleteQueue", 10, 1),
+                r#"{"QueueUrl":"http://127.0.0.1:9297/000000000000/jobs"}"#,
+            ),
+        ];
+        let leaks: Vec<Finding> = analyze(&calls)
+            .into_iter()
+            .filter(|finding| finding.kind == FindingKind::Leaked)
+            .collect();
+        assert_eq!(leaks.len(), 1, "{leaks:?}");
+        assert_eq!(
+            leaks[0].title,
+            "DYNAMODB table/orders created and never deleted"
+        );
+        assert_eq!(leaks[0].severity, Severity::Info);
+        assert_eq!(leaks[0].calls, ["c1"]);
+    }
+
+    #[test]
+    fn essentials_keep_everything_analysis_reads() {
+        let mut calls = vec![
+            with_body(
+                call("c1", "dynamodb", "CreateTable", 0, 1),
+                r#"{"TableName":"orders"}"#,
+            ),
+            on(
+                failing(
+                    call("d1", "dynamodb", "DeleteItem", 5, 1),
+                    400,
+                    "AccessDenied",
+                    None,
+                ),
+                "dynamodb:DeleteItem",
+                "*",
+                true,
+            ),
+        ];
+        calls[1].response.body = Some(BodyTrace {
+            text: Some("x".repeat(10_000)),
+            ..Default::default()
+        });
+        let slim: Vec<Trace> = calls.iter().map(essentials).collect();
+        assert!(slim[1].response.body.is_none());
+        assert!(slim[1].request.body.is_none());
+        assert_eq!(analyze(&slim), analyze(&calls));
+    }
+}

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     access::{self, Access},
+    findings::{Finding, FindingKind, Severity},
     trace::Trace,
 };
 
@@ -545,29 +546,42 @@ impl Report {
             services,
             seconds(self.duration_ms),
         ));
-        for failure in self.failures.iter().take(LISTED_FAILURES) {
-            let attempt = attempt_label(failure.attempt, failure.max_attempts);
-            let blocked_tag = if failure.blocked { " [blocked]" } else { "" };
-            out.push_str(&format!(
-                "  ✗ {} {}  {}  {}{attempt}{blocked_tag}",
-                failure.service.to_ascii_uppercase(),
-                failure.operation,
-                failure.status,
-                failure.code
-            ));
-            if let Some(message) = failure.message.as_deref() {
-                out.push_str("  ");
-                out.push_str(&one_line(message, 120));
+        if self.findings.is_empty() {
+            // A report written before findings existed.
+            for failure in self.failures.iter().take(LISTED_FAILURES) {
+                out.push_str(&failure_lines(failure, 1));
             }
-            out.push('\n');
-            if let Some(hint) = failure.hint.as_deref() {
-                out.push_str(&format!("      → {hint}\n"));
+            if self.failures.len() > LISTED_FAILURES {
+                out.push_str(&format!(
+                    "  … and {} more\n",
+                    self.failures.len() - LISTED_FAILURES
+                ));
             }
         }
-        if self.failures.len() > LISTED_FAILURES {
+        // Access findings are the `access:` list below; the rest lead.
+        let listed: Vec<&Finding> = self.listed_findings().collect();
+        for finding in listed.iter().take(LISTED_FAILURES) {
+            match (finding.kind, self.failure_of(finding)) {
+                (FindingKind::Failure, Some(failure)) => {
+                    out.push_str(&failure_lines(failure, finding.calls.len()));
+                }
+                _ => {
+                    let glyph = match finding.severity {
+                        Severity::Error => '✗',
+                        Severity::Warning => '!',
+                        Severity::Info => '·',
+                    };
+                    out.push_str(&format!("  {glyph} {}\n", finding.title));
+                    if let Some(detail) = finding.detail.as_deref() {
+                        out.push_str(&format!("      → {detail}\n"));
+                    }
+                }
+            }
+        }
+        if listed.len() > LISTED_FAILURES {
             out.push_str(&format!(
                 "  … and {} more\n",
-                self.failures.len() - LISTED_FAILURES
+                listed.len() - LISTED_FAILURES
             ));
         }
         if let Some(regressions) = self.regressions.as_ref()
@@ -613,8 +627,14 @@ impl Report {
                 ));
                 for access in self.access_added.iter().take(LISTED_ACCESS) {
                     out.push_str(&format!(
-                        "    + {:<32} {}\n",
-                        access.action, access.resource
+                        "    + {:<32} {}{}\n",
+                        access.action,
+                        access.resource,
+                        if self.unverified(access) {
+                            "  (resource unknown: request body not readable)"
+                        } else {
+                            ""
+                        }
                     ));
                 }
                 if self.access_added.len() > LISTED_ACCESS {
@@ -683,8 +703,33 @@ impl Report {
 }
 
 impl Report {
+    /// Findings shown in their own list: all but access findings, which the
+    /// access section lists with the calls behind them.
+    fn listed_findings(&self) -> impl Iterator<Item = &Finding> {
+        self.findings
+            .iter()
+            .filter(|finding| finding.kind != FindingKind::Access)
+    }
+
+    /// The latest failed call of a failure finding: the one shown for it.
+    fn failure_of(&self, finding: &Finding) -> Option<&Failure> {
+        let last = finding.calls.last()?;
+        self.failures.iter().find(|failure| &failure.id == last)
+    }
+
+    /// Whether this permission's resource is a `*` standing for one that a
+    /// request body did not let Lenslet read.
+    fn unverified(&self, access: &Access) -> bool {
+        self.access.iter().any(|entry| {
+            entry.used.unverified
+                && entry.action == access.action
+                && entry.resource == access.resource
+        })
+    }
+
     /// The report as GitHub-flavored Markdown: what a PR comment or a CI job
-    /// summary shows. Access changes come first, each with the calls behind it.
+    /// summary shows. Findings lead, then access changes, each with the calls
+    /// behind it.
     pub fn markdown(&self) -> String {
         let mut out = String::new();
         let command = if self.command.is_empty() {
@@ -710,6 +755,7 @@ impl Report {
             plural(self.errors, "error"),
             plural(self.services.len(), "service")
         ));
+        self.markdown_findings(&mut out);
 
         let via = |access: &crate::access::Access| {
             self.access
@@ -719,6 +765,9 @@ impl Report {
                     let mut text = entry.used.via.join(", ");
                     if entry.used.implied {
                         text.push_str(" (implied)");
+                    }
+                    if entry.used.unverified {
+                        text.push_str(" (resource unknown: request body not readable)");
                     }
                     text
                 })
@@ -817,7 +866,7 @@ impl Report {
                 if total == 1 { "is" } else { "are" }
             ));
         }
-        if !self.failures.is_empty() {
+        if !self.failures.is_empty() && self.findings.is_empty() {
             let new: BTreeSet<FailureKind> = self
                 .regressions
                 .as_ref()
@@ -859,6 +908,99 @@ impl Report {
         ));
         out
     }
+}
+
+impl Report {
+    /// The findings table at the top of the Markdown report.
+    fn markdown_findings(&self, out: &mut String) {
+        let listed: Vec<&Finding> = self.listed_findings().collect();
+        if listed.is_empty() {
+            return;
+        }
+        let new: BTreeSet<FailureKind> = self
+            .regressions
+            .as_ref()
+            .map(|regressions| regressions.new_failures.iter().cloned().collect())
+            .unwrap_or_default();
+        out.push_str("| | Finding | Detail |\n|---|---|---|\n");
+        for finding in listed.iter().take(LISTED_FAILURES * 2) {
+            let glyph = match finding.severity {
+                Severity::Error => "✗",
+                Severity::Warning => "!",
+                Severity::Info => "·",
+            };
+            let failure = self
+                .failure_of(finding)
+                .filter(|_| finding.kind == FindingKind::Failure);
+            let marker = match failure {
+                Some(failure) if failure.blocked => " **blocked**",
+                Some(failure)
+                    if new.contains(&FailureKind {
+                        service: failure.service.clone(),
+                        operation: failure.operation.clone(),
+                        code: failure.code.clone(),
+                    }) =>
+                {
+                    " **new**"
+                }
+                _ => "",
+            };
+            // A failure shows its message and its likely cause.
+            let detail = match failure {
+                Some(failure) => [
+                    failure
+                        .message
+                        .as_deref()
+                        .map(|message| one_line(message, 100)),
+                    failure.hint.clone(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" — "),
+                None => finding.detail.clone().unwrap_or_default(),
+            };
+            out.push_str(&format!(
+                "| {glyph} | {}{marker} | {} |\n",
+                finding.title.replace('|', "\\|"),
+                detail.replace('|', "\\|")
+            ));
+        }
+        if listed.len() > LISTED_FAILURES * 2 {
+            out.push_str(&format!(
+                "\n_… and {} more in the JSON report._\n",
+                listed.len() - LISTED_FAILURES * 2
+            ));
+        }
+        out.push('\n');
+    }
+}
+
+/// `  ✗ SQS SendMessage  400  Code ×2 (attempt 2/3)  message` and its cause.
+fn failure_lines(failure: &Failure, count: usize) -> String {
+    let attempt = attempt_label(failure.attempt, failure.max_attempts);
+    let blocked_tag = if failure.blocked { " [blocked]" } else { "" };
+    let times = if count > 1 {
+        format!(" ×{count}")
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "  ✗ {} {}  {}  {}{times}{attempt}{blocked_tag}",
+        failure.service.to_ascii_uppercase(),
+        failure.operation,
+        failure.status,
+        failure.code
+    );
+    if let Some(message) = failure.message.as_deref() {
+        out.push_str("  ");
+        out.push_str(&one_line(message, 120));
+    }
+    out.push('\n');
+    if let Some(hint) = failure.hint.as_deref() {
+        out.push_str(&format!("      → {hint}\n"));
+    }
+    out
 }
 
 fn plural(count: usize, noun: &str) -> String {
@@ -1406,6 +1548,61 @@ mod tests {
                 && del_hint.contains("deleted earlier")
                 && del_hint.contains("call #3"),
             "unexpected hint: {del_hint}"
+        );
+    }
+
+    #[test]
+    fn findings_lead_the_summary_and_the_pr_comment_without_repeats() {
+        use crate::findings::analyze;
+        let mut summary = Summary::default();
+        let mut calls = Vec::new();
+        for id in ["a", "b"] {
+            let mut failed = trace(
+                id,
+                "sqs",
+                400,
+                Some(r#"{"__type":"QueueDoesNotExist","message":"no queue"}"#),
+            );
+            failed.access[0].new = true;
+            failed.access[0].unverified = true;
+            failed.access[0].resource = "*".into();
+            summary.observe(&failed);
+            calls.push(failed);
+        }
+        let mut report = report(&summary);
+        report.command = vec!["npm".into(), "test".into()];
+        report.exit_code = Some(1);
+        report.lock = Some("lenslet.lock".into());
+        report.findings = analyze(&calls);
+        report.set_access_with_gate(&summary, Some(&lock_gate(&BTreeSet::new())));
+        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+
+        let text = report.render("t");
+        assert!(
+            text.contains("✗ SQS SendMessage  400  QueueDoesNotExist ×2  no queue"),
+            "{text}"
+        );
+        assert_eq!(text.matches("QueueDoesNotExist").count(), 1, "{text}");
+        assert!(
+            text.contains("+ sqs:SendMessage                  *  (resource unknown: request body not readable)"),
+            "{text}"
+        );
+        assert_eq!(text.matches("sqs:SendMessage").count(), 1, "{text}");
+
+        let md = report.markdown();
+        let findings_at = md.find("| | Finding | Detail |").expect(&md);
+        assert!(
+            findings_at < md.find("not in `lenslet.lock`").unwrap(),
+            "{md}"
+        );
+        assert!(
+            md.contains("| ✗ | SQS SendMessage → QueueDoesNotExist ×2 | no queue — The resource"),
+            "{md}"
+        );
+        assert!(!md.contains("failed call"), "no second failure table: {md}");
+        assert!(
+            md.contains("(resource unknown: request body not readable)"),
+            "{md}"
         );
     }
 }
