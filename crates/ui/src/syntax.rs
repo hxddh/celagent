@@ -124,7 +124,11 @@ fn highlight_json(text: &str, p: &Palette) -> Vec<(Range<usize>, HighlightStyle)
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
+                        i += 1;
+                        if i < bytes.len() {
+                            let esc_len = text[i..].chars().next().map_or(1, char::len_utf8);
+                            i += esc_len;
+                        }
                         continue;
                     }
                     if bytes[i] == b'"' {
@@ -296,7 +300,7 @@ fn highlight_hex(text: &str, p: &Palette) -> Vec<(Range<usize>, HighlightStyle)>
     let mut offset = 0usize;
     for line in text.split_inclusive('\n') {
         let clean = line.trim_end_matches(['\r', '\n']);
-        if clean.len() >= 6 {
+        if clean.len() >= 6 && clean.is_char_boundary(4) {
             out.push((offset..offset + 4, fg(p.text_faint)));
             if let Some(bar_start) = clean.find('|') {
                 out.push((offset + 4..offset + bar_start, fg(p.accent)));
@@ -480,5 +484,12 @@ mod tests {
         );
         assert_eq!(form_cnt, 2);
         assert_valid_gpui_runs(form, &form_spans);
+
+        // Malformed JSON with backslash immediately before multibyte UTF-8 characters
+        // must never slice inside a codepoint.
+        let malformed = "{\"note\":\"\\中\",\"emoji\":\"\\🚀\",\"trailing\":\"\\";
+        let (bad_spans, bad_cnt) = highlight_code(malformed, SyntaxKind::Json, &["中".to_string()]);
+        assert_eq!(bad_cnt, 1);
+        assert_valid_gpui_runs(malformed, &bad_spans);
     }
 }

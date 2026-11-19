@@ -123,6 +123,7 @@ pub fn replay_call(
     })?;
 
     let req_wire = build_http_request(trace, &target)?;
+    let is_head = trace.method.eq_ignore_ascii_case("HEAD");
     let started = Instant::now();
 
     let raw_response = if target.tls {
@@ -137,18 +138,18 @@ pub fn replay_call(
             .write_all(&req_wire)
             .map_err(|e| format!("TLS write failed: {e}"))?;
         tls_stream.flush().ok();
-        read_bounded(&mut tls_stream)?
+        read_bounded(&mut tls_stream, is_head)?
     } else {
         let mut stream = connect_loopback(&target.host, target.port)?;
         stream
             .write_all(&req_wire)
             .map_err(|e| format!("HTTP write failed: {e}"))?;
         stream.flush().ok();
-        read_bounded(&mut stream)?
+        read_bounded(&mut stream, is_head)?
     };
 
     let ms = started.elapsed().as_millis() as u64;
-    parse_http_response(&raw_response, ms)
+    parse_http_response(&raw_response, is_head, ms)
 }
 
 fn connect_loopback(host: &str, port: u16) -> Result<TcpStream, String> {
@@ -238,9 +239,11 @@ fn build_http_request(trace: &Trace, target: &LoopbackTarget) -> Result<Vec<u8>,
     if let Some(exchange) = trace.request.as_ref() {
         for h in &exchange.headers {
             let low = h.name.to_ascii_lowercase();
+            // Strip hop-by-hop framing headers plus `Expect` because `build_http_request`
+            // transmits the full body eagerly without waiting for `100 Continue`.
             if matches!(
                 low.as_str(),
-                "content-length" | "transfer-encoding" | "connection"
+                "content-length" | "transfer-encoding" | "connection" | "expect"
             ) {
                 continue;
             }
@@ -286,7 +289,7 @@ fn build_http_request(trace: &Trace, target: &LoopbackTarget) -> Result<Vec<u8>,
     Ok(req)
 }
 
-fn read_bounded(reader: &mut impl Read) -> Result<Vec<u8>, String> {
+fn read_bounded(reader: &mut impl Read, is_head: bool) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut chunk = [0u8; 8192];
     while out.len() < MAX_REPLAY_RESPONSE_BYTES {
@@ -295,6 +298,9 @@ fn read_bounded(reader: &mut impl Read) -> Result<Vec<u8>, String> {
             Ok(n) => {
                 let take = n.min(MAX_REPLAY_RESPONSE_BYTES - out.len());
                 out.extend_from_slice(&chunk[..take]);
+                if response_complete(&out, is_head) {
+                    break;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) if !out.is_empty() => {
@@ -310,73 +316,170 @@ fn read_bounded(reader: &mut impl Read) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn parse_http_response(raw: &[u8], ms: u64) -> Result<ReplayOutcome, String> {
-    let mut hdr_slots = [httparse::EMPTY_HEADER; 96];
-    let mut resp = httparse::Response::new(&mut hdr_slots);
-    let body_offset = match resp
-        .parse(raw)
-        .map_err(|e| format!("Malformed HTTP response: {e}"))?
-    {
-        httparse::Status::Complete(offset) => offset,
-        httparse::Status::Partial => return Err("Incomplete HTTP response headers".into()),
-    };
-    let status = resp.code.unwrap_or(502);
-    let mut headers = Vec::new();
-    let mut content_type = None;
-    let mut transfer_chunked = false;
-    let mut content_encoding = None;
-
-    for h in resp.headers.iter() {
-        let name = h.name.to_string();
-        let value = String::from_utf8_lossy(h.value).into_owned();
-        if name.eq_ignore_ascii_case("content-type") {
-            content_type = value
-                .split(';')
-                .next()
-                .map(|s| s.trim().to_ascii_lowercase());
-        } else if name.eq_ignore_ascii_case("transfer-encoding")
-            && value.to_ascii_lowercase().contains("chunked")
-        {
-            transfer_chunked = true;
-        } else if name.eq_ignore_ascii_case("content-encoding") {
-            content_encoding = Some(value.trim().to_ascii_lowercase());
+/// Returns `true` once all leading `1xx` informational responses have been passed
+/// and the final HTTP response body is demonstrably complete in `buf`.
+fn response_complete(buf: &[u8], is_head: bool) -> bool {
+    let mut cursor = 0usize;
+    while cursor < buf.len() {
+        let mut hdr_slots = [httparse::EMPTY_HEADER; 128];
+        let mut resp = httparse::Response::new(&mut hdr_slots);
+        let Ok(httparse::Status::Complete(hdr_len)) = resp.parse(&buf[cursor..]) else {
+            return false;
+        };
+        let status = resp.code.unwrap_or(200);
+        if (100..200).contains(&status) && status != 101 {
+            cursor += hdr_len;
+            continue;
         }
-        headers.push(Header { name, value });
+        let body_start = cursor + hdr_len;
+        if is_head || matches!(status, 204 | 304) {
+            return true;
+        }
+        let mut chunked = false;
+        let mut content_len = None;
+        for h in resp.headers.iter() {
+            if h.name.eq_ignore_ascii_case("transfer-encoding")
+                && std::str::from_utf8(h.value)
+                    .is_ok_and(|v| v.to_ascii_lowercase().contains("chunked"))
+            {
+                chunked = true;
+            } else if h.name.eq_ignore_ascii_case("content-length")
+                && let Ok(s) = std::str::from_utf8(h.value)
+                && let Ok(n) = s.trim().parse::<usize>()
+            {
+                content_len = Some(n);
+            }
+        }
+        let wire_body = &buf[body_start..];
+        if chunked {
+            return chunked_complete(wire_body);
+        }
+        if let Some(cl) = content_len {
+            return wire_body.len() >= cl;
+        }
+        return false;
     }
+    false
+}
 
-    let wire_body = &raw[body_offset..];
-    let unchunked = if transfer_chunked {
-        decode_http_chunked(wire_body)
-    } else {
-        wire_body.to_vec()
-    };
-    let decoded_bytes = match content_encoding.as_deref() {
-        Some("gzip" | "x-gzip") => {
-            decompress_bytes(GzDecoder::new(&unchunked[..])).unwrap_or(unchunked)
+fn chunked_complete(input: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos < input.len() {
+        let rest = &input[pos..];
+        let Some(crlf) = rest.windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        let size_str = std::str::from_utf8(&rest[..crlf])
+            .ok()
+            .and_then(|s| s.split(';').next())
+            .map(str::trim)
+            .unwrap_or("");
+        let Ok(len) = usize::from_str_radix(size_str, 16) else {
+            return false;
+        };
+        pos += crlf + 2;
+        if len == 0 {
+            let tail = &input[pos..];
+            return tail.starts_with(b"\r\n") || tail.windows(4).any(|w| w == b"\r\n\r\n");
         }
-        Some("deflate") => decompress_bytes(ZlibDecoder::new(&unchunked[..]))
-            .or_else(|| decompress_bytes(DeflateDecoder::new(&unchunked[..])))
-            .unwrap_or(unchunked),
-        _ => unchunked,
-    };
+        if pos + len + 2 > input.len() {
+            return false;
+        }
+        pos += len + 2;
+    }
+    false
+}
 
-    let body_bytes = decoded_bytes.len();
-    let body_text = if decoded_bytes.is_empty() {
-        None
-    } else if let Ok(valid) = std::str::from_utf8(&decoded_bytes) {
-        Some(valid.to_string())
-    } else {
-        None
-    };
+fn parse_http_response(raw: &[u8], is_head: bool, ms: u64) -> Result<ReplayOutcome, String> {
+    let mut cursor = 0usize;
+    loop {
+        let mut hdr_slots = [httparse::EMPTY_HEADER; 128];
+        let mut resp = httparse::Response::new(&mut hdr_slots);
+        let hdr_len = match resp
+            .parse(&raw[cursor..])
+            .map_err(|e| format!("Malformed HTTP response: {e}"))?
+        {
+            httparse::Status::Complete(offset) => offset,
+            httparse::Status::Partial => return Err("Incomplete HTTP response headers".into()),
+        };
+        let status = resp.code.unwrap_or(502);
+        // Skip any leading 1xx informational responses (e.g. `100 Continue`, `103 Early Hints`)
+        // so the Inspector always receives the final status, headers, and payload.
+        if (100..200).contains(&status) && status != 101 {
+            cursor += hdr_len;
+            if cursor >= raw.len() {
+                return Err("Incomplete HTTP response after 1xx informational status".into());
+            }
+            continue;
+        }
 
-    Ok(ReplayOutcome {
-        status,
-        ms,
-        headers,
-        content_type,
-        body_text,
-        body_bytes,
-    })
+        let mut headers = Vec::new();
+        let mut content_type = None;
+        let mut transfer_chunked = false;
+        let mut content_encoding = None;
+        let mut content_length = None;
+
+        for h in resp.headers.iter() {
+            let name = h.name.to_string();
+            let value = String::from_utf8_lossy(h.value).into_owned();
+            if name.eq_ignore_ascii_case("content-type") {
+                content_type = value
+                    .split(';')
+                    .next()
+                    .map(|s| s.trim().to_ascii_lowercase());
+            } else if name.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                transfer_chunked = true;
+            } else if name.eq_ignore_ascii_case("content-encoding") {
+                content_encoding = Some(value.trim().to_ascii_lowercase());
+            } else if name.eq_ignore_ascii_case("content-length")
+                && let Ok(n) = value.trim().parse::<usize>()
+            {
+                content_length = Some(n);
+            }
+            headers.push(Header { name, value });
+        }
+
+        let body_offset = cursor + hdr_len;
+        let wire_body = &raw[body_offset..];
+        let unchunked = if is_head || matches!(status, 204 | 304) {
+            Vec::new()
+        } else if transfer_chunked {
+            decode_http_chunked(wire_body)
+        } else if let Some(cl) = content_length {
+            wire_body[..wire_body.len().min(cl)].to_vec()
+        } else {
+            wire_body.to_vec()
+        };
+        let decoded_bytes = match content_encoding.as_deref() {
+            Some("gzip" | "x-gzip") => {
+                decompress_bytes(GzDecoder::new(&unchunked[..])).unwrap_or(unchunked)
+            }
+            Some("deflate") => decompress_bytes(ZlibDecoder::new(&unchunked[..]))
+                .or_else(|| decompress_bytes(DeflateDecoder::new(&unchunked[..])))
+                .unwrap_or(unchunked),
+            _ => unchunked,
+        };
+
+        let body_bytes = decoded_bytes.len();
+        let body_text = if decoded_bytes.is_empty() {
+            None
+        } else if let Ok(valid) = std::str::from_utf8(&decoded_bytes) {
+            Some(valid.to_string())
+        } else {
+            None
+        };
+
+        return Ok(ReplayOutcome {
+            status,
+            ms,
+            headers,
+            content_type,
+            body_text,
+            body_bytes,
+        });
+    }
 }
 
 fn decode_http_chunked(input: &[u8]) -> Vec<u8> {
@@ -466,6 +569,37 @@ mod tests {
         let out = replay_call(&call, &url, Path::new(".")).unwrap();
         assert_eq!(out.status, 200);
         assert_eq!(out.body_text.as_deref(), Some("{\"Item\":{\"ok\":1}}"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn skips_100_continue_informational_responses_and_strips_expect_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 2048];
+            let n = sock.read(&mut req_buf).unwrap();
+            let req_text = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(
+                !req_text.to_ascii_lowercase().contains("expect:"),
+                "{req_text}"
+            );
+            sock.write_all(
+                b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nx-amz-request-id: s3-put-1\r\nContent-Length: 5\r\n\r\n<ok/>",
+            )
+            .unwrap();
+        });
+
+        let call = parse_line(
+            r#"{"type":"call","id":"r2","at":"2026-11-19T00:00:00Z","method":"PUT","path":"/bucket/key","host":"127.0.0.1:4566","service":"s3","operation":"PutObject","status":200,"ms":5,"request":{"headers":[{"name":"expect","value":"100-continue"},{"name":"content-type","value":"text/plain"}],"content_type":"text/plain","body":{"text":"hello","bytes":5,"truncated":false,"binary":false}}}"#,
+        )
+        .unwrap();
+
+        let url = format!("http://127.0.0.1:{port}");
+        let out = replay_call(&call, &url, Path::new(".")).unwrap();
+        assert_eq!(out.status, 200);
+        assert_eq!(out.body_text.as_deref(), Some("<ok/>"));
         server.join().unwrap();
     }
 }
