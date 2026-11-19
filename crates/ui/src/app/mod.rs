@@ -1091,9 +1091,9 @@ impl LensletApp {
     fn render_baseline_button(&self, ui: &Ui, session: &Session, cx: &Context<Self>) -> Div {
         let t = ui.p;
         let label: String = match (&session.baseline, session.baseline_run.as_ref()) {
-            (Baseline::Lock, _) if session.lock_path.is_some() && session.lock.is_none() => {
-                ui.t("lenslet.lock (none yet)", "lenslet.lock（尚无）").into()
-            }
+            (Baseline::Lock, _) if session.lock_path.is_some() && session.lock.is_none() => ui
+                .t("lenslet.lock (none yet)", "lenslet.lock（尚无）")
+                .into(),
             (Baseline::Lock, _) => "lenslet.lock".into(),
             (Baseline::Previous, Some(_)) => ui.t("previous run", "上一次运行").into(),
             (Baseline::Previous, None) => ui.t("previous run (none)", "上一次运行（无）").into(),

@@ -145,12 +145,16 @@ impl LensletApp {
         };
         let session = self.session.clone();
         let clear = self.session.read(cx).runs_dir().is_some().then(|| {
-            widgets::danger_button(ui, "clear-runs", ui.t("Clear finished runs", "清理已结束的运行"))
-                .on_click(cx.listener(move |app, _, _, cx| {
-                    session.update(cx, |session, cx| session.clear_finished_runs(cx));
-                    app.storage = None;
-                    app.open_settings(cx);
-                }))
+            widgets::danger_button(
+                ui,
+                "clear-runs",
+                ui.t("Clear finished runs", "清理已结束的运行"),
+            )
+            .on_click(cx.listener(move |app, _, _, cx| {
+                session.update(cx, |session, cx| session.clear_finished_runs(cx));
+                app.storage = None;
+                app.open_settings(cx);
+            }))
         });
 
         let card = div()
