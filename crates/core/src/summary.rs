@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     access::{self, Access},
-    trace::{Trace, trace_access},
+    trace::Trace,
 };
 
 /// Failed calls listed in the human summary; the report keeps all of them.
@@ -39,15 +39,20 @@ pub struct CausalTracker {
 }
 
 impl CausalTracker {
-    /// Inspect `trace` (using `eval_source` for body-derived concrete ARNs) and
-    /// enrich `trace.problem.hint` if a prior call in this run explains the failure,
-    /// then update lifecycle state on successful create/delete calls.
-    pub fn observe_and_enrich(&mut self, trace: &mut Trace, eval_source: &Trace, call_no: usize) {
+    /// Enrich `trace.problem.hint` when a prior call in this run explains the
+    /// failure, then update lifecycle state on successful create/delete calls.
+    /// `concrete_own` is the call's concrete own access (body-derived ARNs).
+    /// Returns whether the hint changed.
+    pub fn observe_and_enrich(
+        &mut self,
+        trace: &mut Trace,
+        concrete_own: &[Access],
+        call_no: usize,
+    ) -> bool {
         if trace.pending {
-            return;
+            return false;
         }
-        let (concrete_own, _) = access::derive_for_gate(eval_source, true);
-        let lookup_keys = causal_keys(&trace.service, &trace.operation, &concrete_own, true);
+        let lookup_keys = causal_keys(concrete_own, true);
 
         if trace.status >= 400
             && !trace.blocked
@@ -61,7 +66,7 @@ impl CausalTracker {
                             "`{stem}` was deleted earlier in this run at call #{del_call} ({del_op}) before this `{}` ran.",
                             trace.operation
                         ));
-                        return;
+                        return true;
                     }
                     if !matches!(svc.as_str(), "s3" | "iam")
                         && let Some((cr_call, cr_op, Some(cr_reg))) = hist.created.as_ref()
@@ -72,14 +77,14 @@ impl CausalTracker {
                             "Region mismatch: `{stem}` was created in `{cr_reg}` at call #{cr_call} ({cr_op}), but this `{}` targeted `{req_reg}`.",
                             trace.operation
                         ));
-                        return;
+                        return true;
                     }
                 }
             }
         }
 
         if trace.status < 400 {
-            let mutate_keys = causal_keys(&trace.service, &trace.operation, &concrete_own, false);
+            let mutate_keys = causal_keys(concrete_own, false);
             if is_create_operation(&trace.operation) {
                 for key in mutate_keys {
                     let entry = self.resources.entry(key).or_default();
@@ -93,6 +98,7 @@ impl CausalTracker {
                 }
             }
         }
+        false
     }
 }
 
@@ -117,7 +123,7 @@ fn is_missing_resource_code(code: &str, status: u16) -> bool {
         )
 }
 
-fn is_create_operation(op: &str) -> bool {
+pub(crate) fn is_create_operation(op: &str) -> bool {
     matches!(
         op,
         "CreateBucket"
@@ -141,7 +147,7 @@ fn is_create_operation(op: &str) -> bool {
     )
 }
 
-fn is_delete_operation(op: &str) -> bool {
+pub(crate) fn is_delete_operation(op: &str) -> bool {
     matches!(
         op,
         "DeleteBucket"
@@ -165,16 +171,16 @@ fn is_delete_operation(op: &str) -> bool {
     )
 }
 
-fn causal_keys(
-    service: &str,
-    operation: &str,
+/// The resources a call names, as `(service, name)` keys: `("s3",
+/// "s3://bucket/key")`, `("dynamodb", "table/orders")`, `("sqs", "jobs")`.
+pub(crate) fn causal_keys(
     concrete_own: &[Access],
     include_parent_bucket: bool,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for acc in concrete_own {
         let res = acc.resource.as_str();
-        if res == "*" || res == crate::lock::UNVERIFIED_RESOURCE {
+        if res == "*" {
             continue;
         }
         if let Some(s3_rest) = res.strip_prefix("arn:aws:s3:::") {
@@ -218,7 +224,6 @@ fn causal_keys(
         if !out.contains(&key) {
             out.push(key);
         }
-        let _ = (service, operation);
     }
     out
 }
@@ -273,6 +278,10 @@ pub struct AccessUse {
     /// The calls that needed it, e.g. `DYNAMODB DeleteItem` (first few).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub via: Vec<String>,
+    /// A `*` that stands for a resource some call's request body did not let
+    /// Lenslet read (binary or truncated).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unverified: bool,
 }
 
 /// Distinct calls kept per permission in `via`.
@@ -318,8 +327,9 @@ impl Summary {
                 self.denied_footprints.insert(item.key());
             }
         }
-        for (index, access) in trace_access(trace).enumerate() {
-            let entry = self.access.entry(access).or_default();
+        for (index, item) in trace.access.iter().chain(trace.implied.iter()).enumerate() {
+            let entry = self.access.entry(item.key()).or_default();
+            entry.unverified |= item.unverified;
             entry.calls += 1;
             entry.errors += usize::from(failed);
             // Own permissions come first, then implied ones. An entry is
@@ -450,13 +460,6 @@ impl Report {
             .iter()
             .map(|entry| Access::new(entry.action.clone(), entry.resource.clone()))
             .collect()
-    }
-
-    /// Fill in the access table and the comparison with a lock file.
-    #[allow(dead_code)]
-    pub fn set_access(&mut self, summary: &Summary, locked: Option<&BTreeSet<Access>>) {
-        let gate = locked.map(|set| crate::lock::Gate::from_lock("lenslet.lock", set.clone()));
-        self.set_access_with_gate(summary, gate.as_ref());
     }
 
     /// Fill in the access table and compare against either a lock file or an IAM policy gate.
@@ -1114,11 +1117,13 @@ mod tests {
                 action: format!("{service}:SendMessage"),
                 resource: format!("arn:aws:{service}:*:*:jobs"),
                 new: false,
+                unverified: false,
             }],
             implied: Vec::new(),
             new: false,
             blocked: false,
             replay_of: None,
+            blocked_phase: None,
             request: Message::default(),
             response: Message::default(),
         }
@@ -1129,6 +1134,10 @@ mod tests {
             action: action.into(),
             resource: resource.into(),
         }
+    }
+
+    fn lock_gate(locked: &BTreeSet<Access>) -> crate::lock::Gate {
+        crate::lock::Gate::from_lock("lenslet.lock", locked.clone())
     }
 
     fn report(summary: &Summary) -> Report {
@@ -1174,7 +1183,7 @@ mod tests {
         ]
         .into();
         report.lock = Some("lenslet.lock".into());
-        report.set_access(&summary, Some(&locked));
+        report.set_access_with_gate(&summary, Some(&lock_gate(&locked)));
         assert_eq!(
             report.access_added,
             vec![access("s3:SendMessage", "arn:aws:s3:*:*:jobs")]
@@ -1236,7 +1245,7 @@ mod tests {
         let mut summary = Summary::default();
         summary.observe(&trace("a", "sqs", 200, None));
         let mut report = report(&summary);
-        report.set_access(&summary, None);
+        report.set_access_with_gate(&summary, None);
         assert!(report.render("t").contains("--update"));
     }
 
@@ -1259,7 +1268,7 @@ mod tests {
             access("sqs:DeleteMessage", "arn:aws:sqs:*:*:jobs"),
         ]
         .into();
-        report.set_access(&summary, Some(&locked));
+        report.set_access_with_gate(&summary, Some(&lock_gate(&locked)));
         assert_eq!(
             summary.access[&access("s3:SendMessage", "arn:aws:s3:*:*:jobs")].via,
             ["S3 SendMessage"]
@@ -1342,7 +1351,7 @@ mod tests {
             binary: false,
             sha256: String::new(),
         });
-        let snap1 = create_tbl.clone();
+        let snap1 = access::derive_call(&create_tbl).concrete_own;
         tracker.observe_and_enrich(&mut create_tbl, &snap1, 1);
 
         // Call #2: GetItem on `orders` in `us-east-1` fails with ResourceNotFoundException.
@@ -1355,7 +1364,7 @@ mod tests {
         get_wrong_reg.operation = "GetItem".into();
         get_wrong_reg.region = Some("us-east-1".into());
         get_wrong_reg.request.body = create_tbl.request.body.clone();
-        let snap2 = get_wrong_reg.clone();
+        let snap2 = access::derive_call(&get_wrong_reg).concrete_own;
         tracker.observe_and_enrich(&mut get_wrong_reg, &snap2, 2);
         let hint = get_wrong_reg
             .problem
@@ -1374,7 +1383,7 @@ mod tests {
         let mut del_bucket = trace("c3", "s3", 204, None);
         del_bucket.operation = "DeleteBucket".into();
         del_bucket.path = "/receipts".into();
-        let snap3 = del_bucket.clone();
+        let snap3 = access::derive_call(&del_bucket).concrete_own;
         tracker.observe_and_enrich(&mut del_bucket, &snap3, 3);
 
         let mut put_after_del = trace(
@@ -1385,7 +1394,7 @@ mod tests {
         );
         put_after_del.operation = "PutObject".into();
         put_after_del.path = "/receipts/a.txt".into();
-        let snap4 = put_after_del.clone();
+        let snap4 = access::derive_call(&put_after_del).concrete_own;
         tracker.observe_and_enrich(&mut put_after_del, &snap4, 4);
         let del_hint = put_after_del
             .problem

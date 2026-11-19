@@ -43,8 +43,6 @@ pub struct RunHeader {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Record {
     Run(RunHeader),
-    // Read by tests; the CLI itself only needs the header and the report.
-    #[allow(dead_code)]
     Call(Box<Trace>),
     End(Box<Report>),
 }
@@ -107,15 +105,28 @@ pub struct Trace {
     /// The access is not in the lock file: this run grew the footprint.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new: bool,
-    /// Intercepted and denied at the proxy by `--enforce` before reaching the emulator.
+    /// Denied at the proxy by `--enforce` with an AWS `AccessDenied` reply.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub blocked: bool,
+    /// When a blocked call was stopped: `request` (it never reached the
+    /// emulator) or `response` (the emulator had already run it, and only its
+    /// response revealed the denied permission, e.g. an SSE-KMS key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_phase: Option<BlockedPhase>,
     /// Set when this call was re-sent from the window (`x-lenslet-replay-of`):
     /// the id of the recorded call it replays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_of: Option<String>,
     pub request: Message,
     pub response: Message,
+}
+
+/// See [`Trace::blocked_phase`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockedPhase {
+    Request,
+    Response,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

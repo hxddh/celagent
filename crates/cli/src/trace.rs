@@ -9,7 +9,6 @@
 //! written owner-only.
 
 use std::{
-    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -19,9 +18,10 @@ use std::{
 use anyhow::{Context, Result};
 
 use serde::Serialize;
+use tokio::sync::watch;
 
 use crate::{
-    access::{self, Access, CallAccess},
+    lock::{self, Evaluation, Gate},
     summary::{Report, Summary},
 };
 
@@ -30,6 +30,13 @@ pub use lenslet_core::trace::*;
 struct SinkState {
     file: File,
     summary: Summary,
+    /// Finished calls (their [`lenslet_core::findings::essentials`]), for
+    /// the findings at the end.
+    calls: Vec<Trace>,
+    /// Set by [`TraceSink::seal`]: nothing but the `end` line is written after.
+    sealed: bool,
+    /// Bytes written to the file so far.
+    written: u64,
 }
 
 /// Append-only run file. Writes are serialized through one open file handle;
@@ -37,31 +44,18 @@ struct SinkState {
 pub struct TraceSink {
     state: Mutex<SinkState>,
     /// Lock file or IAM policy gate this run is compared/enforced against.
-    gate: Option<crate::lock::Gate>,
+    gate: Option<Gate>,
+    path: PathBuf,
+    run: String,
+    /// The file's length after each line: wakes live event streams.
+    written: watch::Sender<u64>,
 }
 
 impl TraceSink {
-    /// Create the parent directory and the trace file so failures surface at
-    /// startup rather than on the first proxied call. On Unix the trace is
-    /// owner-only (0600).
-    #[allow(dead_code)]
-    pub fn new(
-        path: PathBuf,
-        header: &RunHeader,
-        locked: Option<BTreeSet<Access>>,
-    ) -> Result<Self> {
-        Self::with_gate(
-            path,
-            header,
-            locked.map(|set| crate::lock::Gate::from_lock("lenslet.lock", set)),
-        )
-    }
-
-    pub fn with_gate(
-        path: PathBuf,
-        header: &RunHeader,
-        gate: Option<crate::lock::Gate>,
-    ) -> Result<Self> {
+    /// Create the parent directory and the trace file (replacing one that
+    /// exists) so failures surface at startup rather than on the first
+    /// proxied call. On Unix the trace is owner-only (0600).
+    pub fn new(path: PathBuf, header: &RunHeader, gate: Option<Gate>) -> Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -69,198 +63,176 @@ impl TraceSink {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create trace directory {}", parent.display()))?;
         }
-        let mut file =
+        let file =
             open_trace(&path).with_context(|| format!("open trace file {}", path.display()))?;
         set_owner_only(&path)?;
-        write_record(&mut file, "run", header);
-        Ok(TraceSink {
+        let sink = TraceSink {
             state: Mutex::new(SinkState {
                 file,
                 summary: Summary::default(),
+                calls: Vec::new(),
+                sealed: false,
+                written: 0,
             }),
             gate,
-        })
+            run: header.run.clone(),
+            path,
+            written: watch::Sender::new(0),
+        };
+        if let Some(line) = encode("run", header) {
+            sink.write_line(&mut sink.lock(), &line);
+        }
+        Ok(sink)
     }
 
-    pub fn gate(&self) -> Option<&crate::lock::Gate> {
+    pub fn gate(&self) -> Option<&Gate> {
         self.gate.as_ref()
     }
 
-    /// Append the `end` report. Nothing is written after it.
-    pub fn end(&self, report: &Report) {
-        let mut state = self
-            .state
+    /// The run file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The run id (the file stem).
+    pub fn run(&self) -> &str {
+        &self.run
+    }
+
+    /// Wakes whenever a line has been written; the value is the file length.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.written.subscribe()
+    }
+
+    /// Derive what `trace` needs and check it against this run's gate.
+    pub fn evaluate(&self, trace: &Trace) -> Evaluation {
+        lock::evaluate(trace, self.gate.as_ref())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SinkState> {
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        write_record(&mut state.file, "end", report);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Note a call that has started (for the in-flight count).
     pub fn start(&self, id: &str) {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .summary
-            .start(id);
+        self.lock().summary.start(id);
+    }
+
+    /// Calls started and not yet recorded.
+    pub fn unfinished(&self) -> usize {
+        self.lock().summary.unfinished
     }
 
     /// A copy of the calls seen so far.
+    #[cfg(test)]
     pub fn summary(&self) -> Summary {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .summary
-            .clone()
+        self.lock().summary.clone()
     }
 
-    /// Write one call. Never fails the caller: trace problems are logged to
-    /// stderr and the proxy keeps forwarding.
-    pub fn record(&self, trace: Trace) {
-        self.record_evaluated(trace, None);
-    }
-
-    /// Write one call, deriving permissions and gate decisions from `eval_trace`
-    /// when supplied (so a small `--max-body` capture limit on `trace` never
-    /// hides permissions present in the complete request body).
-    pub fn record_evaluated(&self, mut trace: Trace, eval_trace: Option<&Trace>) {
-        let gate = self.gate.as_ref();
-        let mut newly_denied: Vec<Access> = Vec::new();
-        if !trace.pending {
-            let source = eval_trace.unwrap_or(&trace);
-            if let Some(gate) = gate
-                && gate.is_policy()
-            {
-                let (fp_own, fp_implied) = if trace.access.is_empty() && trace.implied.is_empty() {
-                    access::derive(source)
-                } else {
-                    (
-                        trace.access.iter().map(CallAccess::key).collect(),
-                        trace.implied.iter().map(CallAccess::key).collect(),
-                    )
-                };
-                let req_ctx = crate::lock::RequestContext::from_trace(source);
-                let (c_own, c_implied) = access::derive_for_gate(source, true);
-                let own_denied: Vec<Access> = c_own
-                    .into_iter()
-                    .filter(|entry| !gate.allows_in_context(entry, Some(&req_ctx)))
-                    .collect();
-                let imp_denied: Vec<Access> = c_implied
-                    .into_iter()
-                    .filter(|entry| {
-                        let imp_ctx = req_ctx.for_implied(
-                            &source.service,
-                            source.region.as_deref(),
-                            &entry.action,
-                        );
-                        !gate.allows_in_context(entry, Some(&imp_ctx))
-                    })
-                    .collect();
-                let matches_denied = |fp: &Access, denied: &[Access]| -> bool {
-                    denied.iter().any(|d| {
-                        d.action == fp.action
-                            && (d.resource == crate::lock::UNVERIFIED_RESOURCE
-                                || crate::lock::arn_matches(&fp.resource, &d.resource))
-                    })
-                };
-                trace.access = fp_own
-                    .into_iter()
-                    .map(|entry| CallAccess {
-                        new: matches_denied(&entry, &own_denied),
-                        action: entry.action,
-                        resource: entry.resource,
-                    })
-                    .collect();
-                trace.implied = fp_implied
-                    .into_iter()
-                    .map(|entry| CallAccess {
-                        new: matches_denied(&entry, &imp_denied),
-                        action: entry.action,
-                        resource: entry.resource,
-                    })
-                    .collect();
-                newly_denied.extend(own_denied);
-                newly_denied.extend(imp_denied);
-                trace.new = !newly_denied.is_empty();
-            } else {
-                let gate_derived = gate.map(|_| access::derive_for_gate(source, false));
-                if trace.access.is_empty() {
-                    let (own, implied) = access::derive(source);
-                    trace.access = own
-                        .into_iter()
-                        .map(|entry| CallAccess::from_gate(entry, gate))
-                        .collect();
-                    trace.implied = implied
-                        .into_iter()
-                        .map(|entry| CallAccess::from_gate(entry, gate))
-                        .collect();
-                } else if let Some(gate) = gate {
-                    for entry in trace.access.iter_mut().chain(trace.implied.iter_mut()) {
-                        entry.new = !gate.allows(&entry.key());
-                    }
-                }
-                if let (Some(gate), Some((g_own, g_implied))) = (gate, gate_derived) {
-                    for entry in g_own.into_iter().chain(g_implied) {
-                        if !gate.allows(&entry) {
-                            newly_denied.push(entry);
-                        }
-                    }
-                    trace.new = !newly_denied.is_empty()
-                        || trace
-                            .access
-                            .iter()
-                            .chain(trace.implied.iter())
-                            .any(|entry| entry.new);
-                }
-            }
-        }
-        // The sink lock serializes writes, so this check and the write are
-        // atomic: a pending line can never land after the call's final line.
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if trace.pending && !state.summary.in_flight(&trace.id) {
+    /// Write a `pending` line for a call still in flight. Dropped when the
+    /// call has already finished (or the run has been sealed).
+    pub fn record_pending(&self, trace: &Trace) {
+        let Some(line) = encode("call", trace) else {
+            return;
+        };
+        // The check and the write happen under one lock, so a pending line
+        // can never land after the call's final line.
+        let mut state = self.lock();
+        if state.sealed || !state.summary.in_flight(&trace.id) {
             return;
         }
-        if !trace.pending {
-            let next_call_no = state.summary.calls + 1;
-            let eval_ref = eval_trace.cloned();
-            let causal_src = eval_ref.as_ref().unwrap_or(&trace);
-            // Enrich cross-call root-cause hints before writing both the `.jsonl`
-            // call record and `summary.failures`, keeping them 100% identical.
-            let snap = causal_src.clone();
+        self.write_line(&mut state, &line);
+    }
+
+    /// Write one finished call with its gate evaluation. Never fails the
+    /// caller: trace problems are logged to stderr and the proxy keeps
+    /// forwarding. After [`TraceSink::seal`] the call is dropped and stays
+    /// counted as unfinished.
+    pub fn record(&self, mut trace: Trace, evaluation: Evaluation) {
+        trace.pending = false;
+        trace.access = evaluation.access;
+        trace.implied = evaluation.implied;
+        if self.gate.is_some() {
+            trace.new = !evaluation.denied.is_empty();
+        }
+        // Encode before locking; only a cross-call hint (rare) re-encodes.
+        let mut line = encode("call", &trace);
+        let mut essentials = lenslet_core::findings::essentials(&trace);
+        let mut state = self.lock();
+        if state.sealed {
+            return;
+        }
+        let call_no = state.summary.calls + 1;
+        if state
+            .summary
+            .causal
+            .observe_and_enrich(&mut trace, &evaluation.concrete_own, call_no)
+        {
+            line = encode("call", &trace);
+            essentials.problem = trace.problem.clone();
+        }
+        if self.gate.is_some() {
+            state.summary.gate_evaluated = true;
             state
                 .summary
-                .causal
-                .observe_and_enrich(&mut trace, &snap, next_call_no);
-        }
-        if gate.is_some() && !trace.pending {
-            state.summary.gate_evaluated = true;
-            state.summary.denied_access.extend(newly_denied);
+                .denied_access
+                .extend(evaluation.denied.iter().map(|denial| denial.key()));
         }
         state.summary.observe(&trace);
-        write_record(&mut state.file, "call", &trace);
+        state.calls.push(essentials);
+        if let Some(line) = line {
+            self.write_line(&mut state, &line);
+        }
+    }
+
+    /// Stop recording: calls that finish from now on are dropped (and stay
+    /// counted in `unfinished`). Returns the final tally and the calls.
+    pub fn seal(&self) -> (Summary, Vec<Trace>) {
+        let mut state = self.lock();
+        state.sealed = true;
+        (state.summary.clone(), std::mem::take(&mut state.calls))
+    }
+
+    /// Seal the run and append the `end` report: nothing is written after it.
+    pub fn end(&self, report: &Report) {
+        let line = encode("end", report);
+        let mut state = self.lock();
+        state.sealed = true;
+        if let Some(line) = line {
+            self.write_line(&mut state, &line);
+        }
+    }
+
+    /// One `write_all` per line, so a reader never sees half a record
+    /// followed by another writer's line.
+    fn write_line(&self, state: &mut SinkState, line: &str) {
+        match state.file.write_all(line.as_bytes()) {
+            Ok(()) => {
+                state.written += line.len() as u64;
+                self.written.send_replace(state.written);
+            }
+            Err(error) => eprintln!("lenslet: cannot write trace: {error}"),
+        }
     }
 }
 
-fn write_record<T: Serialize>(file: &mut File, kind: &'static str, value: &T) {
-    let line = match serde_json::to_string(&Tagged { kind, value }) {
-        Ok(line) => line,
+/// `{"type": kind, ...value}` and a newline.
+fn encode<T: Serialize>(kind: &'static str, value: &T) -> Option<String> {
+    match serde_json::to_string(&Tagged { kind, value }) {
+        Ok(line) => Some(line + "\n"),
         Err(error) => {
             eprintln!("lenslet: cannot encode trace: {error}");
-            return;
+            None
         }
-    };
-    // One write per line, so a reader never sees half a record followed by
-    // another writer's line.
-    if let Err(error) = file.write_all(format!("{line}\n").as_bytes()) {
-        eprintln!("lenslet: cannot write trace: {error}");
     }
 }
 
+/// A fresh, owner-only file: `--trace PATH` replaces what was there.
 fn open_trace(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).write(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -285,7 +257,26 @@ fn set_owner_only(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::Access;
     use hyper::{HeaderMap, header::HeaderValue};
+    use std::collections::BTreeSet;
+
+    /// Record a finished call the way the proxy does: evaluate, then write.
+    fn record(sink: &TraceSink, trace: Trace) {
+        let evaluation = sink.evaluate(&trace);
+        sink.record(trace, evaluation);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lenslet-sink-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     fn append(map: &mut HeaderMap, name: &str, value: &str) {
         map.append(
@@ -337,6 +328,7 @@ mod tests {
             new: false,
             blocked: false,
             replay_of: None,
+            blocked_phase: None,
             request: Message {
                 headers: headers(&request_headers),
                 content_type: Some("application/json".to_string()),
@@ -477,8 +469,8 @@ mod tests {
         ));
         let path = dir.join("nested/trace.jsonl");
         let sink = TraceSink::new(path.clone(), &RunHeader::default(), None).unwrap();
-        sink.record(sample_trace());
-        sink.record(sample_trace());
+        record(&sink, sample_trace());
+        record(&sink, sample_trace());
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(
             text.lines().count(),
@@ -522,8 +514,8 @@ mod tests {
 
         // The timer lost the race: the call finished first.
         sink.start(&done.id);
-        sink.record(done.clone());
-        sink.record(late_pending);
+        record(&sink, done.clone());
+        sink.record_pending(&late_pending);
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(
             text.lines().count(),
@@ -539,12 +531,12 @@ mod tests {
             ..done.clone()
         };
         sink.start(&other.id);
-        sink.record(Trace {
+        sink.record_pending(&Trace {
             pending: true,
             ..other.clone()
         });
         assert_eq!(sink.summary().unfinished, 1);
-        sink.record(other);
+        record(&sink, other);
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 4);
         assert_eq!(sink.summary().unfinished, 0);
         let _ = fs::remove_dir_all(&dir);
@@ -556,13 +548,18 @@ mod tests {
         let path = dir.join("trace.jsonl");
         let locked: BTreeSet<Access> =
             [Access::new("s3:PutObject", "arn:aws:s3:::bucket/*")].into();
-        let sink = TraceSink::new(path.clone(), &RunHeader::default(), Some(locked)).unwrap();
+        let sink = TraceSink::new(
+            path.clone(),
+            &RunHeader::default(),
+            Some(Gate::from_lock("lenslet.lock", locked)),
+        )
+        .unwrap();
         let mut trace = sample_trace();
         trace.request.headers.push(HeaderTrace {
             name: "x-amz-server-side-encryption".into(),
             value: "aws:kms".into(),
         });
-        sink.record(trace);
+        record(&sink, trace);
         let text = fs::read_to_string(&path).unwrap();
         let call: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
         assert_eq!(call["new"], true);
@@ -574,6 +571,63 @@ mod tests {
             call["implied"][0]["new"], true,
             "only the implied kms permission is new: {call}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_given_trace_path_is_replaced_not_appended_to() {
+        let dir = temp_dir("truncate");
+        let path = dir.join("fixed.jsonl");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "{\"type\":\"end\"}\nold run\n").unwrap();
+        let sink = TraceSink::new(path.clone(), &RunHeader::default(), None).unwrap();
+        record(&sink, sample_trace());
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.starts_with("{\"type\":\"run\""), "{text}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a replaced trace is owner-only too");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_written_after_the_run_is_sealed() {
+        let dir = temp_dir("sealed");
+        let path = dir.join("trace.jsonl");
+        let sink = TraceSink::new(path.clone(), &RunHeader::default(), None).unwrap();
+        let mut written = sink.subscribe();
+        let late = sample_trace();
+        sink.start(&late.id);
+        let (summary, calls) = sink.seal();
+        assert_eq!((summary.calls, summary.unfinished), (0, 1));
+        assert!(calls.is_empty());
+        // The late call finishes after the report was taken: it is dropped
+        // and stays unfinished.
+        record(&sink, late.clone());
+        sink.record_pending(&Trace {
+            pending: true,
+            ..late
+        });
+        sink.end(&crate::summary::Report::default());
+        assert_eq!(sink.summary().unfinished, 1);
+        let text = fs::read_to_string(&path).unwrap();
+        let kinds: Vec<String> = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(kinds, ["run", "end"]);
+        // Every write is signalled with the file's new length.
+        assert!(written.has_changed().unwrap());
+        assert_eq!(*written.borrow_and_update(), text.len() as u64);
         let _ = fs::remove_dir_all(&dir);
     }
 }

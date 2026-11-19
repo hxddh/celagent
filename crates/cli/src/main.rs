@@ -13,7 +13,7 @@ mod capture;
 mod proxy;
 mod trace;
 
-pub(crate) use lenslet_core::{access, lock, problem, runs, summary, wire};
+pub(crate) use lenslet_core::{access, findings, lock, problem, runs, summary, wire};
 
 use std::{
     ffi::OsString,
@@ -380,8 +380,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
         enforce: options.enforce,
         ..RunHeader::default()
     };
-    let server =
-        Server::start_with_gate(&options, trace_path.clone(), header, gate.clone()).await?;
+    let server = Server::start(&options, trace_path.clone(), header, gate.clone()).await?;
     let endpoint = server.endpoint();
     let started = Instant::now();
 
@@ -419,7 +418,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
                 );
             }
         }
-        if ui && let Err(error) = open_ui(options.trace.as_deref()) {
+        if ui && let Err(error) = open_ui(Some(&trace_path)) {
             eprintln!("lenslet: {error:#}");
         }
         Some(run_child(&command, &env).await?)
@@ -427,7 +426,10 @@ async fn run(args: Vec<String>) -> Result<i32> {
 
     let state = server.state.clone();
     server.stop(Duration::from_secs(2)).await;
-    let summary = state.trace.summary();
+    // From here on, a call that finishes late is not recorded: it stays
+    // counted as unfinished, and nothing is written after the `end` line.
+    let (summary, calls) = state.trace.seal();
+    let gate_label = gate.as_ref().map(|gate| gate.label.clone());
     let mut report = Report {
         version: trace::VERSION,
         run: runs::run_id(&trace_path),
@@ -448,8 +450,13 @@ async fn run(args: Vec<String>) -> Result<i32> {
         trace: trace_path.display().to_string(),
         endpoint: endpoint.clone(),
         upstream: options.upstream.base.clone(),
+        findings: findings::analyze_against(
+            &calls,
+            gate_label.as_deref().unwrap_or(lock::FILE_NAME),
+        ),
         ..Report::default()
     };
+    drop(calls);
     report.set_access_with_gate(&summary, gate.as_ref());
     let runs_dir = trace_path
         .parent()
@@ -461,6 +468,8 @@ async fn run(args: Vec<String>) -> Result<i32> {
         report.compare_with(&previous);
     }
     state.trace.end(&report);
+    // Live event streams end with the `end` line; let them deliver it.
+    server.join(Duration::from_millis(500)).await;
 
     if !quiet {
         eprint!("{}", report.render(&tilde(&trace_path, &home)));
