@@ -671,7 +671,7 @@ fn check_re_evaluates_a_recorded_run_and_names_the_denying_statement() {
     let text = stdout(&denied);
     assert!(text.contains("1 permission denied"), "{text}");
     assert!(
-        text.contains("✗ SQS SendMessage  sqs:SendMessage  arn:aws:sqs:us-east-1:*:jobs"),
+        text.contains("✗ sqs:SendMessage  arn:aws:sqs:us-east-1:*:jobs  (SQS SendMessage)"),
         "{text}"
     );
     assert!(text.contains("→ denied by statement `NoSend`"), "{text}");

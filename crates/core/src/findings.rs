@@ -16,6 +16,9 @@
 //! Severity: failures are errors; access, serial bursts and retries that
 //! finally failed are warnings; leaks and recovered retries are info.
 
+/// How a `leaked` finding's title ends, after the resource it names.
+pub const LEAKED_SUFFIX: &str = " created and never deleted";
+
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
@@ -431,7 +434,7 @@ fn leaked(calls: &[&Trace], found: &mut Found) {
             Finding {
                 kind: FindingKind::Leaked,
                 severity: Severity::Info,
-                title: format!("{what} created and never deleted"),
+                title: format!("{what}{LEAKED_SUFFIX}"),
                 detail: Some(format!(
                     "Created by {}; no later call in this run deleted it.",
                     call_name(call)

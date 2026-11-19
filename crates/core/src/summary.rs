@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     access::{self, Access},
-    findings::{Finding, FindingKind, Severity},
+    findings::{Finding, FindingKind, LEAKED_SUFFIX, Severity},
     trace::Trace,
 };
 
@@ -584,6 +584,9 @@ impl Report {
                 listed.len() - LISTED_FAILURES
             ));
         }
+        if let Some(line) = self.leaked_line() {
+            out.push_str(&format!("  · {line}\n"));
+        }
         if let Some(regressions) = self.regressions.as_ref()
             && (!regressions.new_failures.is_empty()
                 || !regressions.fixed.is_empty()
@@ -708,7 +711,36 @@ impl Report {
     fn listed_findings(&self) -> impl Iterator<Item = &Finding> {
         self.findings
             .iter()
-            .filter(|finding| finding.kind != FindingKind::Access)
+            .filter(|finding| !matches!(finding.kind, FindingKind::Access | FindingKind::Leaked))
+    }
+
+    /// Resources the run created and left behind, as one line: test fixtures
+    /// usually do this on purpose, so they are a note, not a list.
+    fn leaked_line(&self) -> Option<String> {
+        let names: Vec<&str> = self
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::Leaked)
+            .map(|finding| {
+                finding
+                    .title
+                    .strip_suffix(LEAKED_SUFFIX)
+                    .unwrap_or(&finding.title)
+            })
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        let shown = names.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+        let more = if names.len() > 4 {
+            format!(" and {} more", names.len() - 4)
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{} created and not deleted: {shown}{more}",
+            plural(names.len(), "resource")
+        ))
     }
 
     /// The latest failed call of a failure finding: the one shown for it.
@@ -914,7 +946,11 @@ impl Report {
     /// The findings table at the top of the Markdown report.
     fn markdown_findings(&self, out: &mut String) {
         let listed: Vec<&Finding> = self.listed_findings().collect();
+        let leaked = self.leaked_line();
         if listed.is_empty() {
+            if let Some(line) = leaked {
+                out.push_str(&format!("{line}.\n\n"));
+            }
             return;
         }
         let new: BTreeSet<FailureKind> = self
@@ -973,6 +1009,9 @@ impl Report {
             ));
         }
         out.push('\n');
+        if let Some(line) = leaked {
+            out.push_str(&format!("{line}.\n\n"));
+        }
     }
 }
 

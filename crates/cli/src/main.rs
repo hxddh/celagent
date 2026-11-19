@@ -986,6 +986,26 @@ impl CheckReport {
         text
     }
 
+    /// Denials grouped by permission and reason, in first-call order, with how
+    /// many calls hit each: a loop of the same call is one line, not fifty.
+    fn grouped(&self) -> Vec<(&CheckDenial, usize)> {
+        let mut groups: Vec<(&CheckDenial, usize)> = Vec::new();
+        for item in &self.denied {
+            let key = |d: &CheckDenial| {
+                (
+                    d.denial.action.clone(),
+                    d.denial.resource.clone(),
+                    self.reason(&d.denial),
+                )
+            };
+            match groups.iter_mut().find(|(first, _)| key(first) == key(item)) {
+                Some((_, calls)) => *calls += 1,
+                None => groups.push((item, 1)),
+            }
+        }
+        groups
+    }
+
     fn render(&self) -> String {
         let mut out = format!(
             "lenslet check: run {} against {} · {} · ",
@@ -999,15 +1019,20 @@ impl CheckReport {
         }
         out.push_str(&format!(
             "{} denied\n",
-            count(self.denied.len(), "permission")
+            count(self.grouped().len(), "permission")
         ));
-        for item in &self.denied {
+        for (item, calls) in self.grouped() {
+            let times = if calls > 1 {
+                format!(" ×{calls}")
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "  ✗ {} {}  {}  {}\n      → {}\n",
-                item.service.to_ascii_uppercase(),
-                item.operation,
+                "  ✗ {}  {}  ({} {}{times})\n      → {}\n",
                 item.denial.action,
                 item.denial.resource,
+                item.service.to_ascii_uppercase(),
+                item.operation,
                 self.reason(&item.denial)
             ));
         }
@@ -1025,12 +1050,17 @@ impl CheckReport {
         }
         out.push_str(&format!(
             "**{} denied** across {}.\n\n| Call | Permission | Resource | Why |\n|---|---|---|---|\n",
-            count(self.denied.len(), "permission"),
+            count(self.grouped().len(), "permission"),
             count(self.calls, "call")
         ));
-        for item in &self.denied {
+        for (item, calls) in self.grouped() {
+            let times = if calls > 1 {
+                format!(" ×{calls}")
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "| {} {} | `{}` | `{}` | {} |\n",
+                "| {} {}{times} | `{}` | `{}` | {} |\n",
                 item.service.to_ascii_uppercase(),
                 item.operation,
                 item.denial.action,
