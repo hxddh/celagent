@@ -1,11 +1,11 @@
 //! Design tokens for Lenslet: precision-instrument dark and light surfaces
-//! with 6 contrast-calibrated accent palettes.
+//! with contrast-calibrated accents. The active look (appearance, accent,
+//! language, density) is a gpui [`Global`]: set when preferences or the
+//! system appearance change, read by every render through [`Ui`].
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use gpui::{App, Global, Hsla, Rgba, WindowAppearance, rgb};
 
-use gpui::{Hsla, Rgba, WindowAppearance, rgb};
-
-use crate::prefs::{AccentColor, Density, ThemeMode};
+use crate::prefs::{AccentColor, Density, Lang, ThemeMode, UiPrefs};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appearance {
@@ -13,44 +13,121 @@ pub enum Appearance {
     Light,
 }
 
-static ACTIVE_APPEARANCE: AtomicU8 = AtomicU8::new(0);
-static ACTIVE_ACCENT: AtomicU8 = AtomicU8::new(0);
-
-pub fn set_appearance(appearance: Appearance) {
-    let val = match appearance {
-        Appearance::Dark => 0,
-        Appearance::Light => 1,
-    };
-    ACTIVE_APPEARANCE.store(val, Ordering::Relaxed);
+/// Everything a render needs to look right, copied out of the global once.
+#[derive(Clone, Copy, Debug)]
+pub struct Ui {
+    pub p: Palette,
+    pub appearance: Appearance,
+    pub accent: AccentColor,
+    pub lang: Lang,
+    pub density: Density,
+    pub reduce_motion: bool,
 }
 
-pub fn appearance() -> Appearance {
-    match ACTIVE_APPEARANCE.load(Ordering::Relaxed) {
-        1 => Appearance::Light,
-        _ => Appearance::Dark,
+struct UiGlobal(Ui);
+
+impl Global for UiGlobal {}
+
+impl Ui {
+    pub fn new(prefs: &UiPrefs, window: WindowAppearance) -> Self {
+        let appearance = resolve(prefs.theme, window);
+        Ui {
+            p: palette(appearance, prefs.accent),
+            appearance,
+            accent: prefs.accent,
+            lang: prefs.lang,
+            density: prefs.density,
+            reduce_motion: prefs.reduce_motion,
+        }
     }
-}
 
-pub fn set_accent(accent: AccentColor) {
-    let val = match accent {
-        AccentColor::Sky => 0,
-        AccentColor::Indigo => 1,
-        AccentColor::Violet => 2,
-        AccentColor::Emerald => 3,
-        AccentColor::Amber => 4,
-        AccentColor::Rose => 5,
-    };
-    ACTIVE_ACCENT.store(val, Ordering::Relaxed);
-}
+    /// The current look. Falls back to dark defaults before [`Ui::install`].
+    pub fn of(cx: &App) -> Ui {
+        cx.try_global::<UiGlobal>()
+            .map(|global| global.0)
+            .unwrap_or_else(|| Ui::new(&UiPrefs::default(), WindowAppearance::Dark))
+    }
 
-pub fn accent() -> AccentColor {
-    match ACTIVE_ACCENT.load(Ordering::Relaxed) {
-        1 => AccentColor::Indigo,
-        2 => AccentColor::Violet,
-        3 => AccentColor::Emerald,
-        4 => AccentColor::Amber,
-        5 => AccentColor::Rose,
-        _ => AccentColor::Sky,
+    /// Publish a new look; returns whether anything changed.
+    pub fn install(cx: &mut App, ui: Ui) -> bool {
+        let changed = cx.try_global::<UiGlobal>().is_none_or(|old| {
+            let old = old.0;
+            old.appearance != ui.appearance
+                || old.accent != ui.accent
+                || old.lang != ui.lang
+                || old.density != ui.density
+                || old.reduce_motion != ui.reduce_motion
+        });
+        if changed {
+            cx.set_global(UiGlobal(ui));
+        }
+        changed
+    }
+
+    /// English or Chinese.
+    pub fn t<'a>(&self, en: &'a str, zh: &'a str) -> &'a str {
+        if self.lang == Lang::Zh { zh } else { en }
+    }
+
+    pub fn zh(&self) -> bool {
+        self.lang == Lang::Zh
+    }
+
+    pub fn row_height(&self) -> f32 {
+        row_height(self.density)
+    }
+
+    pub fn dark(&self) -> bool {
+        self.appearance == Appearance::Dark
+    }
+
+    pub fn service_color(&self, label: &str) -> Rgba {
+        service_color_for(label, self.appearance)
+    }
+
+    pub fn status_color(&self, status: u16) -> Rgba {
+        let t = &self.p;
+        if status == 0 {
+            rgb(t.text_muted)
+        } else if status >= 500 {
+            rgb(t.red)
+        } else if status >= 400 {
+            rgb(t.red_4xx)
+        } else if status >= 300 {
+            rgb(t.amber)
+        } else {
+            rgb(t.green)
+        }
+    }
+
+    pub fn latency_color(&self, ms: u64) -> Rgba {
+        let t = &self.p;
+        if ms >= 2_000 {
+            rgb(t.red)
+        } else if ms >= 500 {
+            rgb(t.amber)
+        } else {
+            rgb(t.text_muted)
+        }
+    }
+
+    /// Multi-layer elevation shadow for popovers, menus and modals.
+    pub fn elevation(&self) -> Vec<gpui::BoxShadow> {
+        let dark = self.dark();
+        vec![
+            gpui::BoxShadow {
+                color: h(0x000000, if dark { 0.50 } else { 0.14 }),
+                offset: gpui::point(gpui::px(0.0), gpui::px(12.0)),
+                blur_radius: gpui::px(28.0),
+                spread_radius: gpui::px(-4.0),
+            },
+            gpui::BoxShadow {
+                color: h(0x000000, if dark { 0.30 } else { 0.08 }),
+                offset: gpui::point(gpui::px(0.0), gpui::px(2.0)),
+                blur_radius: gpui::px(6.0),
+                spread_radius: gpui::px(0.0),
+            },
+        ]
     }
 }
 
@@ -68,14 +145,14 @@ pub fn resolve(mode: ThemeMode, window: WindowAppearance) -> Appearance {
 /// `(accent_hex, row_selected_hex, row_selected_hover_hex, mark_bg_hex)` for `(mode, accent)`.
 pub const fn accent_tokens(mode: Appearance, accent: AccentColor) -> (u32, u32, u32, u32) {
     match (mode, accent) {
-        (Appearance::Dark, AccentColor::Sky) => (0x7DD3FC, 0x152230, 0x192838, 0x131C27),
+        (Appearance::Dark, AccentColor::Sky) => (0x7DD3FC, 0x14212E, 0x182736, 0x131C27),
         (Appearance::Dark, AccentColor::Indigo) => (0xA5B4FC, 0x181C32, 0x1D223C, 0x15182A),
         (Appearance::Dark, AccentColor::Violet) => (0xC4B5FD, 0x1E1932, 0x241E3C, 0x1A162B),
         (Appearance::Dark, AccentColor::Emerald) => (0x6EE7B7, 0x122622, 0x162E29, 0x11201D),
         (Appearance::Dark, AccentColor::Amber) => (0xFCD34D, 0x262013, 0x2F2717, 0x201B11),
         (Appearance::Dark, AccentColor::Rose) => (0xFDA4AF, 0x281720, 0x311C27, 0x22141B),
 
-        (Appearance::Light, AccentColor::Sky) => (0x0369A1, 0xE6F2FE, 0xDAEBFB, 0xE2EEF9),
+        (Appearance::Light, AccentColor::Sky) => (0x0369A1, 0xE3F0FC, 0xD8E9FA, 0xE2EEF9),
         (Appearance::Light, AccentColor::Indigo) => (0x4338CA, 0xEAEAFE, 0xE0E0FC, 0xE6E7FB),
         (Appearance::Light, AccentColor::Violet) => (0x6D28D9, 0xF0E9FE, 0xE7DDFD, 0xECE5FB),
         (Appearance::Light, AccentColor::Emerald) => (0x047857, 0xE4F7F0, 0xD6F1E7, 0xE0F3EC),
@@ -84,9 +161,18 @@ pub const fn accent_tokens(mode: Appearance, accent: AccentColor) -> (u32, u32, 
     }
 }
 
-/// Swatch preview color for the Settings modal.
-pub fn accent_swatch(accent: AccentColor) -> u32 {
-    accent_tokens(appearance(), accent).0
+/// The palette for an appearance and accent.
+pub fn palette(mode: Appearance, accent: AccentColor) -> Palette {
+    let mut base = match mode {
+        Appearance::Dark => DARK,
+        Appearance::Light => LIGHT,
+    };
+    let (acc, sel, sel_hover, mark) = accent_tokens(mode, accent);
+    base.accent = acc;
+    base.row_selected = sel;
+    base.row_selected_hover = sel_hover;
+    base.mark_bg = mark;
+    base
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,7 +196,6 @@ pub struct Palette {
 
     pub border: u32,
     pub border_subtle: u32,
-    pub border_strong: u32,
 
     pub text: u32,
     pub text_soft: u32,
@@ -149,7 +234,6 @@ pub const DARK: Palette = Palette {
 
     border: 0x1E2632,
     border_subtle: 0x171E28,
-    border_strong: 0x2A3442,
 
     text: 0xE7EDF6,
     text_soft: 0xC5D0DF,
@@ -188,7 +272,6 @@ pub const LIGHT: Palette = Palette {
 
     border: 0xD2DCE7,
     border_subtle: 0xE3EAF2,
-    border_strong: 0xB4C3D4,
 
     text: 0x0F172A,
     text_soft: 0x1E293B,
@@ -207,62 +290,39 @@ pub const LIGHT: Palette = Palette {
     blue: 0x1D4ED8,
 };
 
-/// Active palette for the current render pass, incorporating the active accent.
-pub fn p() -> Palette {
-    let mode = appearance();
-    let mut base = match mode {
-        Appearance::Dark => DARK,
-        Appearance::Light => LIGHT,
-    };
-    let (acc, sel, sel_hover, mark) = accent_tokens(mode, accent());
-    base.accent = acc;
-    base.row_selected = sel;
-    base.row_selected_hover = sel_hover;
-    base.mark_bg = mark;
-    base
-}
-
-// Workbench 3-zone layout rhythm.
+// Layout rhythm: a 4/8-pt grid, one type scale.
 pub const HEADER_H: f32 = 44.0;
-pub const SUBBAR_H: f32 = 38.0;
+pub const SUBBAR_H: f32 = 36.0;
 pub const TIMELINE_H: f32 = 24.0;
 pub const TABLE_HEAD_H: f32 = 28.0;
-pub const SPLITTER_W: f32 = 5.0;
+/// The splitter's grab area; only a 1px line is drawn.
+pub const SPLITTER_HIT_W: f32 = 7.0;
+pub const INSPECTOR_DEFAULT_W: f32 = 480.0;
+pub const BODY_LINE_H: f32 = 18.0;
+
+/// Type scale (px).
+pub mod text {
+    pub const XS: f32 = 10.0;
+    pub const SM: f32 = 11.0;
+    pub const MD: f32 = 12.0;
+    pub const LG: f32 = 13.0;
+    pub const XL: f32 = 15.0;
+}
 
 pub fn row_height(density: Density) -> f32 {
     match density {
-        Density::Comfortable => 54.0,
-        Density::Compact => 40.0,
+        Density::Comfortable => 48.0,
+        Density::Compact => 32.0,
     }
 }
 
-// Stream columns.
-pub const ROW_PAD_X: f32 = 14.0;
-pub const COL_TIME: f32 = 88.0;
-pub const COL_SERVICE: f32 = 88.0;
-pub const COL_STATUS: f32 = 52.0;
-pub const COL_LATENCY: f32 = 114.0;
-pub const COL_AUTH: f32 = 30.0;
-pub const COL_GAP: f32 = 10.0;
-
-/// Multi-layer native elevation shadow for floating popovers, modals, and toasts.
-pub fn elevation_shadow() -> Vec<gpui::BoxShadow> {
-    let dark = matches!(appearance(), Appearance::Dark);
-    vec![
-        gpui::BoxShadow {
-            color: h(0x000000, if dark { 0.52 } else { 0.14 }),
-            offset: gpui::point(gpui::px(0.0), gpui::px(14.0)),
-            blur_radius: gpui::px(32.0),
-            spread_radius: gpui::px(-4.0),
-        },
-        gpui::BoxShadow {
-            color: h(0x000000, if dark { 0.34 } else { 0.08 }),
-            offset: gpui::point(gpui::px(0.0), gpui::px(3.0)),
-            blur_radius: gpui::px(8.0),
-            spread_radius: gpui::px(0.0),
-        },
-    ]
-}
+// Calls table columns.
+pub const ROW_PAD_X: f32 = 16.0;
+pub const COL_TIME: f32 = 84.0;
+pub const COL_SERVICE: f32 = 92.0;
+pub const COL_STATUS: f32 = 56.0;
+pub const COL_LATENCY: f32 = 112.0;
+pub const COL_GAP: f32 = 12.0;
 
 pub fn h(hex: u32, alpha: f32) -> Hsla {
     let mut color: Hsla = rgb(hex).into();
@@ -270,21 +330,10 @@ pub fn h(hex: u32, alpha: f32) -> Hsla {
     color
 }
 
-/// A hairline in an accent color (`hex` is `0xRRGGBB`, like every token here).
-pub fn line(hex: u32, alpha: f32) -> Hsla {
-    h(hex, alpha)
-}
-
 pub fn tint(color: Rgba, alpha: f32) -> Hsla {
     let mut color: Hsla = color.into();
     color.a = alpha;
     color
-}
-
-/// Color for a service label, calibrated per appearance so both dark and light
-/// modes maintain crisp legibility.
-pub fn service_color(label: &str) -> Rgba {
-    service_color_for(label, appearance())
 }
 
 pub fn service_color_for(label: &str, mode: Appearance) -> Rgba {
@@ -334,32 +383,6 @@ fn fnv_index(label: &str, len: usize) -> usize {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash as usize % len
-}
-
-pub fn status_color(status: u16) -> Rgba {
-    let t = p();
-    if status == 0 {
-        rgb(t.text_muted)
-    } else if status >= 500 {
-        rgb(t.red)
-    } else if status >= 400 {
-        rgb(t.red_4xx)
-    } else if status >= 300 {
-        rgb(t.amber)
-    } else {
-        rgb(t.green)
-    }
-}
-
-pub fn latency_color(ms: u64) -> Rgba {
-    let t = p();
-    if ms >= 2_000 {
-        rgb(t.red)
-    } else if ms >= 500 {
-        rgb(t.amber)
-    } else {
-        rgb(t.text_muted)
-    }
 }
 
 #[cfg(test)]

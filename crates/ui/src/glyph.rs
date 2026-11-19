@@ -7,8 +7,7 @@ use gpui::{Hsla, PathBuilder, Window, canvas, div, point, prelude::*, px, rgb};
 use crate::theme;
 
 /// The lens/aperture mark: a machined tile with an iris and six blades.
-pub fn lens_mark(size: f32) -> impl IntoElement {
-    let t = theme::p();
+pub fn lens_mark(t: &theme::Palette, size: f32) -> impl IntoElement {
     let ring = (size * 0.50).max(6.0);
     let dot = (size * 0.15).max(2.0);
     let blade = theme::h(t.accent, 0.82);
@@ -22,7 +21,7 @@ pub fn lens_mark(size: f32) -> impl IntoElement {
         .rounded(px((size * 0.28).max(4.0)))
         .bg(rgb(t.mark_bg))
         .border_1()
-        .border_color(theme::line(t.accent, 0.22))
+        .border_color(theme::h(t.accent, 0.22))
         .overflow_hidden()
         .child(
             canvas(
@@ -261,8 +260,7 @@ pub fn replay_icon(color: Hsla) -> impl IntoElement {
 }
 
 /// A tiny key silhouettes whether SigV4 authorization was present.
-pub fn auth_mark(present: bool) -> impl IntoElement {
-    let t = theme::p();
+pub fn auth_mark(t: &theme::Palette, present: bool) -> impl IntoElement {
     let color = if present {
         theme::h(t.green, 0.9)
     } else {
@@ -302,37 +300,6 @@ pub fn auth_mark(present: bool) -> impl IntoElement {
                 .h(px(3.0))
                 .bg(color),
         )
-}
-
-pub fn pause_icon(color: Hsla) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(2.0))
-        .child(div().w(px(2.0)).h(px(8.0)).rounded(px(0.5)).bg(color))
-        .child(div().w(px(2.0)).h(px(8.0)).rounded(px(0.5)).bg(color))
-}
-
-pub fn play_icon(color: Hsla) -> impl IntoElement {
-    div().w(px(8.0)).h(px(9.0)).child(
-        canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                let cx = bounds.left().to_f64() as f32;
-                let cy = bounds.top().to_f64() as f32;
-                let mut path = PathBuilder::fill();
-                path.move_to(point(px(cx + 0.5), px(cy)));
-                path.line_to(point(px(cx + 0.5), px(cy + 9.0)));
-                path.line_to(point(px(cx + 7.5), px(cy + 4.5)));
-                path.close();
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, color);
-                }
-            },
-        )
-        .absolute()
-        .inset_0(),
-    )
 }
 
 pub fn dot(color: impl Into<Hsla>, size: f32) -> impl IntoElement {
