@@ -2955,7 +2955,7 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "lenslet"
-version = "7.0.0"
+version = "8.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2976,7 +2976,7 @@ dependencies = [
 
 [[package]]
 name = "lenslet-core"
-version = "7.0.0"
+version = "8.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2987,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "lenslet-ui"
-version = "7.0.0"
+version = "8.0.0"
 dependencies = [
  "anyhow",
  "flate2",
