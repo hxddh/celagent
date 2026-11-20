@@ -2,17 +2,20 @@
 
 mod app;
 mod body;
+mod daemon;
 mod demo;
 mod feed;
 mod fonts;
 mod fsguard;
 mod glyph;
 mod i18n;
+mod icons;
 mod lockfile;
 mod model;
 mod prefs;
 mod replay;
 mod search;
+mod sigv4;
 mod sse;
 mod store;
 mod syntax;
@@ -31,8 +34,8 @@ use gpui::{
 use crate::app::*;
 
 /// Context predicates for the key map.
-const LIST: &str = "LensletApp && !Search && !Palette && !Body";
-const NOT_TYPING: &str = "LensletApp && !Search && !Palette";
+const LIST: &str = "LensletApp && !Search && !Palette && !Body && !ComposerField";
+const NOT_TYPING: &str = "LensletApp && !Search && !Palette && !ComposerField";
 
 /// The whole key map. Every `cmd-` binding also gets a `ctrl-` twin off macOS.
 fn key_bindings() -> Vec<KeyBinding> {
@@ -51,8 +54,32 @@ fn key_bindings() -> Vec<KeyBinding> {
             Box::new(|k| KeyBinding::new(k, OpenSettings, Some("LensletApp"))),
         ),
         (
+            "0",
+            Box::new(|k| KeyBinding::new(k, ToggleSidebar, Some("LensletApp"))),
+        ),
+        (
             "b",
             Box::new(|k| KeyBinding::new(k, ToggleInspector, Some("LensletApp"))),
+        ),
+        (
+            "o",
+            Box::new(|k| KeyBinding::new(k, OpenFile, Some("LensletApp"))),
+        ),
+        (
+            "s",
+            Box::new(|k| KeyBinding::new(k, ExportReport, Some("LensletApp"))),
+        ),
+        (
+            "shift-r",
+            Box::new(|k| KeyBinding::new(k, RevealTrace, Some("LensletApp"))),
+        ),
+        (
+            "g",
+            Box::new(|k| KeyBinding::new(k, NextMatch, Some("LensletApp"))),
+        ),
+        (
+            "shift-g",
+            Box::new(|k| KeyBinding::new(k, PrevMatch, Some("LensletApp"))),
         ),
         (
             "r",
@@ -85,6 +112,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         (
             "enter",
             Box::new(|k| KeyBinding::new(k, Replay, Some(NOT_TYPING))),
+        ),
+        (
+            "shift-enter",
+            Box::new(|k| KeyBinding::new(k, OpenComposer, Some(NOT_TYPING))),
         ),
         ("c", Box::new(|k| KeyBinding::new(k, Copy, Some("Body")))),
         (
@@ -137,9 +168,19 @@ fn menus() -> Vec<Menu> {
             ],
         },
         Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("Open Trace File…", OpenFile),
+                MenuItem::action("Export Run Summary…", ExportReport),
+                MenuItem::action("Reveal Trace File", RevealTrace),
+            ],
+        },
+        Menu {
             name: "Edit".into(),
             items: vec![
                 MenuItem::action("Search", FocusSearch),
+                MenuItem::action("Find Next Match", NextMatch),
+                MenuItem::action("Find Previous Match", PrevMatch),
                 MenuItem::separator(),
                 MenuItem::action("Copy Call as curl", CopyCurl),
                 MenuItem::action("Copy IAM Policy JSON", CopyPolicy),
@@ -151,6 +192,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Calls", ShowCalls),
                 MenuItem::action("Access", ShowAccess),
                 MenuItem::separator(),
+                MenuItem::action("Toggle Workspace Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Inspector", ToggleInspector),
                 MenuItem::action("Reload Run", ReloadRun),
             ],
@@ -159,6 +201,7 @@ fn menus() -> Vec<Menu> {
             name: "Run".into(),
             items: vec![
                 MenuItem::action("Replay Selected Call", Replay),
+                MenuItem::action("Edit & Replay Call…", OpenComposer),
                 MenuItem::separator(),
                 MenuItem::action("Previous Run", PrevRun),
                 MenuItem::action("Next Run", NextRun),
@@ -194,53 +237,55 @@ fn main() {
         static LOGGER: StderrLog = StderrLog;
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
     }
-    Application::new().run(|cx: &mut App| {
-        fonts::install(cx);
-        cx.bind_keys(key_bindings());
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        // The native menu bar is a macOS idiom; elsewhere every menu command
-        // is in the command palette.
-        if cfg!(target_os = "macos") {
-            cx.set_menus(menus());
-        }
-
-        let saved = prefs::load(&app::home());
-        let width = saved.window_width.unwrap_or(1340.0).clamp(960.0, 3840.0);
-        let height = saved.window_height.unwrap_or(840.0).clamp(640.0, 2400.0);
-        let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-
-        // A unified, transparent titlebar on macOS; normal decorations
-        // elsewhere (a transparent one would stack two title bars on Linux).
-        let titlebar = if cfg!(target_os = "macos") {
-            gpui::TitlebarOptions {
-                title: Some("Lenslet".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(gpui::point(px(14.0), px(14.0))),
+    Application::new()
+        .with_assets(icons::Assets)
+        .run(|cx: &mut App| {
+            fonts::install(cx);
+            cx.bind_keys(key_bindings());
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            // The native menu bar is a macOS idiom; elsewhere every menu command
+            // is in the command palette.
+            if cfg!(target_os = "macos") {
+                cx.set_menus(menus());
             }
-        } else {
-            gpui::TitlebarOptions {
-                title: Some("Lenslet".into()),
-                appears_transparent: false,
-                traffic_light_position: None,
-            }
-        };
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(960.0), px(640.0))),
-                    window_background: WindowBackgroundAppearance::Opaque,
-                    app_id: Some("lenslet".to_string()),
-                    titlebar: Some(titlebar),
-                    ..Default::default()
-                },
-                |window, cx| cx.new(|cx| LensletApp::new(saved, window, cx)),
-            )
-            .expect("open Lenslet window");
-        window
-            .update(cx, |_, _, cx| cx.activate(true))
-            .expect("activate Lenslet");
-    });
+
+            let saved = prefs::load(&app::home());
+            let width = saved.window_width.unwrap_or(1340.0).clamp(960.0, 3840.0);
+            let height = saved.window_height.unwrap_or(840.0).clamp(640.0, 2400.0);
+            let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+
+            // A unified, transparent titlebar on macOS; normal decorations
+            // elsewhere (a transparent one would stack two title bars on Linux).
+            let titlebar = if cfg!(target_os = "macos") {
+                gpui::TitlebarOptions {
+                    title: Some("Lenslet".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(gpui::point(px(14.0), px(14.0))),
+                }
+            } else {
+                gpui::TitlebarOptions {
+                    title: Some("Lenslet".into()),
+                    appears_transparent: false,
+                    traffic_light_position: None,
+                }
+            };
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_min_size: Some(size(px(960.0), px(640.0))),
+                        window_background: WindowBackgroundAppearance::Opaque,
+                        app_id: Some("lenslet".to_string()),
+                        titlebar: Some(titlebar),
+                        ..Default::default()
+                    },
+                    |window, cx| cx.new(|cx| LensletApp::new(saved, window, cx)),
+                )
+                .expect("open Lenslet window");
+            window
+                .update(cx, |_, _, cx| cx.activate(true))
+                .expect("activate Lenslet");
+        });
 }
 
 #[cfg(test)]

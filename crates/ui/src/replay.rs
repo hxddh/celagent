@@ -126,6 +126,20 @@ pub struct ReplayTarget {
     pub via_proxy: bool,
 }
 
+/// An interactive request edited in the Request Composer.
+#[derive(Clone, Debug)]
+pub struct ComposedRequest {
+    pub call_id: Option<String>,
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub service: String,
+    pub region: String,
+    pub headers: Vec<Header>,
+    pub body: String,
+    pub resign_sigv4: bool,
+}
+
 pub fn replay_call(
     trace: &Trace,
     replay_target: &ReplayTarget,
@@ -144,8 +158,130 @@ pub fn replay_call(
 
     let req_wire = build_http_request(trace, &target, &extra)?;
     let is_head = trace.method.eq_ignore_ascii_case("HEAD");
-    let started = Instant::now();
+    send_wire(&target, &req_wire, is_head, home)
+}
 
+pub fn send_composed(
+    req: &ComposedRequest,
+    replay_target: &ReplayTarget,
+    home: &Path,
+) -> Result<ReplayOutcome, String> {
+    crate::fsguard::assert_io_allowed();
+    let upstream_url = replay_target.url.as_str();
+    let target = parse_loopback_target(upstream_url).ok_or_else(|| {
+        format!("Replay refused: `{upstream_url}` is not a loopback emulator endpoint")
+    })?;
+
+    let method = req.method.trim().to_ascii_uppercase();
+    if method.is_empty() || method.bytes().any(|b| !b.is_ascii_alphabetic()) {
+        return Err(format!("Invalid HTTP method `{method}`"));
+    }
+    let path = if req.path.trim().is_empty() {
+        "/".to_string()
+    } else if req.path.trim().starts_with('/') {
+        req.path.trim().replace(['\r', '\n'], "")
+    } else {
+        format!("/{}", req.path.trim().replace(['\r', '\n'], ""))
+    };
+    let host_val = if req.host.trim().is_empty() {
+        format!("{}:{}", target.host, target.port)
+    } else {
+        req.host.trim().replace(['\r', '\n'], "")
+    };
+
+    let mut clean_headers: Vec<Header> = Vec::with_capacity(req.headers.len() + 2);
+    let mut saw_host = false;
+    for h in &req.headers {
+        let low = h.name.trim().to_ascii_lowercase();
+        if low.is_empty()
+            || matches!(
+                low.as_str(),
+                "content-length" | "transfer-encoding" | "connection" | "expect"
+            )
+            || low.eq_ignore_ascii_case(REPLAY_OF_HEADER)
+        {
+            continue;
+        }
+        if low == "host" {
+            saw_host = true;
+        }
+        clean_headers.push(Header {
+            name: h.name.trim().replace(['\r', '\n'], ""),
+            value: h.value.replace(['\r', '\n'], " "),
+        });
+    }
+    if !saw_host {
+        clean_headers.insert(
+            0,
+            Header {
+                name: "host".into(),
+                value: host_val.clone(),
+            },
+        );
+    }
+
+    if req.resign_sigv4 {
+        let svc = if req.service.trim().is_empty() {
+            "s3"
+        } else {
+            req.service.trim()
+        };
+        let reg = if req.region.trim().is_empty() {
+            "us-east-1"
+        } else {
+            req.region.trim()
+        };
+        let existing_ak = clean_headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+            .and_then(|h| crate::model::decode_sigv4_header(&h.value))
+            .map(|d| d.access_key_id)
+            .filter(|k| !k.is_empty());
+        let ak = existing_ak.as_deref().unwrap_or("test");
+        crate::sigv4::sign_headers(
+            &mut clean_headers,
+            req.body.as_bytes(),
+            &crate::sigv4::SignParams {
+                method: &method,
+                path_and_query: &path,
+                host: &host_val,
+                service: svc,
+                region: reg,
+                access_key: ak,
+                secret_key: "test",
+                session_token: None,
+            },
+        );
+    }
+    let final_headers = clean_headers;
+
+    let body_bytes = req.body.as_bytes();
+    let mut wire = Vec::with_capacity(512 + body_bytes.len());
+    wire.extend_from_slice(format!("{method} {path} HTTP/1.1\r\n").as_bytes());
+    for h in &final_headers {
+        wire.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
+    }
+    if replay_target.via_proxy
+        && let Some(id) = req.call_id.as_deref()
+    {
+        let clean = id.replace(['\r', '\n'], " ");
+        wire.extend_from_slice(format!("{REPLAY_OF_HEADER}: {clean}\r\n").as_bytes());
+    }
+    wire.extend_from_slice(format!("Content-Length: {}\r\n", body_bytes.len()).as_bytes());
+    wire.extend_from_slice(b"Connection: close\r\n\r\n");
+    wire.extend_from_slice(body_bytes);
+
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    send_wire(&target, &wire, is_head, home)
+}
+
+fn send_wire(
+    target: &LoopbackTarget,
+    req_wire: &[u8],
+    is_head: bool,
+    home: &Path,
+) -> Result<ReplayOutcome, String> {
+    let started = Instant::now();
     let raw_response = if target.tls {
         let stream = connect_loopback(&target.host, target.port)?;
         let tls_cfg = build_tls_config(target.port, home)?;
@@ -155,14 +291,14 @@ pub fn replay_call(
             .map_err(|e| format!("TLS handshake init failed: {e}"))?;
         let mut tls_stream = StreamOwned::new(conn, stream);
         tls_stream
-            .write_all(&req_wire)
+            .write_all(req_wire)
             .map_err(|e| format!("TLS write failed: {e}"))?;
         tls_stream.flush().ok();
         read_bounded(&mut tls_stream, is_head)?
     } else {
         let mut stream = connect_loopback(&target.host, target.port)?;
         stream
-            .write_all(&req_wire)
+            .write_all(req_wire)
             .map_err(|e| format!("HTTP write failed: {e}"))?;
         stream.flush().ok();
         read_bounded(&mut stream, is_head)?
@@ -493,6 +629,12 @@ fn parse_http_response(raw: &[u8], is_head: bool, ms: u64) -> Result<ReplayOutco
             Some("deflate") => decompress_bytes(ZlibDecoder::new(&unchunked[..]))
                 .or_else(|| decompress_bytes(DeflateDecoder::new(&unchunked[..])))
                 .unwrap_or(unchunked),
+            Some("zstd") => decompress_bytes(
+                zstd::stream::read::Decoder::new(&unchunked[..])
+                    .map_err(|_| ())
+                    .unwrap_or_else(|_| zstd::stream::read::Decoder::new(&[][..]).unwrap()),
+            )
+            .unwrap_or(unchunked),
             _ => unchunked,
         };
 
@@ -656,6 +798,53 @@ mod tests {
         let out = replay_call(&call, &target, Path::new(".")).unwrap();
         assert_eq!(out.status, 200);
         assert_eq!(out.body_text.as_deref(), Some("<ok/>"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn send_composed_resigns_sigv4_and_delivers_mutated_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 4096];
+            let n = sock.read(&mut req_buf).unwrap();
+            let req_text = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(
+                req_text.contains("AWS4-HMAC-SHA256 Credential=test/"),
+                "{req_text}"
+            );
+            assert!(
+                req_text.contains("{\"TableName\":\"mutated\"}"),
+                "{req_text}"
+            );
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+            )
+            .unwrap();
+        });
+
+        let composed = ComposedRequest {
+            call_id: Some("r3".into()),
+            method: "POST".into(),
+            path: "/".into(),
+            host: format!("127.0.0.1:{port}"),
+            service: "dynamodb".into(),
+            region: "us-east-1".into(),
+            headers: vec![Header {
+                name: "x-amz-target".into(),
+                value: "DynamoDB_20120810.PutItem".into(),
+            }],
+            body: "{\"TableName\":\"mutated\"}".into(),
+            resign_sigv4: true,
+        };
+        let out = send_composed(
+            &composed,
+            &direct(&format!("http://127.0.0.1:{port}")),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(out.status, 200);
         server.join().unwrap();
     }
 }

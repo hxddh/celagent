@@ -35,9 +35,13 @@ pub struct SearchInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    last_scroll_x: Pixels,
     is_selecting: bool,
     access_mode: bool,
     palette_mode: bool,
+    field_mode: bool,
+    mono_mode: bool,
+    custom_placeholder: Option<SharedString>,
 }
 
 impl SearchInput {
@@ -50,9 +54,13 @@ impl SearchInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            last_scroll_x: px(0.0),
             is_selecting: false,
             access_mode: false,
             palette_mode: false,
+            field_mode: false,
+            mono_mode: false,
+            custom_placeholder: None,
         }
     }
 
@@ -60,6 +68,35 @@ impl SearchInput {
         let mut s = Self::new(cx);
         s.palette_mode = true;
         s
+    }
+
+    /// Reusable single-line editable field (e.g. for Request Composer).
+    pub fn new_field(
+        initial: impl Into<SharedString>,
+        placeholder: impl Into<SharedString>,
+        mono: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let content: SharedString = initial.into();
+        let end = content.len();
+        let mut s = Self::new(cx);
+        s.content = content;
+        s.selected_range = end..end;
+        s.field_mode = true;
+        s.mono_mode = mono;
+        s.custom_placeholder = Some(placeholder.into());
+        s
+    }
+
+    pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let content: SharedString = text.into();
+        let end = content.len();
+        self.content = content;
+        self.selected_range = end..end;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.last_scroll_x = px(0.0);
+        cx.notify();
     }
 
     pub fn set_access_mode(&mut self, access_mode: bool, cx: &mut Context<Self>) {
@@ -133,6 +170,43 @@ impl SearchInput {
             .unwrap_or(self.content.len())
     }
 
+    fn previous_word_boundary(&self, offset: usize) -> usize {
+        let before = &self.content[..offset.min(self.content.len())];
+        let mut chars = before.char_indices().rev().peekable();
+        while let Some(&(_, ch)) = chars.peek() {
+            if ch.is_alphanumeric() || ch == '_' {
+                break;
+            }
+            chars.next();
+        }
+        let mut target = 0usize;
+        for (idx, ch) in chars {
+            if !(ch.is_alphanumeric() || ch == '_') {
+                break;
+            }
+            target = idx;
+        }
+        target
+    }
+
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let start = offset.min(self.content.len());
+        let after = &self.content[start..];
+        let mut chars = after.char_indices().peekable();
+        while let Some(&(_, ch)) = chars.peek() {
+            if ch.is_alphanumeric() || ch == '_' {
+                break;
+            }
+            chars.next();
+        }
+        for (rel, ch) in chars {
+            if !(ch.is_alphanumeric() || ch == '_') {
+                return start + rel;
+            }
+        }
+        self.content.len()
+    }
+
     fn backspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx);
@@ -200,8 +274,10 @@ impl SearchInput {
         }
 
         let shift = keystroke.modifiers.shift;
+        let word_jump =
+            keystroke.modifiers.alt || (!cfg!(target_os = "macos") && keystroke.modifiers.control);
         match key {
-            "escape" if !self.palette_mode => {
+            "escape" if !self.palette_mode && !self.field_mode => {
                 if self.content.is_empty() {
                     cx.emit(SearchEvent::Exit);
                 } else {
@@ -209,15 +285,20 @@ impl SearchInput {
                     self.selected_range = 0..0;
                     self.selection_reversed = false;
                     self.marked_range = None;
+                    self.last_scroll_x = px(0.0);
                     cx.notify();
                 }
                 cx.stop_propagation();
             }
-            "enter" if !self.palette_mode => {
+            "enter" if !self.palette_mode && !self.field_mode => {
                 cx.emit(SearchEvent::Exit);
                 cx.stop_propagation();
             }
             "backspace" => {
+                if word_jump && self.selected_range.is_empty() {
+                    let prev = self.previous_word_boundary(self.cursor_offset());
+                    self.select_to(prev, cx);
+                }
                 self.backspace(window, cx);
                 cx.stop_propagation();
             }
@@ -226,15 +307,18 @@ impl SearchInput {
                 cx.stop_propagation();
             }
             "left" => {
-                if shift {
-                    let offset = if self.selected_range.is_empty() {
-                        self.previous_boundary(self.cursor_offset())
+                let step_left = |this: &Self| {
+                    if word_jump {
+                        this.previous_word_boundary(this.cursor_offset())
                     } else {
-                        self.selected_range.start
-                    };
+                        this.previous_boundary(this.cursor_offset())
+                    }
+                };
+                if shift {
+                    let offset = step_left(self);
                     self.select_to(offset, cx);
                 } else if self.selected_range.is_empty() {
-                    let offset = self.previous_boundary(self.cursor_offset());
+                    let offset = step_left(self);
                     self.move_to(offset, cx);
                 } else {
                     self.move_to(self.selected_range.start, cx);
@@ -242,15 +326,18 @@ impl SearchInput {
                 cx.stop_propagation();
             }
             "right" => {
-                if shift {
-                    let offset = if self.selected_range.is_empty() {
-                        self.next_boundary(self.cursor_offset())
+                let step_right = |this: &Self| {
+                    if word_jump {
+                        this.next_word_boundary(this.cursor_offset())
                     } else {
-                        self.selected_range.end
-                    };
+                        this.next_boundary(this.cursor_offset())
+                    }
+                };
+                if shift {
+                    let offset = step_right(self);
                     self.select_to(offset, cx);
                 } else if self.selected_range.is_empty() {
-                    let offset = self.next_boundary(self.cursor_offset());
+                    let offset = step_right(self);
                     self.move_to(offset, cx);
                 } else {
                     self.move_to(self.selected_range.end, cx);
@@ -286,7 +373,7 @@ impl SearchInput {
         else {
             return 0;
         };
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.last_scroll_x)
     }
 
     fn on_mouse_down(
@@ -459,13 +546,14 @@ impl EntityInputHandler for SearchInput {
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.clamp_range(self.range_from_utf16(&range_utf16));
+        let scroll = self.last_scroll_x;
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + last_layout.x_for_index(range.start) - scroll,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + last_layout.x_for_index(range.end) - scroll,
                 bounds.bottom(),
             ),
         ))
@@ -479,7 +567,7 @@ impl EntityInputHandler for SearchInput {
     ) -> Option<usize> {
         let bounds = self.last_bounds?;
         let last_layout = self.last_layout.as_ref()?;
-        let index = last_layout.closest_index_for_x(point.x - bounds.left());
+        let index = last_layout.closest_index_for_x(point.x - bounds.left() + self.last_scroll_x);
         Some(self.offset_to_utf16(index))
     }
 }
@@ -499,6 +587,7 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    scroll_x: Pixels,
 }
 
 impl IntoElement for SearchTextElement {
@@ -603,37 +692,70 @@ impl Element for SearchTextElement {
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(display_text, font_size, &runs, None);
+        let avail_w = (bounds.size.width - px(4.0)).max(px(12.0));
+        let mut line =
+            window
+                .text_system()
+                .shape_line(display_text.clone(), font_size, &runs, None);
+        // When showing placeholder in a narrow search box, ellipsize cleanly so glyphs never
+        // collide against the trailing shortcut badge.
+        if input.content.is_empty() && line.width > avail_w && marked_range.is_none() {
+            let max_chars = ((f32::from(avail_w) / f32::from(font_size).max(8.0)) * 1.65) as usize;
+            let clipped: SharedString =
+                crate::model::ellipsize(&display_text, max_chars.max(6)).into();
+            let clipped_run = [TextRun {
+                len: clipped.len(),
+                font: style.font(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+            line = window
+                .text_system()
+                .shape_line(clipped, font_size, &clipped_run, None);
+        }
 
         let cursor_x = line.x_for_index(cursor);
+        let mut scroll_x = input.last_scroll_x;
+        if input.content.is_empty() {
+            scroll_x = px(0.0);
+        } else if cursor_x - scroll_x > avail_w {
+            scroll_x = cursor_x - avail_w;
+        } else if cursor_x < scroll_x {
+            scroll_x = cursor_x;
+        }
+        let max_scroll = (line.width - avail_w).max(px(0.0));
+        if scroll_x > max_scroll {
+            scroll_x = max_scroll;
+        }
+
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_x, bounds.top() + px(2.0)),
+                        point(bounds.left() + cursor_x - scroll_x, bounds.top() + px(2.0)),
                         size(px(1.5), bounds.bottom() - bounds.top() - px(4.0)),
                     ),
                     rgb(t.accent),
                 )),
             )
         } else {
+            let sel_l = (bounds.left() + line.x_for_index(selected_range.start) - scroll_x)
+                .max(bounds.left());
+            let sel_r = (bounds.left() + line.x_for_index(selected_range.end) - scroll_x)
+                .min(bounds.right());
             (
-                Some(fill(
-                    Bounds::from_corners(
-                        point(
-                            bounds.left() + line.x_for_index(selected_range.start),
-                            bounds.top() + px(1.0),
+                (sel_r > sel_l).then(|| {
+                    fill(
+                        Bounds::from_corners(
+                            point(sel_l, bounds.top() + px(1.0)),
+                            point(sel_r, bounds.bottom() - px(1.0)),
                         ),
-                        point(
-                            bounds.left() + line.x_for_index(selected_range.end),
-                            bounds.bottom() - px(1.0),
-                        ),
-                    ),
-                    theme::h(t.accent, 0.22),
-                )),
+                        theme::h(t.accent, 0.22),
+                    )
+                }),
                 None,
             )
         };
@@ -642,6 +764,7 @@ impl Element for SearchTextElement {
             line: Some(line),
             cursor,
             selection,
+            scroll_x,
         }
     }
 
@@ -665,8 +788,10 @@ impl Element for SearchTextElement {
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
+        let scroll_x = prepaint.scroll_x;
         let line = prepaint.line.take().expect("shaped search text");
-        line.paint(bounds.origin, window.line_height(), window, cx)
+        let paint_origin = point(bounds.origin.x - scroll_x, bounds.origin.y);
+        line.paint(paint_origin, window.line_height(), window, cx)
             .ok();
 
         if focus_handle.is_focused(window)
@@ -678,6 +803,7 @@ impl Element for SearchTextElement {
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.last_scroll_x = scroll_x;
         });
     }
 }
@@ -690,7 +816,9 @@ impl Render for SearchInput {
         let focused = self.focus.is_focused(window);
         let compact = window.viewport_size().width < px(1_180.0);
         let has_query = !self.content.is_empty();
-        let placeholder: SharedString = if self.palette_mode {
+        let placeholder: SharedString = if let Some(custom) = self.custom_placeholder.as_ref() {
+            custom.clone()
+        } else if self.palette_mode {
             ui.t(
                 "Type a command, AWS service, run, or preference…",
                 "输入命令、AWS 服务、历史运行或偏好设置…",
@@ -734,6 +862,55 @@ impl Render for SearchInput {
             })
             .child("×")
             .on_click(cx.listener(|this, _, window, cx| this.clear(window, cx)));
+
+        if self.field_mode {
+            return div()
+                .w_full()
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(9.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(if focused {
+                    theme::h(t.accent, 0.58)
+                } else {
+                    theme::h(t.border, 1.0)
+                })
+                .bg(if focused {
+                    rgb(t.input_focused)
+                } else {
+                    rgb(t.input)
+                })
+                .text_size(px(12.0))
+                .line_height(px(16.0))
+                .font(if self.mono_mode {
+                    fonts::mono_font()
+                } else {
+                    fonts::sans_font()
+                })
+                .text_color(rgb(t.text))
+                .track_focus(&self.focus)
+                .key_context("ComposerField")
+                .cursor_text()
+                .on_key_down(cx.listener(Self::on_key_down))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(SearchTextElement {
+                            input: cx.entity(),
+                            placeholder: placeholder.clone(),
+                        }),
+                )
+                .when(has_query, |el| el.child(clear));
+        }
 
         let trailing: gpui::AnyElement = if self.palette_mode {
             div()
@@ -807,7 +984,7 @@ impl Render for SearchInput {
             .h(px(27.0))
             .flex()
             .items_center()
-            .gap(px(7.0))
+            .gap(px(8.0))
             .px(px(9.0))
             .rounded(px(6.0))
             .border_1()
@@ -842,6 +1019,7 @@ impl Render for SearchInput {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
+                    .pr(px(4.0))
                     .overflow_hidden()
                     .child(SearchTextElement {
                         input: cx.entity(),

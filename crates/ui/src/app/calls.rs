@@ -3,12 +3,17 @@
 //! incrementally for appends, on the background executor for large searches —
 //! never in render.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use gpui::{
     AnyElement, App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString,
-    Stateful, Task, UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
+    FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollStrategy,
+    SharedString, Stateful, Task, UniformListScrollHandle, Window, div, prelude::*, px, rgb,
+    uniform_list,
 };
 use lenslet_core::findings::{Finding, Severity};
 
@@ -17,7 +22,7 @@ use super::{
     widgets,
 };
 use crate::{
-    fonts, glyph,
+    fonts, glyph, i18n,
     model::{
         CallFilter, ServiceFacet, StatusFilter, Trace, display_path, ellipsize, format_latency,
         format_offset, operation_label, search_tokens, short_clock, status_label,
@@ -25,6 +30,16 @@ use crate::{
     store::{BACKGROUND_SEARCH_ROWS, Stats, ViewQuery, filter_rows},
     theme::{self, Ui, text},
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortCol {
+    #[default]
+    Time,
+    Service,
+    Operation,
+    Status,
+    Duration,
+}
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(60);
 const PAGE_ROWS: isize = 20;
@@ -54,6 +69,11 @@ pub struct CallsList {
     /// The user picked a row; stop following the newest call.
     pinned: bool,
     findings_open: bool,
+    sort_col: SortCol,
+    sort_asc: bool,
+    group_retries: bool,
+    attempt_counts: Arc<HashMap<String, usize>>,
+    timeline_drag_anchor: Option<usize>,
     view_generation: u64,
     _search_task: Option<Task<()>>,
     _subscription: gpui::Subscription,
@@ -96,6 +116,11 @@ impl CallsList {
             selected: None,
             pinned: false,
             findings_open: true,
+            sort_col: SortCol::Time,
+            sort_asc: true,
+            group_retries: false,
+            attempt_counts: Arc::new(HashMap::new()),
+            timeline_drag_anchor: None,
             view_generation: 0,
             _search_task: None,
             _subscription: subscription,
@@ -154,8 +179,9 @@ impl CallsList {
 
     fn on_rows(&mut self, delta: crate::store::Delta, cx: &mut Context<Self>) {
         let follow = !self.pinned && self.near_bottom();
+        let custom_view = self.group_retries || self.sort_col != SortCol::Time || !self.sort_asc;
         match delta.appended_from {
-            Some(from) if !delta.reindexed => {
+            Some(from) if !delta.reindexed && !custom_view => {
                 self.snapshot(cx);
                 let query = self.query(cx);
                 let mut view = (*self.view).clone();
@@ -201,23 +227,40 @@ impl CallsList {
         let generation = self.view_generation;
         let query = self.query(cx);
         let rows = self.rows.clone();
+        let sort_col = self.sort_col;
+        let sort_asc = self.sort_asc;
+        let group_retries = self.group_retries;
         let follow = !self.pinned && self.near_bottom();
-        if query.tokens.is_empty() || rows.len() <= BACKGROUND_SEARCH_ROWS {
-            let (view, changed) = compute_view(&rows, &query);
+        if query.tokens.is_empty() && rows.len() <= BACKGROUND_SEARCH_ROWS {
+            let (view, changed, counts) =
+                compute_view(&rows, &query, sort_col, sort_asc, group_retries);
             self.view = Arc::new(view);
             self.changed = changed;
+            self.attempt_counts = Arc::new(counts);
+            self.after_view_change(follow, cx);
+            return;
+        }
+        if rows.len() <= BACKGROUND_SEARCH_ROWS {
+            let (view, changed, counts) =
+                compute_view(&rows, &query, sort_col, sort_asc, group_retries);
+            self.view = Arc::new(view);
+            self.changed = changed;
+            self.attempt_counts = Arc::new(counts);
             self.after_view_change(follow, cx);
             return;
         }
         self._search_task = Some(cx.spawn(async move |this, cx| {
-            let (view, changed) = cx
+            let (view, changed, counts) = cx
                 .background_executor()
-                .spawn(async move { compute_view(&rows, &query) })
+                .spawn(
+                    async move { compute_view(&rows, &query, sort_col, sort_asc, group_retries) },
+                )
                 .await;
             this.update(cx, |list, cx| {
                 if list.view_generation == generation {
                     list.view = Arc::new(view);
                     list.changed = changed;
+                    list.attempt_counts = Arc::new(counts);
                     list.after_view_change(follow, cx);
                 }
             })
@@ -306,6 +349,21 @@ impl CallsList {
             status
         };
         self.set_filter(filter, cx);
+    }
+
+    pub fn toggle_sort(&mut self, col: SortCol, cx: &mut Context<Self>) {
+        if self.sort_col == col {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_col = col;
+            self.sort_asc = !matches!(col, SortCol::Duration | SortCol::Status);
+        }
+        self.recompute(cx);
+    }
+
+    pub fn toggle_group_retries(&mut self, cx: &mut Context<Self>) {
+        self.group_retries = !self.group_retries;
+        self.recompute(cx);
     }
 
     pub fn set_service(&mut self, service: Option<String>, cx: &mut Context<Self>) {
@@ -473,6 +531,27 @@ impl CallsList {
                 StatusFilter::Retries,
                 t.accent,
             ));
+            let entity = entity.clone();
+            bar = bar.child(
+                widgets::chip(
+                    ui,
+                    "f-group-retries",
+                    ui.t("Group retries", "合并重试"),
+                    None,
+                    self.group_retries,
+                    t.accent,
+                )
+                .tooltip(widgets::tip(
+                    ui.t(
+                        "Collapse multi-attempt SDK invocations into their final attempt",
+                        "将同一次 SDK 调用的多次重试折叠为最终尝试",
+                    ),
+                    None,
+                ))
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |list, cx| list.toggle_group_retries(cx));
+                }),
+            );
         }
         if stats.slow > 0 {
             bar = bar.child(status_chip(
@@ -661,13 +740,10 @@ impl CallsList {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .font_family(fonts::mono())
+                            .font(fonts::mono_font())
                             .text_size(px(text::XS))
                             .text_color(rgb(t.text_muted))
-                            .child(match finding.calls.len() {
-                                1 => "1 call".to_string(),
-                                n => format!("{n} calls"),
-                            }),
+                            .child(i18n::calls_count(finding.calls.len(), ui.lang)),
                     );
                 if let Some(detail) = finding.detail.clone() {
                     row = row.tooltip(widgets::tip(detail, None));
@@ -680,7 +756,7 @@ impl CallsList {
                         .px(px(theme::ROW_PAD_X + 20.0))
                         .text_size(px(text::SM))
                         .text_color(rgb(t.text_muted))
-                        .child(format!("+{} more", findings.len() - 6)),
+                        .child(i18n::more_count(findings.len() - 6, ui.lang)),
                 );
             }
             strip = strip.child(list);
@@ -766,15 +842,33 @@ impl CallsList {
                     .flex()
                     .items_end()
                     .cursor_pointer()
-                    .on_click(cx.listener(move |list, _, _, cx| {
-                        let mut filter = list.filter.clone();
-                        let next = Some((win_s, win_e));
-                        filter.time_window = if filter.time_window == next {
-                            None
-                        } else {
-                            next
-                        };
-                        list.set_filter(filter, cx);
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |list, _, _, cx| {
+                            list.timeline_drag_anchor = Some(idx);
+                            let mut filter = list.filter.clone();
+                            let next = Some((win_s, win_e));
+                            filter.time_window = if filter.time_window == next {
+                                None
+                            } else {
+                                next
+                            };
+                            list.set_filter(filter, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |list, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(MouseButton::Left)
+                            && let Some(anchor) = list.timeline_drag_anchor
+                            && anchor != idx
+                        {
+                            let lo = anchor.min(idx);
+                            let hi = anchor.max(idx);
+                            let bs = (lo as f64 * width).floor() as i64;
+                            let be = (((hi + 1) as f64 * width).ceil() as i64).max(bs + 1);
+                            let mut filter = list.filter.clone();
+                            filter.time_window = Some((bs, be));
+                            list.set_filter(filter, cx);
+                        }
                     }))
                     .child(
                         div()
@@ -796,6 +890,14 @@ impl CallsList {
                 .bg(rgb(t.strip))
                 .border_b_1()
                 .border_color(rgb(t.border_subtle))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|list, _, _, _| list.timeline_drag_anchor = None),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|list, _, _, _| list.timeline_drag_anchor = None),
+                )
                 .child(bars)
                 .child(
                     div()
@@ -808,14 +910,43 @@ impl CallsList {
         )
     }
 
-    fn render_head(&self, ui: &Ui) -> Div {
+    fn render_head(&self, ui: &Ui, cx: &mut Context<Self>) -> Div {
         let t = ui.p;
-        let head = |label: &'static str, width: Option<f32>| {
+        let sort_col = self.sort_col;
+        let sort_asc = self.sort_asc;
+        let entity = cx.entity();
+        let head = |id: &'static str,
+                    col: SortCol,
+                    label: &'static str,
+                    width: Option<f32>,
+                    right: bool| {
+            let entity = entity.clone();
+            let active = sort_col == col;
+            let arrow = if !active || (col == SortCol::Time && sort_asc) {
+                ""
+            } else if sort_asc {
+                " ▲"
+            } else {
+                " ▼"
+            };
             let cell = div()
+                .id(id)
+                .flex()
+                .items_center()
+                .when(right, |el| el.justify_end())
                 .text_size(px(text::XS))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(t.text_muted))
-                .child(label);
+                .text_color(rgb(if active && !arrow.is_empty() {
+                    t.accent
+                } else {
+                    t.text_muted
+                }))
+                .cursor_pointer()
+                .hover(move |s| s.text_color(rgb(t.text)))
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |list, cx| list.toggle_sort(col, cx));
+                })
+                .child(format!("{label}{arrow}"));
             match width {
                 Some(w) => cell.w(px(w)).flex_shrink_0(),
                 None => cell.flex_1().min_w(px(0.0)),
@@ -830,19 +961,50 @@ impl CallsList {
             .bg(rgb(t.table_head))
             .border_b_1()
             .border_color(rgb(t.border_subtle))
-            .child(head(ui.t("TIME", "时间"), Some(theme::COL_TIME)))
-            .child(head("SERVICE", Some(theme::COL_SERVICE)))
-            .child(head("OPERATION", None))
-            .child(head("STATUS", Some(theme::COL_STATUS)))
-            .child(head(ui.t("DURATION", "耗时"), Some(theme::COL_LATENCY)).text_right())
+            .child(head(
+                "sort-time",
+                SortCol::Time,
+                ui.t("TIME", "时间"),
+                Some(theme::COL_TIME),
+                false,
+            ))
+            .child(head(
+                "sort-svc",
+                SortCol::Service,
+                "SERVICE",
+                Some(theme::COL_SERVICE),
+                false,
+            ))
+            .child(head(
+                "sort-op",
+                SortCol::Operation,
+                "OPERATION",
+                None,
+                false,
+            ))
+            .child(head(
+                "sort-status",
+                SortCol::Status,
+                "STATUS",
+                Some(theme::COL_STATUS),
+                false,
+            ))
+            .child(head(
+                "sort-dur",
+                SortCol::Duration,
+                ui.t("DURATION", "耗时"),
+                Some(theme::COL_LATENCY),
+                true,
+            ))
     }
 
     fn render_empty(&self, ui: &Ui, health: &Health, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
+        let lang = ui.lang;
         let command = widgets::command_line(ui, START_COMMAND, move |_, cx| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(START_COMMAND.to_string()));
             weak.update(cx, |_, cx| {
-                cx.emit(CallsEvent::Toast("Copied command".into()))
+                cx.emit(CallsEvent::Toast(i18n::copied("command", lang)))
             })
             .ok();
         });
@@ -907,8 +1069,14 @@ fn color_hex(color: gpui::Rgba) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-/// The view and the number of changed calls.
-fn compute_view(rows: &[Arc<Trace>], query: &ViewQuery) -> (Vec<u32>, usize) {
+/// The view, changed-call count, and per-call collapsed attempt counts.
+fn compute_view(
+    rows: &[Arc<Trace>],
+    query: &ViewQuery,
+    sort_col: SortCol,
+    sort_asc: bool,
+    group_retries: bool,
+) -> (Vec<u32>, usize, HashMap<String, usize>) {
     let changed = if query.changes.new_access || !query.changes.new_failures.is_empty() {
         rows.iter()
             .filter(|row| query.changes.is_changed(row))
@@ -916,7 +1084,55 @@ fn compute_view(rows: &[Arc<Trace>], query: &ViewQuery) -> (Vec<u32>, usize) {
     } else {
         0
     };
-    (filter_rows(rows, query), changed)
+    let mut indices = filter_rows(rows, query);
+    let mut collapsed_counts: HashMap<String, usize> = HashMap::new();
+    if group_retries {
+        // Keep only the latest row for each non-replay `invocation_id` in `indices`.
+        let mut last_for_inv: HashMap<&str, (u32, usize)> = HashMap::new();
+        for &ix in &indices {
+            let r = &rows[ix as usize];
+            if r.replay_of.is_none()
+                && let Some(inv) = r.invocation_id.as_deref()
+            {
+                let entry = last_for_inv.entry(inv).or_insert((ix, 0));
+                entry.0 = ix;
+                entry.1 += 1;
+            }
+        }
+        indices.retain(|&ix| {
+            let r = &rows[ix as usize];
+            if r.replay_of.is_none()
+                && let Some(inv) = r.invocation_id.as_deref()
+                && let Some(&(keep_ix, count)) = last_for_inv.get(inv)
+            {
+                if count > 1 && keep_ix == ix {
+                    collapsed_counts.insert(r.id.clone(), count);
+                }
+                return keep_ix == ix;
+            }
+            true
+        });
+    }
+    if !(sort_col == SortCol::Time && sort_asc) {
+        indices.sort_by(|&a, &b| {
+            let ra = &rows[a as usize];
+            let rb = &rows[b as usize];
+            let ord = match sort_col {
+                SortCol::Time => a.cmp(&b),
+                SortCol::Service => ra
+                    .service_name()
+                    .cmp(rb.service_name())
+                    .then_with(|| a.cmp(&b)),
+                SortCol::Operation => operation_label(ra)
+                    .cmp(operation_label(rb))
+                    .then_with(|| a.cmp(&b)),
+                SortCol::Status => ra.status.cmp(&rb.status).then_with(|| a.cmp(&b)),
+                SortCol::Duration => ra.ms.cmp(&rb.ms).then_with(|| a.cmp(&b)),
+            };
+            if sort_asc { ord } else { ord.reverse() }
+        });
+    }
+    (indices, changed, collapsed_counts)
 }
 
 impl Render for CallsList {
@@ -938,6 +1154,7 @@ impl Render for CallsList {
             let rows = self.rows.clone();
             let view = self.view.clone();
             let selected = self.selected.clone();
+            let attempt_counts = self.attempt_counts.clone();
             let entity = cx.entity().downgrade();
             uniform_list("calls", view.len(), move |range, _window, cx| {
                 let _scope = crate::fsguard::RenderScope::enter();
@@ -949,12 +1166,14 @@ impl Render for CallsList {
                         let prev_end = index.checked_sub(1).and_then(|prev| {
                             rows[prev].at_ms().map(|at| at + rows[prev].ms as i64)
                         });
+                        let grouped_attempts = attempt_counts.get(&row.id).copied();
                         call_row(
                             &ui,
                             row,
                             position,
                             selected.as_deref() == Some(row.id.as_str()),
                             changes.is_changed(row),
+                            grouped_attempts,
                             start_ms,
                             span_ms,
                             prev_end,
@@ -983,7 +1202,7 @@ impl Render for CallsList {
             .child(self.render_subbar(&ui, cx))
             .children(self.render_findings(&ui, &findings, cx))
             .children(self.render_timeline(&ui, start_ms, span_ms, cx))
-            .child(self.render_head(&ui))
+            .child(self.render_head(&ui, cx))
             .child(body)
     }
 }
@@ -995,6 +1214,7 @@ fn call_row(
     position: usize,
     selected: bool,
     changed: bool,
+    grouped_attempts: Option<usize>,
     run_start_ms: Option<i64>,
     run_span_ms: i64,
     prev_end_ms: Option<i64>,
@@ -1019,6 +1239,7 @@ fn call_row(
     } else {
         ui.status_color(trace.status)
     };
+    let semantic = trace.semantic_target();
 
     let mut title = div()
         .flex()
@@ -1027,16 +1248,34 @@ fn call_row(
         .min_w(px(0.0))
         .child(
             div()
-                .flex_shrink()
-                .min_w(px(0.0))
+                .flex_shrink_0()
                 .text_size(px(text::LG))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(rgb(t.text))
                 .whitespace_nowrap()
-                .overflow_hidden()
-                .text_ellipsis()
                 .child(operation_label(trace).to_string()),
         );
+    if !comfortable {
+        let compact_hint = if let Some(problem) = trace.problem.as_ref() {
+            Some((problem.code.clone(), status_color))
+        } else {
+            (!semantic.is_empty()).then(|| (semantic.clone(), rgb(t.text_muted)))
+        };
+        if let Some((hint_text, hint_color)) = compact_hint {
+            title = title.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .font(fonts::mono_font())
+                    .text_size(px(text::XS))
+                    .text_color(hint_color)
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(hint_text),
+            );
+        }
+    }
     if trace.blocked {
         title = title.child(widgets::badge(ui, "BLOCKED", t.purple));
     }
@@ -1045,11 +1284,21 @@ fn call_row(
     } else if trace.new && !trace.blocked {
         title = title.child(widgets::badge(ui, "NEW ACCESS", t.amber));
     }
-    if let Some(retry) = trace.retry_badge() {
+    if let Some(n) = grouped_attempts {
+        title = title.child(widgets::badge(ui, format!("↻ ×{n}"), t.accent));
+    } else if let Some(retry) = trace.retry_badge() {
         title = title.child(widgets::badge(ui, retry, t.accent));
     }
     if trace.replay_of.is_some() {
         title = title.child(widgets::badge(ui, "REPLAY", t.accent));
+    }
+    if let Some(role) = trace.caller_role.as_deref() {
+        let short_role = role.rsplit('/').next().unwrap_or(role);
+        title = title.child(widgets::badge(
+            ui,
+            format!("role/{}", ellipsize(short_role, 18)),
+            t.text_muted,
+        ));
     }
 
     let detail = match trace.problem.as_ref() {
@@ -1061,7 +1310,7 @@ fn call_row(
             .child(
                 div()
                     .flex_shrink_0()
-                    .font_family(fonts::mono())
+                    .font(fonts::mono_font())
                     .text_size(px(text::SM))
                     .text_color(status_color)
                     .child(ellipsize(&problem.code, 40)),
@@ -1075,14 +1324,37 @@ fn call_row(
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(problem.message.clone().unwrap_or_default()),
+                    .child(
+                        problem
+                            .message
+                            .clone()
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or_else(|| semantic.clone()),
+                    ),
+            ),
+        None if !semantic.is_empty() => div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .min_w(px(0.0))
+            .font(fonts::mono_font())
+            .text_size(px(text::SM))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_color(rgb(t.text_soft))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(semantic),
             ),
         None => div()
             .flex()
             .items_center()
             .gap(px(6.0))
             .min_w(px(0.0))
-            .font_family(fonts::mono())
+            .font(fonts::mono_font())
             .text_size(px(text::SM))
             .child(
                 div()
@@ -1105,10 +1377,14 @@ fn call_row(
     const TRACK_W: f32 = 44.0;
     let (wf_left, wf_w) = match (trace.at_ms(), run_start_ms) {
         (Some(at), Some(start)) => {
-            let s = ((at - start).max(0) as f32 / run_span_ms as f32).clamp(0.0, 0.96);
-            let d = (trace.ms.max(1) as f32 / run_span_ms as f32).clamp(0.06, 1.0);
-            let left = (s * TRACK_W).min(TRACK_W - 3.0);
-            (left, (d * TRACK_W).clamp(3.0, TRACK_W - left))
+            let s = ((at - start).max(0) as f32 / run_span_ms as f32).clamp(0.0, 0.92);
+            // Log-scaled duration width so 2ms vs 50ms vs 800ms calls stay visually legible
+            // even across multi-minute sessions.
+            let log_ratio = ((1.0 + trace.ms.max(1) as f32).ln()
+                / (1.0 + run_span_ms.max(20) as f32).ln())
+            .clamp(0.08, 0.75);
+            let left = (s * TRACK_W).min(TRACK_W - 4.0);
+            (left, (log_ratio * TRACK_W).clamp(3.5, TRACK_W - left))
         }
         _ => (0.0, 6.0),
     };
@@ -1299,7 +1575,7 @@ fn call_row(
                             ui.latency_color(trace.ms)
                         })
                         .child(if trace.pending {
-                            "running".to_string()
+                            ui.t("running", "进行中").to_string()
                         } else {
                             format_latency(trace.ms)
                         }),

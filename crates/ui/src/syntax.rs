@@ -13,6 +13,8 @@ pub enum SyntaxKind {
     Xml,
     Form,
     Hex,
+    Iac,
+    Diff,
     Plain,
 }
 
@@ -53,6 +55,8 @@ pub fn highlight_code(
             SyntaxKind::Xml => highlight_xml(text, p),
             SyntaxKind::Form => highlight_form(text, p),
             SyntaxKind::Hex => highlight_hex(text, p),
+            SyntaxKind::Iac => highlight_iac(text, p),
+            SyntaxKind::Diff => highlight_diff(text, p),
             SyntaxKind::Plain => Vec::new(),
         }
     } else {
@@ -296,9 +300,138 @@ fn highlight_hex(text: &str, p: &Palette) -> Vec<(Range<usize>, HighlightStyle)>
     out
 }
 
+fn highlight_iac(text: &str, p: &Palette) -> Vec<(Range<usize>, HighlightStyle)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                out.push((start..i, fg(p.text_faint)));
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                out.push((start..i, fg(p.text_faint)));
+            }
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                        if i < bytes.len() {
+                            i += text[i..].chars().next().map_or(1, char::len_utf8);
+                        }
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += text[i..].chars().next().map_or(1, char::len_utf8);
+                }
+                out.push((start..i, fg(p.green)));
+            }
+            b'!' if bytes.get(i + 1).is_some_and(u8::is_ascii_alphabetic) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                out.push((start..i, fg_weight(p.purple, FontWeight::MEDIUM)));
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-'))
+                {
+                    i += 1;
+                }
+                let word = &text[start..i];
+                let mut k = i;
+                while k < bytes.len() && matches!(bytes[k], b' ' | b'\t') {
+                    k += 1;
+                }
+                let is_kw = matches!(
+                    word,
+                    "data"
+                        | "statement"
+                        | "condition"
+                        | "import"
+                        | "from"
+                        | "export"
+                        | "const"
+                        | "new"
+                        | "true"
+                        | "false"
+                );
+                if is_kw {
+                    out.push((start..i, fg_weight(p.purple, FontWeight::MEDIUM)));
+                } else if matches!(bytes.get(k), Some(b':' | b'=')) {
+                    out.push((start..i, fg_weight(p.accent, FontWeight::MEDIUM)));
+                }
+            }
+            _ => {
+                i += text[i..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    out
+}
+
+fn highlight_diff(text: &str, p: &Palette) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let clean_len = line.trim_end_matches(['\r', '\n']).len();
+        if clean_len > 0 {
+            let clean = &line[..clean_len];
+            if clean.starts_with("@@") {
+                out.push((
+                    offset..offset + clean_len,
+                    fg_weight(p.accent, FontWeight::SEMIBOLD),
+                ));
+            } else if clean.starts_with("+++") || clean.starts_with("---") {
+                out.push((
+                    offset..offset + clean_len,
+                    fg_weight(p.text_muted, FontWeight::MEDIUM),
+                ));
+            } else if clean.starts_with('+') {
+                out.push((
+                    offset..offset + clean_len,
+                    HighlightStyle {
+                        color: Some(rgb(p.green).into()),
+                        background_color: Some(theme::h(p.green, 0.10)),
+                        ..Default::default()
+                    },
+                ));
+            } else if clean.starts_with('-') {
+                out.push((
+                    offset..offset + clean_len,
+                    HighlightStyle {
+                        color: Some(rgb(p.red).into()),
+                        background_color: Some(theme::h(p.red, 0.10)),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+        offset += line.len();
+    }
+    out
+}
+
 /// Find all merged, non-overlapping UTF-8 byte ranges in `text` matching any
 /// non-empty token in `tokens` (ASCII case-insensitive or Unicode lowercase match).
-fn find_search_matches(text: &str, tokens: &[String]) -> Vec<Range<usize>> {
+pub fn find_search_matches(text: &str, tokens: &[String]) -> Vec<Range<usize>> {
     let active: Vec<&str> = tokens
         .iter()
         .map(String::as_str)
@@ -486,5 +619,14 @@ mod tests {
         );
         assert_eq!(bad_cnt, 1);
         assert_valid_gpui_runs(malformed, &bad_spans);
+
+        let hcl = "data \"aws_iam_policy_document\" \"lenslet\" {\n  # least privilege\n  statement {\n    actions = [\"s3:GetObject\"]\n  }\n}\n";
+        let (hcl_spans, _) = highlight_code(hcl, SyntaxKind::Iac, &[], &theme::DARK);
+        assert_valid_gpui_runs(hcl, &hcl_spans);
+
+        let diff =
+            "--- recorded\n+++ replay\n@@ -1,2 +1,2 @@\n-  \"status\": 400\n+  \"status\": 200\n";
+        let (diff_spans, _) = highlight_code(diff, SyntaxKind::Diff, &["200".into()], &theme::DARK);
+        assert_valid_gpui_runs(diff, &diff_spans);
     }
 }

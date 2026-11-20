@@ -55,7 +55,7 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   # install your test dependencies
-  - uses: hxddh/lenslet@lenslet-v8.0.0
+  - uses: hxddh/lenslet@lenslet-v9.0.0
     with:
       command: npm test
       emulator: moto_server -p 9298           # or however you start your emulator
@@ -188,22 +188,28 @@ terminal and the PR comment always agree.
 
 One header, two views, one inspector:
 
+- **Workspace Sidebar** (`⌘0`): live local proxy status, detected emulators,
+  1-click **Start / Stop Proxy**, **Copy Env**, **Open Trace File** (`⌘O`), and
+  project-grouped runs with `★` pin protection against retention pruning.
 - **Header**: the run (switch runs with `⌘[` / `⌘]`, or pick one), **Calls |
   Access**, **Compared with ▾** (`lenslet.lock`, the previous run, or any
   recorded run, with a one-line summary of what changed), and search.
-- **Calls** (`⌘1`): filter chips (errors, changed vs the baseline, services),
-  the **Findings** of the run at the top (click one to jump to its calls), a
-  timeline of the run, and the call table with durations drawn to scale.
+- **Calls** (`⌘1`): filter chips (errors, changed vs the baseline, retry
+  grouping, services), the **Findings** of the run at the top (click one to jump
+  to its calls), a brush-selectable timeline of the run, sortable columns, and
+  semantic targets (`table/orders · id="ord-42"`, `s3://bucket/key`, `queue/...`)
+  on every row.
 - **Access** (`⌘2`): every permission the run used, marked not in the lock,
-  unused, implied or `# test`. **Accept into lock** and **Mark `# test`**
-  edit `lenslet.lock` in place (the same atomic write as
-  `lenslet run --update`); **Copy policy** gives the IAM policy.
-- **Inspector** (`⌘B`): why a call failed, its SDK retries, and the request
-  and response bodies, decoded (DynamoDB typed JSON, AWS Query forms, event
-  streams, embedded JSON) or raw. Bodies of any size scroll instantly; select
-  lines and `⌘C`. **Replay** (`⌘⏎`) re-sends the call through the live proxy,
-  so the replay is recorded, checked against the lock, and marked as a
-  replay; it is never counted as a retry.
+  unused, implied or `# test`, plus **Check policy…** to simulate any IAM policy
+  JSON interactively and a built-in **IaC Policy Compiler** exporting **IAM
+  JSON**, **Terraform HCL**, **CloudFormation**, **AWS SAM**, and **AWS CDK
+  TypeScript**.
+- **Inspector** (`⌘B`): why a call failed, its SDK retries, structured SigV4
+  scope & query/header tables, and virtualized bodies with character-level
+  selection, collapsible JSON folding, and `⌘G` / `⇧⌘G` match stepping.
+  **Replay** (`⌘⏎`) re-sends the call, while **Edit & Replay** (`⇧⌘⏎`) opens the
+  Request Composer to mutate payloads/headers, auto re-sign `AWS4-HMAC-SHA256`
+  locally, and view a **Unified Diff** against the recorded response.
 
 ![The Access view](docs/access.png)
 
@@ -249,18 +255,22 @@ The format is in [docs/trace.md](docs/trace.md).
 lenslet init [--upstream ADDRESS] -- COMMAND   first run: lock + CI workflow
 lenslet run [options] [--] COMMAND             run under Lenslet; report at the end
 lenslet run [options]                          no command: a proxy on 127.0.0.1:9297
+lenslet env [--shell sh|fish|pwsh|dotenv|docker] [--listen PORT]
+                                               print SDK environment snippet for a running proxy
 lenslet last [--json]                          the newest run's report
 lenslet runs [--json] [--limit N]              list recorded runs newest-first
 lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]
                                                compare two runs (default: previous vs newest)
-lenslet check [--policy PATH | --lock PATH] [RUN] [--json] [--markdown PATH]
+lenslet check [--policy PATH | --lock PATH] [--context K=V] [RUN] [--json] [--markdown PATH]
                                                would a recorded run pass under this policy/lock?
-lenslet policy [--lock PATH]                   an IAM policy from the lock (without `# test` lines)
+lenslet policy [--lock PATH | --run RUN] [--format iam|terraform|cfn|sam|cdk] [--role ROLE]
+                                               compile least-privilege IaC policy (without `# test`)
 lenslet ui                                     the window
 
 run: --enforce  --check  --strict  --update  --lock PATH  --policy PATH
      --max-body SIZE  --json PATH  --markdown PATH  --quiet  --ui  --no-env
-     --listen PORT  --upstream ADDRESS  --emulator-ca PATH  --trace PATH
+     --listen PORT  --upstream ADDRESS  --route SERVICE=ADDRESS  --allow-docker
+     --emulator-ca PATH  --trace PATH
 ```
 
 `lenslet run` also auto-discovers your local emulator when `--upstream` is
@@ -331,30 +341,39 @@ examples/      a project the action is tested against
 
 ## Limits
 
-- Between the SDK and the proxy: HTTP/1.1 only, loopback only.
+- Strict local-only boundary: the proxy and replay engine accept only loopback
+  (or local Docker container bridge peers when `--allow-docker` is passed) and
+  refuse public internet or real `*.amazonaws.com` upstreams. Both HTTP/1.1 and
+  HTTP/2 (`h2c` and upstream ALPN) are supported.
 - `--enforce` stops a call before it reaches the emulator, except when the
   denied permission only shows in the response (the SSE-KMS key of an S3
   bucket's default encryption): the emulator has then already run the call,
   and the trace marks it `blocked_phase: "response"`.
 - Capture keeps the first 1 MiB of each body by default (`--max-body` or
   `--max-body unlimited` to change), unframing `aws-chunked` and
-  `application/vnd.amazon.eventstream` streams and decompressing `gzip` and
-  `deflate` for inspection while forwarding wire bytes untouched and unredacted.
-- Resources are read for S3, DynamoDB (tables, indexes, and Streams), SQS, SNS,
-  Lambda, SSM Parameter Store, CloudWatch Logs, Kinesis, Bedrock, Secrets
-  Manager, KMS, STS, IAM, EventBridge (including per-entry `PutEvents` bus
-  names), Step Functions (`stateMachine` and `execution` ARNs), Cognito IDP,
-  ECR, Firehose, EventBridge Scheduler, and RDS Data API. Other services get `*`.
-  Calls with unrecognized operations are reported as unmapped rather than guessed.
+  `application/vnd.amazon.eventstream` streams, decompressing `gzip`, `deflate`
+  and `zstd`, and decoding Smithy RPCv2 / AWS CBOR payloads into readable JSON
+  while forwarding wire bytes untouched and unredacted.
+- Resources are derived across 35+ AWS services including S3, DynamoDB (tables,
+  indexes, and Streams), SQS, SNS, Lambda, SSM Parameter Store, CloudWatch Logs,
+  Kinesis, Bedrock, Secrets Manager, KMS, STS, IAM, EventBridge (including
+  per-entry `PutEvents` bus names and Pipes), Step Functions, Cognito IDP, ECR,
+  ECS, EKS, CloudFormation, Glue, Athena, RDS & RDS Data API, API Gateway v1/v2,
+  CloudFront, Route 53, SES/SESv2, SageMaker, OpenSearch, Backup, Firehose, and
+  Scheduler. Other services get `*`. Calls with unrecognized operations are
+  reported as unmapped rather than guessed.
 - `--policy` evaluates wire-observable IAM `Condition` keys (`aws:RequestedRegion`,
-  `iam:PassedToService`, `kms:ViaService`, `s3:prefix`, `s3:delimiter`,
-  `s3:max-keys`, `s3:versionid`, `s3:x-amz-*`) across `String*`, `Arn*`,
-  `Numeric*`, `Bool`, `Null`, `ForAnyValue:`, `ForAllValues:`, and `...IfExists`,
-  and fails closed on policy variables (`${...}`) or cloud-only runtime context
-  keys (such as `aws:PrincipalOrgID`).
+  `aws:RequestTag/*`, `aws:TagKeys`, `dynamodb:LeadingKeys`,
+  `kms:EncryptionContext:*`, `kms:EncryptionContextKeys`, `iam:PassedToService`,
+  `kms:ViaService`, `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:versionid`,
+  `s3:x-amz-*`) across `String*`, `Arn*`, `Numeric*`, `Bool`, `Null`,
+  `ForAnyValue:`, `ForAllValues:`, and `...IfExists`. Cloud-only runtime keys
+  (such as `aws:PrincipalOrgID`) can be supplied with `lenslet check --context KEY=VAL`
+  and otherwise report `missing_context` / fail closed.
 - No Windows build. The macOS app is not notarized.
 
-Earlier versions: [lenslet-v7.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v7.0.0),
+Earlier versions: [lenslet-v8.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v8.0.0),
+[lenslet-v7.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v7.0.0),
 [lenslet-v6.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v6.0.0),
 [lenslet-v5.0.0](https://github.com/hxddh/lenslet/tree/lenslet-v5.0.0),
 [lenslet-v4.1.0](https://github.com/hxddh/lenslet/tree/lenslet-v4.1.0).

@@ -7,14 +7,18 @@ license.workspace = true
 [dependencies]
 lenslet-core = { path = "../core" }
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 gpui = "0.2.2"
 httparse = "1"
 log = "0.4"
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+zstd = { version = "0.13", default-features = false, features = ["no_asm"] }

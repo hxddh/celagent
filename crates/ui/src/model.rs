@@ -170,6 +170,12 @@ pub struct Trace {
     /// Re-sent from the window: the id of the call this replays.
     #[serde(default)]
     pub replay_of: Option<String>,
+    /// Assumed IAM role ARN from an earlier `sts:AssumeRole*` session, if any.
+    #[serde(default)]
+    pub caller_role: Option<String>,
+    /// Concise semantic resource/target summary (e.g. `table/orders · id="1"`).
+    #[serde(default)]
+    pub target: Option<String>,
     #[serde(default)]
     pub request: Option<Exchange>,
     #[serde(default)]
@@ -237,16 +243,25 @@ impl Trace {
         read_at(lref.offset, lref.len).or_else(|| self.hydrate_by_scan(&lref.path))
     }
 
-    /// Fallback when the recorded offset is stale: find the newest line for
-    /// this id anywhere in the file.
+    /// Fallback when the recorded offset is stale: stream line-by-line without
+    /// loading the entire multi-hundred-megabyte run file into memory.
     fn hydrate_by_scan(&self, path: &std::path::Path) -> Option<Trace> {
-        let bytes = std::fs::read(path).ok()?;
+        use std::io::{BufRead, BufReader};
+        let file = File::open(path).ok()?;
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
         let needle = format!("\"id\":\"{}\"", self.id);
+        let mut line = Vec::with_capacity(8 * 1024);
         let mut found = None;
-        for line in bytes.split(|byte| *byte == b'\n') {
-            if line.len() > needle.len()
-                && memfind(line, needle.as_bytes())
-                && let Some(Record::Call(full)) = parse_record(&String::from_utf8_lossy(line))
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line).ok()?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
+            if trimmed.len() > needle.len()
+                && memfind(trimmed, needle.as_bytes())
+                && let Some(Record::Call(full)) = parse_record(&String::from_utf8_lossy(trimmed))
                 && full.id == self.id
             {
                 found = Some(*full);
@@ -273,6 +288,10 @@ impl Trace {
                     self.max_attempts = max;
                 }
             }
+        }
+        if self.target.is_none() {
+            let core = self.to_core_with_request_body();
+            self.target = Some(lenslet_core::catalog::target_summary(&core));
         }
         self.at_ms = parse_rfc3339_ms(&self.at);
         self.service_key = service_id(&self.service);
@@ -332,9 +351,14 @@ impl Trace {
                 haystack.push('\n');
             }
         }
-        for extra in [self.region.as_deref(), self.invocation_id.as_deref()]
-            .into_iter()
-            .flatten()
+        for extra in [
+            self.region.as_deref(),
+            self.invocation_id.as_deref(),
+            self.caller_role.as_deref(),
+            self.target.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             haystack.push_str(extra);
             haystack.push('\n');
@@ -460,10 +484,94 @@ impl Trace {
             blocked: self.blocked,
             blocked_phase: self.blocked_phase,
             replay_of: self.replay_of.clone(),
+            caller_role: self.caller_role.clone(),
+            target: self.target.clone(),
             request: message(self.request.as_ref()),
             response: message(self.response.as_ref()),
         }
     }
+
+    /// Full `lenslet_core::trace::Trace` including request body text (used for
+    /// semantic target derivation and live IAM policy simulation).
+    pub fn to_core_with_request_body(&self) -> lenslet_core::trace::Trace {
+        let mut core = self.to_core();
+        if let Some(req) = self.request.as_ref()
+            && let Some(body) = req.body.as_ref()
+        {
+            core.request.body = Some(lenslet_core::trace::BodyTrace {
+                text: body.text.clone(),
+                hex: body.hex.clone(),
+                encoding: body.encoding.clone(),
+                bytes: body.bytes as u64,
+                truncated: body.truncated,
+                binary: body.binary,
+                sha256: body.sha256.clone().unwrap_or_default(),
+            });
+        }
+        core
+    }
+
+    /// Semantic call target (`table/orders · id="1"`, `s3://...`, `queue/...`),
+    /// falling back to `METHOD /path`.
+    pub fn semantic_target(&self) -> String {
+        if let Some(t) = self.target.as_deref().filter(|s| !s.is_empty()) {
+            return t.to_string();
+        }
+        format!(
+            "{} {}",
+            self.method.to_ascii_uppercase(),
+            display_path(self)
+        )
+    }
+}
+
+/// Decoded components of an `AWS4-HMAC-SHA256` `Authorization` header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedSigV4 {
+    pub access_key_id: String,
+    pub date: String,
+    pub region: String,
+    pub service: String,
+    pub signed_headers: String,
+}
+
+pub fn decode_sigv4_header(auth: &str) -> Option<DecodedSigV4> {
+    let cred = auth.split("Credential=").nth(1)?.split([',', ' ']).next()?;
+    let mut parts = cred.split('/');
+    let access_key_id = parts.next()?.to_string();
+    let date = parts.next()?.to_string();
+    let region = parts.next()?.to_string();
+    let service = parts.next()?.to_string();
+    let signed_headers = auth
+        .split("SignedHeaders=")
+        .nth(1)
+        .and_then(|s| s.split([',', ' ']).next())
+        .unwrap_or("")
+        .to_string();
+    Some(DecodedSigV4 {
+        access_key_id,
+        date,
+        region,
+        service,
+        signed_headers,
+    })
+}
+
+pub fn decoded_query_params(path: &str) -> Vec<(String, String)> {
+    let Some((_, query)) = path.split_once('?') else {
+        return Vec::new();
+    };
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (
+                lenslet_core::wire::percent_decode_query(k),
+                lenslet_core::wire::percent_decode_query(v),
+            )
+        })
+        .collect()
 }
 
 fn memfind(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1161,6 +1269,14 @@ pub fn decode_aws_semantic(
             let pretty = serde_json::to_string_pretty(&frames).ok()?;
             return Some(("EventStream", pretty, false));
         }
+    }
+
+    // 1b. Smithy RPCv2 CBOR decoded to JSON.
+    if encoding.is_some_and(|e| e.contains("cbor"))
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Ok(pretty) = serde_json::to_string_pretty(&val)
+    {
+        return Some(("Smithy CBOR", pretty, false));
     }
 
     // 2. AWS Query `x-www-form-urlencoded` (`Action=SendMessage&...`).

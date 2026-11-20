@@ -173,13 +173,25 @@ pub fn write(
 /// mark. Lines already in the lock are left as they are. Returns how many
 /// lines were added; the file is only rewritten when that is not zero.
 pub fn accept(path: &Path, additions: &[(Access, bool)]) -> Result<usize> {
+    let with_implied: Vec<(Access, bool, bool)> = additions
+        .iter()
+        .map(|(acc, test)| (acc.clone(), *test, false))
+        .collect();
+    accept_with_implied(path, &with_implied)
+}
+
+/// Like [`accept`], also preserving `# implied` notes when accepting from the UI.
+pub fn accept_with_implied(path: &Path, additions: &[(Access, bool, bool)]) -> Result<usize> {
     let mut lock = read(path)?.unwrap_or_default();
     let mut added = 0;
-    for (access, test) in additions {
+    for (access, test, implied) in additions {
         if lock.access.insert(access.clone()) {
             added += 1;
             if *test {
                 lock.test.insert(access.clone());
+            }
+            if *implied {
+                lock.implied.insert(access.clone());
             }
         }
     }
@@ -290,6 +302,8 @@ struct Statement {
     resources: Vec<String>,
     not_resources: Vec<String>,
     conditions: Vec<ConditionClause>,
+    /// Policy variables (`${...}`) referenced in `Resource` / `NotResource`.
+    resource_vars: Vec<String>,
 }
 
 /// Why a permission was allowed or denied.
@@ -301,6 +315,8 @@ pub enum Reason {
     ExplicitDeny,
     /// No `Allow` statement (or lock line) grants it.
     NoAllow,
+    /// Matching statement depends on cloud-runtime context keys not supplied locally.
+    NeedsContext,
 }
 
 /// A gate's verdict on one permission, and the statement that decided it.
@@ -313,14 +329,45 @@ pub struct Decision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
     pub reason: Reason,
+    /// Cloud context keys or policy variables needed to resolve a conditional statement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_context: Vec<String>,
 }
 
 impl Decision {
-    fn no_allow() -> Self {
+    pub fn allowed(by: Option<String>) -> Self {
+        Decision {
+            allowed: true,
+            by,
+            reason: Reason::Allowed,
+            missing_context: Vec::new(),
+        }
+    }
+
+    pub fn explicit_deny(by: String) -> Self {
+        Decision {
+            allowed: false,
+            by: Some(by),
+            reason: Reason::ExplicitDeny,
+            missing_context: Vec::new(),
+        }
+    }
+
+    pub fn no_allow() -> Self {
         Decision {
             allowed: false,
             by: None,
             reason: Reason::NoAllow,
+            missing_context: Vec::new(),
+        }
+    }
+
+    pub fn needs_context(by: String, missing_context: Vec<String>) -> Self {
+        Decision {
+            allowed: false,
+            by: Some(by),
+            reason: Reason::NeedsContext,
+            missing_context,
         }
     }
 }
@@ -373,10 +420,16 @@ struct ConditionClause {
     op: BaseOp,
     if_exists: bool,
     key: String,
+    raw_key: String,
     values: Vec<String>,
+    /// True when `key` is a cloud-runtime IAM context key (not observable on wire).
+    cloud_only: bool,
+    /// Policy variables (`${...}`) referenced in `values`.
+    value_vars: Vec<String>,
 }
 
-/// Request-level IAM context keys unambiguously observable on the local wire.
+/// Request-level IAM context keys unambiguously observable on the local wire
+/// (plus optional simulation overrides passed via `--context`).
 #[derive(Clone, Debug, Default)]
 pub struct RequestContext {
     values: BTreeMap<String, Vec<String>>,
@@ -384,7 +437,10 @@ pub struct RequestContext {
 
 const SUPPORTED_CONDITION_KEYS: &[&str] = &[
     "aws:requestedregion",
+    "aws:tagkeys",
+    "dynamodb:leadingkeys",
     "iam:passedtoservice",
+    "kms:encryptioncontextkeys",
     "kms:viaservice",
     "s3:prefix",
     "s3:delimiter",
@@ -398,6 +454,16 @@ const SUPPORTED_CONDITION_KEYS: &[&str] = &[
     "s3:x-amz-storage-class",
     "s3:x-amz-tagging-directive",
 ];
+
+fn is_wire_condition_key(key: &str) -> bool {
+    SUPPORTED_CONDITION_KEYS.contains(&key)
+        || key
+            .strip_prefix("aws:requesttag/")
+            .is_some_and(|rest| !rest.is_empty())
+        || key
+            .strip_prefix("kms:encryptioncontext:")
+            .is_some_and(|rest| !rest.is_empty())
+}
 
 impl RequestContext {
     pub fn from_trace(trace: &crate::trace::Trace) -> Self {
@@ -456,11 +522,43 @@ impl RequestContext {
                         trimmed.to_string()
                     };
                     values.entry(format!("s3:{low}")).or_default().push(val);
+                } else if low == "x-amz-tagging" {
+                    for pair in header.value.split('&') {
+                        let pair = pair.trim();
+                        if pair.is_empty() {
+                            continue;
+                        }
+                        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                        let k_dec = crate::wire::percent_decode_query(k);
+                        let v_dec = crate::wire::percent_decode_query(v);
+                        if !k_dec.is_empty() {
+                            push_tag(&mut values, &k_dec, &v_dec);
+                        }
+                    }
                 }
             }
         }
 
+        if let Some(body_text) = trace
+            .request
+            .body
+            .as_ref()
+            .and_then(|b| b.text.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            extract_wire_body_context(&trace.service, body_text, &mut values);
+        }
+
         RequestContext { values }
+    }
+
+    /// Merge caller-supplied `--context key=val` overrides into this context.
+    pub fn extend_overrides(&mut self, overrides: &BTreeMap<String, Vec<String>>) {
+        for (k, vals) in overrides {
+            self.values
+                .insert(k.trim().to_ascii_lowercase(), vals.clone());
+        }
     }
 
     pub fn get(&self, key: &str) -> &[String] {
@@ -505,6 +603,281 @@ impl RequestContext {
     }
 }
 
+fn push_unique(values: &mut BTreeMap<String, Vec<String>>, key: &str, val: &str) {
+    let slot = values.entry(key.to_ascii_lowercase()).or_default();
+    if !slot.iter().any(|existing| existing == val) {
+        slot.push(val.to_string());
+    }
+}
+
+fn push_tag(values: &mut BTreeMap<String, Vec<String>>, key: &str, val: &str) {
+    let key = key.trim();
+    if key.is_empty() {
+        return;
+    }
+    push_unique(
+        values,
+        &format!("aws:requesttag/{}", key.to_ascii_lowercase()),
+        val,
+    );
+    push_unique(values, "aws:tagkeys", key);
+}
+
+fn push_tag_key_only(values: &mut BTreeMap<String, Vec<String>>, key: &str) {
+    let key = key.trim();
+    if !key.is_empty() {
+        push_unique(values, "aws:tagkeys", key);
+    }
+}
+
+fn extract_wire_body_context(
+    service: &str,
+    body_text: &str,
+    values: &mut BTreeMap<String, Vec<String>>,
+) {
+    if body_text.starts_with('{')
+        && let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(body_text)
+    {
+        for field in ["Tags", "tags", "TagList", "tagList"] {
+            match map.get(field) {
+                Some(serde_json::Value::Array(arr)) => {
+                    for entry in arr {
+                        let Some(obj) = entry.as_object() else {
+                            continue;
+                        };
+                        let k = obj
+                            .get("Key")
+                            .or_else(|| obj.get("key"))
+                            .and_then(|v| v.as_str());
+                        let v = obj
+                            .get("Value")
+                            .or_else(|| obj.get("value"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if let Some(k) = k {
+                            push_tag(values, k, v);
+                        }
+                    }
+                }
+                Some(serde_json::Value::Object(tag_map)) => {
+                    for (k, v) in tag_map {
+                        if let Some(vs) = v.as_str() {
+                            push_tag(values, k, vs);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for field in ["TagKeys", "tagKeys"] {
+            if let Some(serde_json::Value::Array(arr)) = map.get(field) {
+                for v in arr.iter().filter_map(|v| v.as_str()) {
+                    push_tag_key_only(values, v);
+                }
+            }
+        }
+        if service == "dynamodb" {
+            for field in ["Key", "Item"] {
+                if let Some(serde_json::Value::Object(item)) = map.get(field) {
+                    extract_ddb_scalars(item, values);
+                }
+            }
+            if let Some(serde_json::Value::Object(req_items)) = map.get("RequestItems") {
+                for table_entry in req_items.values() {
+                    if let Some(keys) = table_entry.get("Keys").and_then(|v| v.as_array()) {
+                        for kobj in keys.iter().filter_map(|v| v.as_object()) {
+                            extract_ddb_scalars(kobj, values);
+                        }
+                    }
+                    if let Some(writes) = table_entry.as_array() {
+                        for w in writes {
+                            if let Some(item) = w
+                                .get("PutRequest")
+                                .and_then(|p| p.get("Item"))
+                                .and_then(|v| v.as_object())
+                            {
+                                extract_ddb_scalars(item, values);
+                            }
+                            if let Some(key) = w
+                                .get("DeleteRequest")
+                                .and_then(|d| d.get("Key"))
+                                .and_then(|v| v.as_object())
+                            {
+                                extract_ddb_scalars(key, values);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if service == "kms"
+            && let Some(serde_json::Value::Object(enc)) = map.get("EncryptionContext")
+        {
+            for (k, v) in enc {
+                if let Some(vs) = v.as_str() {
+                    push_unique(
+                        values,
+                        &format!("kms:encryptioncontext:{}", k.to_ascii_lowercase()),
+                        vs,
+                    );
+                    push_unique(values, "kms:encryptioncontextkeys", k);
+                }
+            }
+        }
+        return;
+    }
+
+    if body_text.starts_with('<') {
+        // S3 PutObjectTagging / PutBucketTagging XML `<Tag><Key>...</Key><Value>...</Value></Tag>`
+        let mut rest = body_text;
+        while let Some(start) = rest.find("<Tag>") {
+            let after_start = &rest[start + 5..];
+            let Some(end) = after_start.find("</Tag>") else {
+                break;
+            };
+            let block = &after_start[..end];
+            if let Some(k) = xml_element(block, "Key") {
+                let v = xml_element(block, "Value").unwrap_or_default();
+                push_tag(values, &k, &v);
+            }
+            rest = &after_start[end + 6..];
+        }
+        return;
+    }
+
+    // AWS Query form-urlencoded: `Tag.1.Key=env&Tag.1.Value=prod` or `Tags.member.1.Key=...`
+    if body_text.contains('=') {
+        let mut tag_keys_by_idx: BTreeMap<String, String> = BTreeMap::new();
+        let mut tag_vals_by_idx: BTreeMap<String, String> = BTreeMap::new();
+        for pair in body_text.split('&') {
+            let Some((raw_k, raw_v)) = pair.split_once('=') else {
+                continue;
+            };
+            let k = crate::wire::percent_decode_query(raw_k);
+            let v = crate::wire::percent_decode_query(raw_v);
+            for prefix in ["Tag.", "Tags.member.", "TagSpecification.1.Tag."] {
+                if let Some(tail) = k.strip_prefix(prefix) {
+                    if let Some(idx) = tail.strip_suffix(".Key") {
+                        tag_keys_by_idx.insert(idx.to_string(), v.clone());
+                    } else if let Some(idx) = tail.strip_suffix(".Value") {
+                        tag_vals_by_idx.insert(idx.to_string(), v.clone());
+                    }
+                }
+            }
+            if k.starts_with("TagKeys.member.") {
+                push_tag_key_only(values, &v);
+            }
+        }
+        for (idx, tk) in tag_keys_by_idx {
+            let tv = tag_vals_by_idx.remove(&idx).unwrap_or_default();
+            push_tag(values, &tk, &tv);
+        }
+    }
+}
+
+fn extract_ddb_scalars(
+    item: &serde_json::Map<String, serde_json::Value>,
+    values: &mut BTreeMap<String, Vec<String>>,
+) {
+    for attr in item.values().take(8) {
+        let Some(typed) = attr.as_object() else {
+            continue;
+        };
+        for ty in ["S", "N", "B"] {
+            if let Some(s) = typed.get(ty).and_then(|v| v.as_str()) {
+                push_unique(values, "dynamodb:leadingkeys", s);
+            }
+        }
+    }
+}
+
+fn xml_element(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(
+        xml[start..end]
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'"),
+    )
+}
+
+fn collect_policy_vars(text: &str) -> Vec<String> {
+    let mut vars = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let raw_var = after[..end].trim();
+        // Strip optional default value `${aws:PrincipalTag/team, 'none'}`
+        let key = raw_var
+            .split(',')
+            .next()
+            .unwrap_or(raw_var)
+            .trim()
+            .to_string();
+        if !key.is_empty() && !vars.iter().any(|v: &String| v.eq_ignore_ascii_case(&key)) {
+            vars.push(key);
+        }
+        rest = &after[end + 1..];
+    }
+    vars
+}
+
+fn resolve_policy_template(
+    text: &str,
+    ctx: Option<&RequestContext>,
+    wildcard_unresolved: bool,
+) -> String {
+    if !text.contains("${") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let raw_var = after[..end].trim();
+        let (key_part, default_part) = match raw_var.split_once(',') {
+            Some((k, d)) => (
+                k.trim(),
+                Some(d.trim().trim_matches('\'').trim_matches('"')),
+            ),
+            None => (raw_var, None),
+        };
+        if let Some(val) = ctx.and_then(|c| c.get(key_part).first()) {
+            out.push_str(val);
+        } else if let Some(def) = default_part {
+            out.push_str(def);
+        } else if wildcard_unresolved {
+            out.push('*');
+        } else {
+            out.push_str(&rest[start..start + 2 + end + 1]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[derive(Clone, Debug)]
+enum StatementMatch {
+    NoMatch,
+    Matched,
+    NeedsContext(Vec<String>),
+}
+
 impl Gate {
     pub fn from_lock(label: impl Into<String>, access: BTreeSet<Access>) -> Self {
         Gate {
@@ -524,7 +897,26 @@ impl Gate {
             .with_context(|| format!("parse IAM policy {}", path.display()))
     }
 
+    /// Parse an IAM policy in simulation mode (`lenslet check` and UI Policy Simulator):
+    /// cloud-runtime condition keys (`aws:PrincipalOrgID`, `aws:PrincipalTag/*`, etc.)
+    /// and `${...}` policy variables are retained instead of rejected at load time,
+    /// evaluating to [`Reason::NeedsContext`] unless supplied via `--context key=val`.
+    pub fn from_policy_file_simulating(path: &Path, label: impl Into<String>) -> Result<Self> {
+        let text =
+            fs::read_to_string(path).with_context(|| format!("read policy {}", path.display()))?;
+        Self::from_policy_str_simulating(&text, label)
+            .with_context(|| format!("parse IAM policy {}", path.display()))
+    }
+
     pub fn from_policy_str(text: &str, label: impl Into<String>) -> Result<Self> {
+        Self::parse_policy_inner(text, label, false)
+    }
+
+    pub fn from_policy_str_simulating(text: &str, label: impl Into<String>) -> Result<Self> {
+        Self::parse_policy_inner(text, label, true)
+    }
+
+    fn parse_policy_inner(text: &str, label: impl Into<String>, simulating: bool) -> Result<Self> {
         let doc: serde_json::Value = serde_json::from_str(text).context("invalid JSON")?;
         let raw_statements = match doc.get("Statement") {
             Some(serde_json::Value::Array(items)) => items.clone(),
@@ -538,7 +930,7 @@ impl Gate {
             };
             let conditions = match obj.get("Condition") {
                 None | Some(serde_json::Value::Null) => Vec::new(),
-                Some(cond_val) => parse_conditions(cond_val)?,
+                Some(cond_val) => parse_conditions(cond_val, simulating)?,
             };
             if obj.get("NotPrincipal").is_some()
                 || obj
@@ -578,11 +970,21 @@ impl Gate {
             let not_actions = list("NotAction")?;
             let resources = list("Resource")?;
             let not_resources = list("NotResource")?;
+            let mut resource_vars = Vec::new();
             for res in resources.iter().chain(not_resources.iter()) {
-                if res.contains("${") {
+                let vars = collect_policy_vars(res);
+                if !vars.is_empty() && !simulating {
                     anyhow::bail!(
                         "IAM policy variables (`${{...}}`) in Resource `{res}` cannot be evaluated locally"
                     );
+                }
+                for v in vars {
+                    if !resource_vars
+                        .iter()
+                        .any(|x: &String| x.eq_ignore_ascii_case(&v))
+                    {
+                        resource_vars.push(v);
+                    }
                 }
             }
             if actions.is_empty() && not_actions.is_empty() {
@@ -605,6 +1007,7 @@ impl Gate {
                 resources,
                 not_resources,
                 conditions,
+                resource_vars,
             });
         }
         Ok(Gate {
@@ -631,54 +1034,51 @@ impl Gate {
     }
 
     /// The verdict on `access`, and which statement decided it.
-    ///
-    /// A lock grants exactly the lines it lists: its entries are normalized
-    /// footprints compared with normalized footprints, so a `*` in a lock line
-    /// (a generated name) is not a pattern over other names.
-    ///
-    /// A policy follows IAM: any matching `Deny` wins, else any matching
-    /// `Allow` grants. A `*` in a derived resource is an unknown part (a name
-    /// that could not be read): an `Allow` grants it only when it matches
-    /// every resource the `*` could stand for, while a `Deny` applies when it
-    /// matches any of them.
     pub fn decide(&self, access: &Access, ctx: Option<&RequestContext>) -> Decision {
         match &self.kind {
-            GateKind::Lock(entries) if entries.contains(access) => Decision {
-                allowed: true,
-                by: None,
-                reason: Reason::Allowed,
-            },
+            GateKind::Lock(entries) if entries.contains(access) => Decision::allowed(None),
             GateKind::Lock(_) => Decision::no_allow(),
             GateKind::Policy(statements) => {
-                let mut allowed_by = None;
+                let mut allowed_by: Option<String> = None;
+                let mut needs_context_allow: Option<(String, Vec<String>)> = None;
+                let mut needs_context_deny: Option<(String, Vec<String>)> = None;
                 for statement in statements {
-                    if !statement.matches(access, ctx) {
-                        continue;
+                    match statement.classify(access, ctx) {
+                        StatementMatch::NoMatch => continue,
+                        StatementMatch::Matched => {
+                            if !statement.allow {
+                                return Decision::explicit_deny(statement.label.clone());
+                            }
+                            allowed_by.get_or_insert_with(|| statement.label.clone());
+                        }
+                        StatementMatch::NeedsContext(missing) => {
+                            if statement.allow {
+                                needs_context_allow
+                                    .get_or_insert_with(|| (statement.label.clone(), missing));
+                            } else {
+                                needs_context_deny
+                                    .get_or_insert_with(|| (statement.label.clone(), missing));
+                            }
+                        }
                     }
-                    if !statement.allow {
-                        return Decision {
-                            allowed: false,
-                            by: Some(statement.label.clone()),
-                            reason: Reason::ExplicitDeny,
-                        };
+                }
+                if let Some(by) = allowed_by {
+                    if let Some((deny_by, missing)) = needs_context_deny {
+                        return Decision::needs_context(deny_by, missing);
                     }
-                    allowed_by.get_or_insert_with(|| statement.label.clone());
+                    return Decision::allowed(Some(by));
                 }
-                match allowed_by {
-                    Some(by) => Decision {
-                        allowed: true,
-                        by: Some(by),
-                        reason: Reason::Allowed,
-                    },
-                    None => Decision::no_allow(),
+                if let Some((allow_by, missing)) = needs_context_allow {
+                    return Decision::needs_context(allow_by, missing);
                 }
+                Decision::no_allow()
             }
         }
     }
 }
 
 impl Statement {
-    fn matches(&self, access: &Access, ctx: Option<&RequestContext>) -> bool {
+    fn classify(&self, access: &Access, ctx: Option<&RequestContext>) -> StatementMatch {
         let action_ok = if !self.actions.is_empty() {
             self.actions
                 .iter()
@@ -692,36 +1092,107 @@ impl Statement {
             false
         };
         if !action_ok {
-            return false;
+            return StatementMatch::NoMatch;
         }
-        // An Allow must hold for every resource an unknown part could be; a
-        // Deny applies if it could hold for any of them.
+
+        let mut missing_vars: Vec<String> = Vec::new();
+        for var in &self.resource_vars {
+            if ctx.is_none_or(|c| c.get(var).is_empty()) {
+                missing_vars.push(var.clone());
+            }
+        }
+
         type Matcher = fn(&str, &str) -> bool;
         let (covers, overlaps): (Matcher, Matcher) = (arn_covers, arn_overlaps);
-        let resource_ok = if !self.resources.is_empty() {
-            let matches = if self.allow { covers } else { overlaps };
-            self.resources.iter().any(|p| matches(p, &access.resource))
-        } else if !self.not_resources.is_empty() {
-            let excluded = if self.allow { overlaps } else { covers };
-            !self
-                .not_resources
-                .iter()
-                .any(|p| excluded(p, &access.resource))
-        } else {
-            false
+        let check_resources = |wildcard_unresolved: bool| -> bool {
+            if !self.resources.is_empty() {
+                let matches = if self.allow { covers } else { overlaps };
+                self.resources.iter().any(|p| {
+                    let resolved = resolve_policy_template(p, ctx, wildcard_unresolved);
+                    matches(&resolved, &access.resource)
+                })
+            } else if !self.not_resources.is_empty() {
+                let excluded = if self.allow { overlaps } else { covers };
+                !self.not_resources.iter().any(|p| {
+                    let resolved = resolve_policy_template(p, ctx, wildcard_unresolved);
+                    excluded(&resolved, &access.resource)
+                })
+            } else {
+                false
+            }
         };
-        if !resource_ok {
-            return false;
+
+        if missing_vars.is_empty() {
+            if !check_resources(false) {
+                return StatementMatch::NoMatch;
+            }
+        } else if !check_resources(true) {
+            // Even if unresolved `${...}` expanded to `*`, this resource cannot match.
+            return StatementMatch::NoMatch;
         }
+
         if self.conditions.is_empty() {
-            return true;
+            return if missing_vars.is_empty() {
+                StatementMatch::Matched
+            } else {
+                StatementMatch::NeedsContext(missing_vars)
+            };
         }
+
         let Some(ctx) = ctx else {
+            if !missing_vars.is_empty() {
+                return StatementMatch::NeedsContext(missing_vars);
+            }
+            let cloud_keys: Vec<String> = self
+                .conditions
+                .iter()
+                .filter(|c| c.cloud_only || !c.value_vars.is_empty())
+                .map(|c| c.raw_key.clone())
+                .collect();
+            if !cloud_keys.is_empty() {
+                return StatementMatch::NeedsContext(cloud_keys);
+            }
             // Fail closed when no request context is supplied: conditional Allow
             // does not grant, conditional Deny still triggers.
-            return !self.allow;
+            return if !self.allow {
+                StatementMatch::Matched
+            } else {
+                StatementMatch::NoMatch
+            };
         };
-        self.conditions.iter().all(|clause| clause.evaluate(ctx))
+
+        for clause in &self.conditions {
+            let mut clause_missing = Vec::new();
+            if clause.cloud_only && ctx.get(&clause.key).is_empty() && !clause.if_exists {
+                clause_missing.push(clause.raw_key.clone());
+            }
+            for var in &clause.value_vars {
+                if ctx.get(var).is_empty()
+                    && !clause_missing
+                        .iter()
+                        .any(|k: &String| k.eq_ignore_ascii_case(var))
+                {
+                    clause_missing.push(var.clone());
+                }
+            }
+            if clause_missing.is_empty() {
+                if !clause.evaluate(ctx) {
+                    return StatementMatch::NoMatch;
+                }
+            } else {
+                for key in clause_missing {
+                    if !missing_vars.iter().any(|k| k.eq_ignore_ascii_case(&key)) {
+                        missing_vars.push(key);
+                    }
+                }
+            }
+        }
+
+        if missing_vars.is_empty() {
+            StatementMatch::Matched
+        } else {
+            StatementMatch::NeedsContext(missing_vars)
+        }
     }
 }
 
@@ -762,6 +1233,15 @@ pub struct Evaluation {
 /// Derive what `trace` needs and check it against `gate`. Without a gate
 /// nothing is denied and nothing is new.
 pub fn evaluate(trace: &Trace, gate: Option<&Gate>) -> Evaluation {
+    evaluate_with_context(trace, gate, &BTreeMap::new())
+}
+
+/// Derive what `trace` needs and check it against `gate` with optional context overrides.
+pub fn evaluate_with_context(
+    trace: &Trace,
+    gate: Option<&Gate>,
+    overrides: &BTreeMap<String, Vec<String>>,
+) -> Evaluation {
     let derived = access::derive_call(trace);
     let flag = |entry: &Access| derived.unverified.contains(entry);
     let mut denied = Vec::new();
@@ -771,7 +1251,13 @@ pub fn evaluate(trace: &Trace, gate: Option<&Gate>) -> Evaluation {
         } else {
             (&derived.own, &derived.implied)
         };
-        let ctx = gate.is_policy().then(|| RequestContext::from_trace(trace));
+        let ctx = gate.is_policy().then(|| {
+            let mut c = RequestContext::from_trace(trace);
+            if !overrides.is_empty() {
+                c.extend_overrides(overrides);
+            }
+            c
+        });
         for (entry, is_implied) in own
             .iter()
             .map(|entry| (entry, false))
@@ -819,7 +1305,8 @@ pub fn evaluate(trace: &Trace, gate: Option<&Gate>) -> Evaluation {
         denied,
     }
 }
-fn parse_conditions(value: &serde_json::Value) -> Result<Vec<ConditionClause>> {
+
+fn parse_conditions(value: &serde_json::Value, simulating: bool) -> Result<Vec<ConditionClause>> {
     let Some(ops_map) = value.as_object() else {
         anyhow::bail!("IAM Statement `Condition` must be a JSON object");
     };
@@ -831,19 +1318,24 @@ fn parse_conditions(value: &serde_json::Value) -> Result<Vec<ConditionClause>> {
         };
         for (raw_key, expected_val) in keys_map {
             let key = raw_key.trim().to_ascii_lowercase();
-            if !SUPPORTED_CONDITION_KEYS.contains(&key.as_str()) {
+            let wire = is_wire_condition_key(&key);
+            if !wire && !simulating {
                 anyhow::bail!(
-                    "IAM Condition key `{raw_key}` cannot be evaluated locally; supported wire keys: {}",
+                    "IAM Condition key `{raw_key}` cannot be evaluated locally; supported wire keys: {}, aws:requesttag/*, kms:encryptioncontext:* (use `lenslet check --context {raw_key}=...` to simulate cloud keys)",
                     SUPPORTED_CONDITION_KEYS.join(", ")
                 );
             }
-            let values = parse_condition_values(raw_op, raw_key, op, expected_val)?;
+            let (values, value_vars) =
+                parse_condition_values(raw_op, raw_key, op, expected_val, simulating)?;
             clauses.push(ConditionClause {
                 quantifier,
                 op,
                 if_exists,
                 key,
+                raw_key: raw_key.trim().to_string(),
                 values,
+                cloud_only: !wire,
+                value_vars,
             });
         }
     }
@@ -893,7 +1385,8 @@ fn parse_condition_values(
     raw_key: &str,
     op: BaseOp,
     val: &serde_json::Value,
-) -> Result<Vec<String>> {
+    simulating: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
     let items: Vec<&serde_json::Value> = match val {
         serde_json::Value::Array(arr) => arr.iter().collect(),
         single => vec![single],
@@ -902,6 +1395,7 @@ fn parse_condition_values(
         anyhow::bail!("IAM Condition `{raw_op}` on `{raw_key}` must specify at least one value");
     }
     let mut out = Vec::with_capacity(items.len());
+    let mut vars = Vec::new();
     for item in items {
         let s = match item {
             serde_json::Value::String(s) => s.clone(),
@@ -911,27 +1405,36 @@ fn parse_condition_values(
                 "IAM Condition `{raw_op}` on `{raw_key}` expects string, boolean, or numeric values"
             ),
         };
-        if s.contains("${") {
+        let item_vars = collect_policy_vars(&s);
+        if !item_vars.is_empty() && !simulating {
             anyhow::bail!(
                 "IAM policy variables (`${{...}}`) in Condition `{raw_op}` on `{raw_key}` cannot be evaluated locally"
             );
         }
-        if matches!(op, BaseOp::Bool | BaseOp::Null)
+        for v in item_vars {
+            if !vars.iter().any(|x: &String| x.eq_ignore_ascii_case(&v)) {
+                vars.push(v);
+            }
+        }
+        if vars.is_empty()
+            && matches!(op, BaseOp::Bool | BaseOp::Null)
             && !matches!(s.to_ascii_lowercase().as_str(), "true" | "false")
         {
             anyhow::bail!(
                 "IAM Condition `{raw_op}` on `{raw_key}` expects `true` or `false`, got `{s}`"
             );
         }
-        if matches!(
-            op,
-            BaseOp::NumericEquals
-                | BaseOp::NumericNotEquals
-                | BaseOp::NumericLessThan
-                | BaseOp::NumericLessThanEquals
-                | BaseOp::NumericGreaterThan
-                | BaseOp::NumericGreaterThanEquals
-        ) && s.parse::<f64>().map_or(true, |n| !n.is_finite())
+        if vars.is_empty()
+            && matches!(
+                op,
+                BaseOp::NumericEquals
+                    | BaseOp::NumericNotEquals
+                    | BaseOp::NumericLessThan
+                    | BaseOp::NumericLessThanEquals
+                    | BaseOp::NumericGreaterThan
+                    | BaseOp::NumericGreaterThanEquals
+            )
+            && s.parse::<f64>().map_or(true, |n| !n.is_finite())
         {
             anyhow::bail!(
                 "IAM Condition `{raw_op}` on `{raw_key}` expects finite numbers, got `{s}`"
@@ -939,16 +1442,23 @@ fn parse_condition_values(
         }
         out.push(s);
     }
-    Ok(out)
+    Ok((out, vars))
 }
 
 impl ConditionClause {
     fn evaluate(&self, ctx: &RequestContext) -> bool {
         let actuals = ctx.get(&self.key);
+        let resolved_values: Vec<String> = if self.value_vars.is_empty() {
+            self.values.clone()
+        } else {
+            self.values
+                .iter()
+                .map(|v| resolve_policy_template(v, Some(ctx), false))
+                .collect()
+        };
         if self.op == BaseOp::Null {
             let is_null = actuals.is_empty();
-            return self
-                .values
+            return resolved_values
                 .iter()
                 .any(|v| v.eq_ignore_ascii_case("true") == is_null);
         }
@@ -960,59 +1470,57 @@ impl ConditionClause {
             };
         }
         match self.quantifier {
-            SetQuantifier::ForAnyValue => actuals.iter().any(|a| self.matches_one(a)),
-            SetQuantifier::ForAllValues | SetQuantifier::Single => {
-                actuals.iter().all(|a| self.matches_one(a))
-            }
+            SetQuantifier::ForAnyValue => actuals
+                .iter()
+                .any(|a| self.matches_one(a, &resolved_values)),
+            SetQuantifier::ForAllValues | SetQuantifier::Single => actuals
+                .iter()
+                .all(|a| self.matches_one(a, &resolved_values)),
         }
     }
 
-    fn matches_one(&self, actual: &str) -> bool {
+    fn matches_one(&self, actual: &str, values: &[String]) -> bool {
         match self.op {
-            BaseOp::StringEquals => self.values.iter().any(|p| actual == p),
-            BaseOp::StringNotEquals => self.values.iter().all(|p| actual != p),
-            BaseOp::StringEqualsIgnoreCase => {
-                self.values.iter().any(|p| actual.eq_ignore_ascii_case(p))
-            }
+            BaseOp::StringEquals => values.iter().any(|p| actual == p),
+            BaseOp::StringNotEquals => values.iter().all(|p| actual != p),
+            BaseOp::StringEqualsIgnoreCase => values.iter().any(|p| actual.eq_ignore_ascii_case(p)),
             BaseOp::StringNotEqualsIgnoreCase => {
-                self.values.iter().all(|p| !actual.eq_ignore_ascii_case(p))
+                values.iter().all(|p| !actual.eq_ignore_ascii_case(p))
             }
-            BaseOp::StringLike => self.values.iter().any(|p| glob_match(p, actual)),
-            BaseOp::StringNotLike => self.values.iter().all(|p| !glob_match(p, actual)),
-            BaseOp::ArnEquals => self.values.iter().any(|p| actual == p),
-            BaseOp::ArnNotEquals => self.values.iter().all(|p| actual != p),
-            BaseOp::ArnLike => self.values.iter().any(|p| arn_covers(p, actual)),
-            BaseOp::ArnNotLike => self.values.iter().all(|p| !arn_covers(p, actual)),
+            BaseOp::StringLike => values.iter().any(|p| glob_match(p, actual)),
+            BaseOp::StringNotLike => values.iter().all(|p| !glob_match(p, actual)),
+            BaseOp::ArnEquals => values.iter().any(|p| actual == p),
+            BaseOp::ArnNotEquals => values.iter().all(|p| actual != p),
+            BaseOp::ArnLike => values.iter().any(|p| arn_covers(p, actual)),
+            BaseOp::ArnNotLike => values.iter().all(|p| !arn_covers(p, actual)),
             BaseOp::Bool => {
                 let Some(act_bool) = parse_bool_str(actual) else {
                     return false;
                 };
-                self.values
-                    .iter()
-                    .any(|p| parse_bool_str(p) == Some(act_bool))
+                values.iter().any(|p| parse_bool_str(p) == Some(act_bool))
             }
-            BaseOp::NumericEquals => self.num_any(actual, |a, b| a == b),
+            BaseOp::NumericEquals => Self::num_any(actual, values, |a, b| a == b),
             BaseOp::NumericNotEquals => {
                 let Ok(a) = actual.parse::<f64>() else {
                     return false;
                 };
-                self.values
+                values
                     .iter()
                     .all(|p| p.parse::<f64>().is_ok_and(|b| a != b))
             }
-            BaseOp::NumericLessThan => self.num_any(actual, |a, b| a < b),
-            BaseOp::NumericLessThanEquals => self.num_any(actual, |a, b| a <= b),
-            BaseOp::NumericGreaterThan => self.num_any(actual, |a, b| a > b),
-            BaseOp::NumericGreaterThanEquals => self.num_any(actual, |a, b| a >= b),
+            BaseOp::NumericLessThan => Self::num_any(actual, values, |a, b| a < b),
+            BaseOp::NumericLessThanEquals => Self::num_any(actual, values, |a, b| a <= b),
+            BaseOp::NumericGreaterThan => Self::num_any(actual, values, |a, b| a > b),
+            BaseOp::NumericGreaterThanEquals => Self::num_any(actual, values, |a, b| a >= b),
             BaseOp::Null => unreachable!(),
         }
     }
 
-    fn num_any(&self, actual: &str, cmp: impl Fn(f64, f64) -> bool) -> bool {
+    fn num_any(actual: &str, values: &[String], cmp: impl Fn(f64, f64) -> bool) -> bool {
         let Ok(a) = actual.parse::<f64>() else {
             return false;
         };
-        self.values
+        values
             .iter()
             .any(|p| p.parse::<f64>().is_ok_and(|b| cmp(a, b)))
     }
@@ -1308,20 +1816,9 @@ mod tests {
             ms: 1,
             authorization: true,
             region: Some("us-east-1".into()),
-            invocation_id: None,
-            attempt: None,
-            max_attempts: None,
-            pending: false,
-            error: None,
-            problem: None,
-            access: Vec::new(),
-            implied: Vec::new(),
-            new: false,
-            blocked: false,
-            replay_of: None,
-            blocked_phase: None,
             request: crate::trace::Message::default(),
             response: crate::trace::Message::default(),
+            ..Default::default()
         };
         let put_access = access("s3:PutObject", "arn:aws:s3:::assets/doc.txt");
         // Missing SSE-KMS header → denied.
@@ -1545,11 +2042,7 @@ mod tests {
         let unknown = access("dynamodb:DeleteItem", "*");
         assert_eq!(
             gate.decide(&unknown, None),
-            Decision {
-                allowed: false,
-                by: Some("KeepAudit".into()),
-                reason: Reason::ExplicitDeny,
-            }
+            Decision::explicit_deny("KeepAudit".into())
         );
         // A name that is partly unknown (`orders-*`) cannot be `audit`.
         assert!(gate.allows(&access(
@@ -1593,11 +2086,7 @@ mod tests {
         );
         assert_eq!(
             not_resource.decide(&access("s3:GetObject", "*"), None),
-            Decision {
-                allowed: false,
-                by: Some("Statement[1]".into()),
-                reason: Reason::ExplicitDeny,
-            }
+            Decision::explicit_deny("Statement[1]".into())
         );
         assert!(not_resource.allows(&access("s3:GetObject", "arn:aws:s3:::public/a")));
         assert_eq!(
@@ -1646,11 +2135,7 @@ mod tests {
         assert!(!gate.allows(&access("sqs:SendMessage", "arn:aws:sqs:*:*:jobs")));
         assert_eq!(
             gate.decide(&access("sqs:DeleteQueue", "*"), None),
-            Decision {
-                allowed: false,
-                by: None,
-                reason: Reason::NoAllow,
-            }
+            Decision::no_allow()
         );
     }
 
@@ -1779,11 +2264,7 @@ mod tests {
                 resource: "arn:aws:dynamodb:us-east-1:*:table/audit-20261119".into(),
                 implied: false,
                 unverified: false,
-                decision: Decision {
-                    allowed: false,
-                    by: Some("KeepAudit".into()),
-                    reason: Reason::ExplicitDeny,
-                },
+                decision: Decision::explicit_deny("KeepAudit".into()),
             }]
         );
         assert_eq!(
@@ -1807,5 +2288,138 @@ mod tests {
         );
         let evaluation = evaluate(&trace, Some(&lock));
         assert!(evaluation.denied.is_empty() && !evaluation.access[0].new);
+    }
+
+    #[test]
+    fn wire_abac_tags_leading_keys_encryption_context_and_simulation_context() {
+        let abac_policy = r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "TaggedS3",
+                    "Effect": "Allow",
+                    "Action": "s3:PutObject",
+                    "Resource": "arn:aws:s3:::assets/*",
+                    "Condition": {
+                        "StringEquals": { "aws:RequestTag/env": "prod" },
+                        "ForAllValues:StringEquals": { "aws:TagKeys": ["env", "team"] }
+                    }
+                },
+                {
+                    "Sid": "TenantRows",
+                    "Effect": "Allow",
+                    "Action": "dynamodb:GetItem",
+                    "Resource": "arn:aws:dynamodb:*:*:table/orders",
+                    "Condition": {
+                        "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": ["tenant#acme"] }
+                    }
+                },
+                {
+                    "Sid": "ScopedKms",
+                    "Effect": "Allow",
+                    "Action": "kms:Decrypt",
+                    "Resource": "arn:aws:kms:*:*:key/*",
+                    "Condition": {
+                        "StringEquals": { "kms:EncryptionContext:tenant": "acme" }
+                    }
+                }
+            ]
+        }"#;
+        let gate = Gate::from_policy_str(abac_policy, "abac.json").unwrap();
+
+        let mut s3_put = crate::trace::Trace {
+            method: "PUT".into(),
+            path: "/assets/r.json?x-id=PutObject".into(),
+            service: "s3".into(),
+            operation: "PutObject".into(),
+            request: crate::trace::Message {
+                headers: vec![crate::trace::HeaderTrace {
+                    name: "x-amz-tagging".into(),
+                    value: "env=prod&team=payments".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let put_acc = access("s3:PutObject", "arn:aws:s3:::assets/r.json");
+        assert!(gate.allows_in_context(&put_acc, Some(&RequestContext::from_trace(&s3_put))));
+        s3_put.request.headers[0].value = "env=prod&rogue=1".into();
+        assert!(!gate.allows_in_context(&put_acc, Some(&RequestContext::from_trace(&s3_put))));
+
+        let ddb_get = crate::trace::Trace {
+            method: "POST".into(),
+            path: "/".into(),
+            service: "dynamodb".into(),
+            operation: "GetItem".into(),
+            request: crate::trace::Message {
+                body: Some(crate::trace::BodyTrace {
+                    text: Some(r#"{"TableName":"orders","Key":{"pk":{"S":"tenant#acme"}}}"#.into()),
+                    bytes: 58,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(evaluate(&ddb_get, Some(&gate)).denied.is_empty());
+
+        let kms_dec = crate::trace::Trace {
+            method: "POST".into(),
+            path: "/".into(),
+            service: "kms".into(),
+            operation: "Decrypt".into(),
+            request: crate::trace::Message {
+                body: Some(crate::trace::BodyTrace {
+                    text: Some(r#"{"KeyId":"k1","EncryptionContext":{"tenant":"acme"}}"#.into()),
+                    bytes: 52,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(evaluate(&kms_dec, Some(&gate)).denied.is_empty());
+
+        // Simulation mode parses enterprise cloud keys and `${...}` variables,
+        // returning NeedsContext until `--context` supplies them.
+        let enterprise = r#"{
+            "Statement": [{
+                "Sid": "HomeFolderInOrg",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::corp-home/${aws:username}/*",
+                "Condition": {
+                    "StringEquals": { "aws:PrincipalOrgID": "o-999" }
+                }
+            }]
+        }"#;
+        let sim_gate = Gate::from_policy_str_simulating(enterprise, "corp.json").unwrap();
+        let alice_get = crate::trace::Trace {
+            method: "GET".into(),
+            path: "/corp-home/alice/notes.txt?x-id=GetObject".into(),
+            service: "s3".into(),
+            operation: "GetObject".into(),
+            ..Default::default()
+        };
+        let eval_missing = evaluate(&alice_get, Some(&sim_gate));
+        assert_eq!(eval_missing.denied.len(), 1);
+        assert_eq!(eval_missing.denied[0].decision.reason, Reason::NeedsContext);
+        assert_eq!(
+            eval_missing.denied[0].decision.missing_context,
+            vec!["aws:username".to_string(), "aws:PrincipalOrgID".to_string()]
+        );
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("aws:username".into(), vec!["alice".into()]);
+        overrides.insert("aws:PrincipalOrgID".into(), vec!["o-999".into()]);
+        assert!(
+            evaluate_with_context(&alice_get, Some(&sim_gate), &overrides)
+                .denied
+                .is_empty()
+        );
+
+        overrides.insert("aws:username".into(), vec!["bob".into()]);
+        let eval_bob = evaluate_with_context(&alice_get, Some(&sim_gate), &overrides);
+        assert_eq!(eval_bob.denied[0].decision.reason, Reason::NoAllow);
     }
 }

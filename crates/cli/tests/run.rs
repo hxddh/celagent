@@ -708,3 +708,79 @@ fn check_re_evaluates_a_recorded_run_and_names_the_denying_statement() {
     assert_eq!(usage.status.code(), Some(2));
     assert_eq!(env.lenslet(&["check", "--nope"]).status.code(), Some(2));
 }
+
+#[test]
+fn env_iac_formats_and_context_simulation_work_end_to_end() {
+    let env = Env::new();
+    let sh_out = env.lenslet(&["env", "--shell", "sh", "--listen", "9299"]);
+    assert_eq!(sh_out.status.code(), Some(0));
+    let sh_text = String::from_utf8_lossy(&sh_out.stdout);
+    assert!(sh_text.contains("export AWS_ENDPOINT_URL=http://127.0.0.1:9299"));
+    assert!(sh_text.contains("unset AWS_PROFILE"));
+
+    let docker_out = env.lenslet(&["env", "--shell", "docker"]);
+    assert_eq!(docker_out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&docker_out.stdout)
+            .contains("AWS_ENDPOINT_URL=http://host.docker.internal:9297")
+    );
+
+    if !has_curl() {
+        return;
+    }
+    let out = env.run(&["--update"], &["SendMessage"], 0);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let tf_out = env.lenslet(&["policy", "--format", "terraform"]);
+    assert_eq!(tf_out.status.code(), Some(0), "{}", stderr(&tf_out));
+    let tf_text = String::from_utf8_lossy(&tf_out.stdout);
+    assert!(tf_text.contains("data \"aws_iam_policy_document\" \"lenslet\""));
+    assert!(tf_text.contains("\"sqs:SendMessage\""));
+
+    let cfn_out = env.lenslet(&["policy", "--run", "latest", "--format", "cfn"]);
+    assert_eq!(cfn_out.status.code(), Some(0), "{}", stderr(&cfn_out));
+    let cfn_text = String::from_utf8_lossy(&cfn_out.stdout);
+    assert!(cfn_text.contains("PolicyDocument:"), "{cfn_text}");
+    assert!(
+        cfn_text.contains("!Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:jobs'"),
+        "{cfn_text}"
+    );
+
+    // Enterprise policy with cloud-runtime `aws:PrincipalOrgID`: `check` reports
+    // `needs cloud context` without `--context`, and passes with `--context`.
+    let corp_policy = env.work.join("corp.json");
+    std::fs::write(
+        &corp_policy,
+        r#"{
+            "Statement": [{
+                "Sid": "InOrgOnly",
+                "Effect": "Allow",
+                "Action": "sqs:SendMessage",
+                "Resource": "arn:aws:sqs:*:*:jobs",
+                "Condition": { "StringEquals": { "aws:PrincipalOrgID": "o-acme" } }
+            }]
+        }"#,
+    )
+    .unwrap();
+    let needs_ctx = env.lenslet(&["check", "--policy", "corp.json"]);
+    assert_eq!(needs_ctx.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&needs_ctx.stdout).contains("needs cloud context"),
+        "{}",
+        String::from_utf8_lossy(&needs_ctx.stdout)
+    );
+
+    let with_ctx = env.lenslet(&[
+        "check",
+        "--policy",
+        "corp.json",
+        "--context",
+        "aws:PrincipalOrgID=o-acme",
+    ]);
+    assert_eq!(
+        with_ctx.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&with_ctx.stdout)
+    );
+}

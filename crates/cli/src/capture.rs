@@ -38,6 +38,7 @@ pub enum Encoding {
     Identity,
     Gzip,
     Deflate,
+    Zstd,
 }
 
 /// The classified `content-type` and wire encoding of a message.
@@ -53,6 +54,8 @@ pub struct Content {
     pub aws_chunked: bool,
     /// Whether the wire body uses `application/vnd.amazon.eventstream` binary framing.
     pub event_stream: bool,
+    /// Whether the wire body uses Smithy RPCv2 CBOR (`application/cbor`).
+    pub cbor: bool,
     /// Supported compression layer (after unframing `aws-chunked`, when present).
     pub encoding: Option<Encoding>,
     /// Non-identity wire encoding label for trace metadata, e.g. `aws-chunked` or `gzip`.
@@ -142,6 +145,9 @@ pub fn content(headers: &HeaderMap) -> Content {
                 "deflate" if compression == Some(Encoding::Identity) => {
                     compression = Some(Encoding::Deflate);
                 }
+                "zstd" if compression == Some(Encoding::Identity) => {
+                    compression = Some(Encoding::Zstd);
+                }
                 _ => {
                     compression = None;
                     break;
@@ -154,21 +160,41 @@ pub fn content(headers: &HeaderMap) -> Content {
         m == "application/vnd.amazon.eventstream"
             || m.starts_with("application/vnd.amazon.eventstream+")
     });
+    let rpcv2_header = headers
+        .get("smithy-protocol")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("rpc-v2-cbor"));
+    let cbor = rpcv2_header
+        || media.as_deref().is_some_and(|m| {
+            m == "application/cbor"
+                || m.starts_with("application/x-amz-cbor")
+                || m.ends_with("+cbor")
+        });
 
-    let wire_encoding = match (&raw_encoding, aws_chunked, event_stream) {
-        (Some(raw), _, true) => Some(format!("aws-eventstream,{raw}")),
-        (None, true, true) => Some("aws-chunked,aws-eventstream".to_string()),
-        (None, false, true) => Some("aws-eventstream".to_string()),
-        (Some(raw), _, false) => Some(raw.clone()),
-        (None, true, false) => Some("aws-chunked".to_string()),
-        (None, false, false) => None,
-    };
+    let mut enc_parts: Vec<String> = Vec::new();
+    if aws_chunked
+        && !raw_encoding
+            .as_deref()
+            .is_some_and(|r| r.contains("aws-chunked"))
+    {
+        enc_parts.push("aws-chunked".to_string());
+    }
+    if event_stream {
+        enc_parts.push("aws-eventstream".to_string());
+    }
+    if cbor {
+        enc_parts.push("cbor".to_string());
+    }
+    if let Some(raw) = &raw_encoding {
+        enc_parts.push(raw.clone());
+    }
+    let wire_encoding = (!enc_parts.is_empty()).then(|| enc_parts.join(","));
 
-    let known_text = media.as_deref().is_some_and(is_text) || event_stream;
+    let known_text = media.as_deref().is_some_and(is_text) || event_stream || cbor;
     let untyped_or_octet = matches!(
         media.as_deref(),
         None | Some("application/octet-stream" | "binary/octet-stream")
-    );
+    ) && !cbor;
 
     Content {
         content_type: media,
@@ -176,6 +202,7 @@ pub fn content(headers: &HeaderMap) -> Content {
         sniff_utf8: untyped_or_octet && compression.is_some(),
         aws_chunked,
         event_stream,
+        cbor,
         encoding: compression,
         wire_encoding,
     }
@@ -241,6 +268,7 @@ impl Capture {
         }
         if !content.aws_chunked
             && !content.event_stream
+            && !content.cbor
             && matches!(content.encoding, Some(Encoding::Identity) | None)
         {
             return Cow::Borrowed(&self.prefix);
@@ -354,6 +382,15 @@ fn decode_payload(prefix: &[u8], content: &Content, limit: usize) -> Option<(Vec
     if content.event_stream {
         let (events, ev_capped) = decode_eventstream(&decompressed, limit)?;
         return Some((events, comp_capped || ev_capped));
+    }
+    if content.cbor {
+        let json_text = lenslet_core::cbor::decode_cbor_pretty(&decompressed)?;
+        let mut bytes = json_text.into_bytes();
+        let cbor_capped = bytes.len() > limit;
+        if cbor_capped {
+            bytes.truncate(limit);
+        }
+        return Some((bytes, comp_capped || cbor_capped));
     }
     Some((decompressed.into_owned(), comp_capped))
 }
@@ -615,6 +652,10 @@ fn decode_compressed(prefix: &[u8], encoding: Encoding, limit: usize) -> Option<
             } else {
                 read_bounded(Box::new(DeflateDecoder::new(prefix)))
             }
+        }
+        Encoding::Zstd => {
+            let decoder = zstd::stream::read::Decoder::new(prefix).ok()?;
+            read_bounded(Box::new(decoder))
         }
     };
     if out.is_empty() {
@@ -1059,5 +1100,29 @@ mod tests {
         let text = body.text.unwrap();
         assert!(text.contains(r#""text":"hi""#), "{text}");
         assert!(text.contains(r#""event":"messageStop""#), "{text}");
+    }
+
+    #[test]
+    fn decodes_smithy_rpcv2_cbor_and_zstd_payloads_to_readable_json() {
+        // CBOR map `{"Namespace": "Shop/Checkout"}`
+        let mut cbor_bytes = vec![0xa1, 0x69];
+        cbor_bytes.extend_from_slice(b"Namespace");
+        cbor_bytes.push(0x6d);
+        cbor_bytes.extend_from_slice(b"Shop/Checkout");
+
+        let compressed = zstd::stream::encode_all(&cbor_bytes[..], 1).unwrap();
+        let mut cap = Capture::new(true);
+        cap.feed(&compressed);
+        let body = cap
+            .body(&content(&headers(&[
+                ("content-type", "application/cbor"),
+                ("smithy-protocol", "rpc-v2-cbor"),
+                ("content-encoding", "zstd"),
+            ])))
+            .unwrap();
+        assert!(!body.binary);
+        assert_eq!(body.encoding.as_deref(), Some("cbor,zstd"));
+        let text = body.text.unwrap();
+        assert!(text.contains(r#""Namespace": "Shop/Checkout""#), "{text}");
     }
 }

@@ -8,7 +8,7 @@
 //! re-render only for what they show.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -18,7 +18,7 @@ use futures::StreamExt;
 use gpui::{Context, EventEmitter, Task};
 use lenslet_core::{
     findings::Finding,
-    lock::Lock,
+    lock::{Decision, Gate, Lock, RequestContext},
     summary::{Report, RunDiff},
 };
 
@@ -27,7 +27,9 @@ use crate::{
     feed::{self, FeedMode, FeedMsg, LoadResult, Loaded, RunSummary, Source},
     lockfile,
     model::{Access, RunInfo, Trace},
+    prefs::Lang,
     store::{AccessBaseline, AccessRow, CallStore, ChangeSet, Delta, access_rows},
+    theme::Ui,
 };
 
 /// Live findings are recomputed at most this often.
@@ -89,6 +91,8 @@ pub struct Session {
     pub diff: Option<RunDiff>,
     pub changes: ChangeSet,
     pub access_rows: Arc<Vec<AccessRow>>,
+    pub sim_policy: Option<(String, Arc<Gate>)>,
+    pub sim_decisions: Arc<BTreeMap<Access, Decision>>,
     pub findings: Arc<Vec<Finding>>,
     findings_running: bool,
     findings_dirty: bool,
@@ -119,6 +123,8 @@ impl Session {
             diff: None,
             changes: ChangeSet::default(),
             access_rows: Arc::new(Vec::new()),
+            sim_policy: None,
+            sim_decisions: Arc::new(BTreeMap::new()),
             findings: Arc::new(Vec::new()),
             findings_running: false,
             findings_dirty: false,
@@ -554,12 +560,17 @@ impl Session {
                     new_failures: Arc::new(BTreeSet::new()),
                     new_access: true,
                 };
-                // O(permissions), not O(calls): the store keeps the table.
+                // O(permissions), not O(calls): cumulative_access_entries keeps
+                // early permissions even if >5,000 live calls roll over the window.
                 let live;
                 let used = match report {
                     Some(report) => &report.access,
                     None => {
-                        live = self.store.access_entries();
+                        live = if self.store.rows().len() < crate::model::MAX_ROWS {
+                            self.store.access_entries()
+                        } else {
+                            self.store.cumulative_access_entries()
+                        };
                         &live
                     }
                 };
@@ -593,6 +604,92 @@ impl Session {
                 self.diff = Some(diff);
             }
         }
+        if self.sim_policy.is_some() {
+            self.recompute_sim_decisions();
+        }
+        cx.emit(SessionEvent::Derived);
+        cx.notify();
+    }
+
+    fn recompute_sim_decisions(&mut self) {
+        let Some((_, gate)) = self.sim_policy.as_ref() else {
+            self.sim_decisions = Arc::new(BTreeMap::new());
+            return;
+        };
+        let mut map = BTreeMap::new();
+        for row in self.access_rows.iter() {
+            let sample = self
+                .store
+                .rows()
+                .iter()
+                .find(|c| !c.pending && c.uses(&row.access))
+                .map(|c| c.to_core_with_request_body());
+            let decision = match sample {
+                Some(core_trace) => {
+                    let base_ctx = RequestContext::from_trace(&core_trace);
+                    let ctx = if row.implied {
+                        base_ctx.for_implied(
+                            &core_trace.service,
+                            core_trace.region.as_deref(),
+                            &row.access.action,
+                        )
+                    } else {
+                        base_ctx
+                    };
+                    gate.decide(&row.access, Some(&ctx))
+                }
+                None => gate.decide(&row.access, None),
+            };
+            map.insert(row.access.clone(), decision);
+        }
+        self.sim_decisions = Arc::new(map);
+    }
+
+    /// Load an external IAM policy JSON file to simulate against this run's permissions.
+    pub fn load_sim_policy(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let lang = Ui::of(cx).lang;
+        let label = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("policy.json")
+            .to_string();
+        let gate_label = label.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::fsguard::assert_io_allowed();
+                    Gate::from_policy_file_simulating(&path, gate_label)
+                })
+                .await;
+            this.update(cx, |session, cx| match loaded {
+                Ok(gate) => {
+                    session.sim_policy = Some((label.clone(), Arc::new(gate)));
+                    session.recompute_sim_decisions();
+                    let msg = match lang {
+                        Lang::En => format!("Simulated against {label}"),
+                        Lang::Zh => format!("已加载策略模拟：{label}"),
+                    };
+                    cx.emit(SessionEvent::Toast(msg));
+                    cx.emit(SessionEvent::Derived);
+                    cx.notify();
+                }
+                Err(error) => {
+                    let msg = match lang {
+                        Lang::En => format!("Invalid IAM policy: {error}"),
+                        Lang::Zh => format!("无效的 IAM 策略：{error}"),
+                    };
+                    cx.emit(SessionEvent::Toast(msg));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn clear_sim_policy(&mut self, cx: &mut Context<Self>) {
+        self.sim_policy = None;
+        self.sim_decisions = Arc::new(BTreeMap::new());
         cx.emit(SessionEvent::Derived);
         cx.notify();
     }
@@ -657,23 +754,25 @@ impl Session {
         self.lock_path.is_some()
     }
 
-    /// Accept permissions into the lock (background), then re-read it.
-    pub fn accept(&mut self, entries: Vec<(Access, bool)>, cx: &mut Context<Self>) {
+    /// Accept permissions into the lock (background), preserving `# implied` & `# test`.
+    pub fn accept(&mut self, entries: Vec<(Access, bool, bool)>, cx: &mut Context<Self>) {
         let Some(path) = self.lock_path.clone() else {
             return;
         };
         if entries.is_empty() {
             return;
         }
+        let lang = Ui::of(cx).lang;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { lockfile::accept(&path, &entries) })
+                .spawn(async move { lockfile::accept_with_implied(&path, &entries) })
                 .await;
             this.update(cx, |session, cx| {
-                let message = match result {
-                    Ok(added) => format!("Added {added} to lenslet.lock"),
-                    Err(error) => format!("lenslet.lock: {error}"),
+                let message = match (result, lang) {
+                    (Ok(added), Lang::En) => format!("Added {added} to lenslet.lock"),
+                    (Ok(added), Lang::Zh) => format!("已向 lenslet.lock 写入 {added} 项权限"),
+                    (Err(error), _) => format!("lenslet.lock: {error}"),
                 };
                 cx.emit(SessionEvent::Toast(message));
                 session.refresh_lock(cx);
@@ -687,19 +786,50 @@ impl Session {
         let Some(path) = self.lock_path.clone() else {
             return;
         };
+        let lang = Ui::of(cx).lang;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { lockfile::set_test_mark(&path, &access, test) })
                 .await;
             this.update(cx, |session, cx| {
-                let message = match result {
-                    Ok(_) if test => "Marked `# test` in lenslet.lock".to_string(),
-                    Ok(_) => "Removed `# test` in lenslet.lock".to_string(),
-                    Err(error) => format!("lenslet.lock: {error}"),
+                let message = match (result, test, lang) {
+                    (Ok(_), true, Lang::En) => "Marked `# test` in lenslet.lock".to_string(),
+                    (Ok(_), true, Lang::Zh) => "已在 lenslet.lock 标记 `# test`".to_string(),
+                    (Ok(_), false, Lang::En) => "Removed `# test` in lenslet.lock".to_string(),
+                    (Ok(_), false, Lang::Zh) => "已取消 lenslet.lock 中的 `# test`".to_string(),
+                    (Err(error), _, _) => format!("lenslet.lock: {error}"),
                 };
                 cx.emit(SessionEvent::Toast(message));
                 session.refresh_lock(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Pin or unpin a run so retention pruning preserves it.
+    pub fn toggle_pin_run(&mut self, run_id: String, pinned: bool, cx: &mut Context<Self>) {
+        let Some(dir) = self.runs_dir() else {
+            return;
+        };
+        let lang = Ui::of(cx).lang;
+        let id_for_io = run_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { feed::set_run_pinned(&dir, &id_for_io, pinned) })
+                .await;
+            this.update(cx, |session, cx| {
+                let msg = match (res, pinned, lang) {
+                    (Ok(_), true, Lang::En) => format!("Pinned run {run_id}"),
+                    (Ok(_), true, Lang::Zh) => format!("已置顶保留运行 {run_id}"),
+                    (Ok(_), false, Lang::En) => format!("Unpinned run {run_id}"),
+                    (Ok(_), false, Lang::Zh) => format!("已取消置顶 {run_id}"),
+                    (Err(e), _, _) => e.to_string(),
+                };
+                cx.emit(SessionEvent::Toast(msg));
+                session.refresh_runs(cx);
             })
             .ok();
         })
@@ -711,6 +841,7 @@ impl Session {
         let Some(dir) = self.runs_dir() else {
             return;
         };
+        let lang = Ui::of(cx).lang;
         let keep = self.path.clone();
         cx.spawn(async move |this, cx| {
             let removed = cx
@@ -718,9 +849,11 @@ impl Session {
                 .spawn(async move { feed::clear_finished_runs(&dir, keep.as_deref()) })
                 .await;
             this.update(cx, |session, cx| {
-                cx.emit(SessionEvent::Toast(format!(
-                    "Cleared {removed} finished runs"
-                )));
+                let msg = match lang {
+                    Lang::En => format!("Cleared {removed} finished runs"),
+                    Lang::Zh => format!("已清理 {removed} 个已结束运行"),
+                };
+                cx.emit(SessionEvent::Toast(msg));
                 session.refresh_runs(cx);
             })
             .ok();

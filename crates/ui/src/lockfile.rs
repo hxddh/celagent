@@ -37,9 +37,17 @@ pub fn read(path: &Path) -> anyhow::Result<Option<Lock>> {
 /// Add permissions to the lock (`test` marks them `# test`). Returns how many
 /// were not already in it. The write is `lenslet_core::lock`'s: atomic and
 /// canonical, the same file `lenslet run --update` writes.
+#[cfg(test)]
 pub fn accept(path: &Path, entries: &[(Access, bool)]) -> anyhow::Result<usize> {
     fsguard::assert_io_allowed();
     lenslet_core::lock::accept(path, entries)
+}
+
+/// Add permissions to the lock (`(access, test, implied)`), preserving `# implied`
+/// notes for KMS / `iam:PassRole` entries accepted from the window.
+pub fn accept_with_implied(path: &Path, entries: &[(Access, bool, bool)]) -> anyhow::Result<usize> {
+    fsguard::assert_io_allowed();
+    lenslet_core::lock::accept_with_implied(path, entries)
 }
 
 /// Mark or unmark a permission `# test`. Marking one the lock does not have

@@ -2,13 +2,13 @@
 //! or raw), split into lines with their syntax and search highlights, built
 //! once per (call, side, mode, query, look) and cached.
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use gpui::HighlightStyle;
 
 use crate::{
     model::{Body, decode_aws_semantic, format_hex_dump, pretty_body},
-    syntax::{SyntaxKind, highlight_code},
+    syntax::{SyntaxKind, find_search_matches, highlight_code},
     theme::Palette,
 };
 
@@ -40,6 +40,10 @@ pub struct BodyDoc {
     /// The longest line, to size horizontal scrolling.
     pub widest: usize,
     pub matches: usize,
+    /// Display-line indices containing at least one search match, in ascending order.
+    pub match_lines: Vec<usize>,
+    /// Multi-line JSON block ranges (`open_line -> close_line`) for code folding.
+    pub fold_ranges: HashMap<usize, usize>,
     /// What the decoder recognized, e.g. `DynamoDB` (Decoded mode only).
     pub decoder: Option<&'static str>,
     /// Decoded differs from raw, so the toggle means something.
@@ -65,6 +69,54 @@ impl BodyDoc {
                 out.push('\n');
             }
             out.push_str(self.line_text(index));
+        }
+        out
+    }
+
+    /// Character-accurate slice between `(first_line, first_col)` and `(last_line, last_col)`.
+    pub fn copy_selection(
+        &self,
+        first_line: usize,
+        first_col: usize,
+        last_line: usize,
+        last_col: usize,
+    ) -> String {
+        if self.lines.is_empty() {
+            return String::new();
+        }
+        let max_line = self.lines.len() - 1;
+        let fl = first_line.min(max_line);
+        let ll = last_line.min(max_line);
+        let clamp_col = |line_ix: usize, col: usize| -> usize {
+            let line = self.line_text(line_ix);
+            let mut c = col.min(line.len());
+            while c > 0 && !line.is_char_boundary(c) {
+                c -= 1;
+            }
+            c
+        };
+        if fl == ll {
+            let line = self.line_text(fl);
+            let s = clamp_col(fl, first_col);
+            let e = clamp_col(fl, last_col);
+            if s == e {
+                return line.to_string();
+            }
+            return line[s.min(e)..s.max(e)].to_string();
+        }
+        let mut out = String::new();
+        for index in fl..=ll {
+            if index > fl && !self.continued[index] {
+                out.push('\n');
+            }
+            let line = self.line_text(index);
+            if index == fl {
+                out.push_str(&line[clamp_col(index, first_col)..]);
+            } else if index == ll {
+                out.push_str(&line[..clamp_col(index, last_col)]);
+            } else {
+                out.push_str(line);
+            }
         }
         out
     }
@@ -146,9 +198,175 @@ impl BodyDoc {
             .enumerate()
             .max_by_key(|(_, range)| range.len())
             .map_or(0, |(index, _)| index);
+        if matches > 0 {
+            let raw_matches = find_search_matches(&text, tokens);
+            let mut line_ix = 0usize;
+            for m in raw_matches {
+                while line_ix < doc.lines.len() && doc.lines[line_ix].end <= m.start {
+                    line_ix += 1;
+                }
+                let mut cur = line_ix;
+                while cur < doc.lines.len() && doc.lines[cur].start < m.end {
+                    if doc.match_lines.last().copied() != Some(cur) {
+                        doc.match_lines.push(cur);
+                    }
+                    cur += 1;
+                }
+            }
+        }
+        if kind == SyntaxKind::Json && text.len() <= 256 * 1024 {
+            doc.fold_ranges = compute_json_folds(&text, &doc.lines);
+        }
         doc.text = Arc::from(text);
         doc
     }
+}
+
+fn compute_json_folds(text: &str, lines: &[Range<usize>]) -> HashMap<usize, usize> {
+    let mut folds = HashMap::new();
+    let mut stack: Vec<(u8, usize)> = Vec::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    for (line_ix, range) in lines.iter().enumerate() {
+        for &b in &text.as_bytes()[range.clone()] {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' => stack.push((b'}', line_ix)),
+                b'[' => stack.push((b']', line_ix)),
+                b'}' | b']' => {
+                    if let Some(&(expect, open_line)) = stack.last()
+                        && expect == b
+                    {
+                        stack.pop();
+                        if line_ix > open_line {
+                            folds.entry(open_line).or_insert(line_ix);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    folds
+}
+
+/// Produce a clean unified-style diff between a recorded response body and a replay body.
+pub fn diff_text(recorded: &str, replay: &str) -> String {
+    if recorded == replay {
+        return "--- recorded\n+++ replay\n@@ identical @@\n (Payloads are byte-for-byte identical)"
+            .into();
+    }
+    let a: Vec<&str> = recorded.lines().collect();
+    let b: Vec<&str> = replay.lines().collect();
+    let mut out = String::from("--- recorded\n+++ replay\n");
+
+    // Trim shared prefix & suffix first so common headers/footers cost O(N).
+    let mut prefix = 0usize;
+    while prefix < a.len() && prefix < b.len() && a[prefix] == b[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < (a.len() - prefix)
+        && suffix < (b.len() - prefix)
+        && a[a.len() - 1 - suffix] == b[b.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let a_mid = &a[prefix..a.len() - suffix];
+    let b_mid = &b[prefix..b.len() - suffix];
+    out.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        prefix + 1,
+        a_mid.len(),
+        prefix + 1,
+        b_mid.len()
+    ));
+
+    let ctx_before = prefix.saturating_sub(2);
+    for line in &a[ctx_before..prefix] {
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // Bounded LCS over the changed middle window (up to 400x400 lines).
+    if a_mid.len() * b_mid.len() <= 160_000 {
+        let n = a_mid.len();
+        let m = b_mid.len();
+        let mut dp = vec![0u16; (n + 1) * (m + 1)];
+        let idx = |i: usize, j: usize| i * (m + 1) + j;
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                dp[idx(i, j)] = if a_mid[i] == b_mid[j] {
+                    dp[idx(i + 1, j + 1)].saturating_add(1)
+                } else {
+                    dp[idx(i + 1, j)].max(dp[idx(i, j + 1)])
+                };
+            }
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < n && j < m {
+            if a_mid[i] == b_mid[j] {
+                out.push(' ');
+                out.push_str(a_mid[i]);
+                out.push('\n');
+                i += 1;
+                j += 1;
+            } else if dp[idx(i + 1, j)] >= dp[idx(i, j + 1)] {
+                out.push('-');
+                out.push_str(a_mid[i]);
+                out.push('\n');
+                i += 1;
+            } else {
+                out.push('+');
+                out.push_str(b_mid[j]);
+                out.push('\n');
+                j += 1;
+            }
+        }
+        while i < n {
+            out.push('-');
+            out.push_str(a_mid[i]);
+            out.push('\n');
+            i += 1;
+        }
+        while j < m {
+            out.push('+');
+            out.push_str(b_mid[j]);
+            out.push('\n');
+            j += 1;
+        }
+    } else {
+        for line in a_mid {
+            out.push('-');
+            out.push_str(line);
+            out.push('\n');
+        }
+        for line in b_mid {
+            out.push('+');
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    let suffix_start = a.len() - suffix;
+    for line in &a[suffix_start..(suffix_start + 2).min(a.len())] {
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end_matches('\n').to_string()
 }
 
 /// Build the document for a message body.
@@ -293,5 +511,24 @@ mod tests {
         cache.insert(key.clone(), Arc::new(raw));
         assert!(cache.get(&key).is_some());
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn json_folds_match_lines_char_selection_and_diff_work() {
+        let json = "{\n  \"a\": {\n    \"id\": \"ord-1\"\n  },\n  \"b\": \"ord-2\"\n}";
+        let doc = BodyDoc::from_text(
+            json.into(),
+            SyntaxKind::Json,
+            &["ord-".into()],
+            &theme::DARK,
+        );
+        assert_eq!(doc.match_lines, vec![2, 4]);
+        assert_eq!(doc.fold_ranges.get(&0), Some(&5));
+        assert_eq!(doc.fold_ranges.get(&1), Some(&3));
+        assert_eq!(doc.copy_selection(2, 11, 2, 16), "ord-1");
+
+        let diff = diff_text("{\n  \"ok\": false\n}", "{\n  \"ok\": true\n}");
+        assert!(diff.contains("-  \"ok\": false"));
+        assert!(diff.contains("+  \"ok\": true"));
     }
 }

@@ -58,6 +58,7 @@ pub struct CallStore {
     stats: Stats,
     services: BTreeMap<String, (String, usize)>,
     access: BTreeMap<Access, AccessAgg>,
+    ever_access: BTreeMap<Access, AccessAgg>,
     revision: u64,
 }
 
@@ -100,7 +101,7 @@ impl CallStore {
         facets
     }
 
-    fn contribute(&mut self, row: &Trace, add: bool) {
+    fn contribute(&mut self, row: &Trace, add: bool, evict: bool) {
         let step = |value: &mut usize, on: bool| {
             if on {
                 if add {
@@ -124,22 +125,42 @@ impl CallStore {
         if row.pending {
             return;
         }
+        let via_label = add.then(|| format!("{} {}", row.service_name(), operation_label(row)));
         for (call_access, implied) in row.call_access() {
-            let agg = self.access.entry(call_access.key()).or_default();
+            let key = call_access.key();
+            let is_new = row.is_access_new(call_access);
+            let agg = self.access.entry(key.clone()).or_default();
             step(&mut agg.calls, true);
             step(&mut agg.errors, row.is_error());
             step(&mut agg.direct, !implied);
-            step(&mut agg.new, row.is_access_new(call_access));
+            step(&mut agg.new, is_new);
             step(&mut agg.unverified, call_access.unverified);
-            if add && agg.via.len() < 3 {
-                let via = format!("{} {}", row.service_name(), operation_label(row));
-                if !agg.via.contains(&via) {
-                    agg.via.push(via);
+            if let Some(via) = via_label.as_ref()
+                && agg.via.len() < 3
+                && !agg.via.contains(via)
+            {
+                agg.via.push(via.clone());
+            }
+            if !evict {
+                let ever = self.ever_access.entry(key).or_default();
+                step(&mut ever.calls, true);
+                step(&mut ever.errors, row.is_error());
+                step(&mut ever.direct, !implied);
+                step(&mut ever.new, is_new);
+                step(&mut ever.unverified, call_access.unverified);
+                if let Some(via) = via_label.as_ref()
+                    && ever.via.len() < 3
+                    && !ever.via.contains(via)
+                {
+                    ever.via.push(via.clone());
                 }
             }
         }
         if !add {
             self.access.retain(|_, agg| agg.calls > 0);
+            if !evict {
+                self.ever_access.retain(|_, agg| agg.calls > 0);
+            }
         }
     }
 
@@ -176,14 +197,14 @@ impl CallStore {
                 if trace.line_ref.is_none() {
                     trace.line_ref = old.line_ref.clone();
                 }
-                self.contribute(&old, false);
-                self.contribute(&trace, true);
+                self.contribute(&old, false, false);
+                self.contribute(&trace, true, false);
                 Arc::make_mut(&mut self.rows)[at] = Arc::new(trace);
                 delta.replaced.push(at);
                 delta.changed = true;
                 continue;
             }
-            self.contribute(&trace, true);
+            self.contribute(&trace, true, false);
             let rows = Arc::make_mut(&mut self.rows);
             let key = order_key(&trace);
             let mut pos = rows.len();
@@ -211,7 +232,7 @@ impl CallStore {
             let excess = self.rows.len() - MAX_ROWS;
             let evicted: Vec<Arc<Trace>> = Arc::make_mut(&mut self.rows).drain(..excess).collect();
             for row in &evicted {
-                self.contribute(row, false);
+                self.contribute(row, false, true);
                 self.index.remove(&row.id);
             }
             for (index, row) in self.rows.iter().enumerate() {
@@ -246,23 +267,15 @@ impl CallStore {
             .collect()
     }
 
-    /// The access table of the calls seen so far (used while a run is live).
+    /// The access table of the calls currently in the window.
     pub fn access_entries(&self) -> Vec<AccessEntry> {
-        self.access
-            .iter()
-            .map(|(access, agg)| AccessEntry {
-                action: access.action.clone(),
-                resource: access.resource.clone(),
-                used: AccessUse {
-                    calls: agg.calls,
-                    errors: agg.errors,
-                    implied: agg.direct == 0,
-                    unverified: agg.unverified > 0,
-                    via: agg.via.clone(),
-                },
-                new: agg.new > 0,
-            })
-            .collect()
+        entries_from_map(&self.access)
+    }
+
+    /// Cumulative access table across the entire live session (never evicted
+    /// when `MAX_ROWS` rolls over).
+    pub fn cumulative_access_entries(&self) -> Vec<AccessEntry> {
+        entries_from_map(&self.ever_access)
     }
 
     /// A report for a run that has not ended yet, from the calls seen so far:
@@ -296,10 +309,27 @@ impl CallStore {
             unfinished: self.stats.pending,
             services,
             failures,
-            access: self.access_entries(),
+            access: self.cumulative_access_entries(),
             ..Report::default()
         }
     }
+}
+
+fn entries_from_map(map: &BTreeMap<Access, AccessAgg>) -> Vec<AccessEntry> {
+    map.iter()
+        .map(|(access, agg)| AccessEntry {
+            action: access.action.clone(),
+            resource: access.resource.clone(),
+            used: AccessUse {
+                calls: agg.calls,
+                errors: agg.errors,
+                implied: agg.direct == 0,
+                unverified: agg.unverified > 0,
+                via: agg.via.clone(),
+            },
+            new: agg.new > 0,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -505,22 +535,34 @@ pub fn access_rows(
     rows.into_values().collect()
 }
 
+/// Compile the permissions used in this run (minus `# test`) into any IaC format.
+pub fn compile_policy(rows: &[AccessRow], opts: &lenslet_core::iac::CompileOptions) -> String {
+    let inputs: Vec<lenslet_core::iac::PolicyInput> = rows
+        .iter()
+        .filter(|row| row.used && !row.test)
+        .map(|row| lenslet_core::iac::PolicyInput {
+            access: row.access.clone(),
+            implied: row.implied,
+            via: row.via.clone(),
+        })
+        .collect();
+    lenslet_core::iac::compile(&inputs, opts)
+}
+
+/// Compile a single permission row into any IaC format (preserving its `implied`/`via` conditions).
+pub fn compile_single_permission(
+    row: &AccessRow,
+    opts: &lenslet_core::iac::CompileOptions,
+) -> String {
+    let mut single = row.clone();
+    single.used = true;
+    single.test = false;
+    compile_policy(&[single], opts)
+}
+
 /// The lock a policy is generated from: what this run used, minus `# test`.
 pub fn policy_json(rows: &[AccessRow]) -> String {
-    let lock = Lock {
-        access: rows
-            .iter()
-            .filter(|row| row.used)
-            .map(|row| row.access.clone())
-            .collect(),
-        test: rows
-            .iter()
-            .filter(|row| row.test)
-            .map(|row| row.access.clone())
-            .collect(),
-        ..Lock::default()
-    };
-    serde_json::to_string_pretty(&lenslet_core::lock::policy(&lock)).unwrap_or_else(|_| "{}".into())
+    compile_policy(rows, &lenslet_core::iac::CompileOptions::default())
 }
 
 /// One IAM statement for a single permission.
@@ -609,6 +651,8 @@ mod tests {
         let entries = store.access_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].used.calls, MAX_ROWS);
+        let cumulative = store.cumulative_access_entries();
+        assert_eq!(cumulative[0].used.calls, MAX_ROWS + 10);
     }
 
     #[test]
