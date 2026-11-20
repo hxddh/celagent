@@ -188,9 +188,8 @@ pub struct LensletApp {
 
 impl Drop for LensletApp {
     fn drop(&mut self) {
-        if let Some(mut child) = self.managed_proxy.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = self.managed_proxy.take() {
+            daemon::stop_proxy_on_exit(child, self.proxy_port);
         }
     }
 }
@@ -649,9 +648,8 @@ impl LensletApp {
                     .update(cx, |session, cx| session.set_baseline(baseline, cx));
             }
             Cmd::Quit => {
-                if let Some(mut child) = self.managed_proxy.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                if let Some(child) = self.managed_proxy.take() {
+                    daemon::stop_proxy_on_exit(child, self.proxy_port);
                 }
                 cx.quit();
             }
@@ -787,12 +785,12 @@ impl LensletApp {
     }
 
     fn stop_managed_proxy(&mut self, cx: &mut Context<Self>) {
-        if let Some(mut child) = self.managed_proxy.take() {
+        if let Some(child) = self.managed_proxy.take() {
+            let port = self.proxy_port;
             let lang = Ui::of(cx).lang;
             cx.background_executor()
                 .spawn(async move {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    daemon::stop_proxy_gracefully(child, port);
                 })
                 .detach();
             self.env_probe.running = false;

@@ -297,6 +297,7 @@ struct Statement {
     /// `Sid`, or `Statement[i]` (0-based) when the statement has none.
     label: String,
     allow: bool,
+    simulating: bool,
     actions: Vec<String>,
     not_actions: Vec<String>,
     resources: Vec<String>,
@@ -433,6 +434,10 @@ struct ConditionClause {
 #[derive(Clone, Debug, Default)]
 pub struct RequestContext {
     values: BTreeMap<String, Vec<String>>,
+    /// Wire keys that cannot be unambiguously derived from this specific call
+    /// without external schema metadata (e.g. `dynamodb:LeadingKeys` on a
+    /// composite-key `Key` or schemaless `PutItem` `Item`).
+    ambiguous: BTreeSet<String>,
 }
 
 const SUPPORTED_CONDITION_KEYS: &[&str] = &[
@@ -539,6 +544,7 @@ impl RequestContext {
             }
         }
 
+        let mut ambiguous: BTreeSet<String> = BTreeSet::new();
         if let Some(body_text) = trace
             .request
             .body
@@ -547,18 +553,23 @@ impl RequestContext {
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
-            extract_wire_body_context(&trace.service, body_text, &mut values);
+            extract_wire_body_context(&trace.service, body_text, &mut values, &mut ambiguous);
         }
 
-        RequestContext { values }
+        RequestContext { values, ambiguous }
     }
 
     /// Merge caller-supplied `--context key=val` overrides into this context.
     pub fn extend_overrides(&mut self, overrides: &BTreeMap<String, Vec<String>>) {
         for (k, vals) in overrides {
-            self.values
-                .insert(k.trim().to_ascii_lowercase(), vals.clone());
+            let norm = k.trim().to_ascii_lowercase();
+            self.ambiguous.remove(&norm);
+            self.values.insert(norm, vals.clone());
         }
+    }
+
+    pub fn is_ambiguous(&self, key: &str) -> bool {
+        self.ambiguous.contains(&key.to_ascii_lowercase())
     }
 
     pub fn get(&self, key: &str) -> &[String] {
@@ -634,6 +645,7 @@ fn extract_wire_body_context(
     service: &str,
     body_text: &str,
     values: &mut BTreeMap<String, Vec<String>>,
+    ambiguous: &mut BTreeSet<String>,
 ) {
     if body_text.starts_with('{')
         && let Ok(serde_json::Value::Object(map)) =
@@ -678,36 +690,57 @@ fn extract_wire_body_context(
             }
         }
         if service == "dynamodb" {
-            for field in ["Key", "Item"] {
-                if let Some(serde_json::Value::Object(item)) = map.get(field) {
-                    extract_ddb_scalars(item, values);
+            // Only a single-attribute `Key` unambiguously identifies the partition
+            // key (`dynamodb:LeadingKeys`). Composite `Key`s (partition + sort key),
+            // `PutItem` `Item`s (which include non-key attributes), and `Query`
+            // expressions require table `KeySchema` metadata not present on the wire.
+            if let Some(serde_json::Value::Object(key_obj)) = map.get("Key") {
+                if key_obj.len() == 1 {
+                    extract_ddb_single_key(key_obj, values);
+                } else if !key_obj.is_empty() {
+                    ambiguous.insert("dynamodb:leadingkeys".into());
                 }
+            } else if map.contains_key("Item")
+                || map.contains_key("KeyConditionExpression")
+                || map.contains_key("KeyConditions")
+                || map.contains_key("TransactItems")
+            {
+                ambiguous.insert("dynamodb:leadingkeys".into());
             }
             if let Some(serde_json::Value::Object(req_items)) = map.get("RequestItems") {
+                let mut batch_ambiguous = false;
                 for table_entry in req_items.values() {
                     if let Some(keys) = table_entry.get("Keys").and_then(|v| v.as_array()) {
                         for kobj in keys.iter().filter_map(|v| v.as_object()) {
-                            extract_ddb_scalars(kobj, values);
+                            if kobj.len() == 1 {
+                                extract_ddb_single_key(kobj, values);
+                            } else if !kobj.is_empty() {
+                                batch_ambiguous = true;
+                            }
                         }
                     }
                     if let Some(writes) = table_entry.as_array() {
                         for w in writes {
-                            if let Some(item) = w
-                                .get("PutRequest")
-                                .and_then(|p| p.get("Item"))
-                                .and_then(|v| v.as_object())
-                            {
-                                extract_ddb_scalars(item, values);
+                            if w.get("PutRequest").is_some() {
+                                batch_ambiguous = true;
                             }
                             if let Some(key) = w
                                 .get("DeleteRequest")
                                 .and_then(|d| d.get("Key"))
                                 .and_then(|v| v.as_object())
                             {
-                                extract_ddb_scalars(key, values);
+                                if key.len() == 1 {
+                                    extract_ddb_single_key(key, values);
+                                } else if !key.is_empty() {
+                                    batch_ambiguous = true;
+                                }
                             }
                         }
                     }
+                }
+                if batch_ambiguous {
+                    values.remove("dynamodb:leadingkeys");
+                    ambiguous.insert("dynamodb:leadingkeys".into());
                 }
             }
         }
@@ -776,14 +809,13 @@ fn extract_wire_body_context(
     }
 }
 
-fn extract_ddb_scalars(
-    item: &serde_json::Map<String, serde_json::Value>,
+fn extract_ddb_single_key(
+    key_obj: &serde_json::Map<String, serde_json::Value>,
     values: &mut BTreeMap<String, Vec<String>>,
 ) {
-    for attr in item.values().take(8) {
-        let Some(typed) = attr.as_object() else {
-            continue;
-        };
+    if let Some(attr) = key_obj.values().next()
+        && let Some(typed) = attr.as_object()
+    {
         for ty in ["S", "N", "B"] {
             if let Some(s) = typed.get(ty).and_then(|v| v.as_str()) {
                 push_unique(values, "dynamodb:leadingkeys", s);
@@ -1002,6 +1034,7 @@ impl Gate {
             statements.push(Statement {
                 label,
                 allow,
+                simulating,
                 actions,
                 not_actions,
                 resources,
@@ -1163,6 +1196,18 @@ impl Statement {
 
         for clause in &self.conditions {
             let mut clause_missing = Vec::new();
+            if ctx.is_ambiguous(&clause.key) && ctx.get(&clause.key).is_empty() && !clause.if_exists
+            {
+                if self.simulating {
+                    clause_missing.push(clause.raw_key.clone());
+                } else {
+                    return if !self.allow {
+                        StatementMatch::Matched
+                    } else {
+                        StatementMatch::NoMatch
+                    };
+                }
+            }
             if clause.cloud_only && ctx.get(&clause.key).is_empty() && !clause.if_exists {
                 clause_missing.push(clause.raw_key.clone());
             }
@@ -2362,6 +2407,39 @@ mod tests {
             ..Default::default()
         };
         assert!(evaluate(&ddb_get, Some(&gate)).denied.is_empty());
+
+        // Composite keys (`pk` + `sk`) and `PutItem` items do not pollute
+        // `dynamodb:LeadingKeys` with sort keys or non-key attributes; simulation
+        // surfaces `NeedsContext` until `--context dynamodb:LeadingKeys=...` is given.
+        let sim_ddb_gate = Gate::from_policy_str_simulating(abac_policy, "abac.json").unwrap();
+        let ddb_composite = crate::trace::Trace {
+            method: "POST".into(),
+            path: "/".into(),
+            service: "dynamodb".into(),
+            operation: "GetItem".into(),
+            request: crate::trace::Message {
+                body: Some(crate::trace::BodyTrace {
+                    text: Some(
+                        r#"{"TableName":"orders","Key":{"pk":{"S":"tenant#acme"},"sk":{"S":"ord#1"}}}"#
+                            .into(),
+                    ),
+                    bytes: 74,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let comp_eval = evaluate(&ddb_composite, Some(&sim_ddb_gate));
+        assert_eq!(comp_eval.denied.len(), 1);
+        assert_eq!(comp_eval.denied[0].decision.reason, Reason::NeedsContext);
+        let mut ddb_ctx = BTreeMap::new();
+        ddb_ctx.insert("dynamodb:LeadingKeys".into(), vec!["tenant#acme".into()]);
+        assert!(
+            evaluate_with_context(&ddb_composite, Some(&sim_ddb_gate), &ddb_ctx)
+                .denied
+                .is_empty()
+        );
 
         let kms_dec = crate::trace::Trace {
             method: "POST".into(),

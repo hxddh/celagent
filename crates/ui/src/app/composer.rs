@@ -32,6 +32,7 @@ pub struct RequestComposer {
     host: String,
     service: String,
     region: String,
+    encoding: Option<String>,
     base_headers: Vec<Header>,
     target: Option<ReplayTarget>,
     home: PathBuf,
@@ -58,6 +59,7 @@ impl RequestComposer {
             host: String::new(),
             service: "s3".into(),
             region: "us-east-1".into(),
+            encoding: None,
             base_headers: Vec::new(),
             target: None,
             home,
@@ -84,6 +86,11 @@ impl RequestComposer {
             .region
             .clone()
             .unwrap_or_else(|| "us-east-1".to_string());
+        self.encoding = call
+            .request
+            .as_ref()
+            .and_then(|r| r.body.as_ref())
+            .and_then(|b| b.encoding.clone());
         self.base_headers = call
             .request
             .as_ref()
@@ -155,6 +162,7 @@ impl RequestComposer {
             host: self.host.clone(),
             service: self.service.clone(),
             region: self.region.clone(),
+            encoding: self.encoding.clone(),
             headers,
             body,
             resign_sigv4: self.resign_sigv4,

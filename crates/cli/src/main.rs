@@ -560,7 +560,22 @@ async fn run_child(command: &[String], env: &ChildEnv) -> Result<i32> {
     Ok(exit_code(status))
 }
 
+#[cfg(unix)]
+async fn wait_for_sigterm() {
+    if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        sig.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm() {
+    std::future::pending::<()>().await;
+}
+
 async fn serve_until_interrupted(server: &Server, options: &Options, home: &Path) {
+    let stop_notify = server.shutdown_requested();
     println!("lenslet {} · proxy until Ctrl-C", env!("CARGO_PKG_VERSION"));
     println!("  endpoint  {}", server.endpoint());
     println!("  upstream  {}", options.upstream.base);
@@ -570,7 +585,11 @@ async fn serve_until_interrupted(server: &Server, options: &Options, home: &Path
         tilde(&options.emulator_dir().join("emulator_credentials"), home),
         tilde(&options.emulator_dir().join("config"), home),
     );
-    tokio::signal::ctrl_c().await.ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = stop_notify.notified() => {}
+        () = wait_for_sigterm() => {}
+    }
     eprintln!();
 }
 

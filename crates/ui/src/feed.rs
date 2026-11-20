@@ -640,7 +640,12 @@ mod tests {
         drop(dead);
         let mut rx = start(path.clone(), Some(endpoint), state);
         let full = synthetic_run(2, None, true);
-        fs::write(&path, &full).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&full.as_bytes()[partial.len()..])
+            .unwrap();
         let msgs: Vec<FeedMsg> = futures::executor::block_on(async {
             let mut out = Vec::new();
             while let Some(msg) = rx.next().await {

@@ -149,6 +149,48 @@ pub fn spawn_proxy(port: u16, enforce: bool, cwd: Option<&Path>) -> Result<Child
         .map_err(|e| format!("failed to start `lenslet run`: {e}"))
 }
 
+/// Request a clean shutdown via `POST /_lenslet/shutdown` so `lenslet run` seals
+/// the trace and writes its `end` report before exiting; falls back to `kill()`
+/// only if `grace` expires.
+pub fn stop_proxy_gracefully(child: Child, port: u16) {
+    fsguard::assert_io_allowed();
+    stop_proxy_inner(child, port, Duration::from_millis(2_500));
+}
+
+/// Graceful proxy shutdown safe to call during window teardown (`Cmd::Quit` / `Drop`)
+/// without tripping [`fsguard`], bounded so quitting never stalls the UI.
+pub fn stop_proxy_on_exit(child: Child, port: u16) {
+    stop_proxy_inner(child, port, Duration::from_millis(800));
+}
+
+fn stop_proxy_inner(mut child: Child, port: u16, grace: Duration) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+        let req = format!(
+            "POST /_lenslet/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(req.as_bytes()).is_ok() {
+            let _ = stream.flush();
+            let mut drain = [0u8; 256];
+            let _ = stream.read(&mut drain);
+        }
+    }
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Symlink (or copy on Windows) the bundled `lenslet` CLI into `~/.local/bin/lenslet`
 /// (or `/usr/local/bin/lenslet` when already writable).
 pub fn install_cli_to_path(home: &Path) -> Result<PathBuf, String> {

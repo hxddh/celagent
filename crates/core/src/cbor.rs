@@ -41,6 +41,79 @@ pub fn decode_cbor_compact(input: &[u8]) -> Option<String> {
     serde_json::to_string(&val).ok()
 }
 
+/// Encode a [`serde_json::Value`] into definite-length RFC 8949 CBOR bytes.
+pub fn encode_cbor(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_value(value, &mut out);
+    out
+}
+
+fn encode_value(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Null => out.push(0xf6),
+        Value::Bool(false) => out.push(0xf4),
+        Value::Bool(true) => out.push(0xf5),
+        Value::Number(num) => {
+            if let Some(u) = num.as_u64() {
+                write_type_arg(out, 0, u);
+            } else if let Some(i) = num.as_i64() {
+                if i >= 0 {
+                    write_type_arg(out, 0, i as u64);
+                } else {
+                    let arg = (-1i128 - (i as i128)) as u64;
+                    write_type_arg(out, 1, arg);
+                }
+            } else if let Some(f) = num.as_f64() {
+                out.push(0xfb);
+                out.extend_from_slice(&f.to_be_bytes());
+            } else {
+                out.push(0xf6);
+            }
+        }
+        Value::String(s) => {
+            write_type_arg(out, 3, s.len() as u64);
+            out.extend_from_slice(s.as_bytes());
+        }
+        Value::Array(items) => {
+            write_type_arg(out, 4, items.len() as u64);
+            for item in items {
+                encode_value(item, out);
+            }
+        }
+        Value::Object(map) => {
+            write_type_arg(out, 5, map.len() as u64);
+            for (k, v) in map {
+                write_type_arg(out, 3, k.len() as u64);
+                out.extend_from_slice(k.as_bytes());
+                encode_value(v, out);
+            }
+        }
+    }
+}
+
+fn write_type_arg(out: &mut Vec<u8>, major: u8, arg: u64) {
+    let hi = major << 5;
+    match arg {
+        0..=23 => out.push(hi | (arg as u8)),
+        24..=0xff => {
+            out.push(hi | 24);
+            out.push(arg as u8);
+        }
+        0x100..=0xffff => {
+            out.push(hi | 25);
+            out.extend_from_slice(&(arg as u16).to_be_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            out.push(hi | 26);
+            out.extend_from_slice(&(arg as u32).to_be_bytes());
+        }
+        _ => {
+            out.push(hi | 27);
+            out.extend_from_slice(&arg.to_be_bytes());
+        }
+    }
+}
+
 struct CborReader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -324,5 +397,17 @@ mod tests {
         assert_eq!(json["DelaySeconds"], 5);
         assert_eq!(json["Tags"]["env"], "dev");
         assert!(json["At"].as_str().unwrap().starts_with("2023-11-14T"));
+
+        let roundtrip_src = serde_json::json!({
+            "QueueName": "orders",
+            "DelaySeconds": 5,
+            "Negative": -42,
+            "Ratio": 1.5,
+            "Active": true,
+            "Empty": null,
+            "Items": ["a", "b"],
+        });
+        let encoded = encode_cbor(&roundtrip_src);
+        assert_eq!(decode_cbor(&encoded).as_ref(), Some(&roundtrip_src));
     }
 }

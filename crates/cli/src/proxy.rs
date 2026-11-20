@@ -91,6 +91,7 @@ pub struct State {
     pub max_body: usize,
     pub enforce: bool,
     pub trace: Arc<TraceSink>,
+    pub shutdown_req: Arc<tokio::sync::Notify>,
 }
 
 impl State {
@@ -360,6 +361,15 @@ impl Options {
         self.emulator_ca
             .clone()
             .unwrap_or_else(|| self.emulator_dir().join("ca.pem"))
+    }
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
     }
 }
 
@@ -780,16 +790,30 @@ fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
     }
 }
 
+#[cfg(test)]
 async fn handle<B>(req: Request<B>, state: Arc<State>) -> Result<Response<Body>, Infallible>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    handle_with_inspect_limit(req, state, MAX_INSPECT_BYTES).await
+    handle_inner(req, state, MAX_INSPECT_BYTES, true).await
 }
 
+async fn handle_peer<B>(
+    req: Request<B>,
+    state: Arc<State>,
+    peer_loopback: bool,
+) -> Result<Response<Body>, Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    handle_inner(req, state, MAX_INSPECT_BYTES, peer_loopback).await
+}
+
+#[cfg(test)]
 async fn handle_with_inspect_limit<B>(
-    mut req: Request<B>,
+    req: Request<B>,
     state: Arc<State>,
     inspect_limit: usize,
 ) -> Result<Response<Body>, Infallible>
@@ -797,7 +821,20 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    if let Some(response) = lenslet_endpoint(&req, &state) {
+    handle_inner(req, state, inspect_limit, true).await
+}
+
+async fn handle_inner<B>(
+    mut req: Request<B>,
+    state: Arc<State>,
+    inspect_limit: usize,
+    peer_loopback: bool,
+) -> Result<Response<Body>, Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if let Some(response) = lenslet_endpoint(&req, &state, peer_loopback) {
         return Ok(response);
     }
     let started = Instant::now();
@@ -1146,10 +1183,33 @@ where
     }
 }
 
-/// `GET /_lenslet/events` and `GET /_lenslet/health`: Lenslet's own
-/// endpoints on the proxy address. They never go upstream and are never
-/// recorded.
-fn lenslet_endpoint<B>(req: &Request<B>, state: &Arc<State>) -> Option<Response<Body>> {
+/// `GET /_lenslet/events`, `GET /_lenslet/health`, and loopback-only
+/// `POST /_lenslet/shutdown`: Lenslet's own endpoints on the proxy address.
+/// They never go upstream and are never recorded.
+fn lenslet_endpoint<B>(
+    req: &Request<B>,
+    state: &Arc<State>,
+    peer_loopback: bool,
+) -> Option<Response<Body>> {
+    if req.method() == hyper::Method::POST && req.uri().path() == "/_lenslet/shutdown" {
+        if !peer_loopback {
+            return Some(error_response(
+                StatusCode::FORBIDDEN,
+                "shutdown requires loopback peer",
+            ));
+        }
+        state.shutdown_req.notify_one();
+        let mut response = Response::new(
+            Full::new(Bytes::from_static(br#"{"stopping":true}"#))
+                .map_err(|never| match never {})
+                .boxed(),
+        );
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        return Some(response);
+    }
     if req.method() != hyper::Method::GET {
         return None;
     }
@@ -1437,6 +1497,7 @@ impl Server {
             max_body: options.max_body,
             enforce: options.enforce,
             trace,
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
         let shutdown = watch::Sender::new(false);
         let tasks = std::iter::once(listener)
@@ -1454,6 +1515,11 @@ impl Server {
     /// The endpoint SDKs should use.
     pub fn endpoint(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// Notified when a loopback peer calls `POST /_lenslet/shutdown`.
+    pub fn shutdown_requested(&self) -> Arc<tokio::sync::Notify> {
+        self.state.shutdown_req.clone()
     }
 
     /// Give in-flight calls up to `grace` to finish, then stop accepting
@@ -1494,7 +1560,12 @@ async fn serve(listener: TcpListener, state: Arc<State>, mut shutdown: watch::Re
                         drop(stream);
                         continue;
                     }
-                    connections.spawn(serve_connection(stream, state.clone(), shutdown.clone()));
+                    connections.spawn(serve_connection(
+                        stream,
+                        is_loopback_ip(peer.ip()),
+                        state.clone(),
+                        shutdown.clone(),
+                    ));
                 }
             }
             () = stopped(&mut shutdown) => break,
@@ -1512,10 +1583,11 @@ async fn stopped(shutdown: &mut watch::Receiver<bool>) {
 
 async fn serve_connection(
     stream: TcpStream,
+    peer_loopback: bool,
     state: Arc<State>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let service = service_fn(move |req| handle(req, state.clone()));
+    let service = service_fn(move |req| handle_peer(req, state.clone(), peer_loopback));
     let mut builder = conn_auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
@@ -1702,6 +1774,7 @@ mod tests {
             max_body: MAX_CAPTURE_BYTES,
             enforce: false,
             trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), None).unwrap()),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -2198,6 +2271,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
         for request in [
             sdk_request("GET", "/bucket/key?x-id=GetObject", b""),
@@ -2239,6 +2313,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
 
         // Allowed S3 call reaches upstream normally.
@@ -2345,6 +2420,7 @@ mod tests {
             trace: Arc::new(
                 TraceSink::new(temp.trace(), &RunHeader::default(), Some(policy.clone())).unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
 
         // 1. Concrete key inside allowed prefix (`public/readme.txt`) succeeds and is NOT marked new.
@@ -2444,6 +2520,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
 
         let payload = br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"order-padding-0000000000000000000000000000"}}}}],"secret_orders":[{"PutRequest":{"Item":{"id":{"S":"2"}}}}]}}"#;
@@ -2529,6 +2606,7 @@ mod tests {
             trace: Arc::new(
                 TraceSink::new(temp.trace(), &RunHeader::default(), Some(admin)).unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
 
         let polled = Arc::new(AtomicUsize::new(0));
@@ -2584,6 +2662,7 @@ mod tests {
             max_body: MAX_CAPTURE_BYTES,
             enforce,
             trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), Some(gate)).unwrap()),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -2867,6 +2946,7 @@ mod tests {
             max_body: 64,
             enforce: false,
             trace: Arc::new(TraceSink::new(temp.trace(), &RunHeader::default(), None).unwrap()),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
         let payload = br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"order-padding-0000000000000000000000000000"}}}}],"secret_orders":[{"PutRequest":{"Item":{"id":{"S":"2"}}}}]}}"#;
         let request = Request::builder()
