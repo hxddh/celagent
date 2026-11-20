@@ -91,12 +91,28 @@ pub struct UiPrefs {
     pub inspector_width: f32,
     #[serde(default = "default_true")]
     pub inspector_open: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default = "default_true")]
     pub sidebar_open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_width: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_height: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_workspaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_upstream: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_routes: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxy_enforce: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxy_allow_docker: bool,
 }
 
 impl Default for UiPrefs {
@@ -109,9 +125,17 @@ impl Default for UiPrefs {
             reduce_motion: false,
             inspector_width: default_inspector_width(),
             inspector_open: true,
-            sidebar_open: false,
+            sidebar_open: true,
             window_width: None,
             window_height: None,
+            workspace_dir: None,
+            recent_workspaces: Vec::new(),
+            last_command: None,
+            proxy_port: None,
+            proxy_upstream: None,
+            proxy_routes: Vec::new(),
+            proxy_enforce: false,
+            proxy_allow_docker: false,
         }
     }
 }
@@ -176,6 +200,25 @@ fn detect_system_lang() -> Lang {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleLanguages"])
+        .output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        for line in text.lines() {
+            let trimmed = line.trim().trim_matches(['"', ',', '(', ')', ' ']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            return if trimmed.starts_with("zh") {
+                Lang::Zh
+            } else {
+                Lang::En
+            };
+        }
+    }
     Lang::En
 }
 
@@ -216,9 +259,10 @@ mod tests {
             reduce_motion: true,
             inspector_width: 520.0,
             inspector_open: false,
-            sidebar_open: true,
+            sidebar_open: false,
             window_width: Some(1440.0),
             window_height: Some(900.0),
+            ..UiPrefs::default()
         };
         save(&dir, &prefs);
         let text = fs::read_to_string(path(&dir)).unwrap();

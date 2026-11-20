@@ -230,6 +230,52 @@ impl LensletApp {
                     ))
                     .child(row(
                         ui,
+                        ui.t("Local Proxy Gate", "本地代理默认门禁"),
+                        ui.t(
+                            "Options used when starting the managed proxy from the Sidebar.",
+                            "从侧栏启动托管本地代理时使用的默认策略。",
+                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                widgets::chip(
+                                    ui,
+                                    "set-proxy-enforce",
+                                    "--enforce",
+                                    None,
+                                    prefs.proxy_enforce,
+                                    t.purple,
+                                )
+                                .on_click(cx.listener(
+                                    |app, _, window, cx| {
+                                        let next = !app.prefs.proxy_enforce;
+                                        app.update_prefs(window, cx, |p| p.proxy_enforce = next);
+                                    },
+                                )),
+                            )
+                            .child(
+                                widgets::chip(
+                                    ui,
+                                    "set-proxy-docker",
+                                    "--allow-docker",
+                                    None,
+                                    prefs.proxy_allow_docker,
+                                    t.accent,
+                                )
+                                .on_click(cx.listener(
+                                    |app, _, window, cx| {
+                                        let next = !app.prefs.proxy_allow_docker;
+                                        app.update_prefs(window, cx, |p| {
+                                            p.proxy_allow_docker = next
+                                        });
+                                    },
+                                )),
+                            ),
+                    ))
+                    .child(row(
+                        ui,
                         ui.t("Command-Line Tool", "命令行工具 (CLI)"),
                         ui.t(
                             "Symlink `lenslet` into ~/.local/bin so any terminal can run it.",

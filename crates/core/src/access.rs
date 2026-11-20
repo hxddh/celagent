@@ -2153,15 +2153,13 @@ mod tests {
                 }),
                 body: body.map(|text| BodyTrace {
                     text: Some(text.into()),
-                    hex: None,
-                    encoding: None,
                     bytes: text.len() as u64,
-                    truncated: false,
-                    binary: false,
-                    sha256: String::new(),
+                    ..Default::default()
                 }),
+                ..Default::default()
             },
             response: Message::default(),
+            ..Default::default()
         }
     }
 
@@ -3141,11 +3139,9 @@ mod tests {
         cbor.request.body = Some(BodyTrace {
             text: None,
             hex: Some("a1".into()),
-            encoding: None,
             bytes: 40,
-            truncated: false,
             binary: true,
-            sha256: String::new(),
+            ..Default::default()
         });
         let derived = derive_call(&cbor);
         assert_eq!(derived.own, vec![Access::new("sqs:SendMessage", "*")]);

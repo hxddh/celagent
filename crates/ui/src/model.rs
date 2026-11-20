@@ -39,9 +39,15 @@ pub struct Body {
     #[serde(default)]
     pub hex: Option<String>,
     #[serde(default)]
+    pub raw_b64: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
+    #[serde(default)]
     pub encoding: Option<String>,
     #[serde(default)]
     pub bytes: usize,
+    #[serde(default)]
+    pub decoded_bytes: Option<usize>,
     #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
@@ -62,6 +68,28 @@ impl Body {
     pub fn is_empty(&self) -> bool {
         self.size() == 0 && self.text.as_deref().unwrap_or("").is_empty()
     }
+
+    /// Reconstruct exact raw wire bytes when retained inline (`raw_b64`), in a
+    /// sidecar content-addressed `blob`, or as unencoded UTF-8 `text`.
+    pub fn raw_wire_bytes(&self, trace_path: Option<&std::path::Path>) -> Option<Vec<u8>> {
+        if let Some(b64) = self.raw_b64.as_deref()
+            && let Some(bytes) = lenslet_core::trace::b64_decode(b64)
+        {
+            return Some(bytes);
+        }
+        if let Some(blob) = self.blob.as_deref()
+            && let Some(tp) = trace_path
+        {
+            crate::fsguard::assert_io_allowed();
+            if let Some(bytes) = lenslet_core::runs::read_blob(tp, blob) {
+                return Some(bytes);
+            }
+        }
+        if !self.binary && !self.truncated && self.encoding.is_none() {
+            return Some(self.text.as_deref().unwrap_or("").as_bytes().to_vec());
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -69,7 +97,11 @@ pub struct Exchange {
     #[serde(default)]
     pub headers: Vec<Header>,
     #[serde(default)]
+    pub trailers: Vec<Header>,
+    #[serde(default)]
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub raw_content_type: Option<String>,
     #[serde(default)]
     pub body: Option<Body>,
 }
@@ -87,7 +119,7 @@ impl Exchange {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Record {
-    Run(RunHeader),
+    Run(Box<RunHeader>),
     Call(Box<Trace>),
     End(Box<Report>),
 }
@@ -176,6 +208,18 @@ pub struct Trace {
     /// Concise semantic resource/target summary (e.g. `table/orders · id="1"`).
     #[serde(default)]
     pub target: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub upstream_protocol: Option<String>,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    #[serde(default)]
+    pub client_addr: Option<String>,
+    #[serde(default)]
+    pub ttfb_ms: Option<u64>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
     #[serde(default)]
     pub request: Option<Exchange>,
     #[serde(default)]
@@ -356,6 +400,10 @@ impl Trace {
             self.invocation_id.as_deref(),
             self.caller_role.as_deref(),
             self.target.as_deref(),
+            self.upstream.as_deref(),
+            self.client_addr.as_deref(),
+            self.access_key_id.as_deref(),
+            self.protocol.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -381,6 +429,9 @@ impl Trace {
             .into_iter()
             .flatten()
         {
+            for hdr in exchange.headers.iter().chain(exchange.trailers.iter()) {
+                let _ = writeln!(haystack, "{}: {}", hdr.name, hdr.value);
+            }
             if let Some(content_type) = exchange.content_type.as_deref() {
                 haystack.push_str(content_type);
                 haystack.push('\n');
@@ -457,7 +508,9 @@ impl Trace {
     pub fn to_core(&self) -> lenslet_core::trace::Trace {
         let message = |exchange: Option<&Exchange>| lenslet_core::trace::Message {
             headers: exchange.map(|e| e.headers.clone()).unwrap_or_default(),
+            trailers: exchange.map(|e| e.trailers.clone()).unwrap_or_default(),
             content_type: exchange.and_then(|e| e.content_type.clone()),
+            raw_content_type: exchange.and_then(|e| e.raw_content_type.clone()),
             body: None,
         };
         lenslet_core::trace::Trace {
@@ -486,6 +539,12 @@ impl Trace {
             replay_of: self.replay_of.clone(),
             caller_role: self.caller_role.clone(),
             target: self.target.clone(),
+            protocol: self.protocol.clone(),
+            upstream_protocol: self.upstream_protocol.clone(),
+            upstream: self.upstream.clone(),
+            client_addr: self.client_addr.clone(),
+            ttfb_ms: self.ttfb_ms,
+            access_key_id: self.access_key_id.clone(),
             request: message(self.request.as_ref()),
             response: message(self.response.as_ref()),
         }
@@ -501,8 +560,11 @@ impl Trace {
             core.request.body = Some(lenslet_core::trace::BodyTrace {
                 text: body.text.clone(),
                 hex: body.hex.clone(),
+                raw_b64: body.raw_b64.clone(),
+                blob: body.blob.clone(),
                 encoding: body.encoding.clone(),
                 bytes: body.bytes as u64,
+                decoded_bytes: body.decoded_bytes.map(|n| n as u64),
                 truncated: body.truncated,
                 binary: body.binary,
                 sha256: body.sha256.clone().unwrap_or_default(),
@@ -639,7 +701,7 @@ pub fn parse_records_at(bytes: &[u8], base_offset: u64, source: Option<&Arc<Path
                 }
                 parsed.calls.push(*trace);
             }
-            Some(Record::Run(header)) => parsed.header = Some(header),
+            Some(Record::Run(header)) => parsed.header = Some(*header),
             Some(Record::End(report)) => parsed.report = Some(*report),
             None => parsed.bad += 1,
         }
@@ -1141,12 +1203,19 @@ pub fn format_hex_dump(hex_str: &str) -> String {
             bytes.push(val);
         }
     }
+    format_hex_bytes(&bytes)
+}
+
+/// Render raw bytes as a 16-byte-per-row Hex + ASCII dump (up to 256 KiB inline display).
+pub fn format_hex_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
     }
+    const MAX_HEX_DISPLAY: usize = 256 * 1024;
+    let shown = &bytes[..bytes.len().min(MAX_HEX_DISPLAY)];
     let mut out = String::new();
-    for (row_idx, row) in bytes.chunks(16).enumerate() {
-        let _ = write!(out, "{:04x}  ", row_idx * 16);
+    for (row_idx, row) in shown.chunks(16).enumerate() {
+        let _ = write!(out, "{:06x}  ", row_idx * 16);
         for (i, byte) in row.iter().enumerate() {
             if i == 8 {
                 out.push(' ');
@@ -1169,6 +1238,13 @@ pub fn format_hex_dump(hex_str: &str) -> String {
             out.push(ch);
         }
         out.push_str("|\n");
+    }
+    if bytes.len() > MAX_HEX_DISPLAY {
+        let _ = writeln!(
+            out,
+            "# … {} total wire bytes (use Save Payload… to export complete binary file)",
+            format_bytes(bytes.len())
+        );
     }
     out.trim_end().to_string()
 }
@@ -1553,6 +1629,7 @@ mod tests {
                 }],
                 content_type: None,
                 body: None,
+                ..Default::default()
             },
             response: Message {
                 headers: Vec::new(),
@@ -1565,7 +1642,9 @@ mod tests {
                     truncated: false,
                     binary: false,
                     sha256: "ab".repeat(32),
+                    ..Default::default()
                 }),
+                ..Default::default()
             },
             ..Default::default()
         };

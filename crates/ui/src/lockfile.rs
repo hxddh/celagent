@@ -64,6 +64,12 @@ pub fn set_test_mark(path: &Path, access: &Access, test: bool) -> anyhow::Result
     Ok(false)
 }
 
+/// Remove permissions from `lenslet.lock`.
+pub fn remove(path: &Path, entries: &[Access]) -> anyhow::Result<usize> {
+    fsguard::assert_io_allowed();
+    lenslet_core::lock::remove(path, entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -219,6 +219,26 @@ pub fn set_test_mark(path: &Path, access: &Access, test: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// Remove permissions from the lock (along with any `# test` / `# implied`
+/// annotations). Returns how many entries were removed.
+pub fn remove(path: &Path, removals: &[Access]) -> Result<usize> {
+    let Some(mut lock) = read(path)? else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    for access in removals {
+        if lock.access.remove(access) {
+            lock.test.remove(access);
+            lock.implied.remove(access);
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        write_atomic(path, &render_lock(&lock))?;
+    }
+    Ok(removed)
+}
+
 /// Replace `path` with `text` atomically: a temporary file in the same
 /// directory, synced, given the old file's permissions, then renamed over it.
 /// A symlinked lock is written through to its target.
@@ -2292,6 +2312,7 @@ mod tests {
                     bytes: 40,
                     ..Default::default()
                 }),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -2499,5 +2520,40 @@ mod tests {
         overrides.insert("aws:username".into(), vec!["bob".into()]);
         let eval_bob = evaluate_with_context(&alice_get, Some(&sim_gate), &overrides);
         assert_eq!(eval_bob.denied[0].decision.reason, Reason::NoAllow);
+    }
+
+    #[test]
+    fn remove_deletes_entries_and_preserves_marks_on_remaining() {
+        let dir = std::env::temp_dir().join(format!("lenslet-lock-rm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lenslet.lock");
+        fs::write(
+            &path,
+            "# custom header\ns3:GetObject arn:aws:s3:::b/*\ns3:PutObject arn:aws:s3:::b/*  # test\nsqs:SendMessage arn:aws:sqs:us-east-1:123:q  # implied\n",
+        )
+        .unwrap();
+
+        let removed = remove(
+            &path,
+            &[Access {
+                action: "s3:GetObject".into(),
+                resource: "arn:aws:s3:::b/*".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(removed, 1);
+        let parsed = read(&path).unwrap().unwrap();
+        assert_eq!(parsed.header, vec!["# custom header".to_string()]);
+        assert_eq!(parsed.access.len(), 2);
+        assert!(parsed.test.contains(&Access {
+            action: "s3:PutObject".into(),
+            resource: "arn:aws:s3:::b/*".into(),
+        }));
+        assert!(parsed.implied.contains(&Access {
+            action: "sqs:SendMessage".into(),
+            resource: "arn:aws:sqs:us-east-1:123:q".into(),
+        }));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

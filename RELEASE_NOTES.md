@@ -1,10 +1,10 @@
-# Lenslet 9.0.0
+# Lenslet 10.0.0
 
-Lenslet 9.0 turns Lenslet from a passive HTTP/1.1 trace viewer into an active,
-protocol-complete local AWS flight recorder, interactive SigV4 workbench, and
-multi-format IaC policy compiler — while preserving strict local-only safety
-boundaries (`127.0.0.1` / `localhost` / local Docker bridge only, zero cloud
-forwarding, zero payload redaction).
+Lenslet 10.0 transforms Lenslet into a self-contained, end-to-end native desktop
+cloud workbench with zero-loss wire observability and full Apple HIG / Linux /
+Windows platform conformance — while maintaining Lenslet's strict local-only
+boundary (`127.0.0.1` / `localhost` / local container bridge only, zero cloud
+forwarding, zero telemetry).
 
 ```bash
 curl -fsSL https://github.com/hxddh/lenslet/releases/latest/download/install.sh | sh
@@ -13,68 +13,73 @@ lenslet init -- npm test
 
 ## Highlights
 
-- **Universal AWS Wire Coverage (HTTP/2 `h2c`, Smithy RPCv2 CBOR & `zstd`).**
-  - Dual-stack HTTP/1.1 and HTTP/2 (`h2c`) proxy listener on the same port, plus
-    HTTP/2 upstream negotiation.
-  - Native RFC 8949 CBOR decoder (`application/cbor`, `application/x-amz-cbor-1.1`,
-    `smithy-protocol: rpc-v2-cbor`) and `zstd` decompression, so modern AWS SDK
-    v2/v3 calls (CloudWatch, DynamoDB, Kinesis, Smithy RPCv2) decode into
-    human-readable JSON and derive exact resource ARNs instead of falling back
-    to `unverified: *`.
-- **Multi-Upstream Local Routing & Container Support.**
-  - Route individual AWS services to dedicated local emulators with repeatable
-    `--route SERVICE=ADDRESS` (e.g. `--route s3=http://127.0.0.1:9000 --route dynamodb=http://127.0.0.1:8000`)
-    and automatic standalone discovery for MinIO (`:9000`), DynamoDB Local (`:8000`),
-    and ElasticMQ (`:9324`) alongside AWS Emulator (`:9298`), LocalStack (`:4566`),
-    and Moto (`:5000`).
-  - `--allow-docker` binds `0.0.0.0` while enforcing a strict local/container-bridge
-    IP filter and refusing non-local upstreams (`*.amazonaws.com` or public IPs).
-  - `lenslet env [--shell sh|fish|pwsh|dotenv|docker]` prints copy-ready SDK
-    environment configuration for any shell or container.
-- **Interactive Desktop Workbench (`lenslet ui` / `Lenslet.app`).**
-  - **Workspace Sidebar (`⌘0`)**: live local proxy status (`/_lenslet/health`),
-    detected emulators, 1-click **Start / Stop Proxy**, **Copy Env**, **Open
-    Trace File (`⌘O`)**, and project-grouped run history with `★` pin protection.
-  - **Semantic Call Stream**: extracts human-meaningful targets (`table/orders · id="ord-42"`,
-    `s3://bucket/key`, `queue/jobs`, `fn/worker`) on every row (including Compact
-    density), plus clickable column sorting, SDK retry-chain grouping (`↻ ×N`),
-    dual-scale waterfall bars, and timeline brush-drag range selection.
-  - **Request Composer & Local SigV4 Re-signer (`⇧⌘⏎`)**: edit HTTP method, path,
-    headers, and JSON/XML/Form body, automatically re-sign `AWS4-HMAC-SHA256`
-    locally, dispatch to your emulator, and inspect **Replay** alongside a
-    syntax-highlighted **Unified Diff** against the recorded response.
-  - **Structured Headers & Payload Viewer**: SigV4 credential-scope card, decoded
-    query parameters, character-accurate text selection (double-click to copy an
-    ARN or token), collapsible multi-line JSON folding (`▾`/`▸`), search match
-    stepping (`⌘G` / `⇧⌘G`), crisp embedded SVG icons, and disabled contextual
-    ligatures so S3 ARNs (`arn:aws:s3:::bucket`) never render with `:::` ligature
-    artifacts.
-- **Role-Aware Access, Policy Simulator & Multi-Format IaC Compiler.**
-  - Tracks `sts:AssumeRole*` session credentials across a run to attribute calls
-    and permissions per assumed role (`caller_role` on calls, `roles` in reports)
-    and supports `--role ROLE` filtering in `lenslet policy`.
-  - Expanded REST URI & ARN catalog covering 35+ AWS services (ECS, EKS,
-    CloudFormation, Glue, Athena, RDS, API Gateway v1/v2, CloudFront, Route 53,
-    SES/SESv2, SageMaker, OpenSearch, EventBridge Pipes, AWS Backup, and more).
-  - Synthesizes least-privilege `iam:PassedToService` and `kms:ViaService`
-    conditions automatically and compiles directly to **IAM JSON**, **Terraform
-    (`aws_iam_policy_document`)**, **CloudFormation**, **AWS SAM**, and **AWS
-    CDK TypeScript** from both `lenslet policy --format ...` and the Access UI.
-  - Wire-level ABAC condition extraction (`aws:RequestTag/*`, `aws:TagKeys`,
-    `dynamodb:LeadingKeys`, `kms:EncryptionContext:*`), explicit `needs_context`
-    diagnostics with `--context KEY=VAL` overrides in `lenslet check`, and
-    interactive **Check policy…** simulation directly inside the Access view.
+- **End-to-End In-App Workflow (Zero Terminal Required).**
+  - **Run Launcher (`⌘N` / `Ctrl+N`)**: Pick any workspace folder (with recent
+    workspace switcher), auto-detect project test presets (`npm`/`pnpm`/`yarn`/`bun`,
+    `pytest`/`uv`, `cargo test`, `go test`, `make test`), configure local
+    emulator upstreams, per-service `--route` mappings, `--allow-docker`, and
+    choose between **Record**, **Update Lock (`--update`)**, **Check Lock
+    (`--check --strict`)**, and **Enforce Live (`--enforce`)**.
+  - **Live Output & Run Telemetry Console (`⌘3`)**: `lenslet run --log <PATH>`
+    tees child `stdout` and `stderr` into an owner-only (`0600`) companion log
+    streamed live inside the desktop workbench alongside 100% of `RunHeader`
+    and `Report` telemetry.
+  - **Local Emulator Lifecycle & Multi-Shell Snippets**: Automatically probes
+    installed local emulators (`aws-emulator`, `moto_server`, `localstack`,
+    `minio`) for 1-click startup from the Sidebar or Run Launcher, and copies
+    `AWS_ENDPOINT_URL` snippets in 5 formats (`sh/zsh`, `fish`, `PowerShell`,
+    `.env`, `docker`).
+  - **Scratch AWS Request Composer (`⇧⌘N`)**: Craft and locally SigV4-sign new
+    AWS requests from scratch using 1-click templates (S3, DynamoDB, SQS, STS),
+    multi-header `;` overrides, and `-Header` removals without needing a prior
+    recorded call.
+  - **Full `lenslet.lock` Lifecycle & 1-Click CI Init**: Remove individual
+    permissions or bulk-prune unused permissions directly from `lenslet.lock`,
+    bind a workspace folder to create `lenslet.lock` from proxy sessions, and
+    generate `.github/workflows/lenslet.yml` in one click.
+
+- **Zero-Loss Wire & Protocol Observability.**
+  - **Lossless Binary & Encoded Payloads**: Preserves exact wire frames inline
+    via `raw_b64` (`≤ 32 KiB`) and streams larger payloads (`> 32 KiB`, up to
+    64 MiB+ by default with bounded RAM) into content-addressed owner-only
+    sidecar blobs (`~/.lenslet/runs/blobs/<sha256>.bin`), enabling lossless
+    `Raw` wire inspection, binary/CBOR/`gzip`/`zstd`/`aws-chunked` replay, and
+    1-click **Save Payload… (`⌥⌘S`)** export.
+  - **HTTP/2 Trailers, `aws-chunked` Checksums & Complete EventStream Headers**:
+    Captures HTTP/2 `trailers` and `aws-chunked` trailing checksum headers
+    (e.g. `x-amz-checksum-crc32`), preserves full `Content-Type` parameters,
+    and decodes all 10 `aws-eventstream` frame header types plus binary
+    `payload_base64`.
+  - **Transport, Routing & Latency Breakdown**: Records and displays client and
+    upstream HTTP protocol versions (`HTTP/1.1 → HTTP/2`), peer socket address,
+    resolved upstream URL, `TTFB` vs body-transfer timing, full SigV4 scope and
+    signature headers, replay response headers, and explicit `+N earlier · Load
+    all` / corrupt-line indicators so zero calls or bytes are silently hidden.
+
+- **Native Platform Conformance (macOS Apple HIG, Linux & Windows).**
+  - **Apple HIG Menu Bar & Native Selectors**: Standard 7-menu layout (`Lenslet`,
+    `File`, `Edit`, `View`, `Run`, `Window`, `Help`) with `Services`, `Hide` /
+    `Hide Others` / `Show All`, `OsAction::{Undo, Redo, Cut, Copy, Paste,
+    SelectAll}` (enabling `⌘C`/`⌘V`/`⌘Z`/`⌘A` inside both GPUI fields and
+    native `NSOpenPanel`/`NSSavePanel` dialogs), `NSApp.windowsMenu` management,
+    Spotlight Menu Search, Dock context menu, and live `En`/`中文` localization.
+  - **Desktop OS Integration**: Supports Dock click reopen after `⌘W`
+    (`on_reopen`), Finder `.jsonl` file association & `on_open_urls`, external
+    file/folder/policy drag-and-drop, titlebar drag & double-click zoom, login
+    shell `PATH` hydration on macOS, `AppleLanguages` locale detection, and
+    bundled `dev.lenslet.app.desktop` + icon on Linux.
 
 ## Fixed
 
-- Streaming `BufReader` trace hydration when inspecting calls in large multi-MB
-  run files (eliminating full-file `fs::read_to_string` memory spikes).
-- Cumulative live-session permission retention in `CallStore` so runs exceeding
-  5,000 live calls never drop early permissions from the Access workbench.
-- Preserved `# implied` annotations when accepting permissions from the desktop
-  UI into `lenslet.lock`.
-- Eliminated search placeholder/cursor overlap against the shortcut badge and
-  localized 100% of remaining UI strings in `中文` mode.
-- Workspace-aware and pin-aware run retention (`~/.lenslet/runs/pinned.json`),
-  plus resilient retry logic in `scripts/package-macos.sh` for macOS `.dmg`
-  packaging.
+- Cleanly terminates managed proxies, active command runs, and local emulators
+  via `on_app_quit` and `SIGTERM` forwarding so `⌘Q` never leaves orphan
+  processes and stopped runs still seal their `end` report.
+- Fixed an index-shift bug in `CallStore::ingest` when out-of-order calls and
+  in-place `pending → finished` updates arrived in the same batch, and tracked
+  `Delta::replaced_ids` across `reindexed` batches so Inspector never freezes on
+  `pending`.
+- Preserved authoritative empty `report.findings` on finished runs, tracked
+  exact `max_end_ms` across >256-call runs, updated Call row `NEW ACCESS` badges
+  live on `lenslet.lock` edits, fixed the Sidebar folder SVG asset path, added
+  full `Undo`/`Redo` + global shortcut passthrough in text inputs, and pruned
+  companion `.log` and orphan `.bin` blobs during storage cleanup.

@@ -839,13 +839,10 @@ mod tests {
                 content_type: Some("application/x-amz-json-1.0".into()),
                 body: Some(BodyTrace {
                     text: Some(r#"{"TableName":"orders","Key":{"orderId":{"S":"ord-42"}}}"#.into()),
-                    hex: None,
-                    encoding: None,
                     bytes: 55,
-                    truncated: false,
-                    binary: false,
-                    sha256: String::new(),
+                    ..Default::default()
                 }),
+                ..Default::default()
             },
             ..Trace::default()
         };

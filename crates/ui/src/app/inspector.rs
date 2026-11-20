@@ -264,11 +264,18 @@ impl Inspector {
             self.body.update(cx, |body, cx| body.set_doc(doc, cx));
             return;
         }
-        let source = DocSource::of(&call, self.tab, self.side, self.replays.get(&call.id));
+        let trace_path = self.session.read(cx).path.clone();
+        let source = DocSource::of(
+            &call,
+            self.tab,
+            self.side,
+            self.replays.get(&call.id),
+            trace_path,
+        );
         let tokens = self.tokens.clone();
         let mode = self.mode;
         let palette = ui.p;
-        if source.len() <= SYNC_BUILD_BYTES {
+        if !source.needs_async_io() && source.len() <= SYNC_BUILD_BYTES {
             let doc = Arc::new(source.build(mode, &tokens, &palette));
             self.docs.insert(key, doc.clone());
             self.body.update(cx, |body, cx| body.set_doc(doc, cx));
@@ -352,6 +359,7 @@ impl Inspector {
             return;
         }
         let id = call.id.clone();
+        let trace_path = self.session.read(cx).path.clone();
         self.replays.insert(id.clone(), ReplayState::Running);
         self.tab = Tab::Exchange;
         cx.notify();
@@ -359,7 +367,14 @@ impl Inspector {
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move { replay::replay_call(&call, &target, &home) })
+                .spawn(async move {
+                    replay::replay_call_with_trace_path(
+                        &call,
+                        &target,
+                        &home,
+                        trace_path.as_deref(),
+                    )
+                })
                 .await;
             this.update(cx, |inspector, cx| {
                 let state = match outcome {
@@ -369,6 +384,84 @@ impl Inspector {
                 inspector.apply_composed_replay(id, state, cx);
             })
             .ok();
+        })
+        .detach();
+    }
+
+    pub fn save_payload(&mut self, cx: &mut Context<Self>) {
+        let Some(call) = self.full.clone() else {
+            return;
+        };
+        let session = self.session.read(cx);
+        let trace_path = session.path.clone();
+        let dir = session
+            .run
+            .as_ref()
+            .filter(|r| !r.header.cwd.is_empty())
+            .map(|r| std::path::PathBuf::from(&r.header.cwd))
+            .unwrap_or_else(|| self.home.clone());
+        let side = self.side;
+        let mode = self.mode;
+        let doc_text = self.body.read(cx).doc().text.to_string();
+        let replay_raw = self.replays.get(&call.id).and_then(|st| match st {
+            ReplayState::Done(out) => Some(out.raw_bytes.clone()),
+            _ => None,
+        });
+        let suggested = match side {
+            Side::Request => format!("{}-request.bin", call.id),
+            Side::Response => format!("{}-response.bin", call.id),
+            Side::Replay => format!("{}-replay.bin", call.id),
+            Side::Diff => format!("{}-diff.patch", call.id),
+        };
+        let lang = Ui::of(cx).lang;
+        let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(dest))) = rx.await {
+                let target = dest.clone();
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::fsguard::assert_io_allowed();
+                        let bytes: Vec<u8> = match side {
+                            Side::Replay if mode == BodyMode::Raw => {
+                                replay_raw.unwrap_or_else(|| doc_text.into_bytes())
+                            }
+                            Side::Request | Side::Response => {
+                                let ex = if side == Side::Request {
+                                    call.request.as_ref()
+                                } else {
+                                    call.response.as_ref()
+                                };
+                                let body_opt = ex.and_then(|e| e.body.as_ref());
+                                if let Some(b) = body_opt
+                                    && (mode == BodyMode::Raw || b.binary)
+                                    && let Some(wire) = b.raw_wire_bytes(trace_path.as_deref())
+                                {
+                                    wire
+                                } else {
+                                    doc_text.into_bytes()
+                                }
+                            }
+                            _ => doc_text.into_bytes(),
+                        };
+                        let len = bytes.len();
+                        std::fs::write(&target, bytes).map(|()| len)
+                    })
+                    .await;
+                this.update(cx, |_, cx| {
+                    let msg = match (res, lang) {
+                        (Ok(n), crate::prefs::Lang::En) => {
+                            format!("Saved {} ({})", dest.display(), format_bytes(n))
+                        }
+                        (Ok(n), crate::prefs::Lang::Zh) => {
+                            format!("已保存 {}（{}）", dest.display(), format_bytes(n))
+                        }
+                        (Err(e), _) => format!("Save error: {e}"),
+                    };
+                    cx.emit(InspectorEvent::Toast(msg));
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -603,8 +696,14 @@ impl Inspector {
 
     fn render_tabs(&self, ui: &Ui, call: &Trace, cx: &mut Context<Self>) -> Div {
         let t = ui.p;
-        let headers = call.request.as_ref().map_or(0, |r| r.headers.len())
-            + call.response.as_ref().map_or(0, |r| r.headers.len());
+        let headers = call
+            .request
+            .as_ref()
+            .map_or(0, |r| r.headers.len() + r.trailers.len())
+            + call
+                .response
+                .as_ref()
+                .map_or(0, |r| r.headers.len() + r.trailers.len());
         let permissions = call.access.len() + call.implied.len();
         let tabs = [
             (Tab::Exchange, ui.t("Exchange", "报文"), None),
@@ -987,17 +1086,29 @@ impl Inspector {
         }
         if !doc.is_empty() {
             let body = self.body.clone();
-            toolbar = toolbar.child(
-                widgets::button(ui, "copy-body", ui.t("Copy", "复制"))
-                    .tooltip(widgets::tip(
-                        ui.t(
-                            "Copy the selection, or the whole body",
-                            "复制选中字符或整个报文",
-                        ),
-                        Some(i18n::shortcut("C")),
-                    ))
-                    .on_click(move |_, _, cx| body.update(cx, |body, cx| body.copy(cx))),
-            );
+            toolbar = toolbar
+                .child(
+                    widgets::button(ui, "save-body", ui.t("Save…", "保存…"))
+                        .tooltip(widgets::tip(
+                            ui.t(
+                                "Save exact payload bytes to a file",
+                                "将完整原始/解码报文保存到文件",
+                            ),
+                            Some(i18n::shortcut("⌥S")),
+                        ))
+                        .on_click(cx.listener(|insp, _, _, cx| insp.save_payload(cx))),
+                )
+                .child(
+                    widgets::button(ui, "copy-body", ui.t("Copy", "复制"))
+                        .tooltip(widgets::tip(
+                            ui.t(
+                                "Copy the selection, or the whole body",
+                                "复制选中字符或整个报文",
+                            ),
+                            Some(i18n::shortcut("C")),
+                        ))
+                        .on_click(move |_, _, cx| body.update(cx, |body, cx| body.copy(cx))),
+                );
         }
 
         div()
@@ -1044,9 +1155,23 @@ impl Inspector {
         };
         let mut parts = Vec::new();
         if let Some(body) = exchange.body.as_ref() {
-            parts.push(format_bytes(body.size()));
+            match body.decoded_bytes {
+                Some(dec) if dec != body.size() => {
+                    parts.push(format!(
+                        "{} wire → {} decoded",
+                        format_bytes(body.size()),
+                        format_bytes(dec)
+                    ));
+                }
+                _ => parts.push(format_bytes(body.size())),
+            }
             if let Some(encoding) = body.encoding.as_deref() {
                 parts.push(encoding.to_string());
+            }
+            if body.blob.is_some() {
+                parts.push(ui.t("lossless blob", "无损旁路存储").into());
+            } else if body.raw_b64.is_some() && (body.binary || body.encoding.is_some()) {
+                parts.push(ui.t("lossless wire", "无损原始帧").into());
             }
             if body.truncated {
                 parts.push(ui.t("truncated", "已截断").into());
@@ -1055,7 +1180,11 @@ impl Inspector {
                 parts.push(ui.t("binary", "二进制").into());
             }
         }
-        if let Some(ct) = exchange.content_type.as_deref() {
+        if let Some(ct) = exchange
+            .raw_content_type
+            .as_deref()
+            .or(exchange.content_type.as_deref())
+        {
             parts.push(ct.to_string());
         }
         parts.join(" · ")
@@ -1125,7 +1254,72 @@ impl Inspector {
             .overflow_y_scroll()
             .gap(px(14.0));
 
-        // 1. SigV4 Authorization Scope breakdown
+        // 1. Transport, Routing & Latency Breakdown
+        {
+            let mut conn_box = div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .p(px(10.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgb(t.border_subtle))
+                .bg(theme::h(t.text, 0.03))
+                .child(widgets::label(
+                    ui,
+                    ui.t(
+                        "CONNECTION, ROUTING & TIMING",
+                        "连接协议、上游路由与耗时拆解",
+                    ),
+                ));
+            let proto = match (call.protocol.as_deref(), call.upstream_protocol.as_deref()) {
+                (Some(c), Some(u)) if c != u => format!("{c} → {u}"),
+                (Some(c), _) => c.to_string(),
+                (None, Some(u)) => u.to_string(),
+                (None, None) => "HTTP/1.1".to_string(),
+            };
+            conn_box = conn_box.child(widgets::meta_row(ui, "Protocol", widgets::mono(ui, proto)));
+            if let Some(peer) = call.client_addr.as_deref() {
+                conn_box = conn_box.child(widgets::meta_row(
+                    ui,
+                    ui.t("Client Peer", "客户端地址"),
+                    widgets::mono(ui, peer.to_string()),
+                ));
+            }
+            conn_box = conn_box.child(widgets::meta_row(
+                ui,
+                "Host",
+                widgets::mono(ui, call.host.clone()),
+            ));
+            if let Some(up) = call.upstream.as_deref() {
+                conn_box = conn_box.child(widgets::meta_row(
+                    ui,
+                    ui.t("Upstream", "实际转发上游"),
+                    widgets::mono(ui, up.to_string()),
+                ));
+            }
+            let timing = match call.ttfb_ms {
+                Some(ttfb) if !call.pending => {
+                    let transfer = call.ms.saturating_sub(ttfb);
+                    format!(
+                        "{} total (TTFB {} + body {})",
+                        format_latency(call.ms),
+                        format_latency(ttfb),
+                        format_latency(transfer)
+                    )
+                }
+                _ if call.pending => ui.t("in flight…", "请求进行中…").to_string(),
+                _ => format_latency(call.ms),
+            };
+            conn_box = conn_box.child(widgets::meta_row(
+                ui,
+                ui.t("Timing", "耗时拆解"),
+                widgets::mono(ui, timing),
+            ));
+            scroll = scroll.child(conn_box);
+        }
+
+        // 2. SigV4 Authorization Scope breakdown (complete, zero redaction)
         if let Some(auth_val) = call
             .request
             .as_ref()
@@ -1143,8 +1337,18 @@ impl Inspector {
                 .bg(theme::h(t.accent, 0.05))
                 .child(widgets::label(
                     ui,
-                    ui.t("SIGV4 CREDENTIAL SCOPE", "SIGV4 签名凭证域"),
+                    ui.t("SIGV4 CREDENTIAL & SIGNATURE", "SIGV4 凭证域与签名详情"),
                 ));
+            let sig_hex = call
+                .request
+                .as_ref()
+                .and_then(|r| r.header("authorization"))
+                .and_then(|raw| {
+                    raw.split([',', ' '])
+                        .find_map(|p| p.trim().strip_prefix("Signature="))
+                })
+                .unwrap_or_default()
+                .to_string();
             for (k, v) in [
                 ("Algorithm", "AWS4-HMAC-SHA256".to_string()),
                 ("AccessKeyId", auth_val.access_key_id),
@@ -1153,13 +1357,52 @@ impl Inspector {
                     format!("{}/{}/{}", auth_val.date, auth_val.region, auth_val.service),
                 ),
                 ("SignedHeaders", auth_val.signed_headers),
+                ("Signature", sig_hex),
             ] {
-                sig_box = sig_box.child(widgets::meta_row(ui, k, widgets::mono(ui, v)));
+                if !v.is_empty() {
+                    sig_box = sig_box.child(widgets::meta_row(ui, k, widgets::mono(ui, v)));
+                }
             }
+            if let Some(req) = call.request.as_ref() {
+                for hdr_key in [
+                    "x-amz-date",
+                    "x-amz-content-sha256",
+                    "x-amz-decoded-content-length",
+                    "x-amz-security-token",
+                ] {
+                    if let Some(val) = req.header(hdr_key) {
+                        sig_box = sig_box.child(widgets::meta_row(
+                            ui,
+                            hdr_key,
+                            widgets::mono(ui, val.to_string()),
+                        ));
+                    }
+                }
+            }
+            scroll = scroll.child(sig_box);
+        } else if let Some(akid) = call.access_key_id.as_deref() {
+            let sig_box = div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .p(px(10.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(theme::h(t.accent, 0.30))
+                .bg(theme::h(t.accent, 0.05))
+                .child(widgets::label(
+                    ui,
+                    ui.t("PRESIGNED / QUERY CREDENTIAL", "预签名 URL 凭证"),
+                ))
+                .child(widgets::meta_row(
+                    ui,
+                    "AccessKeyId",
+                    widgets::mono(ui, akid.to_string()),
+                ));
             scroll = scroll.child(sig_box);
         }
 
-        // 2. Decoded Query Parameters
+        // 3. Decoded Query Parameters
         let query_params = decoded_query_params(&call.path);
         if !query_params.is_empty() {
             scroll = scroll.child(
@@ -1177,27 +1420,66 @@ impl Inspector {
             );
         }
 
-        // 3. Request & Response Headers
-        if let Some(req) = call.request.as_ref()
-            && !req.headers.is_empty()
-        {
-            scroll = scroll.child(self.render_kv_section(
-                ui,
-                ui.t("REQUEST HEADERS", "请求 Headers"),
-                "req-h",
-                &req.headers,
-                lang,
-                cx,
-            ));
+        // 4. Request Headers & Trailers
+        if let Some(req) = call.request.as_ref() {
+            if !req.headers.is_empty() {
+                scroll = scroll.child(self.render_kv_section(
+                    ui,
+                    ui.t("REQUEST HEADERS", "请求 Headers"),
+                    "req-h",
+                    &req.headers,
+                    lang,
+                    cx,
+                ));
+            }
+            if !req.trailers.is_empty() {
+                scroll = scroll.child(self.render_kv_section(
+                    ui,
+                    ui.t(
+                        "REQUEST TRAILERS (CHUNKED / H2)",
+                        "请求尾部字段 (Trailers / 校验和)",
+                    ),
+                    "req-t",
+                    &req.trailers,
+                    lang,
+                    cx,
+                ));
+            }
         }
-        if let Some(res) = call.response.as_ref()
-            && !res.headers.is_empty()
+
+        // 5. Response Headers & Trailers
+        if let Some(res) = call.response.as_ref() {
+            if !res.headers.is_empty() {
+                scroll = scroll.child(self.render_kv_section(
+                    ui,
+                    ui.t("RESPONSE HEADERS", "响应 Headers"),
+                    "res-h",
+                    &res.headers,
+                    lang,
+                    cx,
+                ));
+            }
+            if !res.trailers.is_empty() {
+                scroll = scroll.child(self.render_kv_section(
+                    ui,
+                    ui.t("RESPONSE TRAILERS (H2 / STREAM)", "响应尾部字段 (Trailers)"),
+                    "res-t",
+                    &res.trailers,
+                    lang,
+                    cx,
+                ));
+            }
+        }
+
+        // 6. Replay Response Headers (if replayed)
+        if let Some(ReplayState::Done(out)) = self.replays.get(&call.id)
+            && !out.headers.is_empty()
         {
             scroll = scroll.child(self.render_kv_section(
                 ui,
-                ui.t("RESPONSE HEADERS", "响应 Headers"),
-                "res-h",
-                &res.headers,
+                ui.t("REPLAY RESPONSE HEADERS", "重放响应 Headers"),
+                "rep-h",
+                &out.headers,
                 lang,
                 cx,
             ));
@@ -1294,6 +1576,7 @@ impl Inspector {
 
     fn render_access(&self, ui: &Ui, call: &Trace, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = ui.p;
+        let live_lock = self.session.read(cx).changes.live_lock.clone();
         let mut list = div().flex().flex_col();
         let entries: Vec<_> = call.call_access().collect();
         if entries.is_empty() {
@@ -1309,6 +1592,10 @@ impl Inspector {
         }
         for (index, (access, implied)) in entries.into_iter().enumerate() {
             let key = access.key();
+            let is_new = match live_lock.as_ref() {
+                Some(locked) => !locked.contains(&key),
+                None => call.is_access_new(access),
+            };
             let mut name = div().flex().items_center().gap(px(6.0)).child(
                 div()
                     .font(fonts::mono_font())
@@ -1320,7 +1607,10 @@ impl Inspector {
             if implied {
                 name = name.child(widgets::badge(ui, "IMPLIED", t.text_muted));
             }
-            if call.is_access_new(access) {
+            if access.unverified {
+                name = name.child(widgets::badge(ui, "UNVERIFIED", t.amber));
+            }
+            if is_new {
                 name = name.child(if call.blocked {
                     widgets::badge(ui, "DENIED", t.purple)
                 } else {
@@ -1358,6 +1648,30 @@ impl Inspector {
             })
             .unwrap_or("—")
             .to_string();
+        let extended_id = call
+            .response
+            .as_ref()
+            .and_then(|r| r.header("x-amz-id-2"))
+            .map(str::to_string);
+        let trace_id = call
+            .response
+            .as_ref()
+            .and_then(|r| {
+                r.header("x-amzn-trace-id")
+                    .or_else(|| r.header("x-amz-cf-id"))
+            })
+            .or_else(|| {
+                call.request
+                    .as_ref()
+                    .and_then(|r| r.header("x-amzn-trace-id"))
+            })
+            .map(str::to_string);
+        let user_agent = call
+            .request
+            .as_ref()
+            .and_then(|r| r.header("user-agent"))
+            .map(str::to_string);
+
         let mut meta = div().flex().flex_col();
         let semantic = call.semantic_target();
         if !semantic.is_empty() {
@@ -1374,6 +1688,13 @@ impl Inspector {
                 widgets::mono(ui, role.to_string()),
             ));
         }
+        if let Some(akid) = call.access_key_id.as_deref() {
+            meta = meta.child(widgets::meta_row(
+                ui,
+                "AccessKeyId",
+                widgets::mono(ui, akid.to_string()),
+            ));
+        }
         meta = meta
             .child(widgets::meta_row(
                 ui,
@@ -1382,9 +1703,53 @@ impl Inspector {
             ))
             .child(widgets::meta_row(
                 ui,
+                ui.t("Timing", "耗时拆解"),
+                widgets::mono(
+                    ui,
+                    match call.ttfb_ms {
+                        Some(ttfb) if !call.pending => format!(
+                            "{} (TTFB {} + transfer {})",
+                            format_latency(call.ms),
+                            format_latency(ttfb),
+                            format_latency(call.ms.saturating_sub(ttfb))
+                        ),
+                        _ => format_latency(call.ms),
+                    },
+                ),
+            ))
+            .child(widgets::meta_row(
+                ui,
+                "Protocol",
+                widgets::mono(
+                    ui,
+                    match (call.protocol.as_deref(), call.upstream_protocol.as_deref()) {
+                        (Some(c), Some(u)) if c != u => format!("{c} → {u}"),
+                        (Some(c), _) => c.to_string(),
+                        (None, Some(u)) => u.to_string(),
+                        (None, None) => "HTTP/1.1".to_string(),
+                    },
+                ),
+            ))
+            .child(widgets::meta_row(
+                ui,
                 "Host",
                 widgets::mono(ui, call.host.clone()),
-            ))
+            ));
+        if let Some(up) = call.upstream.as_deref() {
+            meta = meta.child(widgets::meta_row(
+                ui,
+                ui.t("Upstream", "实际转发上游"),
+                widgets::mono(ui, up.to_string()),
+            ));
+        }
+        if let Some(peer) = call.client_addr.as_deref() {
+            meta = meta.child(widgets::meta_row(
+                ui,
+                ui.t("Client Peer", "客户端地址"),
+                widgets::mono(ui, peer.to_string()),
+            ));
+        }
+        meta = meta
             .child(widgets::meta_row(
                 ui,
                 "Region",
@@ -1394,12 +1759,21 @@ impl Inspector {
                 ui,
                 "Request ID",
                 widgets::mono(ui, request_id),
-            ))
-            .child(widgets::meta_row(
-                ui,
-                "Call ID",
-                widgets::mono(ui, call.id.clone()),
             ));
+        if let Some(ext) = extended_id {
+            meta = meta.child(widgets::meta_row(ui, "Extended ID", widgets::mono(ui, ext)));
+        }
+        if let Some(tid) = trace_id {
+            meta = meta.child(widgets::meta_row(ui, "Trace ID", widgets::mono(ui, tid)));
+        }
+        if let Some(ua) = user_agent {
+            meta = meta.child(widgets::meta_row(ui, "SDK / Agent", widgets::mono(ui, ua)));
+        }
+        meta = meta.child(widgets::meta_row(
+            ui,
+            "Call ID",
+            widgets::mono(ui, call.id.clone()),
+        ));
         if let Some(invocation) = call.invocation_id.as_deref() {
             meta = meta.child(widgets::meta_row(
                 ui,
@@ -1411,16 +1785,33 @@ impl Inspector {
             ("Request", call.request.as_ref()),
             ("Response", call.response.as_ref()),
         ] {
-            if let Some(sha) = exchange
-                .and_then(|e| e.body.as_ref())
-                .and_then(|b| b.sha256.as_deref())
-                .filter(|sha| sha.len() > 8)
+            if let Some(ex) = exchange
+                && let Some(b) = ex.body.as_ref()
             {
+                let mut size_desc = format_bytes(b.size());
+                if let Some(dec) = b.decoded_bytes
+                    && dec != b.size()
+                {
+                    size_desc = format!("{} wire → {} decoded", size_desc, format_bytes(dec));
+                }
+                if let Some(enc) = b.encoding.as_deref() {
+                    size_desc.push_str(&format!(" · {enc}"));
+                }
+                if let Some(blob) = b.blob.as_deref() {
+                    size_desc.push_str(&format!(" · blob:{}", &blob[..blob.len().min(12)]));
+                }
                 meta = meta.child(widgets::meta_row(
                     ui,
-                    format!("{side} SHA-256"),
-                    widgets::mono(ui, sha.to_string()),
+                    format!("{side} Body"),
+                    widgets::mono(ui, size_desc),
                 ));
+                if let Some(sha) = b.sha256.as_deref().filter(|sha| sha.len() > 8) {
+                    meta = meta.child(widgets::meta_row(
+                        ui,
+                        format!("{side} SHA-256"),
+                        widgets::mono(ui, sha.to_string()),
+                    ));
+                }
             }
         }
         if let Some(of) = call.replay_of.as_deref() {
@@ -1573,6 +1964,7 @@ enum DocSource {
     Body {
         body: Option<Body>,
         content_type: String,
+        trace_path: Option<std::path::PathBuf>,
     },
     Diff {
         rec_body: Option<Body>,
@@ -1584,47 +1976,99 @@ enum DocSource {
 }
 
 impl DocSource {
-    fn of(call: &Trace, tab: Tab, side: Side, replay: Option<&ReplayState>) -> DocSource {
-        let message = |exchange: Option<&Exchange>| DocSource::Body {
-            body: exchange.and_then(|e| e.body.clone()),
-            content_type: exchange
-                .and_then(|e| e.content_type.clone())
-                .unwrap_or_default(),
-        };
+    fn of(
+        call: &Trace,
+        tab: Tab,
+        side: Side,
+        replay: Option<&ReplayState>,
+        trace_path: Option<std::path::PathBuf>,
+    ) -> DocSource {
+        let message =
+            |exchange: Option<&Exchange>, trace_path: Option<std::path::PathBuf>| DocSource::Body {
+                body: exchange.and_then(|e| e.body.clone()),
+                content_type: exchange
+                    .and_then(|e| {
+                        e.raw_content_type
+                            .clone()
+                            .or_else(|| e.content_type.clone())
+                    })
+                    .unwrap_or_default(),
+                trace_path,
+            };
         if tab == Tab::Headers {
             let mut text = String::new();
-            for (title, exchange) in [
-                ("Request", call.request.as_ref()),
-                ("Response", call.response.as_ref()),
-            ] {
-                if !text.is_empty() {
-                    text.push('\n');
+            let req_proto = call.protocol.as_deref().unwrap_or("HTTP/1.1");
+            text.push_str(&format!(
+                "# Request ({} {} {})\n",
+                call.method.to_ascii_uppercase(),
+                call.path,
+                req_proto
+            ));
+            if let Some(req) = call.request.as_ref() {
+                for header in &req.headers {
+                    text.push_str(&format!("{}: {}\n", header.name, header.value));
                 }
-                text.push_str(&format!("# {title}\n"));
-                if let Some(exchange) = exchange {
-                    for header in &exchange.headers {
-                        text.push_str(&format!("{}: {}\n", header.name, header.value));
+                if !req.trailers.is_empty() {
+                    text.push_str("\n# Request Trailers\n");
+                    for tr in &req.trailers {
+                        text.push_str(&format!("{}: {}\n", tr.name, tr.value));
                     }
+                }
+            }
+            text.push_str(&format!(
+                "\n# Response ({} {})\n",
+                call.upstream_protocol
+                    .as_deref()
+                    .or(call.protocol.as_deref())
+                    .unwrap_or("HTTP/1.1"),
+                if call.pending {
+                    "pending".to_string()
+                } else {
+                    format!("{} {}", status_label(call.status), status_text(call.status))
+                }
+            ));
+            if let Some(res) = call.response.as_ref() {
+                for header in &res.headers {
+                    text.push_str(&format!("{}: {}\n", header.name, header.value));
+                }
+                if !res.trailers.is_empty() {
+                    text.push_str("\n# Response Trailers\n");
+                    for tr in &res.trailers {
+                        text.push_str(&format!("{}: {}\n", tr.name, tr.value));
+                    }
+                }
+            }
+            if let Some(ReplayState::Done(out)) = replay
+                && !out.headers.is_empty()
+            {
+                text.push_str(&format!("\n# Replay Response ({})\n", out.status));
+                for header in &out.headers {
+                    text.push_str(&format!("{}: {}\n", header.name, header.value));
                 }
             }
             return DocSource::Text(text.trim_end().to_string());
         }
         match side {
-            Side::Request => message(call.request.as_ref()),
-            Side::Response => message(call.response.as_ref()),
+            Side::Request => message(call.request.as_ref(), trace_path),
+            Side::Response => message(call.response.as_ref(), trace_path),
             Side::Replay => match replay {
                 Some(ReplayState::Done(ReplayOutcome {
                     body_text,
                     content_type,
                     body_bytes,
+                    raw_bytes,
                     ..
                 })) => DocSource::Body {
-                    body: body_text.clone().map(|text| Body {
-                        text: Some(text),
+                    body: Some(Body {
+                        text: body_text.clone(),
                         bytes: *body_bytes,
+                        binary: body_text.is_none() && !raw_bytes.is_empty(),
+                        raw_b64: (!raw_bytes.is_empty())
+                            .then(|| lenslet_core::trace::b64_encode(raw_bytes)),
                         ..Body::default()
                     }),
                     content_type: content_type.clone().unwrap_or_default(),
+                    trace_path: None,
                 },
                 _ => DocSource::Text(String::new()),
             },
@@ -1653,10 +2097,22 @@ impl DocSource {
         }
     }
 
+    fn needs_async_io(&self) -> bool {
+        matches!(
+            self,
+            DocSource::Body {
+                body: Some(Body { blob: Some(_), .. }),
+                ..
+            }
+        )
+    }
+
     fn len(&self) -> usize {
         match self {
             DocSource::Body { body, .. } => body.as_ref().map_or(0, |body| {
-                body.text.as_ref().map_or(0, String::len) + body.hex.as_ref().map_or(0, String::len)
+                body.text.as_ref().map_or(0, String::len)
+                    + body.hex.as_ref().map_or(0, String::len)
+                    + body.raw_b64.as_ref().map_or(0, String::len)
             }),
             DocSource::Diff {
                 rec_body, rep_body, ..
@@ -1676,8 +2132,22 @@ impl DocSource {
 
     fn build(&self, mode: BodyMode, tokens: &[String], palette: &theme::Palette) -> BodyDoc {
         match self {
-            DocSource::Body { body, content_type } => {
-                body::build(body.as_ref(), content_type, mode, tokens, palette)
+            DocSource::Body {
+                body,
+                content_type,
+                trace_path,
+            } => {
+                let raw_wire = body
+                    .as_ref()
+                    .and_then(|b| b.raw_wire_bytes(trace_path.as_deref()));
+                body::build_with_wire(
+                    body.as_ref(),
+                    raw_wire.as_deref(),
+                    content_type,
+                    mode,
+                    tokens,
+                    palette,
+                )
             }
             DocSource::Diff {
                 rec_body,

@@ -1,5 +1,8 @@
 //! The run-file schema: the records `lenslet run` writes and every reader parses.
 
+use std::collections::BTreeMap;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
@@ -36,13 +39,25 @@ pub struct RunHeader {
     /// Whether unlocked/denied calls were actively blocked by `--enforce`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enforce: bool,
+    /// Per-service local upstream overrides (`service` -> URL), when `--route` or auto-routing is active.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routes: BTreeMap<String, String>,
+    /// Whether local container bridge connections (`--allow-docker`) were enabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_docker: bool,
+    /// Configured body capture byte limit (`--max-body`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body: Option<u64>,
+    /// Optional captured stdout/stderr log file for child command runs (`--log`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
 }
 
 /// One line of a run file, for readers.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Record {
-    Run(RunHeader),
+    Run(Box<RunHeader>),
     Call(Box<Trace>),
     End(Box<Report>),
 }
@@ -123,6 +138,24 @@ pub struct Trace {
     /// Concise semantic target summary (e.g. `table/orders · id="ord-42"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Client wire HTTP protocol version (`HTTP/1.1`, `HTTP/2.0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Upstream response HTTP protocol version (`HTTP/1.1`, `HTTP/2.0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_protocol: Option<String>,
+    /// Resolved local upstream URL that handled this call (e.g. `http://127.0.0.1:9000`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    /// Peer socket address of the calling SDK/container (`127.0.0.1:54321`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_addr: Option<String>,
+    /// Time to first response header byte from upstream, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u64>,
+    /// SigV4 `AccessKeyId` presented on the request (Authorization header or presigned URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
     pub request: Message,
     pub response: Message,
 }
@@ -139,15 +172,21 @@ pub enum BlockedPhase {
 pub struct Message {
     /// Raw header values in map order, duplicates preserved.
     pub headers: Vec<HeaderTrace>,
+    /// Trailing HTTP headers (`HTTP/2` trailers or `aws-chunked` checksum trailers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trailers: Vec<HeaderTrace>,
     /// Media type without parameters, e.g. `application/xml`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// Full `Content-Type` header value when parameters (`; charset=...`, `; boundary=...`) were sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_content_type: Option<String>,
     /// Absent when the body was empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<BodyTrace>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeaderTrace {
     pub name: String,
     pub value: String,
@@ -158,14 +197,23 @@ pub struct BodyTrace {
     /// Absent for binary (or non-text) bodies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    /// Hex preview (up to the first 512 bytes) when `binary` is true.
+    /// Hex preview (up to the first 4096 bytes) when `binary` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hex: Option<String>,
+    /// Inline base64 of exact wire bytes for compact binary or wire-encoded payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_b64: Option<String>,
+    /// Sidecar content-addressed blob filename (`<sha256>.bin` in `<trace_dir>/blobs/`) for lossless full-body retention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
     /// Wire content encoding when decoded for inspection (`aws-chunked`, `gzip`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
-    /// Total bytes of the original body, not just the captured prefix.
+    /// Total wire bytes of the original body, not just the captured prefix.
     pub bytes: u64,
+    /// Total decoded/uncompressed payload bytes when different from wire `bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoded_bytes: Option<u64>,
     /// The capture holds only a prefix of a text body.
     pub truncated: bool,
     pub binary: bool,
@@ -194,4 +242,14 @@ pub fn trace_access(trace: &Trace) -> impl Iterator<Item = Access> + '_ {
         .iter()
         .chain(trace.implied.iter())
         .map(CallAccess::key)
+}
+
+/// Base64-encode raw wire bytes for lossless inline storage.
+pub fn b64_encode(bytes: &[u8]) -> String {
+    BASE64.encode(bytes)
+}
+
+/// Base64-decode inline wire bytes.
+pub fn b64_decode(input: &str) -> Option<Vec<u8>> {
+    BASE64.decode(input.trim()).ok()
 }

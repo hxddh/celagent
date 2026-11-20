@@ -7,7 +7,9 @@ use std::{collections::HashMap, ops::Range, sync::Arc};
 use gpui::HighlightStyle;
 
 use crate::{
-    model::{Body, decode_aws_semantic, format_hex_dump, pretty_body},
+    model::{
+        Body, decode_aws_semantic, format_bytes, format_hex_bytes, format_hex_dump, pretty_body,
+    },
     syntax::{SyntaxKind, find_search_matches, highlight_code},
     theme::Palette,
 };
@@ -370,8 +372,23 @@ pub fn diff_text(recorded: &str, replay: &str) -> String {
 }
 
 /// Build the document for a message body.
+#[cfg(test)]
 pub fn build(
     body: Option<&Body>,
+    content_type: &str,
+    mode: BodyMode,
+    tokens: &[String],
+    p: &Palette,
+) -> BodyDoc {
+    build_with_wire(body, None, content_type, mode, tokens, p)
+}
+
+/// Build the document for a message body, including optional lossless wire bytes
+/// (from `raw_b64` or sidecar `blob`) so `Raw` mode can show exact `aws-chunked`
+/// frames, compressed wire hex, or complete multi-KB binary dumps.
+pub fn build_with_wire(
+    body: Option<&Body>,
+    raw_wire: Option<&[u8]>,
     content_type: &str,
     mode: BodyMode,
     tokens: &[String],
@@ -380,6 +397,35 @@ pub fn build(
     let Some(body) = body else {
         return BodyDoc::default();
     };
+    if mode == BodyMode::Raw
+        && (body.binary || body.encoding.is_some())
+        && let Some(wire) = raw_wire.filter(|w| !w.is_empty())
+    {
+        if let Ok(utf8_wire) = std::str::from_utf8(wire)
+            && !utf8_wire
+                .bytes()
+                .any(|b| matches!(b, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F))
+        {
+            let mut doc = BodyDoc::from_text(utf8_wire.to_string(), SyntaxKind::Plain, tokens, p);
+            doc.decodable = body.text.is_some();
+            return doc;
+        }
+        let header = match (body.encoding.as_deref(), body.decoded_bytes) {
+            (Some(enc), Some(dec)) => format!(
+                "# Raw wire frame ({enc}): {} → decoded {}\n",
+                format_bytes(wire.len()),
+                format_bytes(dec)
+            ),
+            (Some(enc), None) => {
+                format!("# Raw wire frame ({enc}): {}\n", format_bytes(wire.len()))
+            }
+            _ => String::new(),
+        };
+        let dump = format!("{header}{}", format_hex_bytes(wire));
+        let mut doc = BodyDoc::from_text(dump, SyntaxKind::Hex, tokens, p);
+        doc.decodable = body.text.is_some();
+        return doc;
+    }
     if let Some(text) = body.text.as_deref().filter(|text| !text.is_empty()) {
         let semantic = decode_aws_semantic(text, content_type, body.encoding.as_deref());
         let pretty = if semantic.is_none() {
@@ -387,7 +433,8 @@ pub fn build(
         } else {
             None
         };
-        let decodable = semantic.is_some() || pretty.is_some();
+        let has_distinct_wire = body.encoding.is_some() && raw_wire.is_some_and(|w| !w.is_empty());
+        let decodable = semantic.is_some() || pretty.is_some() || has_distinct_wire;
         let (shown, decoder, is_form) = match (mode, semantic, pretty) {
             (BodyMode::Decoded, Some((label, decoded, is_form)), _) => {
                 (decoded, Some(label), is_form)
@@ -400,6 +447,9 @@ pub fn build(
         doc.decoder = decoder;
         doc.decodable = decodable;
         return doc;
+    }
+    if let Some(wire) = raw_wire.filter(|w| !w.is_empty()) {
+        return BodyDoc::from_text(format_hex_bytes(wire), SyntaxKind::Hex, tokens, p);
     }
     if let Some(hex) = body.hex.as_deref().filter(|hex| !hex.is_empty()) {
         return BodyDoc::from_text(format_hex_dump(hex), SyntaxKind::Hex, tokens, p);

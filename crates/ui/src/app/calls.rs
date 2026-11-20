@@ -210,10 +210,11 @@ impl CallsList {
                 self.recompute(cx);
             }
         }
-        // The selected call finished: show its final line.
+        // The selected call finished: show its final line even if `reindexed` shifted indices.
         if let Some(id) = self.selected.clone()
             && let Some(position) = self.rows.iter().position(|row| row.id == id)
-            && delta.replaced.contains(&position)
+            && (delta.replaced.contains(&position)
+                || delta.replaced_ids.iter().any(|rid| rid == &id))
         {
             cx.emit(CallsEvent::Selected(Some(self.rows[position].clone())));
         }
@@ -631,17 +632,70 @@ impl CallsList {
                 }),
             );
         }
-        bar.child(div().flex_1())
-            .when(!self.tokens.is_empty() || self.filter.is_active(), |bar| {
-                bar.child(
-                    div()
-                        .flex_shrink_0()
-                        .font_family(fonts::mono())
-                        .text_size(px(text::SM))
-                        .text_color(rgb(t.text_muted))
-                        .child(format!("{} / {}", self.view.len(), self.rows.len())),
+        let sess_ref = self.session.read(cx);
+        let evicted = sess_ref.evicted;
+        let unbounded = sess_ref.store.is_unbounded();
+        let skipped = sess_ref.skipped;
+        let session_ent = self.session.clone();
+
+        bar = bar.child(div().flex_1());
+        if evicted > 0 && !unbounded {
+            bar = bar.child(
+                widgets::chip(
+                    ui,
+                    "load-all-evicted",
+                    if ui.zh() {
+                        format!("+{evicted} 更早调用 · 加载全部")
+                    } else {
+                        format!("+{evicted} earlier · Load all")
+                    },
+                    None,
+                    true,
+                    t.amber,
                 )
-            })
+                .tooltip(widgets::tip(
+                    ui.t(
+                        "Showing newest 5,000 calls for speed; click to load 100% of calls in this trace",
+                        "默认展示最新 5,000 条调用；点击无损加载该追踪文件的全部记录",
+                    ),
+                    None,
+                ))
+                .on_click(move |_, _, cx| {
+                    session_ent.update(cx, |s, cx| s.load_all_calls(cx));
+                }),
+            );
+        }
+        if skipped > 0 {
+            bar = bar.child(
+                widgets::badge(
+                    ui,
+                    if ui.zh() {
+                        format!("{skipped} 行解析跳过")
+                    } else {
+                        format!("{skipped} corrupt lines")
+                    },
+                    t.red,
+                )
+                .id("corrupt-lines-badge")
+                .tooltip(widgets::tip(
+                    ui.t(
+                        "Malformed or truncated JSONL lines were encountered in the trace file",
+                        "追踪文件中存在损坏或截断的 JSONL 行",
+                    ),
+                    None,
+                )),
+            );
+        }
+        bar.when(!self.tokens.is_empty() || self.filter.is_active(), |bar| {
+            bar.child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(fonts::mono())
+                    .text_size(px(text::SM))
+                    .text_color(rgb(t.text_muted))
+                    .child(format!("{} / {}", self.view.len(), self.rows.len())),
+            )
+        })
     }
 
     fn render_findings(
@@ -1014,10 +1068,55 @@ impl CallsList {
                 ui,
                 ui.t("No runs yet", "还没有运行记录"),
                 ui.t(
-                    "Start your local AWS emulator, then run your tests through Lenslet. Every AWS call shows up here as it happens.",
-                    "先启动本地 AWS 模拟器，再通过 Lenslet 运行测试。每个 AWS 调用都会实时出现在这里。",
+                    "Launch your test suite directly inside Lenslet (⌘N), start the local proxy, or run from your terminal. Every AWS call appears live with zero payload loss.",
+                    "按 ⌘N 直接在应用内启动测试套件、一键开启本地代理，或在终端运行。每一个 AWS 请求都会零丢失实时呈现。",
                 ),
-                Some(command),
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    widgets::primary_button(
+                                        ui,
+                                        "empty-launch-run",
+                                        ui.t("Run Command… (⌘N)", "发起运行… (⌘N)"),
+                                    )
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(super::OpenLauncher), cx);
+                                    }),
+                                )
+                                .child(
+                                    widgets::button(
+                                        ui,
+                                        "empty-start-proxy",
+                                        ui.t("Start Local Proxy", "启动本地代理"),
+                                    )
+                                    .on_click(|_, window, cx| {
+                                        window
+                                            .dispatch_action(Box::new(super::StartProxyAction), cx);
+                                    }),
+                                )
+                                .child(
+                                    widgets::button(
+                                        ui,
+                                        "empty-open-trace",
+                                        ui.t("Open Trace…", "打开追踪文件…"),
+                                    )
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(super::OpenFile), cx);
+                                    }),
+                                ),
+                        )
+                        .child(command)
+                        .into_any_element(),
+                ),
             )
             .into_any_element(),
             Health::Error(error) => widgets::empty_state(
@@ -1281,7 +1380,7 @@ fn call_row(
     }
     if changed && trace.is_error() {
         title = title.child(widgets::badge(ui, "NEW FAILURE", t.red));
-    } else if trace.new && !trace.blocked {
+    } else if !trace.blocked && (changed && !trace.is_error()) {
         title = title.child(widgets::badge(ui, "NEW ACCESS", t.amber));
     }
     if let Some(n) = grouped_attempts {

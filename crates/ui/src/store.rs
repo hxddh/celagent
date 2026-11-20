@@ -46,6 +46,8 @@ pub struct Delta {
     pub appended_from: Option<usize>,
     /// Indices of rows replaced in place (a pending call that finished).
     pub replaced: Vec<usize>,
+    /// IDs of calls replaced in place (preserved even when `reindexed` is true).
+    pub replaced_ids: Vec<String>,
     /// Rows moved (out-of-order insert or eviction): indices are invalid.
     pub reindexed: bool,
     pub changed: bool,
@@ -59,6 +61,9 @@ pub struct CallStore {
     services: BTreeMap<String, (String, usize)>,
     access: BTreeMap<Access, AccessAgg>,
     ever_access: BTreeMap<Access, AccessAgg>,
+    evicted_total: usize,
+    max_end_ms: Option<i64>,
+    unbounded: bool,
     revision: u64,
 }
 
@@ -83,6 +88,18 @@ impl CallStore {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    pub fn evicted_total(&self) -> usize {
+        self.evicted_total
+    }
+
+    pub fn max_end_ms(&self) -> Option<i64> {
+        self.max_end_ms
+    }
+
+    pub fn is_unbounded(&self) -> bool {
+        self.unbounded
     }
 
     /// Services present, sorted by label.
@@ -117,6 +134,10 @@ impl CallStore {
         step(&mut self.stats.blocked, row.blocked);
         step(&mut self.stats.slow, row.is_slow());
         step(&mut self.stats.pending, row.pending);
+        if add && let Some(at) = row.at_ms() {
+            let end = at.saturating_add(row.ms as i64);
+            self.max_end_ms = Some(self.max_end_ms.map_or(end, |prev| prev.max(end)));
+        }
         let facet = self
             .services
             .entry(row.service_key().to_string())
@@ -166,7 +187,19 @@ impl CallStore {
 
     /// Replace everything with `rows` (a fresh load).
     pub fn reset(&mut self, rows: Vec<Trace>) -> Delta {
+        self.reset_with_cap(rows, false, 0)
+    }
+
+    /// Replace everything with `rows`, optionally disabling the `MAX_ROWS` window cap.
+    pub fn reset_with_cap(
+        &mut self,
+        rows: Vec<Trace>,
+        unbounded: bool,
+        prior_evicted: usize,
+    ) -> Delta {
         *self = CallStore {
+            unbounded,
+            evicted_total: prior_evicted,
             revision: self.revision + 1,
             ..CallStore::default()
         };
@@ -188,21 +221,30 @@ impl CallStore {
         };
         let mut reorder_from: Option<usize> = None;
         for trace in incoming {
-            if let Some(&at) = self.index.get(&trace.id) {
-                let old = self.rows[at].clone();
-                if old.pending == trace.pending && old.status == trace.status {
+            if let Some(&hint) = self.index.get(&trace.id) {
+                let actual = if self.rows.get(hint).is_some_and(|r| r.id == trace.id) {
+                    Some(hint)
+                } else {
+                    self.rows.iter().rposition(|r| r.id == trace.id)
+                };
+                if let Some(at) = actual {
+                    let old = self.rows[at].clone();
+                    if old.pending == trace.pending && old.status == trace.status {
+                        continue;
+                    }
+                    let mut trace = trace;
+                    if trace.line_ref.is_none() {
+                        trace.line_ref = old.line_ref.clone();
+                    }
+                    self.contribute(&old, false, false);
+                    self.contribute(&trace, true, false);
+                    let id = trace.id.clone();
+                    Arc::make_mut(&mut self.rows)[at] = Arc::new(trace);
+                    delta.replaced.push(at);
+                    delta.replaced_ids.push(id);
+                    delta.changed = true;
                     continue;
                 }
-                let mut trace = trace;
-                if trace.line_ref.is_none() {
-                    trace.line_ref = old.line_ref.clone();
-                }
-                self.contribute(&old, false, false);
-                self.contribute(&trace, true, false);
-                Arc::make_mut(&mut self.rows)[at] = Arc::new(trace);
-                delta.replaced.push(at);
-                delta.changed = true;
-                continue;
             }
             self.contribute(&trace, true, false);
             let rows = Arc::make_mut(&mut self.rows);
@@ -228,8 +270,9 @@ impl CallStore {
             }
             delta.reindexed = true;
         }
-        if self.rows.len() > MAX_ROWS {
+        if !self.unbounded && self.rows.len() > MAX_ROWS {
             let excess = self.rows.len() - MAX_ROWS;
+            self.evicted_total = self.evicted_total.saturating_add(excess);
             let evicted: Vec<Arc<Trace>> = Arc::make_mut(&mut self.rows).drain(..excess).collect();
             for row in &evicted {
                 self.contribute(row, false, true);
@@ -343,11 +386,21 @@ pub struct ChangeSet {
     pub new_failures: Arc<BTreeSet<FailureKind>>,
     /// Count calls needing access the lock lacks as changed.
     pub new_access: bool,
+    /// Live in-memory `lenslet.lock` permissions so accepting/removing from the
+    /// UI immediately updates Call row badges without rewriting the trace file.
+    pub live_lock: Option<Arc<BTreeSet<Access>>>,
 }
 
 impl ChangeSet {
     pub fn is_changed(&self, trace: &Trace) -> bool {
-        (self.new_access && trace.new)
+        let access_changed = if !self.new_access {
+            false
+        } else if let Some(locked) = self.live_lock.as_ref() {
+            !trace.pending && trace.access().any(|acc| !locked.contains(&acc))
+        } else {
+            trace.new
+        };
+        access_changed
             || (!self.new_failures.is_empty()
                 && trace
                     .failure_kind()
@@ -733,5 +786,39 @@ mod tests {
             AccessBaseline::Lock(Some(&lock)),
         ));
         assert!(policy.contains("s3:GetObject") && !policy.contains("sqs:SendMessage"));
+    }
+
+    #[test]
+    fn replaced_ids_survive_reindex_and_live_lock_updates_changed_set() {
+        let mut store = CallStore::default();
+        let p1 = parse_line(&call_line("c2", 2_000, 0, r#","pending":true"#)).unwrap();
+        store.ingest(vec![p1]);
+
+        let finished = parse_line(&call_line(
+            "c2",
+            2_000,
+            200,
+            r#","new":true,"access":[{"action":"s3:GetObject","resource":"arn:aws:s3:::b/*"}]"#,
+        ))
+        .unwrap();
+        let earlier = parse_line(&call_line("c1", 1_000, 200, "")).unwrap();
+
+        // Ingesting an out-of-order earlier call + replacement sets `reindexed = true`.
+        let delta = store.ingest(vec![earlier, finished]);
+        assert!(delta.reindexed);
+        assert_eq!(delta.replaced_ids, vec!["c2".to_string()]);
+
+        // Live lock overrides stale `trace.new` once permission is accepted into `lenslet.lock`.
+        let row = &store.rows()[1];
+        let mut cs = ChangeSet {
+            new_failures: Arc::new(BTreeSet::new()),
+            new_access: true,
+            live_lock: Some(Arc::new(BTreeSet::new())),
+        };
+        assert!(cs.is_changed(row));
+        cs.live_lock = Some(Arc::new(
+            [Access::new("s3:GetObject", "arn:aws:s3:::b/*")].into(),
+        ));
+        assert!(!cs.is_changed(row));
     }
 }

@@ -1434,6 +1434,7 @@ mod tests {
             target: None,
             request: Message::default(),
             response: Message::default(),
+            ..Default::default()
         }
     }
 
@@ -1652,12 +1653,8 @@ mod tests {
         create_tbl.region = Some("us-west-2".into());
         create_tbl.request.body = Some(crate::trace::BodyTrace {
             text: Some(r#"{"TableName":"orders"}"#.into()),
-            hex: None,
-            encoding: None,
             bytes: 22,
-            truncated: false,
-            binary: false,
-            sha256: String::new(),
+            ..Default::default()
         });
         let snap1 = access::derive_call(&create_tbl).concrete_own;
         tracker.observe_and_enrich(&mut create_tbl, &snap1, 1);

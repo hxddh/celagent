@@ -83,6 +83,8 @@ pub struct Loaded {
     pub report: Option<Report>,
     pub calls: Vec<Trace>,
     pub skipped: usize,
+    pub evicted: usize,
+    pub unbounded: bool,
     pub tail: TailState,
 }
 
@@ -164,8 +166,15 @@ pub fn load(path: &Path) -> LoadResult {
     };
     let source = Arc::new(path.to_path_buf());
     let mut parsed = parse_records_at(complete, body_offset, Some(&source));
+    let mut evicted = 0usize;
     if parsed.calls.len() > MAX_ROWS {
-        parsed.calls.drain(..parsed.calls.len() - MAX_ROWS);
+        let drop_n = parsed.calls.len() - MAX_ROWS;
+        parsed.calls.drain(..drop_n);
+        evicted += drop_n;
+    }
+    if start > 0 {
+        // Estimate or count lines before `body_offset` so the UI surfaces exact truncation.
+        evicted = evicted.max(1);
     }
     // A long run's header is far before the tail that was read.
     let header = parsed.header.or_else(|| lenslet_core::runs::header(path));
@@ -175,6 +184,83 @@ pub fn load(path: &Path) -> LoadResult {
         report: parsed.report,
         calls: parsed.calls,
         skipped: parsed.bad,
+        evicted,
+        unbounded: false,
+        tail: TailState {
+            offset: len,
+            file_key: file_key(&metadata),
+            carry,
+        },
+    }))
+}
+
+/// Read every single call in `path` from byte 0 without any `MAX_ROWS` window cap.
+pub fn load_unbounded(path: &Path) -> LoadResult {
+    fsguard::assert_io_allowed();
+    use std::io::{BufRead, BufReader};
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return LoadResult::Missing,
+        Err(error) => return LoadResult::Error(short_io_error(&error)),
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) if metadata.is_dir() => {
+            return LoadResult::Error("trace path is a directory".into());
+        }
+        Ok(metadata) => metadata,
+        Err(error) => return LoadResult::Error(short_io_error(&error)),
+    };
+    let len = metadata.len();
+    let source = Arc::new(path.to_path_buf());
+    let mut reader = BufReader::with_capacity(128 * 1024, file);
+    let mut line = Vec::with_capacity(8 * 1024);
+    let mut offset: u64 = 0;
+    let mut calls = Vec::new();
+    let mut header = None;
+    let mut report = None;
+    let mut skipped = 0usize;
+    let mut carry = Vec::new();
+
+    loop {
+        line.clear();
+        let n = match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) => return LoadResult::Error(short_io_error(&error)),
+        };
+        if !line.ends_with(b"\n") {
+            carry = line.clone();
+            break;
+        }
+        let slice = &line[..n - 1];
+        let line_offset = offset;
+        offset += n as u64;
+        if slice.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match parse_record(&String::from_utf8_lossy(slice)) {
+            Some(Record::Call(mut trace)) => {
+                trace.dehydrate(LineRef {
+                    path: source.clone(),
+                    offset: line_offset,
+                    len: slice.len(),
+                });
+                calls.push(*trace);
+            }
+            Some(Record::Run(h)) => header = Some(*h),
+            Some(Record::End(r)) => report = Some(*r),
+            None => skipped += 1,
+        }
+    }
+
+    LoadResult::Loaded(Box::new(Loaded {
+        path: path.to_path_buf(),
+        header,
+        report,
+        calls,
+        skipped,
+        evicted: 0,
+        unbounded: true,
         tail: TailState {
             offset: len,
             file_key: file_key(&metadata),
@@ -187,7 +273,7 @@ pub fn load(path: &Path) -> LoadResult {
 #[derive(Debug)]
 pub enum FeedMsg {
     Calls(Vec<Trace>),
-    Header(RunHeader),
+    Header(Box<RunHeader>),
     End(Box<Report>),
     /// The file was truncated or replaced: here is all of it again.
     Reset(Box<Loaded>),
@@ -379,7 +465,7 @@ fn poll_tail(path: &Path, state: &mut TailState) -> TailPoll {
     let parsed = parse_records_at(&complete, base_offset, Some(&source));
     let mut records: Vec<Record> = Vec::new();
     if let Some(header) = parsed.header {
-        records.push(Record::Run(header));
+        records.push(Record::Run(Box::new(header)));
     }
     records.extend(
         parsed
@@ -486,14 +572,27 @@ pub fn newest_run(dir: &Path) -> Option<PathBuf> {
     lenslet_core::runs::list(dir).pop()
 }
 
-/// `(file_count, total_bytes)` for the runs directory. Background only.
+/// `(file_count, total_bytes)` for the runs directory (including `.log` & sidecar `blobs/*.bin`). Background only.
 pub fn storage_stats(dir: &Path) -> (usize, u64) {
     fsguard::assert_io_allowed();
     let files = lenslet_core::runs::list(dir);
-    let bytes = files
+    let mut bytes: u64 = files
         .iter()
         .filter_map(|path| fs::metadata(path).ok().map(|m| m.len()))
         .sum();
+    for path in &files {
+        let log = lenslet_core::runs::log_path_for(path);
+        if let Ok(m) = fs::metadata(&log) {
+            bytes += m.len();
+        }
+    }
+    if let Ok(entries) = fs::read_dir(dir.join("blobs")) {
+        for e in entries.flatten() {
+            if let Ok(m) = e.metadata() {
+                bytes += m.len();
+            }
+        }
+    }
     (files.len(), bytes)
 }
 
@@ -510,8 +609,12 @@ pub fn clear_finished_runs(dir: &Path, keep: Option<&Path>) -> usize {
             continue;
         }
         if lenslet_core::runs::report(&path).is_some() && fs::remove_file(&path).is_ok() {
+            let _ = fs::remove_file(lenslet_core::runs::log_path_for(&path));
             removed += 1;
         }
+    }
+    if removed > 0 {
+        lenslet_core::runs::prune_orphan_blobs(dir);
     }
     removed
 }

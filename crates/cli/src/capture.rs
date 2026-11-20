@@ -9,6 +9,7 @@
 use std::{
     borrow::Cow,
     io::Read,
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -23,13 +24,21 @@ use hyper::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::trace::BodyTrace;
+use crate::trace::{self, BodyTrace, HeaderTrace};
 
-/// Default maximum number of body bytes kept for the trace (1 MiB).
+/// Default maximum number of body bytes kept inline in the trace JSONL (1 MiB).
 pub const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
-/// Binary payloads keep an unredacted hex preview of their first 512 bytes.
-pub const HEX_PREVIEW_BYTES: usize = 512;
+/// Maximum raw wire bytes stored in sidecar `<trace_dir>/blobs/<sha256>.bin` (64 MiB)
+/// so binary, compressed, or multi-megabyte bodies never lose data while keeping RAM bounded.
+pub const MAX_SIDE_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+/// Binary payloads keep an unredacted inline hex preview up to 4 KiB (with full bytes in `raw_b64` / `blob`).
+pub const HEX_PREVIEW_BYTES: usize = 4096;
+
+/// Payloads up to 32 KiB that are binary or wire-encoded also embed `raw_b64` inline
+/// so standalone `.jsonl` files stay 100% lossless even without the sidecar `blobs/` directory.
+pub const INLINE_RAW_BYTES: usize = 32 * 1024;
 
 /// Content encodings Lenslet can decode on the captured prefix while forwarding
 /// the wire bytes untouched.
@@ -46,6 +55,8 @@ pub enum Encoding {
 pub struct Content {
     /// Friendly media type without parameters, e.g. `application/xml`.
     pub content_type: Option<String>,
+    /// Full `Content-Type` header when parameters (`; charset=...`, `; boundary=...`) were sent.
+    pub raw_content_type: Option<String>,
     /// Whether the declared media type is a known text format with a decodable encoding.
     pub text: bool,
     /// Whether an untyped or `octet-stream` payload may be shown as text when it is valid UTF-8.
@@ -114,12 +125,16 @@ pub fn parse_size(raw: &str) -> Result<usize> {
 /// invocations) also surfaces readable UTF-8 text instead of hiding it as
 /// opaque binary, while true binary payloads keep size, SHA-256 and a hex preview.
 pub fn content(headers: &HeaderMap) -> Content {
-    let media = headers
+    let full_ct = headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let media = full_ct
         .and_then(|value| value.split(';').next())
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
+    let raw_content_type = full_ct.filter(|raw| raw.contains(';')).map(str::to_string);
 
     let raw_encoding = headers
         .get("content-encoding")
@@ -198,6 +213,7 @@ pub fn content(headers: &HeaderMap) -> Content {
 
     Content {
         content_type: media,
+        raw_content_type,
         text: known_text && compression.is_some(),
         sniff_utf8: untyped_or_octet && compression.is_some(),
         aws_chunked,
@@ -225,12 +241,28 @@ fn is_text(media: &str) -> bool {
         )
 }
 
-/// A bounded capture of one body.
+struct SpillTemp {
+    path: PathBuf,
+    file: std::fs::File,
+    written: usize,
+    cap: usize,
+}
+
+impl Drop for SpillTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A bounded capture of one body, with optional sidecar blob persistence and trailer capture.
 pub struct Capture {
     prefix: Vec<u8>,
     limit: usize,
     bytes: u64,
     hasher: Sha256,
+    blobs_dir: Option<PathBuf>,
+    spill: Option<SpillTemp>,
+    http_trailers: Vec<HeaderTrace>,
 }
 
 impl Capture {
@@ -240,24 +272,106 @@ impl Capture {
     }
 
     pub fn with_limit(limit: usize) -> Self {
+        Self::with_blobs(limit, None)
+    }
+
+    pub fn with_blobs(limit: usize, blobs_dir: Option<PathBuf>) -> Self {
         Capture {
             prefix: Vec::new(),
             limit,
             bytes: 0,
             hasher: Sha256::new(),
+            blobs_dir: blobs_dir.filter(|_| limit > 0),
+            spill: None,
+            http_trailers: Vec::new(),
         }
     }
 
     pub fn feed(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
         self.bytes = self.bytes.saturating_add(data.len() as u64);
         self.hasher.update(data);
         if self.limit == 0 {
             return;
         }
-        let room = self.limit.saturating_sub(self.prefix.len());
+        // Cap in-memory buffer at 8 MiB even when `--max-body unlimited` so streaming
+        // multi-hundred-MB transfers stay lean while spilling full bytes to disk.
+        let mem_cap = self.limit.min(8 * 1024 * 1024);
+        let room = mem_cap.saturating_sub(self.prefix.len());
         if room > 0 {
             self.prefix.extend_from_slice(&data[..data.len().min(room)]);
         }
+        let spill_cap = self.limit.max(MAX_SIDE_BLOB_BYTES);
+        if self.blobs_dir.is_some()
+            && (self.bytes as usize > INLINE_RAW_BYTES || self.prefix.len() >= mem_cap)
+        {
+            if self.spill.is_none()
+                && let Some(dir) = self.blobs_dir.as_ref()
+                && let Some(mut sp) = create_spill_temp(dir, spill_cap)
+            {
+                let initial = &self.prefix[..self.prefix.len().min(sp.cap)];
+                let prev_excluding = initial
+                    .len()
+                    .min(self.bytes.saturating_sub(data.len() as u64) as usize);
+                if prev_excluding > 0 {
+                    use std::io::Write as _;
+                    if sp.file.write_all(&self.prefix[..prev_excluding]).is_ok() {
+                        sp.written += prev_excluding;
+                    }
+                }
+                self.spill = Some(sp);
+            }
+            if let Some(sp) = self.spill.as_mut()
+                && sp.written < sp.cap
+            {
+                use std::io::Write as _;
+                let take = data.len().min(sp.cap - sp.written);
+                if sp.file.write_all(&data[..take]).is_ok() {
+                    sp.written += take;
+                }
+            }
+        }
+    }
+
+    pub fn feed_trailers(&mut self, map: &HeaderMap) {
+        self.http_trailers.extend(trace::headers(map));
+    }
+
+    /// HTTP/2 trailers plus any `aws-chunked` trailing checksum headers captured in the body.
+    pub fn trailers(&self, content: &Content) -> Vec<HeaderTrace> {
+        let mut out = self.http_trailers.clone();
+        if content.aws_chunked && !self.prefix.is_empty() {
+            for tr in extract_aws_chunked_trailers(&self.prefix) {
+                if !out.contains(&tr) {
+                    out.push(tr);
+                }
+            }
+        }
+        out
+    }
+
+    fn persist_wire_blob(&self, sha256: &str) -> Option<String> {
+        let dir = self.blobs_dir.as_ref()?;
+        if let Some(sp) = self.spill.as_ref()
+            && sp.written as u64 == self.bytes
+        {
+            let name = format!("{sha256}.bin");
+            let dest = dir.join(&name);
+            if dest.is_file() {
+                return Some(name);
+            }
+            let _ = lenslet_core::runs::set_mode(&sp.path, 0o600);
+            if std::fs::copy(&sp.path, &dest).is_ok() {
+                let _ = lenslet_core::runs::set_mode(&dest, 0o600);
+                return Some(name);
+            }
+        }
+        if self.bytes <= self.prefix.len() as u64 {
+            return lenslet_core::runs::write_blob(dir, sha256, &self.prefix);
+        }
+        None
     }
 
     /// The retained prefix of the body, unframed and decompressed when a
@@ -292,8 +406,11 @@ impl Capture {
             return Some(BodyTrace {
                 text: None,
                 hex: None,
+                raw_b64: None,
+                blob: None,
                 encoding: content.wire_encoding.clone(),
                 bytes: self.bytes,
+                decoded_bytes: None,
                 truncated: false,
                 binary: true,
                 sha256,
@@ -302,16 +419,31 @@ impl Capture {
 
         let wire_truncated = self.bytes > self.prefix.len() as u64;
         let decoded = decode_payload(&self.prefix, content, self.limit);
+        let inline_raw_b64 = |is_bin_or_enc: bool| -> Option<String> {
+            (is_bin_or_enc && !wire_truncated && self.bytes <= INLINE_RAW_BYTES as u64)
+                .then(|| lenslet_core::trace::b64_encode(&self.prefix))
+        };
 
         if let Some((ref bytes, capped)) = decoded {
             let truncated = wire_truncated || capped;
+            let has_enc = content.wire_encoding.is_some();
+            let decoded_len =
+                (!truncated && bytes.len() as u64 != self.bytes).then_some(bytes.len() as u64);
+            let blob = if truncated || (has_enc && self.bytes > INLINE_RAW_BYTES as u64) {
+                self.persist_wire_blob(&sha256)
+            } else {
+                None
+            };
             if content.text {
                 let text = lossy_trimmed_utf8(bytes, truncated);
                 return Some(BodyTrace {
                     text: Some(text),
                     hex: None,
+                    raw_b64: inline_raw_b64(has_enc),
+                    blob,
                     encoding: content.wire_encoding.clone(),
                     bytes: self.bytes,
+                    decoded_bytes: decoded_len,
                     truncated,
                     binary: false,
                     sha256,
@@ -324,8 +456,11 @@ impl Capture {
                 return Some(BodyTrace {
                     text: Some(text),
                     hex: None,
+                    raw_b64: inline_raw_b64(has_enc),
+                    blob,
                     encoding: content.wire_encoding.clone(),
                     bytes: self.bytes,
+                    decoded_bytes: decoded_len,
                     truncated,
                     binary: false,
                     sha256,
@@ -335,8 +470,11 @@ impl Capture {
                 return Some(BodyTrace {
                     text: Some(String::new()),
                     hex: None,
+                    raw_b64: inline_raw_b64(true),
+                    blob,
                     encoding: content.wire_encoding.clone(),
                     bytes: self.bytes,
+                    decoded_bytes: Some(0),
                     truncated: false,
                     binary: false,
                     sha256,
@@ -350,17 +488,58 @@ impl Capture {
         };
         let preview_len = preview_source.len().min(HEX_PREVIEW_BYTES);
         let hex_preview = (preview_len > 0).then(|| hex(&preview_source[..preview_len]));
+        let blob = if self.bytes > INLINE_RAW_BYTES as u64 || wire_truncated {
+            self.persist_wire_blob(&sha256)
+        } else {
+            None
+        };
+        let has_blob = blob.is_some();
 
         Some(BodyTrace {
             text: None,
             hex: hex_preview,
+            raw_b64: inline_raw_b64(true),
+            blob,
             encoding: content.wire_encoding.clone(),
             bytes: self.bytes,
-            truncated: wire_truncated,
+            decoded_bytes: decoded
+                .as_ref()
+                .filter(|(_, capped)| !*capped && !wire_truncated)
+                .map(|(b, _)| b.len() as u64)
+                .filter(|&n| n != self.bytes),
+            truncated: wire_truncated && !has_blob,
             binary: true,
             sha256,
         })
     }
+}
+
+fn create_spill_temp(dir: &PathBuf, cap: usize) -> Option<SpillTemp> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).ok()?;
+        let _ = lenslet_core::runs::set_mode(dir, 0o700);
+    }
+    let path = dir.join(format!(
+        ".spill-{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&path).ok()?;
+    Some(SpillTemp {
+        path,
+        file,
+        written: 0,
+        cap,
+    })
 }
 
 /// Unframe `aws-chunked` / `vnd.amazon.eventstream` and decompress `gzip`/`deflate` up to `limit`.
@@ -426,13 +605,14 @@ fn decode_eventstream(input: &[u8], limit: usize) -> Option<(Vec<u8>, bool)> {
 
         let headers_buf = &rem[12..12 + headers_len];
         let payload_buf = &rem[12 + headers_len..total_len - 4];
-        let (event_type, message_type, exception_type) = parse_eventstream_headers(headers_buf)?;
+        let (event_type, message_type, exception_type, all_headers) =
+            parse_eventstream_headers(headers_buf)?;
 
         let label = exception_type
             .or(event_type)
             .or(message_type)
             .unwrap_or_else(|| "event".to_string());
-        let line_json = format_eventstream_frame(&label, payload_buf);
+        let line_json = format_eventstream_frame(&label, &all_headers, payload_buf);
         let line_bytes = line_json.as_bytes();
         let needed = line_bytes.len() + usize::from(!out.is_empty());
         if out.len().saturating_add(needed) > limit {
@@ -453,28 +633,57 @@ fn decode_eventstream(input: &[u8], limit: usize) -> Option<(Vec<u8>, bool)> {
 #[allow(clippy::type_complexity)]
 fn parse_eventstream_headers(
     buf: &[u8],
-) -> Option<(Option<String>, Option<String>, Option<String>)> {
+) -> Option<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    serde_json::Map<String, serde_json::Value>,
+)> {
     let mut pos = 0usize;
     let mut event_type = None;
     let mut message_type = None;
     let mut exception_type = None;
+    let mut extra = serde_json::Map::new();
 
     while pos < buf.len() {
         let name_len = *buf.get(pos)? as usize;
         pos += 1;
-        let name = std::str::from_utf8(buf.get(pos..pos.checked_add(name_len)?)?).ok()?;
+        let name = std::str::from_utf8(buf.get(pos..pos.checked_add(name_len)?)?)
+            .ok()?
+            .to_string();
         pos += name_len;
         let val_type = *buf.get(pos)?;
         pos += 1;
-        match val_type {
-            0 | 1 => {}
-            2 => pos = pos.checked_add(1)?,
-            3 => pos = pos.checked_add(2)?,
-            4 => pos = pos.checked_add(4)?,
-            5 | 8 => pos = pos.checked_add(8)?,
+        let json_val = match val_type {
+            0 => serde_json::Value::Bool(true),
+            1 => serde_json::Value::Bool(false),
+            2 => {
+                let v = *buf.get(pos)? as i8;
+                pos += 1;
+                serde_json::Value::Number(v.into())
+            }
+            3 => {
+                let s = buf.get(pos..pos.checked_add(2)?)?;
+                pos += 2;
+                serde_json::Value::Number(i16::from_be_bytes([s[0], s[1]]).into())
+            }
+            4 => {
+                let s = buf.get(pos..pos.checked_add(4)?)?;
+                pos += 4;
+                serde_json::Value::Number(i32::from_be_bytes([s[0], s[1], s[2], s[3]]).into())
+            }
+            5 | 8 => {
+                let s = buf.get(pos..pos.checked_add(8)?)?;
+                pos += 8;
+                let n = i64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+                serde_json::Value::Number(n.into())
+            }
             6 => {
                 let b_len = u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize;
-                pos = pos.checked_add(2)?.checked_add(b_len)?;
+                let slice =
+                    buf.get(pos.checked_add(2)?..pos.checked_add(2)?.checked_add(b_len)?)?;
+                pos += 2 + b_len;
+                serde_json::Value::String(lenslet_core::trace::b64_encode(slice))
             }
             7 => {
                 let s_len = u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize;
@@ -483,45 +692,78 @@ fn parse_eventstream_headers(
                     .ok()?
                     .to_string();
                 pos += s_len;
-                match name {
-                    ":event-type" => event_type = Some(val),
-                    ":message-type" => message_type = Some(val),
-                    ":exception-type" | ":error-code" => exception_type = Some(val),
+                match name.as_str() {
+                    ":event-type" => event_type = Some(val.clone()),
+                    ":message-type" => message_type = Some(val.clone()),
+                    ":exception-type" | ":error-code" => exception_type = Some(val.clone()),
                     _ => {}
                 }
+                serde_json::Value::String(val)
             }
-            9 => pos = pos.checked_add(16)?,
+            9 => {
+                let u = buf.get(pos..pos.checked_add(16)?)?;
+                pos += 16;
+                serde_json::Value::String(format!(
+                    "{}-{}-{}-{}-{}",
+                    hex(&u[0..4]),
+                    hex(&u[4..6]),
+                    hex(&u[6..8]),
+                    hex(&u[8..10]),
+                    hex(&u[10..16])
+                ))
+            }
             _ => return None,
+        };
+        if !matches!(name.as_str(), ":event-type" | ":message-type") {
+            extra.insert(name, json_val);
         }
         if pos > buf.len() {
             return None;
         }
     }
-    Some((event_type, message_type, exception_type))
+    Some((event_type, message_type, exception_type, extra))
 }
 
-fn format_eventstream_frame(event: &str, payload: &[u8]) -> String {
-    if payload.is_empty() {
-        return serde_json::json!({ "event": event }).to_string();
+fn format_eventstream_frame(
+    event: &str,
+    headers: &serde_json::Map<String, serde_json::Value>,
+    payload: &[u8],
+) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("event".into(), serde_json::Value::String(event.to_string()));
+    if !headers.is_empty() {
+        obj.insert("headers".into(), serde_json::Value::Object(headers.clone()));
     }
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(payload) {
-        // Bedrock `InvokeModelWithResponseStream` wraps provider JSON in `{"bytes":"<base64>"}`.
-        if let Some(b64) = val.get("bytes").and_then(|v| v.as_str())
-            && let Some(decoded) = decode_base64(b64)
-        {
-            if let Ok(inner_json) = serde_json::from_slice::<serde_json::Value>(&decoded) {
-                return serde_json::json!({ "event": event, "data": inner_json }).to_string();
+    if !payload.is_empty() {
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(payload) {
+            // Bedrock `InvokeModelWithResponseStream` wraps provider JSON in `{"bytes":"<base64>"}`.
+            if let Some(b64) = val.get("bytes").and_then(|v| v.as_str())
+                && let Some(decoded) = decode_base64(b64)
+            {
+                if let Ok(inner_json) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+                    obj.insert("data".into(), inner_json);
+                    return serde_json::Value::Object(obj).to_string();
+                }
+                if let Ok(inner_str) = std::str::from_utf8(&decoded) {
+                    obj.insert("text".into(), serde_json::Value::String(inner_str.into()));
+                    return serde_json::Value::Object(obj).to_string();
+                }
             }
-            if let Ok(inner_str) = std::str::from_utf8(&decoded) {
-                return serde_json::json!({ "event": event, "text": inner_str }).to_string();
-            }
+            obj.insert("data".into(), val);
+        } else if let Ok(text) = std::str::from_utf8(payload) {
+            obj.insert("text".into(), serde_json::Value::String(text.into()));
+        } else {
+            obj.insert(
+                "bytes".into(),
+                serde_json::Value::Number(payload.len().into()),
+            );
+            obj.insert(
+                "payload_base64".into(),
+                serde_json::Value::String(lenslet_core::trace::b64_encode(payload)),
+            );
         }
-        return serde_json::json!({ "event": event, "data": val }).to_string();
     }
-    if let Ok(text) = std::str::from_utf8(payload) {
-        return serde_json::json!({ "event": event, "text": text }).to_string();
-    }
-    serde_json::json!({ "event": event, "bytes": payload.len() }).to_string()
+    serde_json::Value::Object(obj).to_string()
 }
 
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
@@ -620,6 +862,58 @@ fn decode_aws_chunked(input: &[u8], limit: usize) -> Option<(Vec<u8>, bool)> {
     }
 
     Some((out, capped))
+}
+
+/// Extract trailing headers (`x-amz-checksum-*`, `x-amz-trailer-signature`, ...)
+/// sent after the terminal `0[;chunk-signature=...]\r\n` chunk of an `aws-chunked` stream.
+fn extract_aws_chunked_trailers(input: &[u8]) -> Vec<HeaderTrace> {
+    let mut pos = 0usize;
+    while pos < input.len() {
+        let rest = &input[pos..];
+        let Some(rel_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            return Vec::new();
+        };
+        let header = &rest[..rel_end];
+        let size_part = header
+            .split(|&b| b == b';')
+            .next()
+            .unwrap_or(header)
+            .trim_ascii();
+        let Ok(size_str) = std::str::from_utf8(size_part) else {
+            return Vec::new();
+        };
+        let Ok(chunk_size) = usize::from_str_radix(size_str, 16) else {
+            return Vec::new();
+        };
+        pos += rel_end + 2;
+        if chunk_size == 0 {
+            let mut trailers = Vec::new();
+            for raw_line in input[pos..].split(|&b| b == b'\n') {
+                let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(colon) = line.iter().position(|&b| b == b':') {
+                    let name = String::from_utf8_lossy(&line[..colon]).trim().to_string();
+                    let value = String::from_utf8_lossy(&line[colon + 1..])
+                        .trim()
+                        .to_string();
+                    if !name.is_empty() {
+                        trailers.push(HeaderTrace { name, value });
+                    }
+                }
+            }
+            return trailers;
+        }
+        if pos.saturating_add(chunk_size) > input.len() {
+            return Vec::new();
+        }
+        pos += chunk_size;
+        if input.get(pos..pos + 2) == Some(b"\r\n") {
+            pos += 2;
+        }
+    }
+    Vec::new()
 }
 
 /// Decompress up to `limit` bytes of a `gzip` or `deflate` stream.
@@ -764,10 +1058,14 @@ where
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
         match &polled {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref()
+                if let Some(data) = frame.data_ref() {
+                    if let Ok(mut capture) = this.capture.lock() {
+                        capture.feed(data);
+                    }
+                } else if let Some(trailers) = frame.trailers_ref()
                     && let Ok(mut capture) = this.capture.lock()
                 {
-                    capture.feed(data);
+                    capture.feed_trailers(trailers);
                 }
             }
             Poll::Ready(Some(Err(_))) | Poll::Ready(None) => this.end(),
@@ -1124,5 +1422,47 @@ mod tests {
         assert_eq!(body.encoding.as_deref(), Some("cbor,zstd"));
         let text = body.text.unwrap();
         assert!(text.contains(r#""Namespace": "Shop/Checkout""#), "{text}");
+        assert!(
+            body.raw_b64.is_some(),
+            "encoded wire bytes preserved in raw_b64"
+        );
+    }
+
+    #[test]
+    fn preserves_aws_chunked_trailers_and_spills_large_payloads_to_sidecar_blobs() {
+        let chunked_frame = b"5;chunk-signature=deadbeef\r\nhello\r\n0;chunk-signature=cafebabe\r\nx-amz-checksum-crc32:789abc==\r\n\r\n";
+        let mut cap = Capture::new(true);
+        cap.feed(chunked_frame);
+        let ct = content(&headers(&[
+            ("content-type", "text/plain; charset=utf-8"),
+            ("content-encoding", "aws-chunked"),
+        ]));
+        let body = cap.body(&ct).unwrap();
+        assert_eq!(body.text.as_deref(), Some("hello"));
+        assert_eq!(body.decoded_bytes, Some(5));
+        assert!(body.raw_b64.is_some());
+        let trs = cap.trailers(&ct);
+        assert_eq!(trs.len(), 1);
+        assert_eq!(trs[0].name, "x-amz-checksum-crc32");
+        assert_eq!(trs[0].value, "789abc==");
+
+        // >32 KiB binary payload spills losslessly to sidecar `.bin` blob.
+        let bdir = std::env::temp_dir().join(format!("lenslet-cap-blobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bdir);
+        let large_bin: Vec<u8> = (0..40_000).map(|i| ((i * 31) & 0xff) as u8).collect();
+        let mut cap_blob = Capture::with_blobs(64 * 1024 * 1024, Some(bdir.clone()));
+        cap_blob.feed(&large_bin);
+        let out = cap_blob
+            .body(&content(&headers(&[(
+                "content-type",
+                "application/octet-stream",
+            )])))
+            .unwrap();
+        assert!(out.binary);
+        assert!(!out.truncated);
+        assert_eq!(out.bytes, large_bin.len() as u64);
+        let blob_name = out.blob.expect("sidecar blob recorded");
+        assert_eq!(std::fs::read(bdir.join(blob_name)).unwrap(), large_bin);
+        let _ = std::fs::remove_dir_all(&bdir);
     }
 }

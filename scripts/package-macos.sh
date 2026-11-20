@@ -55,8 +55,54 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>zh_CN</string>
+  </array>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSHumanReadableCopyright</key><string>Copyright © Lenslet Contributors. Apache-2.0 / MIT.</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Lenslet Run Trace</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeIconFile</key><string>AppIcon</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>dev.lenslet.trace</string>
+        <string>public.json</string>
+      </array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>jsonl</string>
+      </array>
+    </dict>
+  </array>
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>dev.lenslet.trace</string>
+      <key>UTTypeDescription</key><string>Lenslet AWS Run Trace (.jsonl)</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.utf8-plain-text</string>
+        <string>public.data</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>jsonl</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
 </dict></plist>
 PLIST
 

@@ -85,6 +85,39 @@ impl LensletApp {
             });
         };
         add(
+            ui.t("Run Command Through Lenslet…", "在 Lenslet 中发起运行…")
+                .into(),
+            Some(i18n::shortcut("N")),
+            Cmd::OpenLauncher,
+        );
+        add(
+            ui.t("Compose New Local AWS Request…", "新建本地 AWS 请求…")
+                .into(),
+            Some(i18n::shortcut("⇧N")),
+            Cmd::NewRequest,
+        );
+        add(
+            ui.t("Open Workspace Folder…", "打开项目工作区目录…").into(),
+            Some(i18n::shortcut("⌥O")),
+            Cmd::OpenWorkspace,
+        );
+        add(
+            ui.t(
+                "Generate GitHub Actions CI Workflow (.github/workflows/lenslet.yml)",
+                "生成 GitHub Actions CI 工作流 (.github/workflows/lenslet.yml)",
+            )
+            .into(),
+            None,
+            Cmd::InitCiWorkflow,
+        );
+        if self.managed_run.is_some() {
+            add(
+                ui.t("Stop Active Command Run", "停止当前运行的命令").into(),
+                Some(i18n::shortcut(".")),
+                Cmd::StopActiveRun,
+            );
+        }
+        add(
             ui.t("Show Calls", "显示请求").into(),
             Some(i18n::shortcut("1")),
             Cmd::Mode(Mode::Calls),
@@ -93,6 +126,15 @@ impl LensletApp {
             ui.t("Show Access", "显示权限").into(),
             Some(i18n::shortcut("2")),
             Cmd::Mode(Mode::Access),
+        );
+        add(
+            ui.t(
+                "Show Output & Run Telemetry",
+                "显示终端输出与全量运行元数据",
+            )
+            .into(),
+            Some(i18n::shortcut("3")),
+            Cmd::Mode(Mode::Console),
         );
         add(
             ui.t("Search", "搜索").into(),
@@ -150,7 +192,31 @@ impl LensletApp {
             ui.t("Copy Proxy Shell Environment", "复制代理终端环境变量")
                 .into(),
             None,
-            Cmd::CopyProxyEnv,
+            Cmd::CopyProxyEnv(crate::daemon::ShellFormat::Sh),
+        );
+        if session.evicted > 0 && !session.store.is_unbounded() {
+            add(
+                if ui.zh() {
+                    format!("无损加载全部调用记录（+{}）", session.evicted)
+                } else {
+                    format!("Load All Calls Without Cap (+{})", session.evicted)
+                },
+                None,
+                Cmd::LoadAllCalls,
+            );
+        }
+        if self.inspector.read(cx).call().is_some() {
+            add(
+                ui.t("Save Selected Payload…", "保存当前请求/响应报文…")
+                    .into(),
+                Some(i18n::shortcut("⌥S")),
+                Cmd::SavePayload,
+            );
+        }
+        add(
+            ui.t("About Lenslet", "关于 Lenslet").into(),
+            None,
+            Cmd::OpenAbout,
         );
         add(
             ui.t("Reload Run", "重新加载运行").into(),

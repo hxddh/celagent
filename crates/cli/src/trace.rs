@@ -362,19 +362,19 @@ mod tests {
                 content_type: Some("application/json".to_string()),
                 body: Some(BodyTrace {
                     text: Some(r#"{"password":"hunter2","name":"lenslet"}"#.to_string()),
-                    hex: None,
-                    encoding: None,
                     bytes: 40,
-                    truncated: false,
-                    binary: false,
                     sha256: "0".repeat(64),
+                    ..Default::default()
                 }),
+                ..Default::default()
             },
             response: Message {
                 headers: headers(&response_headers),
                 content_type: Some("application/json".to_string()),
                 body: None,
+                ..Default::default()
             },
+            ..Default::default()
         }
     }
 

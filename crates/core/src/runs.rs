@@ -39,6 +39,70 @@ pub fn dir(home: &Path) -> PathBuf {
     home.join(".lenslet/runs")
 }
 
+/// Companion stdout/stderr log path (`<run>.log`) for a run file (`<run>.jsonl`).
+pub fn log_path_for(trace_path: &Path) -> PathBuf {
+    trace_path.with_extension("log")
+}
+
+/// Content-addressed sidecar blob directory (`<trace_dir>/blobs`) holding exact
+/// raw wire bodies for binary, compressed, or multi-megabyte payloads.
+/// Accepts either a run `.jsonl` file path or the runs directory itself.
+pub fn blobs_dir(trace_or_dir: &Path) -> PathBuf {
+    if trace_or_dir.extension().is_none() && trace_or_dir.is_dir() {
+        return trace_or_dir.join("blobs");
+    }
+    trace_or_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("blobs")
+}
+
+fn valid_sha256_hex(sha256: &str) -> bool {
+    sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Persist `bytes` into `<blobs_dir>/<sha256>.bin` (owner-only `0600`) when not
+/// already present, returning the relative blob filename `<sha256>.bin`.
+pub fn write_blob(blobs_dir: &Path, sha256: &str, bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || !valid_sha256_hex(sha256) {
+        return None;
+    }
+    let name = format!("{}.bin", sha256.to_ascii_lowercase());
+    let dest = blobs_dir.join(&name);
+    if dest.is_file() {
+        return Some(name);
+    }
+    if !blobs_dir.exists() {
+        fs::create_dir_all(blobs_dir).ok()?;
+        let _ = set_mode(blobs_dir, 0o700);
+    }
+    let tmp = blobs_dir.join(format!(
+        ".{}.{}.{}.tmp",
+        name,
+        std::process::id(),
+        Utc::now().timestamp_subsec_nanos()
+    ));
+    fs::write(&tmp, bytes).ok()?;
+    let _ = set_mode(&tmp, 0o600);
+    if fs::rename(&tmp, &dest).is_err() && !dest.is_file() {
+        let _ = fs::remove_file(&tmp);
+        return None;
+    }
+    let _ = fs::remove_file(&tmp);
+    Some(name)
+}
+
+/// Read exact wire bytes from `<trace_dir>/blobs/<blob_name>`, guarding strictly
+/// against path traversal.
+pub fn read_blob(trace_path: &Path, blob_name: &str) -> Option<Vec<u8>> {
+    let stem = blob_name.strip_suffix(".bin")?;
+    if !valid_sha256_hex(stem) {
+        return None;
+    }
+    fs::read(blobs_dir(trace_path).join(blob_name)).ok()
+}
+
 /// Prepare the runs directory, drop old runs, and name the new run file.
 pub fn create(dir: &Path) -> Result<PathBuf> {
     if !dir.exists() {
@@ -199,11 +263,53 @@ fn prune(dir: &Path, keep: usize) {
             }
         }
     }
-    let candidates = runs.into_iter().filter(|run| {
-        !is_active(run) && !pinned.contains(&run_id(run)) && !protected.contains(run)
-    });
-    for run in candidates.take(excess) {
+    let candidates: Vec<PathBuf> = runs
+        .iter()
+        .filter(|run| {
+            !is_active(run) && !pinned.contains(&run_id(run)) && !protected.contains(*run)
+        })
+        .take(excess)
+        .cloned()
+        .collect();
+    for run in &candidates {
+        let _ = fs::remove_file(log_path_for(run));
         let _ = fs::remove_file(run);
+    }
+    if !candidates.is_empty() {
+        prune_orphan_blobs(dir);
+    }
+}
+
+pub fn prune_orphan_blobs(dir: &Path) {
+    let bdir = dir.join("blobs");
+    let Ok(entries) = fs::read_dir(&bdir) else {
+        return;
+    };
+    let blob_files: Vec<(String, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .filter(|(name, _)| name.ends_with(".bin"))
+        .collect();
+    if blob_files.is_empty() {
+        return;
+    }
+    let mut referenced = BTreeSet::new();
+    for run in list(dir) {
+        let Ok(file) = File::open(&run) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            for (name, _) in &blob_files {
+                if !referenced.contains(name) && line.contains(name.as_str()) {
+                    referenced.insert(name.clone());
+                }
+            }
+        }
+    }
+    for (name, path) in blob_files {
+        if !referenced.contains(&name) {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -213,7 +319,7 @@ pub fn header(path: &Path) -> Option<RunHeader> {
         .read_line(&mut line)
         .ok()?;
     match serde_json::from_str(&line).ok()? {
-        Record::Run(header) => Some(header),
+        Record::Run(header) => Some(*header),
         _ => None,
     }
 }
@@ -474,6 +580,53 @@ mod tests {
         );
         assert!(set_pinned(&dir, "20261110-000000-1", false).unwrap());
         assert!(!read_pinned(&dir).contains("20261110-000000-1"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sidecar_blobs_roundtrip_and_orphan_blobs_are_pruned() {
+        let dir = temp_dir("blobs");
+        let bdir = blobs_dir(&dir);
+        let kept_hash = "a".repeat(64);
+        let orphan_hash = "b".repeat(64);
+        let payload = b"lossless binary s3 object bytes \x00\xff\x7f";
+        write_blob(&bdir, &kept_hash, payload).unwrap();
+        write_blob(&bdir, &orphan_hash, b"orphan").unwrap();
+
+        let run_path = dir.join("20261119-000000-1.jsonl");
+        fs::write(
+            &run_path,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({
+                    "type": "run", "version": 3, "run": "20261119-000000-1",
+                    "command": ["pytest"], "cwd": "/w", "pid": 1,
+                    "endpoint": "http://127.0.0.1:1", "upstream": "u", "started": "s"
+                }),
+                serde_json::json!({
+                    "type": "call", "id": "c1", "at": "2026-11-19T00:00:00Z",
+                    "method": "PUT", "path": "/b/k", "status": 200, "ms": 2,
+                    "service": "s3", "operation": "PutObject",
+                    "request": { "body": { "bytes": payload.len(), "binary": true, "blob": format!("{kept_hash}.bin") } }
+                }),
+                serde_json::json!({
+                    "type": "end", "version": 3, "run": "20261119-000000-1", "exit_code": 0,
+                    "ended": "e", "duration_ms": 2, "calls": 1, "errors": 0, "unfinished": 0,
+                    "services": {}, "failures": [], "access": [], "lock": null,
+                    "access_added": [], "access_unused": [], "regressions": null,
+                    "trace": "", "endpoint": "", "upstream": ""
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_blob(&run_path, &format!("{kept_hash}.bin")).unwrap(),
+            payload
+        );
+        prune_orphan_blobs(&dir);
+        assert!(bdir.join(format!("{kept_hash}.bin")).exists());
+        assert!(!bdir.join(format!("{orphan_hash}.bin")).exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

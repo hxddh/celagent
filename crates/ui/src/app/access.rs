@@ -355,6 +355,31 @@ impl AccessView {
                 }),
             );
         }
+        let unused_in_lock: Vec<Access> = self
+            .rows
+            .iter()
+            .filter(|row| row.in_lock && !row.used && !row.test)
+            .map(|row| row.access.clone())
+            .collect();
+        if editable && self.filter == AccessFilter::Removed && !unused_in_lock.is_empty() {
+            let session = self.session.clone();
+            let n = unused_in_lock.len();
+            bar = bar.child(
+                widgets::danger_button(
+                    ui,
+                    "prune-unused",
+                    if ui.zh() {
+                        format!("移除未使用（{n}）")
+                    } else {
+                        format!("Prune {n} unused")
+                    },
+                )
+                .on_click(move |_, _, cx| {
+                    let entries = unused_in_lock.clone();
+                    session.update(cx, |session, cx| session.remove_from_lock(entries, cx));
+                }),
+            );
+        }
         let rows = self.rows.clone();
         bar.child(
             widgets::button(ui, "copy-policy", ui.t("Copy policy", "复制策略"))
@@ -841,16 +866,35 @@ impl Render for AccessDetail {
             );
         } else if row.used && !row.in_lock {
             actions = actions.child(
-                widgets::primary_button(&ui, "accept", ui.t("Accept into lock", "写入 lock"))
-                    .opacity(0.45)
-                    .cursor_default()
-                    .tooltip(widgets::tip(
-                        ui.t(
-                            "This run has no lenslet.lock to write: it is checked against an IAM policy, or its project folder is unknown",
-                            "此运行没有可写的 lenslet.lock：它按 IAM policy 检查，或项目目录未知",
-                        ),
-                        None,
-                    )),
+                widgets::primary_button(
+                    &ui,
+                    "choose-ws-for-lock",
+                    ui.t("Choose Workspace for lock…", "选择工作区以写入 lock…"),
+                )
+                .tooltip(widgets::tip(
+                    ui.t(
+                        "Pick a project folder to create or update lenslet.lock",
+                        "选择一个项目目录以创建或更新 lenslet.lock",
+                    ),
+                    Some(i18n::shortcut("⌥O")),
+                ))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(super::OpenWorkspace), cx);
+                }),
+            );
+        }
+        if editable && row.in_lock {
+            let session = self.session.clone();
+            let access = row.access.clone();
+            actions = actions.child(
+                widgets::danger_button(
+                    &ui,
+                    "remove-lock",
+                    ui.t("Remove from lock", "从 lock 移除"),
+                )
+                .on_click(move |_, _, cx| {
+                    session.update(cx, |s, cx| s.remove_from_lock(vec![access.clone()], cx));
+                }),
             );
         }
         if editable && (row.in_lock || row.used) {
