@@ -161,6 +161,7 @@ struct RunArgs {
     command: Vec<String>,
     json: Option<String>,
     markdown: Option<String>,
+    log: Option<PathBuf>,
     quiet: bool,
     ui: bool,
     no_env: bool,
@@ -177,6 +178,7 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
         command: Vec::new(),
         json: None,
         markdown: None,
+        log: None,
         quiet: false,
         ui: false,
         no_env: false,
@@ -197,6 +199,7 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
             }
             "--json" => parsed.json = Some(value()?),
             "--markdown" => parsed.markdown = Some(value()?),
+            "--log" => parsed.log = Some(PathBuf::from(value()?)),
             "--lock" => parsed.lock = Some(PathBuf::from(value()?)),
             "--policy" => parsed.policy = Some(PathBuf::from(value()?)),
             "--strict" => parsed.strict = true,
@@ -319,6 +322,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
         command,
         json,
         markdown,
+        log,
         quiet,
         ui,
         no_env,
@@ -395,6 +399,11 @@ async fn run(args: Vec<String>) -> Result<i32> {
             options.upstream.base, options.upstream.port
         );
     }
+    let header_routes = options
+        .routes
+        .iter()
+        .map(|(svc, up)| (svc.clone(), up.base.clone()))
+        .collect();
     let header = RunHeader {
         version: trace::VERSION,
         run: runs::run_id(&trace_path),
@@ -405,6 +414,10 @@ async fn run(args: Vec<String>) -> Result<i32> {
         lock: (policy_label.is_none() && locked.is_some()).then(|| lock_label.clone()),
         policy: policy_label.clone(),
         enforce: options.enforce,
+        routes: header_routes,
+        allow_docker: options.allow_docker,
+        max_body: Some(options.max_body as u64),
+        log: log.as_ref().map(|p| p.display().to_string()),
         ..RunHeader::default()
     };
     let server = Server::start(&options, trace_path.clone(), header, gate.clone()).await?;
@@ -448,7 +461,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
         if ui && let Err(error) = open_ui(Some(&trace_path)) {
             eprintln!("lenslet: {error:#}");
         }
-        Some(run_child(&command, &env).await?)
+        Some(run_child(&command, &env, log.as_deref(), server.shutdown_requested()).await?)
     };
 
     let state = server.state.clone();
@@ -535,9 +548,38 @@ async fn run(args: Vec<String>) -> Result<i32> {
     })
 }
 
-async fn run_child(command: &[String], env: &ChildEnv) -> Result<i32> {
+async fn run_child(
+    command: &[String],
+    env: &ChildEnv,
+    log_path: Option<&Path>,
+    stop_notify: std::sync::Arc<tokio::sync::Notify>,
+) -> Result<i32> {
+    use tokio::io::AsyncReadExt as _;
+    let log_sink = if let Some(path) = log_path {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create log directory {}", parent.display()))?;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(path)
+            .with_context(|| format!("open log file {}", path.display()))?;
+        Some(std::sync::Arc::new(std::sync::Mutex::new(file)))
+    } else {
+        None
+    };
+
     let mut child = tokio::process::Command::new(&command[0]);
     child.args(&command[1..]).stdin(Stdio::inherit());
+    if log_sink.is_some() {
+        child.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     // Remove first: a placeholder key replaces a real one of the same name.
     for name in &env.remove {
         child.env_remove(name);
@@ -548,15 +590,80 @@ async fn run_child(command: &[String], env: &ChildEnv) -> Result<i32> {
     let mut child = match child.spawn() {
         Ok(child) => child,
         Err(error) => {
-            eprintln!("lenslet: cannot start `{}`: {error}", command[0]);
+            let msg = format!("lenslet: cannot start `{}`: {error}\n", command[0]);
+            eprint!("{msg}");
+            if let Some(sink) = log_sink.as_ref()
+                && let Ok(mut f) = sink.lock()
+            {
+                use std::io::Write as _;
+                let _ = f.write_all(msg.as_bytes());
+            }
             return Ok(127);
         }
     };
-    // Ctrl-C reaches the child through the terminal; Lenslet waits for it to
-    // exit so the report still covers every call.
+
+    let mut tee_tasks = Vec::new();
+    if let Some(sink) = log_sink {
+        if let Some(mut out) = child.stdout.take() {
+            let sink = sink.clone();
+            tee_tasks.push(tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = out.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    {
+                        use std::io::Write as _;
+                        let _ = std::io::stdout().write_all(&buf[..n]);
+                        let _ = std::io::stdout().flush();
+                        if let Ok(mut f) = sink.lock() {
+                            let _ = f.write_all(&buf[..n]);
+                            let _ = f.flush();
+                        }
+                    }
+                }
+            }));
+        }
+        if let Some(mut err) = child.stderr.take() {
+            let sink = sink.clone();
+            tee_tasks.push(tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = err.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    {
+                        use std::io::Write as _;
+                        let _ = std::io::stderr().write_all(&buf[..n]);
+                        let _ = std::io::stderr().flush();
+                        if let Ok(mut f) = sink.lock() {
+                            let _ = f.write_all(&buf[..n]);
+                            let _ = f.flush();
+                        }
+                    }
+                }
+            }));
+        }
+    }
+
+    // Ctrl-C reaches the child through the terminal; `SIGTERM` or `/_lenslet/shutdown`
+    // terminates the child cleanly so the `end` report is still written.
     let interrupts = tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
-    let status = child.wait().await.context("wait for the command")?;
+    let status = tokio::select! {
+        res = child.wait() => res.context("wait for the command")?,
+        () = stop_notify.notified() => {
+            let _ = child.start_kill();
+            child.wait().await.context("wait for stopped command")?
+        }
+        () = wait_for_sigterm() => {
+            let _ = child.start_kill();
+            child.wait().await.context("wait for terminated command")?
+        }
+    };
     interrupts.abort();
+    for task in tee_tasks {
+        let _ = tokio::time::timeout(Duration::from_millis(250), task).await;
+    }
     Ok(exit_code(status))
 }
 
@@ -1477,14 +1584,19 @@ fn open_ui(trace: Option<&Path>) -> Result<()> {
         .filter(|_| cfg!(target_os = "macos"));
     let mut command = if let Some(app) = app {
         let mut open = std::process::Command::new("open");
-        open.arg(app);
+        open.arg("-a").arg(app);
         if let Some(trace) = trace {
             open.arg("--env")
                 .arg(format!("LENSLET_TRACE={}", trace.display()));
+            open.arg(trace);
         }
         open
     } else if dir.join(name).is_file() {
-        std::process::Command::new(dir.join(name))
+        let mut bin = std::process::Command::new(dir.join(name));
+        if let Some(trace) = trace {
+            bin.arg(trace);
+        }
+        bin
     } else {
         bail!(
             "the Lenslet window is not installed next to {} (expected {name}{}). \

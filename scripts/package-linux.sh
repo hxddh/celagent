@@ -13,11 +13,27 @@ OUT="${2:-dist}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="$(uname -m)"
 NAME="lenslet-${VERSION}-${ARCH}-linux"
-mkdir -p "$OUT/$NAME/assets/fonts"
+mkdir -p "$OUT/$NAME/assets/fonts" \
+         "$OUT/$NAME/share/applications" \
+         "$OUT/$NAME/share/icons/hicolor/512x512/apps"
 
 cp "$ROOT/target/release/lenslet" "$ROOT/target/release/lenslet-ui" "$OUT/$NAME/"
 cp "$ROOT/README.md" "$ROOT/RELEASE_NOTES.md" "$ROOT/LICENSE" "$OUT/$NAME/"
 cp "$ROOT/assets/fonts/LICENSE-"* "$OUT/$NAME/assets/fonts/"
+cp "$ROOT/assets/app-icon.png" "$OUT/$NAME/share/icons/hicolor/512x512/apps/dev.lenslet.app.png"
+cat > "$OUT/$NAME/share/applications/dev.lenslet.app.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Lenslet
+Comment=Local AWS SDK Flight Recorder & Least-Privilege IAM Workbench
+Exec=lenslet-ui %f
+Icon=dev.lenslet.app
+Terminal=false
+Categories=Development;Debugger;Cloud;
+MimeType=application/jsonl;application/x-ndjson;
+StartupWMClass=dev.lenslet.app
+Keywords=AWS;IAM;LocalStack;Moto;S3;DynamoDB;Trace;
+DESKTOP
 strip "$OUT/$NAME/lenslet" "$OUT/$NAME/lenslet-ui"
 
 # The binaries run where their glibc is at least the one they need.

@@ -8,7 +8,7 @@ on:
       tag:
         description: 'lenslet-v* tag to publish (created at the dispatched commit if it does not exist)'
         required: true
-        default: 'lenslet-v9.0.0'
+        default: 'lenslet-v10.0.0'
 
 permissions:
   contents: write

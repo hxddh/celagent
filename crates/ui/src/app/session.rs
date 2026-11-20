@@ -80,6 +80,9 @@ pub struct Session {
     pub store: CallStore,
     pub feed_mode: Option<FeedMode>,
     pub skipped: usize,
+    pub evicted: usize,
+    pub console_log: Arc<str>,
+    pub workspace_fallback: Option<PathBuf>,
     feed_task: Option<Task<()>>,
     _watch_task: Option<Task<()>>,
 
@@ -114,6 +117,9 @@ impl Session {
             store: CallStore::default(),
             feed_mode: None,
             skipped: 0,
+            evicted: 0,
+            console_log: Arc::from(""),
+            workspace_fallback: None,
             feed_task: None,
             _watch_task: None,
             lock_path: None,
@@ -144,6 +150,14 @@ impl Session {
             session._watch_task = Some(session.watch_newest(cx));
         }
         session
+    }
+
+    pub fn set_workspace_fallback(&mut self, dir: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.workspace_fallback != dir {
+            self.workspace_fallback = dir;
+            self.refresh_lock(cx);
+            cx.notify();
+        }
     }
 
     pub fn is_live(&self) -> bool {
@@ -177,15 +191,7 @@ impl Session {
         let Some(start) = self.run_start_ms() else {
             return 1;
         };
-        let end = self
-            .store
-            .rows()
-            .iter()
-            .rev()
-            .take(256)
-            .filter_map(|row| row.at_ms().map(|at| at + row.ms as i64))
-            .max()
-            .unwrap_or(start + 1);
+        let end = self.store.max_end_ms().unwrap_or(start + 1);
         (end - start).max(1)
     }
 
@@ -240,7 +246,10 @@ impl Session {
                 self.health = Health::Missing;
                 self.path = None;
                 self.run = None;
+                self.evicted = 0;
+                self.console_log = Arc::from("");
                 self.store.reset(Vec::new());
+                self.refresh_lock(cx);
                 cx.emit(SessionEvent::RunChanged);
             }
             LoadResult::Error(error) => {
@@ -263,22 +272,96 @@ impl Session {
         let path_changed = self.path.as_ref() != Some(&loaded.path);
         self.path = Some(loaded.path);
         self.skipped = loaded.skipped;
+        self.evicted = loaded.evicted;
         self.run = Some(RunInfo {
             header: loaded.header.unwrap_or_default(),
             report: loaded.report,
         });
-        self.store.reset(loaded.calls);
+        self.store
+            .reset_with_cap(loaded.calls, loaded.unbounded, loaded.evicted);
         self.health = Health::Ready;
         self.findings = Arc::new(Vec::new());
         self.findings_at = None;
         if path_changed {
             self.baseline_run = None;
+            self.console_log = Arc::from("");
         }
         cx.emit(SessionEvent::RunChanged);
         self.refresh_lock(cx);
+        self.refresh_console_log(cx);
         self.resolve_baseline(cx);
         self.recompute(cx);
         self.schedule_findings(cx);
+    }
+
+    /// Re-load the current trace file without the 5,000-row rolling window cap.
+    pub fn load_all_calls(&mut self, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let generation = self.generation;
+        let lang = Ui::of(cx).lang;
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { feed::load_unbounded(&path) })
+                .await;
+            this.update(cx, |session, cx| {
+                if session.generation != generation {
+                    return;
+                }
+                if let LoadResult::Loaded(loaded) = res {
+                    let count = loaded.calls.len();
+                    session.install_loaded(*loaded, cx);
+                    let msg = match lang {
+                        Lang::En => format!("Loaded all {count} calls from trace"),
+                        Lang::Zh => format!("已加载全部 {count} 条调用记录"),
+                    };
+                    cx.emit(SessionEvent::Toast(msg));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Read companion stdout/stderr `.log` file for the active run on the background executor.
+    pub fn refresh_console_log(&mut self, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
+        let log_path = self
+            .run
+            .as_ref()
+            .and_then(|r| r.header.log.as_deref())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| self.path.as_deref().map(lenslet_core::runs::log_path_for));
+        let Some(log_path) = log_path else {
+            return;
+        };
+        let generation = self.generation;
+        cx.spawn(async move |this, cx| {
+            let text = cx
+                .background_executor()
+                .spawn(async move { crate::daemon::read_run_log(&log_path, 512 * 1024) })
+                .await;
+            this.update(cx, |session, cx| {
+                if session.generation == generation {
+                    let next = text.unwrap_or_default();
+                    if session.console_log.as_ref() != next {
+                        session.console_log = Arc::from(next);
+                        cx.emit(SessionEvent::Derived);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Keep the run current: event stream when live, file tail otherwise.
@@ -321,7 +404,7 @@ impl Session {
                 FeedMsg::Calls(more) => calls.extend(more),
                 FeedMsg::Header(header) => {
                     if let Some(run) = self.run.as_mut() {
-                        run.header = header;
+                        run.header = *header;
                     }
                 }
                 FeedMsg::End(report) => {
@@ -349,14 +432,17 @@ impl Session {
                 self.health = Health::Ready;
             }
             let delta = self.store.ingest(calls);
+            self.evicted = self.evicted.max(self.store.evicted_total());
             if delta.changed {
                 cx.emit(SessionEvent::Rows(delta));
                 self.recompute(cx);
                 self.schedule_findings(cx);
             }
+            self.refresh_console_log(cx);
         }
         if ended {
             self.feed_mode = Some(FeedMode::Done);
+            self.refresh_console_log(cx);
             self.refresh_runs(cx);
             self.recompute(cx);
             self.findings_at = None;
@@ -446,9 +532,16 @@ impl Session {
             self.run
                 .as_ref()
                 .and_then(|run| lockfile::lock_path(&run.header))
+                .or_else(|| {
+                    self.workspace_fallback
+                        .as_ref()
+                        .filter(|d| d.is_dir())
+                        .map(|d| d.join("lenslet.lock"))
+                })
         };
         let Some(path) = self.lock_path.clone() else {
             self.lock = None;
+            self.recompute(cx);
             return;
         };
         let generation = self.generation;
@@ -553,12 +646,14 @@ impl Session {
     pub fn recompute(&mut self, cx: &mut Context<Self>) {
         let report = self.run.as_ref().and_then(|run| run.report.as_ref());
         let lock = self.lock.as_ref();
+        let live_lock = lock.map(|l| Arc::new(l.access.clone()));
         match (&self.baseline, self.baseline_run.as_ref()) {
             (Baseline::Lock, _) | (_, None) => {
                 self.diff = None;
                 self.changes = ChangeSet {
                     new_failures: Arc::new(BTreeSet::new()),
                     new_access: true,
+                    live_lock,
                 };
                 // O(permissions), not O(calls): cumulative_access_entries keeps
                 // early permissions even if >5,000 live calls roll over the window.
@@ -595,6 +690,7 @@ impl Session {
                 self.changes = ChangeSet {
                     new_failures: Arc::new(diff.new_failures.iter().cloned().collect()),
                     new_access: false,
+                    live_lock: None,
                 };
                 self.access_rows = Arc::new(access_rows(
                     &target.access,
@@ -694,12 +790,10 @@ impl Session {
         cx.notify();
     }
 
-    /// Findings: the report's when it has them, else computed from the calls
+    /// Findings: the report's when the run ended, else computed from the calls
     /// off the main thread, at most every [`FINDINGS_THROTTLE`] while live.
     pub fn schedule_findings(&mut self, cx: &mut Context<Self>) {
-        if let Some(report) = self.run.as_ref().and_then(|run| run.report.as_ref())
-            && !report.findings.is_empty()
-        {
+        if let Some(report) = self.run.as_ref().and_then(|run| run.report.as_ref()) {
             self.findings = Arc::new(report.findings.clone());
             cx.emit(SessionEvent::Derived);
             return;
@@ -772,6 +866,34 @@ impl Session {
                 let message = match (result, lang) {
                     (Ok(added), Lang::En) => format!("Added {added} to lenslet.lock"),
                     (Ok(added), Lang::Zh) => format!("已向 lenslet.lock 写入 {added} 项权限"),
+                    (Err(error), _) => format!("lenslet.lock: {error}"),
+                };
+                cx.emit(SessionEvent::Toast(message));
+                session.refresh_lock(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Remove permissions from `lenslet.lock` (background).
+    pub fn remove_from_lock(&mut self, entries: Vec<Access>, cx: &mut Context<Self>) {
+        let Some(path) = self.lock_path.clone() else {
+            return;
+        };
+        if entries.is_empty() {
+            return;
+        }
+        let lang = Ui::of(cx).lang;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { lockfile::remove(&path, &entries) })
+                .await;
+            this.update(cx, |session, cx| {
+                let message = match (result, lang) {
+                    (Ok(removed), Lang::En) => format!("Removed {removed} from lenslet.lock"),
+                    (Ok(removed), Lang::Zh) => format!("已从 lenslet.lock 移除 {removed} 项权限"),
                     (Err(error), _) => format!("lenslet.lock: {error}"),
                 };
                 cx.emit(SessionEvent::Toast(message));

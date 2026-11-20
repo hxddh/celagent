@@ -109,6 +109,16 @@ pub fn replay_icon(color: Hsla) -> impl IntoElement {
     crate::icons::icon("icons/refresh.svg", 12.0, color)
 }
 
+/// Hamburger menu icon (`☰`) for cross-platform non-macOS header bar.
+pub fn menu_icon(color: Hsla) -> impl IntoElement {
+    crate::icons::icon("icons/menu.svg", 14.0, color)
+}
+
+/// Plus icon (`+`) for launching a new run or request.
+pub fn plus_icon(color: Hsla) -> impl IntoElement {
+    crate::icons::icon("icons/plus.svg", 12.0, color)
+}
+
 /// A tiny key silhouettes whether SigV4 authorization was present.
 pub fn auth_mark(t: &theme::Palette, present: bool) -> impl IntoElement {
     let color = if present {

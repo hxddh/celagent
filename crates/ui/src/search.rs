@@ -14,9 +14,15 @@ use gpui::{
 };
 
 use crate::{
+    app::{
+        Copy as EditCopy, Cut as EditCut, Paste as EditPaste, Redo as EditRedo,
+        SelectAll as EditSelectAll, Undo as EditUndo,
+    },
     fonts, glyph,
     theme::{self, Ui},
 };
+
+const MAX_UNDO: usize = 64;
 
 /// What the field tells its owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +48,8 @@ pub struct SearchInput {
     field_mode: bool,
     mono_mode: bool,
     custom_placeholder: Option<SharedString>,
+    undo_stack: Vec<(SharedString, Range<usize>)>,
+    redo_stack: Vec<(SharedString, Range<usize>)>,
 }
 
 impl SearchInput {
@@ -61,6 +69,8 @@ impl SearchInput {
             field_mode: false,
             mono_mode: false,
             custom_placeholder: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -245,35 +255,168 @@ impl SearchInput {
         }
     }
 
+    fn push_undo(&mut self) {
+        if self
+            .undo_stack
+            .last()
+            .is_some_and(|(prev, _)| prev == &self.content)
+        {
+            return;
+        }
+        if self.undo_stack.len() >= MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack
+            .push((self.content.clone(), self.selected_range.clone()));
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        if let Some((prev, sel)) = self.undo_stack.pop() {
+            self.redo_stack
+                .push((self.content.clone(), self.selected_range.clone()));
+            self.content = prev;
+            self.selected_range = self.clamp_range(sel);
+            self.selection_reversed = false;
+            self.marked_range = None;
+            cx.notify();
+        }
+    }
+
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        if let Some((next, sel)) = self.redo_stack.pop() {
+            self.undo_stack
+                .push((self.content.clone(), self.selected_range.clone()));
+            self.content = next;
+            self.selected_range = self.clamp_range(sel);
+            self.selection_reversed = false;
+            self.marked_range = None;
+            cx.notify();
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let key = keystroke.key.as_str();
         let secondary = keystroke.modifiers.secondary();
+        let shift = keystroke.modifiers.shift;
 
         if secondary {
             match key {
                 "a" => {
                     self.select_all(cx);
                     cx.stop_propagation();
+                    return;
                 }
                 "c" => {
                     self.copy(cx);
                     cx.stop_propagation();
+                    return;
                 }
                 "x" => {
                     self.cut(window, cx);
                     cx.stop_propagation();
+                    return;
                 }
                 "v" => {
                     self.paste(window, cx);
                     cx.stop_propagation();
+                    return;
+                }
+                "z" => {
+                    if shift {
+                        self.redo(cx);
+                    } else {
+                        self.undo(cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "y" if !cfg!(target_os = "macos") => {
+                    self.redo(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "left" if cfg!(target_os = "macos") => {
+                    if shift {
+                        self.select_to(0, cx);
+                    } else {
+                        self.move_to(0, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "right" if cfg!(target_os = "macos") => {
+                    if shift {
+                        self.select_to(self.content.len(), cx);
+                    } else {
+                        self.move_to(self.content.len(), cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "backspace" if cfg!(target_os = "macos") => {
+                    if self.selected_range.is_empty() {
+                        self.select_to(0, cx);
+                    }
+                    self.replace_text_in_range(None, "", window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // Let app-level shortcuts (⌘K, ⌘N, ⌘O, ⌘,, ⌘1..3, ⌘W, ⌘Q) bubble up cleanly.
+                _ => return,
+            }
+        }
+
+        // Standard macOS Cocoa Emacs control bindings (⌃A, ⌃E, ⌃K, ⌃U, ⌃H, ⌃D).
+        if cfg!(target_os = "macos") && keystroke.modifiers.control && !keystroke.modifiers.alt {
+            match key {
+                "a" => {
+                    if shift {
+                        self.select_to(0, cx);
+                    } else {
+                        self.move_to(0, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "e" => {
+                    if shift {
+                        self.select_to(self.content.len(), cx);
+                    } else {
+                        self.move_to(self.content.len(), cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "k" => {
+                    let cur = self.cursor_offset();
+                    self.selected_range = cur..self.content.len();
+                    self.replace_text_in_range(None, "", window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "u" => {
+                    let cur = self.cursor_offset();
+                    self.selected_range = 0..cur;
+                    self.replace_text_in_range(None, "", window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "h" => {
+                    self.backspace(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "d" => {
+                    self.delete(window, cx);
+                    cx.stop_propagation();
+                    return;
                 }
                 _ => {}
             }
-            return;
         }
 
-        let shift = keystroke.modifiers.shift;
         let word_jump =
             keystroke.modifiers.alt || (!cfg!(target_os = "macos") && keystroke.modifiers.control);
         match key {
@@ -383,12 +526,25 @@ impl SearchInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus);
-        self.is_selecting = true;
         let offset = self.index_for_position(event.position);
-        if event.modifiers.shift {
-            self.select_to(offset, cx);
+        if event.click_count >= 3 {
+            self.select_all(cx);
+            self.is_selecting = false;
+        } else if event.click_count == 2 {
+            let start =
+                self.previous_word_boundary(offset.saturating_add(1).min(self.content.len()));
+            let end = self.next_word_boundary(start);
+            self.selected_range = start..end;
+            self.selection_reversed = false;
+            self.is_selecting = false;
+            cx.notify();
         } else {
-            self.move_to(offset, cx);
+            self.is_selecting = true;
+            if event.modifiers.shift {
+                self.select_to(offset, cx);
+            } else {
+                self.move_to(offset, cx);
+            }
         }
         cx.stop_propagation();
     }
@@ -502,6 +658,7 @@ impl EntityInputHandler for SearchInput {
         );
 
         let new_text = new_text.replace(['\n', '\r'], " ");
+        self.push_undo();
         self.content =
             (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
                 .into();
@@ -864,52 +1021,51 @@ impl Render for SearchInput {
             .on_click(cx.listener(|this, _, window, cx| this.clear(window, cx)));
 
         if self.field_mode {
-            return div()
-                .w_full()
-                .h(px(28.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(9.0))
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(if focused {
-                    theme::h(t.accent, 0.58)
-                } else {
-                    theme::h(t.border, 1.0)
-                })
-                .bg(if focused {
-                    rgb(t.input_focused)
-                } else {
-                    rgb(t.input)
-                })
-                .text_size(px(12.0))
-                .line_height(px(16.0))
-                .font(if self.mono_mode {
-                    fonts::mono_font()
-                } else {
-                    fonts::sans_font()
-                })
-                .text_color(rgb(t.text))
-                .track_focus(&self.focus)
-                .key_context("ComposerField")
-                .cursor_text()
-                .on_key_down(cx.listener(Self::on_key_down))
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                .on_mouse_move(cx.listener(Self::on_mouse_move))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .child(SearchTextElement {
+            return self.attach_edit_actions(
+                div()
+                    .w_full()
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(9.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if focused {
+                        theme::h(t.accent, 0.58)
+                    } else {
+                        theme::h(t.border, 1.0)
+                    })
+                    .bg(if focused {
+                        rgb(t.input_focused)
+                    } else {
+                        rgb(t.input)
+                    })
+                    .text_size(px(12.0))
+                    .line_height(px(16.0))
+                    .font(if self.mono_mode {
+                        fonts::mono_font()
+                    } else {
+                        fonts::sans_font()
+                    })
+                    .text_color(rgb(t.text))
+                    .track_focus(&self.focus)
+                    .key_context("ComposerField")
+                    .cursor_text()
+                    .on_key_down(cx.listener(Self::on_key_down))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(
+                        SearchTextElement {
                             input: cx.entity(),
                             placeholder: placeholder.clone(),
-                        }),
-                )
-                .when(has_query, |el| el.child(clear));
+                        },
+                    ))
+                    .when(has_query, |el| el.child(clear)),
+                cx,
+            );
         }
 
         let trailing: gpui::AnyElement = if self.palette_mode {
@@ -943,90 +1099,121 @@ impl Render for SearchInput {
         };
 
         if self.palette_mode {
-            return div()
+            return self.attach_edit_actions(
+                div()
+                    .w_full()
+                    .h(px(40.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .px(px(14.0))
+                    .border_b_1()
+                    .border_color(rgb(t.border_subtle))
+                    .bg(rgb(t.panel))
+                    .text_size(px(13.0))
+                    .line_height(px(18.0))
+                    .font_family(fonts::sans())
+                    .text_color(rgb(t.text))
+                    .track_focus(&self.focus)
+                    .key_context("Palette")
+                    .cursor_text()
+                    .on_key_down(cx.listener(Self::on_key_down))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .child(glyph::search_icon(theme::h(t.accent, 0.9)))
+                    .child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(
+                        SearchTextElement {
+                            input: cx.entity(),
+                            placeholder: placeholder.clone(),
+                        },
+                    ))
+                    .child(trailing),
+                cx,
+            );
+        }
+
+        self.attach_edit_actions(
+            div()
                 .w_full()
-                .h(px(40.0))
+                .h(px(27.0))
                 .flex()
                 .items_center()
-                .gap(px(9.0))
-                .px(px(14.0))
-                .border_b_1()
-                .border_color(rgb(t.border_subtle))
-                .bg(rgb(t.panel))
-                .text_size(px(13.0))
-                .line_height(px(18.0))
+                .gap(px(8.0))
+                .px(px(9.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(if focused {
+                    theme::h(t.accent, 0.52)
+                } else {
+                    theme::h(t.border, 1.0)
+                })
+                .bg(if focused {
+                    rgb(t.input_focused)
+                } else {
+                    rgb(t.input)
+                })
+                .text_size(px(12.0))
+                .line_height(px(16.0))
                 .font_family(fonts::sans())
-                .text_color(rgb(t.text))
+                .text_color(rgb(t.text_soft))
                 .track_focus(&self.focus)
-                .key_context("Palette")
+                .key_context("Search")
                 .cursor_text()
                 .on_key_down(cx.listener(Self::on_key_down))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
-                .child(glyph::search_icon(theme::h(t.accent, 0.9)))
+                .child(glyph::search_icon(if focused {
+                    theme::h(t.accent, 0.75)
+                } else {
+                    theme::h(t.text_muted, 0.9)
+                }))
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
+                        .pr(px(4.0))
                         .overflow_hidden()
                         .child(SearchTextElement {
                             input: cx.entity(),
                             placeholder: placeholder.clone(),
                         }),
                 )
-                .child(trailing);
-        }
+                .child(trailing),
+            cx,
+        )
+    }
+}
 
-        div()
-            .w_full()
-            .h(px(27.0))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(9.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(if focused {
-                theme::h(t.accent, 0.52)
-            } else {
-                theme::h(t.border, 1.0)
-            })
-            .bg(if focused {
-                rgb(t.input_focused)
-            } else {
-                rgb(t.input)
-            })
-            .text_size(px(12.0))
-            .line_height(px(16.0))
-            .font_family(fonts::sans())
-            .text_color(rgb(t.text_soft))
-            .track_focus(&self.focus)
-            .key_context("Search")
-            .cursor_text()
-            .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(glyph::search_icon(if focused {
-                theme::h(t.accent, 0.75)
-            } else {
-                theme::h(t.text_muted, 0.9)
-            }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .pr(px(4.0))
-                    .overflow_hidden()
-                    .child(SearchTextElement {
-                        input: cx.entity(),
-                        placeholder: placeholder.clone(),
-                    }),
-            )
-            .child(trailing)
+impl SearchInput {
+    fn attach_edit_actions(&self, el: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
+        el.on_action(cx.listener(|this, _: &EditCut, window, cx| {
+            this.cut(window, cx);
+            cx.stop_propagation();
+        }))
+        .on_action(cx.listener(|this, _: &EditCopy, _, cx| {
+            this.copy(cx);
+            cx.stop_propagation();
+        }))
+        .on_action(cx.listener(|this, _: &EditPaste, window, cx| {
+            this.paste(window, cx);
+            cx.stop_propagation();
+        }))
+        .on_action(cx.listener(|this, _: &EditSelectAll, _, cx| {
+            this.select_all(cx);
+            cx.stop_propagation();
+        }))
+        .on_action(cx.listener(|this, _: &EditUndo, _, cx| {
+            this.undo(cx);
+            cx.stop_propagation();
+        }))
+        .on_action(cx.listener(|this, _: &EditRedo, _, cx| {
+            this.redo(cx);
+            cx.stop_propagation();
+        }))
     }
 }
 

@@ -74,6 +74,18 @@ const ICONS: &[(&str, &str)] = &[
         "icons/diff.svg",
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><path d="M8 3.2v5.6M5.2 6h5.6M5.2 12.2h5.6"/></svg>"#,
     ),
+    (
+        "icons/menu.svg",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><path d="M2.5 4.2h11M2.5 8h11M2.5 11.8h11"/></svg>"#,
+    ),
+    (
+        "icons/plus.svg",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.6" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>"#,
+    ),
+    (
+        "icons/terminal.svg",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.5" width="12.4" height="11" rx="2"/><path d="M4.5 6l2.4 2-2.4 2M8.2 10h3.2"/></svg>"#,
+    ),
 ];
 
 impl AssetSource for Assets {

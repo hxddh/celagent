@@ -42,6 +42,7 @@ pub struct ReplayOutcome {
     pub content_type: Option<String>,
     pub body_text: Option<String>,
     pub body_bytes: usize,
+    pub raw_bytes: Vec<u8>,
 }
 
 /// Whether `trace` can be faithfully replayed against `upstream_url`.
@@ -56,6 +57,10 @@ pub fn can_replay(trace: &Trace, upstream_url: Option<&str>) -> bool {
         return false;
     }
     if let Some(body) = trace.request.as_ref().and_then(|r| r.body.as_ref()) {
+        let has_lossless_wire = body.raw_b64.is_some() || body.blob.is_some();
+        if has_lossless_wire {
+            return true;
+        }
         if body.binary || body.truncated {
             return false;
         }
@@ -141,10 +146,20 @@ pub struct ComposedRequest {
     pub resign_sigv4: bool,
 }
 
+#[cfg(test)]
 pub fn replay_call(
     trace: &Trace,
     replay_target: &ReplayTarget,
     home: &Path,
+) -> Result<ReplayOutcome, String> {
+    replay_call_with_trace_path(trace, replay_target, home, None)
+}
+
+pub fn replay_call_with_trace_path(
+    trace: &Trace,
+    replay_target: &ReplayTarget,
+    home: &Path,
+    trace_path: Option<&Path>,
 ) -> Result<ReplayOutcome, String> {
     crate::fsguard::assert_io_allowed();
     let upstream_url = replay_target.url.as_str();
@@ -157,7 +172,7 @@ pub fn replay_call(
         format!("Replay refused: `{upstream_url}` is not a loopback emulator endpoint")
     })?;
 
-    let req_wire = build_http_request(trace, &target, &extra)?;
+    let req_wire = build_http_request(trace, &target, &extra, trace_path)?;
     let is_head = trace.method.eq_ignore_ascii_case("HEAD");
     send_wire(&target, &req_wire, is_head, home)
 }
@@ -489,6 +504,7 @@ fn build_http_request(
     trace: &Trace,
     target: &LoopbackTarget,
     extra: &[(&str, &str)],
+    trace_path: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
     let path = if trace.path.starts_with('/') {
         trace.path.clone()
@@ -501,16 +517,29 @@ fn build_http_request(
         format!("/{}", trace.path)
     };
 
+    let exact_raw_wire = trace
+        .request
+        .as_ref()
+        .and_then(|r| r.body.as_ref())
+        .filter(|b| b.binary || b.truncated || b.encoding.is_some())
+        .and_then(|b| b.raw_wire_bytes(trace_path));
+
     let body_encoding = trace
         .request
         .as_ref()
         .and_then(|r| r.body.as_ref())
         .and_then(|b| b.encoding.as_deref());
-    let decoded_wire = body_encoding.is_some();
-    let compressed_wire = body_encoding.is_some_and(|enc| {
-        let low = enc.to_ascii_lowercase();
-        low.contains("gzip") || low.contains("deflate") || low.contains("zstd")
-    });
+    // When `exact_raw_wire` is available (from `raw_b64` or sidecar `blob`), we
+    // transmit the untouched compressed/binary/CBOR wire payload (preserving original
+    // Content-Encoding & SigV4 body hash!), only unframing `aws-chunked` if needed.
+    let using_raw_wire =
+        exact_raw_wire.is_some() && !body_encoding.is_some_and(|e| e.contains("aws-chunked"));
+    let decoded_wire = body_encoding.is_some() && !using_raw_wire;
+    let compressed_wire = decoded_wire
+        && body_encoding.is_some_and(|enc| {
+            let low = enc.to_ascii_lowercase();
+            low.contains("gzip") || low.contains("deflate") || low.contains("zstd")
+        });
     let cbor_wire = decoded_wire
         && is_cbor_wire(
             body_encoding,
@@ -520,19 +549,23 @@ fn build_http_request(
                 .map(|r| r.headers.as_slice())
                 .unwrap_or(&[]),
         );
-    let body_text = trace
-        .request
-        .as_ref()
-        .and_then(|r| r.body.as_ref())
-        .and_then(|b| {
-            if b.binary || b.truncated {
-                None
-            } else {
-                Some(b.text.as_deref().unwrap_or(""))
-            }
-        })
-        .unwrap_or("");
-    let owned_body = encode_wire_body(body_text, cbor_wire)?;
+    let owned_body = if let Some(raw) = exact_raw_wire.filter(|_| using_raw_wire) {
+        raw
+    } else {
+        let body_text = trace
+            .request
+            .as_ref()
+            .and_then(|r| r.body.as_ref())
+            .and_then(|b| {
+                if b.binary || b.truncated {
+                    None
+                } else {
+                    Some(b.text.as_deref().unwrap_or(""))
+                }
+            })
+            .unwrap_or("");
+        encode_wire_body(body_text, cbor_wire)?
+    };
     let body_bytes: &[u8] = &owned_body;
 
     let mut req = Vec::with_capacity(512 + body_bytes.len());
@@ -803,6 +836,7 @@ fn parse_http_response(raw: &[u8], is_head: bool, ms: u64) -> Result<ReplayOutco
             content_type,
             body_text,
             body_bytes,
+            raw_bytes: decoded_bytes,
         });
     }
 }

@@ -55,7 +55,7 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   # install your test dependencies
-  - uses: hxddh/lenslet@lenslet-v9.0.0
+  - uses: hxddh/lenslet@lenslet-v10.0.0
     with:
       command: npm test
       emulator: moto_server -p 9298           # or however you start your emulator

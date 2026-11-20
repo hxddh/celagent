@@ -90,6 +90,7 @@ pub struct State {
     endpoint: String,
     pub max_body: usize,
     pub enforce: bool,
+    pub blobs_dir: Option<PathBuf>,
     pub trace: Arc<TraceSink>,
     pub shutdown_req: Arc<tokio::sync::Notify>,
 }
@@ -144,7 +145,11 @@ impl Pending {
         self.finished.store(true, Ordering::SeqCst);
         self.trace.ms = self.started.elapsed().as_millis() as u64;
         self.trace.request.body = snapshot(&self.request_capture, &self.request_content);
+        self.trace.request.trailers =
+            snapshot_trailers(&self.request_capture, &self.request_content);
         self.trace.response.body = snapshot(&self.response_capture, &self.response_content);
+        self.trace.response.trailers =
+            snapshot_trailers(&self.response_capture, &self.response_content);
         let operation_capture = self
             .derive_capture
             .as_deref()
@@ -233,6 +238,24 @@ fn snapshot(capture: &Mutex<Capture>, content: &Content) -> Option<trace::BodyTr
         .map(|capture| capture.body(content))
         .ok()
         .flatten()
+}
+
+fn snapshot_trailers(capture: &Mutex<Capture>, content: &Content) -> Vec<trace::HeaderTrace> {
+    capture
+        .lock()
+        .map(|capture| capture.trailers(content))
+        .unwrap_or_default()
+}
+
+fn http_version_label(version: hyper::Version) -> &'static str {
+    match version {
+        hyper::Version::HTTP_09 => "HTTP/0.9",
+        hyper::Version::HTTP_10 => "HTTP/1.0",
+        hyper::Version::HTTP_11 => "HTTP/1.1",
+        hyper::Version::HTTP_2 => "HTTP/2.0",
+        hyper::Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    }
 }
 
 /// Unique per proxied call: nanosecond timestamp plus a process-local sequence.
@@ -796,19 +819,20 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    handle_inner(req, state, MAX_INSPECT_BYTES, true).await
+    handle_inner(req, state, MAX_INSPECT_BYTES, None, true).await
 }
 
 async fn handle_peer<B>(
     req: Request<B>,
     state: Arc<State>,
+    peer: SocketAddr,
     peer_loopback: bool,
 ) -> Result<Response<Body>, Infallible>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    handle_inner(req, state, MAX_INSPECT_BYTES, peer_loopback).await
+    handle_inner(req, state, MAX_INSPECT_BYTES, Some(peer), peer_loopback).await
 }
 
 #[cfg(test)]
@@ -821,13 +845,14 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    handle_inner(req, state, inspect_limit, true).await
+    handle_inner(req, state, inspect_limit, None, true).await
 }
 
 async fn handle_inner<B>(
     mut req: Request<B>,
     state: Arc<State>,
     inspect_limit: usize,
+    peer: Option<SocketAddr>,
     peer_loopback: bool,
 ) -> Result<Response<Body>, Infallible>
 where
@@ -838,6 +863,7 @@ where
         return Ok(response);
     }
     let started = Instant::now();
+    let client_protocol = http_version_label(req.version()).to_string();
     let replay_of = req
         .headers_mut()
         .remove(REPLAY_HEADER)
@@ -877,7 +903,10 @@ where
 
     let request_content = capture::content(req.headers());
     let request_headers = trace::headers(req.headers());
-    let request_capture = Arc::new(Mutex::new(Capture::with_limit(state.max_body)));
+    let request_capture = Arc::new(Mutex::new(Capture::with_blobs(
+        state.max_body,
+        state.blobs_dir.clone(),
+    )));
 
     let mut trace = Trace {
         id: next_id(),
@@ -905,9 +934,17 @@ where
         replay_of,
         caller_role: None,
         target: None,
+        protocol: Some(client_protocol),
+        upstream_protocol: None,
+        upstream: None,
+        client_addr: peer.map(|p| p.to_string()),
+        ttfb_ms: None,
+        access_key_id: access_key_id.clone(),
         request: Message {
             headers: request_headers,
+            trailers: Vec::new(),
             content_type: request_content.content_type.clone(),
+            raw_content_type: request_content.raw_content_type.clone(),
             body: None,
         },
         response: Message::default(),
@@ -957,8 +994,12 @@ where
             };
             if let Ok(mut capture) = request_capture.lock() {
                 capture.feed(&collected.data);
+                if let Some(ref tr) = collected.trailers {
+                    capture.feed_trailers(tr);
+                }
             }
             trace.request.body = snapshot(&request_capture, &request_content);
+            trace.request.trailers = snapshot_trailers(&request_capture, &request_content);
             let inspect = Mutex::new(Capture::with_limit(inspect_limit));
             if let Ok(mut capture) = inspect.lock() {
                 capture.feed(&collected.data);
@@ -1042,6 +1083,7 @@ where
     };
 
     let target_base = state.upstream_for(&service).to_string();
+    trace.upstream = Some(target_base.clone());
     let upstream_uri = format!("{target_base}{forward_path}");
     let mut upstream = match Request::builder()
         .method(parts.method)
@@ -1089,15 +1131,21 @@ where
 
     match state.client.request(upstream).await {
         Ok(response) => {
+            let ttfb = started.elapsed().as_millis() as u64;
             let status = response.status();
+            let resp_proto = http_version_label(response.version()).to_string();
             let mut headers = response.headers().clone();
+            let response_content = capture::content(&headers);
             trace.status = status.as_u16();
+            trace.ttfb_ms = Some(ttfb);
+            trace.upstream_protocol = Some(resp_proto);
             trace.response = Message {
                 headers: trace::headers(&headers),
-                content_type: capture::content(&headers).content_type,
+                trailers: Vec::new(),
+                content_type: response_content.content_type.clone(),
+                raw_content_type: response_content.raw_content_type.clone(),
                 body: None,
             };
-            let response_content = capture::content(&headers);
             strip_hop_by_hop(&mut headers);
 
             // Only an S3 response reveals more access (the SSE-KMS key of
@@ -1127,7 +1175,10 @@ where
                 evaluation = Some(checked);
             }
 
-            let response_capture = Arc::new(Mutex::new(Capture::with_limit(state.max_body)));
+            let response_capture = Arc::new(Mutex::new(Capture::with_blobs(
+                state.max_body,
+                state.blobs_dir.clone(),
+            )));
             let pending = Pending {
                 state: state.clone(),
                 trace,
@@ -1162,6 +1213,7 @@ where
             trace.problem = Some(problem::unreachable(&target_base, &detail));
             trace.error = Some(detail);
             trace.request.body = snapshot(&request_capture, &request_content);
+            trace.request.trailers = snapshot_trailers(&request_capture, &request_content);
             let operation_capture = derive_capture.as_deref().unwrap_or(&request_capture);
             resolve_operation(
                 &mut trace,
@@ -1397,11 +1449,19 @@ fn reject_blocked(
                 .unwrap_or(wire.content_type)
                 .to_string(),
         ),
+        raw_content_type: wire
+            .content_type
+            .contains(';')
+            .then(|| wire.content_type.to_string()),
+        trailers: Vec::new(),
         body: Some(trace::BodyTrace {
             text: Some(wire.body.clone()),
             hex: None,
+            raw_b64: None,
+            blob: None,
             encoding: None,
             bytes: body_bytes.len() as u64,
+            decoded_bytes: None,
             truncated: false,
             binary: false,
             sha256,
@@ -1488,6 +1548,7 @@ impl Server {
             .iter()
             .map(|(svc, up)| (svc.clone(), up.base.clone()))
             .collect();
+        let blobs_dir = (options.max_body > 0).then(|| lenslet_core::runs::blobs_dir(&trace_path));
         let trace = Arc::new(TraceSink::new(trace_path, &header, gate)?);
         let state = Arc::new(State {
             client: client(roots),
@@ -1496,6 +1557,7 @@ impl Server {
             endpoint,
             max_body: options.max_body,
             enforce: options.enforce,
+            blobs_dir,
             trace,
             shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
@@ -1562,6 +1624,7 @@ async fn serve(listener: TcpListener, state: Arc<State>, mut shutdown: watch::Re
                     }
                     connections.spawn(serve_connection(
                         stream,
+                        peer,
                         is_loopback_ip(peer.ip()),
                         state.clone(),
                         shutdown.clone(),
@@ -1583,11 +1646,12 @@ async fn stopped(shutdown: &mut watch::Receiver<bool>) {
 
 async fn serve_connection(
     stream: TcpStream,
+    peer: SocketAddr,
     peer_loopback: bool,
     state: Arc<State>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let service = service_fn(move |req| handle_peer(req, state.clone(), peer_loopback));
+    let service = service_fn(move |req| handle_peer(req, state.clone(), peer, peer_loopback));
     let mut builder = conn_auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
@@ -1773,6 +1837,7 @@ mod tests {
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce: false,
+            blobs_dir: None,
             trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), None).unwrap()),
             shutdown_req: Arc::new(tokio::sync::Notify::new()),
         })
@@ -2263,6 +2328,7 @@ mod tests {
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce: false,
+            blobs_dir: None,
             trace: Arc::new(
                 TraceSink::new(
                     temp.trace(),
@@ -2305,6 +2371,7 @@ mod tests {
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce: true,
+            blobs_dir: None,
             trace: Arc::new(
                 TraceSink::new(
                     temp.trace(),
@@ -2417,6 +2484,7 @@ mod tests {
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce: true,
+            blobs_dir: None,
             trace: Arc::new(
                 TraceSink::new(temp.trace(), &RunHeader::default(), Some(policy.clone())).unwrap(),
             ),
@@ -2512,6 +2580,7 @@ mod tests {
             endpoint: String::new(),
             max_body: 64,
             enforce: true,
+            blobs_dir: None,
             trace: Arc::new(
                 TraceSink::new(
                     temp.trace(),
@@ -2603,6 +2672,7 @@ mod tests {
             endpoint: String::new(),
             max_body: 64,
             enforce: true,
+            blobs_dir: None,
             trace: Arc::new(
                 TraceSink::new(temp.trace(), &RunHeader::default(), Some(admin)).unwrap(),
             ),
@@ -2661,6 +2731,7 @@ mod tests {
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce,
+            blobs_dir: None,
             trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), Some(gate)).unwrap()),
             shutdown_req: Arc::new(tokio::sync::Notify::new()),
         })
@@ -2945,6 +3016,7 @@ mod tests {
             endpoint: String::new(),
             max_body: 64,
             enforce: false,
+            blobs_dir: None,
             trace: Arc::new(TraceSink::new(temp.trace(), &RunHeader::default(), None).unwrap()),
             shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
