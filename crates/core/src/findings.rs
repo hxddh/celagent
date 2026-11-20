@@ -124,6 +124,8 @@ pub fn essentials(trace: &Trace) -> Trace {
         blocked: trace.blocked,
         blocked_phase: trace.blocked_phase,
         replay_of: trace.replay_of.clone(),
+        caller_role: trace.caller_role.clone(),
+        target: trace.target.clone(),
         request: Message {
             headers: Vec::new(),
             content_type: trace.request.content_type.clone(),

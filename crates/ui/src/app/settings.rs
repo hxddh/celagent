@@ -230,6 +230,22 @@ impl LensletApp {
                     ))
                     .child(row(
                         ui,
+                        ui.t("Command-Line Tool", "命令行工具 (CLI)"),
+                        ui.t(
+                            "Symlink `lenslet` into ~/.local/bin so any terminal can run it.",
+                            "将 `lenslet` 链接到 ~/.local/bin，以便在任意终端直接使用。",
+                        ),
+                        widgets::button(
+                            ui,
+                            "install-cli",
+                            ui.t("Install CLI to PATH", "安装 CLI 到 PATH"),
+                        )
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            app.run_cmd(Cmd::InstallCli, window, cx)
+                        })),
+                    ))
+                    .child(row(
+                        ui,
                         ui.t("Storage", "存储"),
                         &format!("~/.lenslet/runs · {storage_text}"),
                         div().children(clear),

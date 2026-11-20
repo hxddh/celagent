@@ -117,6 +117,12 @@ pub struct Trace {
     /// the id of the recorded call it replays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_of: Option<String>,
+    /// IAM role ARN attributed via an earlier `sts:AssumeRole*` session in the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_role: Option<String>,
+    /// Concise semantic target summary (e.g. `table/orders · id="ord-42"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub request: Message,
     pub response: Message,
 }

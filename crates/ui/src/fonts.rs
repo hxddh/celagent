@@ -5,9 +5,12 @@
 //! through explicit platform CJK system fallbacks so characters never render as
 //! missing-glyph boxes (`□`).
 
-use std::{borrow::Cow, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    sync::{Arc, OnceLock},
+};
 
-use gpui::{App, FontFallbacks};
+use gpui::{App, FontFallbacks, FontFeatures};
 
 pub const SANS_FAMILY: &str = "Inter";
 pub const MONO_FAMILY: &str = "JetBrains Mono";
@@ -101,6 +104,27 @@ pub fn sans_font() -> gpui::Font {
     gpui::Font {
         family: sans().into(),
         features: gpui::FontFeatures::default(),
+        fallbacks: Some(fallbacks()),
+        weight: gpui::FontWeight::NORMAL,
+        style: gpui::FontStyle::Normal,
+    }
+}
+
+/// Disable JetBrains Mono contextual/standard ligatures (`calt=0`, `liga=0`) so
+/// AWS S3 ARNs (`arn:aws:s3:::bucket`) never collapse `:::` into a single glyph,
+/// and enable tabular numerals (`tnum=1`) for aligned timestamps and latencies.
+pub fn mono_features() -> FontFeatures {
+    FontFeatures(Arc::new(vec![
+        ("calt".into(), 0),
+        ("liga".into(), 0),
+        ("tnum".into(), 1),
+    ]))
+}
+
+pub fn mono_font() -> gpui::Font {
+    gpui::Font {
+        family: mono().into(),
+        features: mono_features(),
         fallbacks: Some(fallbacks()),
         weight: gpui::FontWeight::NORMAL,
         style: gpui::FontStyle::Normal,

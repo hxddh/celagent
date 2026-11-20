@@ -412,7 +412,7 @@ fn file_key(_metadata: &fs::Metadata) -> u64 {
     0
 }
 
-/// A finished-or-not run in the runs directory, for the run switcher.
+/// A finished-or-not run in the runs directory, for the run switcher & sidebar.
 #[derive(Clone, Debug)]
 pub struct RunSummary {
     pub path: PathBuf,
@@ -420,6 +420,7 @@ pub struct RunSummary {
     pub header: Option<RunHeader>,
     pub report: Option<Report>,
     pub bytes: u64,
+    pub pinned: bool,
 }
 
 impl RunSummary {
@@ -431,25 +432,52 @@ impl RunSummary {
         }
     }
 
+    pub fn project_name(&self) -> String {
+        let Some(cwd) = self
+            .header
+            .as_ref()
+            .map(|h| h.cwd.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return "workspace".into();
+        };
+        Path::new(cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| cwd.to_string())
+    }
+
     pub fn ended(&self) -> bool {
         self.report.is_some()
     }
 }
 
-/// Every run in `dir`, newest first, with its header and report. Background only.
+/// Every run in `dir`, newest first, with its header, report, and pin state. Background only.
 pub fn list_runs(dir: &Path) -> Vec<RunSummary> {
     fsguard::assert_io_allowed();
+    let pinned = lenslet_core::runs::read_pinned(dir);
     lenslet_core::runs::list(dir)
         .into_iter()
         .rev()
-        .map(|path| RunSummary {
-            id: lenslet_core::runs::run_id(&path),
-            header: lenslet_core::runs::header(&path),
-            report: lenslet_core::runs::report(&path),
-            bytes: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-            path,
+        .map(|path| {
+            let id = lenslet_core::runs::run_id(&path);
+            let is_pinned = pinned.contains(&id);
+            RunSummary {
+                id,
+                header: lenslet_core::runs::header(&path),
+                report: lenslet_core::runs::report(&path),
+                bytes: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                pinned: is_pinned,
+                path,
+            }
         })
         .collect()
+}
+
+pub fn set_run_pinned(dir: &Path, id: &str, pin: bool) -> anyhow::Result<bool> {
+    fsguard::assert_io_allowed();
+    lenslet_core::runs::set_pinned(dir, id, pin)
 }
 
 /// Just the newest run file's path (cheap: one directory listing).
@@ -469,12 +497,16 @@ pub fn storage_stats(dir: &Path) -> (usize, u64) {
     (files.len(), bytes)
 }
 
-/// Delete finished run files (never `keep` or a run still going). Background only.
+/// Delete finished run files (never `keep`, pinned runs, or a run still going). Background only.
 pub fn clear_finished_runs(dir: &Path, keep: Option<&Path>) -> usize {
     fsguard::assert_io_allowed();
+    let pinned = lenslet_core::runs::read_pinned(dir);
     let mut removed = 0;
     for path in lenslet_core::runs::list(dir) {
         if keep.is_some_and(|keep| keep == path) {
+            continue;
+        }
+        if pinned.contains(&lenslet_core::runs::run_id(&path)) {
             continue;
         }
         if lenslet_core::runs::report(&path).is_some() && fs::remove_file(&path).is_ok() {
@@ -608,7 +640,12 @@ mod tests {
         drop(dead);
         let mut rx = start(path.clone(), Some(endpoint), state);
         let full = synthetic_run(2, None, true);
-        fs::write(&path, &full).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&full.as_bytes()[partial.len()..])
+            .unwrap();
         let msgs: Vec<FeedMsg> = futures::executor::block_on(async {
             let mut out = Vec::new();
             while let Some(msg) = rx.next().await {

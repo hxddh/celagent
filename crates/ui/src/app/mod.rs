@@ -1,35 +1,41 @@
-//! The Lenslet window: a header (run, mode, baseline, search), the active
-//! list (Calls or Access) with its inspector beside it, and the overlays
-//! (run switcher, baseline picker, context menus, command palette, settings).
+//! The Lenslet window: a header (sidebar toggle, run, mode, baseline, search),
+//! the collapsible Workspace Sidebar, the active list (Calls or Access) with
+//! its inspector beside it, and the overlays (run switcher, baseline picker,
+//! context menus, Request Composer, command palette, settings).
 //!
 //! The root owns only chrome state. Data lives in the [`Session`] model; the
 //! lists and inspectors are child entities that re-render on their own.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, process::Child, sync::Arc, time::Duration};
 
 use gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Corner, CursorStyle, Div,
-    DragMoveEvent, ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton, Pixels,
-    Point, Render, SharedString, Stateful, Task, Window, actions, anchored, deferred, div, point,
-    prelude::*, px, rgb,
+    DragMoveEvent, ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton,
+    PathPromptOptions, Pixels, Point, Render, SharedString, Stateful, Task, Window, actions,
+    anchored, deferred, div, point, prelude::*, px, rgb,
 };
 
 mod access;
 mod bodyview;
 mod calls;
+mod composer;
 mod inspector;
 mod palette;
 mod session;
 mod settings;
+mod sidebar;
 mod widgets;
 
 use self::{
     access::{AccessDetail, AccessEvent, AccessView},
     calls::{CallsEvent, CallsList},
+    composer::{ComposerEvent, RequestComposer, render_composer_overlay},
     inspector::{Inspector, InspectorEvent},
     session::{Baseline, Health, Session, SessionEvent},
+    sidebar::SIDEBAR_W,
 };
 use crate::{
+    daemon::{self, DEFAULT_PROXY_PORT, ProxyHealth},
     feed::{FeedMode, Source},
     fonts, glyph, i18n,
     model::{Access, StatusFilter, Trace, format_bytes, search_tokens, to_curl},
@@ -45,9 +51,16 @@ actions!(
         OpenPalette,
         FocusSearch,
         OpenSettings,
+        ToggleSidebar,
         ToggleInspector,
+        OpenFile,
+        ExportReport,
+        RevealTrace,
+        NextMatch,
+        PrevMatch,
         ReloadRun,
         Replay,
+        OpenComposer,
         ShowCalls,
         ShowAccess,
         PrevRun,
@@ -69,8 +82,9 @@ actions!(
     ]
 );
 
-const TOAST_MILLIS: u64 = 1_600;
+const TOAST_MILLIS: u64 = 1_800;
 const PREFS_DEBOUNCE: Duration = Duration::from_millis(500);
+const DAEMON_POLL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -85,9 +99,18 @@ pub enum Cmd {
     Mode(Mode),
     FocusSearch,
     OpenSettings,
+    ToggleSidebar,
     ToggleInspector,
+    OpenFile,
+    ExportReport,
+    RevealTrace,
+    StartProxy,
+    StopProxy,
+    CopyProxyEnv,
+    InstallCli,
     Reload,
     Replay,
+    OpenComposer,
     CopyCurl(Arc<Trace>),
     CopyText(&'static str, String),
     CopyPolicy,
@@ -95,7 +118,7 @@ pub enum Cmd {
     FilterService(String),
     FilterAccess(Access),
     ClearFilters,
-    Accept(Vec<Access>),
+    Accept(Vec<(Access, bool)>),
     SetTestMark(Access, bool),
     PrevRun,
     NextRun,
@@ -139,6 +162,7 @@ pub struct LensletApp {
     inspector: Entity<Inspector>,
     access: Entity<AccessView>,
     access_detail: Entity<AccessDetail>,
+    composer: Entity<RequestComposer>,
     search: Entity<SearchInput>,
     palette_input: Entity<SearchInput>,
     root_focus: FocusHandle,
@@ -150,12 +174,24 @@ pub struct LensletApp {
     palette_index: usize,
     palette_entries: Vec<MenuEntry>,
     settings_open: bool,
+    composer_open: bool,
     storage: Option<(usize, u64)>,
+    env_probe: ProxyHealth,
+    managed_proxy: Option<Child>,
+    proxy_port: u16,
     toast: Option<(String, u64)>,
     toast_seq: u64,
     prefs_seq: u64,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
+}
+
+impl Drop for LensletApp {
+    fn drop(&mut self) {
+        if let Some(child) = self.managed_proxy.take() {
+            daemon::stop_proxy_on_exit(child, self.proxy_port);
+        }
+    }
 }
 
 /// A child view that keeps its last frame until it notifies. It lays out as
@@ -196,7 +232,8 @@ impl LensletApp {
         let calls = cx.new(|cx| CallsList::new(session.clone(), cx));
         let inspector = cx.new(|cx| Inspector::new(session.clone(), home(), cx));
         let access = cx.new(|cx| AccessView::new(session.clone(), cx));
-        let access_detail = cx.new(|_| AccessDetail::new(session.clone()));
+        let access_detail = cx.new(|cx| AccessDetail::new(session.clone(), cx));
+        let composer = cx.new(|cx| RequestComposer::new(home(), cx));
         let search = cx.new(SearchInput::new);
         let palette_input = cx.new(SearchInput::new_palette);
 
@@ -205,7 +242,6 @@ impl LensletApp {
                 SessionEvent::Toast(message) => this.show_toast(message.clone(), cx),
                 SessionEvent::RunChanged | SessionEvent::Runs => cx.notify(),
                 SessionEvent::Derived => {
-                    // Header shows the baseline summary.
                     cx.notify();
                 }
                 SessionEvent::Rows(_) => {}
@@ -224,19 +260,46 @@ impl LensletApp {
                 }
                 CallsEvent::Toast(message) => this.show_toast(message.clone(), cx),
             }),
-            cx.subscribe(&inspector, |this, _, event, cx| match event {
-                InspectorEvent::OpenAccess(access) => {
-                    let access = access.clone();
-                    this.set_mode(Mode::Access, cx);
-                    this.access.update(cx, |view, cx| view.select(access, cx));
-                }
-                InspectorEvent::Select(id) => {
-                    let id = id.clone();
-                    this.calls
-                        .update(cx, |list, cx| list.select_id(Some(id), true, cx));
-                }
-                InspectorEvent::Toast(message) => this.show_toast(message.clone(), cx),
-            }),
+            cx.subscribe_in(
+                &inspector,
+                window,
+                |this, _, event, window, cx| match event {
+                    InspectorEvent::OpenAccess(access) => {
+                        let access = access.clone();
+                        this.set_mode(Mode::Access, cx);
+                        this.access.update(cx, |view, cx| view.select(access, cx));
+                    }
+                    InspectorEvent::Select(id) => {
+                        let id = id.clone();
+                        this.calls
+                            .update(cx, |list, cx| list.select_id(Some(id), true, cx));
+                    }
+                    InspectorEvent::OpenComposer(call, target) => {
+                        let call = call.clone();
+                        let target = target.clone();
+                        this.open_composer_with(&call, target, window, cx);
+                    }
+                    InspectorEvent::Toast(message) => this.show_toast(message.clone(), cx),
+                },
+            ),
+            cx.subscribe_in(
+                &composer,
+                window,
+                |this, _, event, window, cx| match event {
+                    ComposerEvent::Close => {
+                        this.composer_open = false;
+                        this.focus_list(window, cx);
+                        cx.notify();
+                    }
+                    ComposerEvent::Sent(call_id, state) => {
+                        let call_id = call_id.clone();
+                        let state = state.clone();
+                        this.inspector.update(cx, |insp, cx| {
+                            insp.apply_composed_replay(call_id, state, cx);
+                        });
+                    }
+                },
+            ),
             cx.subscribe(&access, |this, _, event, cx| {
                 this.on_access_event(event, cx)
             }),
@@ -268,6 +331,11 @@ impl LensletApp {
             }
         }));
 
+        let mut tasks = Vec::new();
+        if !demo {
+            tasks.push(Self::spawn_daemon_poller(cx));
+        }
+
         let root_focus = cx.focus_handle();
         let app = LensletApp {
             session,
@@ -275,6 +343,7 @@ impl LensletApp {
             inspector,
             access,
             access_detail,
+            composer,
             search,
             palette_input,
             root_focus,
@@ -285,14 +354,17 @@ impl LensletApp {
             palette_index: 0,
             palette_entries: Vec::new(),
             settings_open: false,
+            composer_open: false,
             storage: None,
+            env_probe: ProxyHealth::default(),
+            managed_proxy: None,
+            proxy_port: DEFAULT_PROXY_PORT,
             toast: None,
             toast_seq: 0,
             prefs_seq: 0,
-            _tasks: Vec::new(),
+            _tasks: tasks,
             _subscriptions: subscriptions,
         };
-        // The list may have picked a call before we subscribed (demo).
         let selected = app.calls.read(cx).selected();
         app.inspector
             .update(cx, |inspector, cx| inspector.set_call(selected, cx));
@@ -302,6 +374,55 @@ impl LensletApp {
         let focus = app.calls.focus_handle(cx);
         window.focus(&focus);
         app
+    }
+
+    fn spawn_daemon_poller(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok((port, managed)) = this.update(cx, |app, _| {
+                    if let Some(child) = app.managed_proxy.as_mut()
+                        && matches!(child.try_wait(), Ok(Some(_)))
+                    {
+                        app.managed_proxy = None;
+                    }
+                    (app.proxy_port, app.managed_proxy.is_some())
+                }) else {
+                    break;
+                };
+                let probe = cx
+                    .background_executor()
+                    .spawn(async move { daemon::probe_environment(port, managed) })
+                    .await;
+                let gone = this
+                    .update(cx, |app, cx| {
+                        if app.env_probe != probe {
+                            app.env_probe = probe;
+                            cx.notify();
+                        }
+                    })
+                    .is_err();
+                if gone {
+                    break;
+                }
+                cx.background_executor().timer(DAEMON_POLL).await;
+            }
+        })
+    }
+
+    fn open_composer_with(
+        &mut self,
+        call: &Trace,
+        target: crate::replay::ReplayTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_open = true;
+        self.palette_open = false;
+        self.settings_open = false;
+        self.overlay = None;
+        self.composer
+            .update(cx, |comp, cx| comp.load(call, target, window, cx));
+        cx.notify();
     }
 
     fn on_access_event(&mut self, event: &AccessEvent, cx: &mut Context<Self>) {
@@ -344,6 +465,8 @@ impl LensletApp {
         if Ui::install(cx, Ui::new(&self.prefs, window.appearance())) {
             self.inspector
                 .update(cx, |inspector, cx| inspector.restyle(cx));
+            self.access_detail
+                .update(cx, |detail, cx| detail.restyle(cx));
             cx.refresh_windows();
         }
     }
@@ -414,7 +537,7 @@ impl LensletApp {
         }
     }
 
-    fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focus = match self.mode {
             Mode::Calls => self.calls.focus_handle(cx),
             Mode::Access => self.access.focus_handle(cx),
@@ -425,8 +548,7 @@ impl LensletApp {
     // -- Commands -----------------------------------------------------------
 
     fn run_cmd_cx(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
-        // Commands that need a window are routed through `run_cmd`; the rest
-        // are handled here.
+        let ui = Ui::of(cx);
         match cmd {
             Cmd::FilterAccess(access) => {
                 self.set_mode(Mode::Calls, cx);
@@ -441,9 +563,14 @@ impl LensletApp {
                 let endpoint = self.session.read(cx).header_endpoint().map(str::to_string);
                 match to_curl(&call, endpoint.as_deref()) {
                     Some(curl) => self.copy("curl", curl, cx),
-                    None => {
-                        self.show_toast("This request's body can't be rebuilt as curl".into(), cx)
-                    }
+                    None => self.show_toast(
+                        ui.t(
+                            "This request's body can't be rebuilt as curl",
+                            "该请求体无法重建为 curl",
+                        )
+                        .into(),
+                        cx,
+                    ),
                 }
             }
             Cmd::CopyPolicy => {
@@ -469,7 +596,10 @@ impl LensletApp {
                 });
             }
             Cmd::Accept(entries) => {
-                let entries = entries.into_iter().map(|a| (a, false)).collect();
+                let entries = entries
+                    .into_iter()
+                    .map(|(a, implied)| (a, false, implied))
+                    .collect();
                 self.session
                     .update(cx, |session, cx| session.accept(entries, cx));
             }
@@ -478,15 +608,37 @@ impl LensletApp {
                     .update(cx, |session, cx| session.set_test_mark(access, test, cx));
             }
             Cmd::Mode(mode) => self.set_mode(mode, cx),
+            Cmd::ToggleSidebar => {
+                self.prefs.sidebar_open = !self.prefs.sidebar_open;
+                self.save_prefs(cx);
+                cx.notify();
+            }
             Cmd::ToggleInspector => {
                 self.prefs.inspector_open = !self.prefs.inspector_open;
                 self.save_prefs(cx);
                 cx.notify();
             }
+            Cmd::OpenFile => self.prompt_open_file(cx),
+            Cmd::ExportReport => self.prompt_export_report(cx),
+            Cmd::RevealTrace => {
+                if let Some(path) = self.session.read(cx).path.clone() {
+                    cx.reveal_path(&path);
+                }
+            }
+            Cmd::StartProxy => self.start_managed_proxy(cx),
+            Cmd::StopProxy => self.stop_managed_proxy(cx),
+            Cmd::CopyProxyEnv => {
+                let snippet = daemon::shell_env_snippet(self.proxy_port);
+                self.copy("AWS_ENDPOINT_URL env", snippet, cx);
+            }
+            Cmd::InstallCli => self.install_cli(cx),
             Cmd::Reload => self.reload(cx),
             Cmd::Replay => self
                 .inspector
                 .update(cx, |inspector, cx| inspector.replay(cx)),
+            Cmd::OpenComposer => self
+                .inspector
+                .update(cx, |inspector, cx| inspector.open_composer(cx)),
             Cmd::PrevRun => self.session.update(cx, |s, cx| s.step_run(-1, cx)),
             Cmd::NextRun => self.session.update(cx, |s, cx| s.step_run(1, cx)),
             Cmd::FollowLatest => self.follow_latest(cx),
@@ -495,13 +647,18 @@ impl LensletApp {
                 self.session
                     .update(cx, |session, cx| session.set_baseline(baseline, cx));
             }
-            Cmd::Quit => cx.quit(),
+            Cmd::Quit => {
+                if let Some(child) = self.managed_proxy.take() {
+                    daemon::stop_proxy_on_exit(child, self.proxy_port);
+                }
+                cx.quit();
+            }
             Cmd::OpenSettings => self.open_settings(cx),
             Cmd::FocusSearch | Cmd::Theme(_) | Cmd::Accent(_) | Cmd::Density(_) | Cmd::Lang(_) => {}
         }
     }
 
-    fn run_cmd(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn run_cmd(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = None;
         match cmd {
             Cmd::FocusSearch => {
@@ -521,9 +678,156 @@ impl LensletApp {
         cx.notify();
     }
 
+    fn prompt_open_file(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        let session = self.session.clone();
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                session
+                    .update(cx, |s, cx| s.switch(Source::File(path), cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn prompt_export_report(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        let report = session
+            .run
+            .as_ref()
+            .and_then(|r| r.report.clone())
+            .unwrap_or_else(|| {
+                let run_id = session
+                    .run
+                    .as_ref()
+                    .map(|r| r.header.run.clone())
+                    .unwrap_or_default();
+                session.store.live_report(&run_id)
+            });
+        let Ok(json) = serde_json::to_string_pretty(&report) else {
+            return;
+        };
+        let dir = session
+            .run
+            .as_ref()
+            .filter(|r| !r.header.cwd.is_empty())
+            .map(|r| PathBuf::from(&r.header.cwd))
+            .unwrap_or_else(home);
+        let lang = Ui::of(cx).lang;
+        let rx = cx.prompt_for_new_path(&dir, Some("lenslet-report.json"));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let target = path.clone();
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::fsguard::assert_io_allowed();
+                        std::fs::write(&target, json)
+                    })
+                    .await;
+                this.update(cx, |app, cx| {
+                    let msg = match (res, lang) {
+                        (Ok(()), Lang::En) => format!("Saved {}", path.display()),
+                        (Ok(()), Lang::Zh) => format!("已保存 {}", path.display()),
+                        (Err(e), _) => format!("Save failed: {e}"),
+                    };
+                    app.show_toast(msg, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn start_managed_proxy(&mut self, cx: &mut Context<Self>) {
+        if self.managed_proxy.is_some() || self.env_probe.running {
+            return;
+        }
+        let port = self.proxy_port;
+        let cwd = self
+            .session
+            .read(cx)
+            .run
+            .as_ref()
+            .filter(|r| !r.header.cwd.is_empty())
+            .map(|r| PathBuf::from(&r.header.cwd));
+        let lang = Ui::of(cx).lang;
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { daemon::spawn_proxy(port, false, cwd.as_deref()) })
+                .await;
+            this.update(cx, |app, cx| match res {
+                Ok(child) => {
+                    app.managed_proxy = Some(child);
+                    app.env_probe.running = true;
+                    app.env_probe.managed = true;
+                    app.follow_latest(cx);
+                    let msg = match lang {
+                        Lang::En => format!("Proxy listening on http://127.0.0.1:{port}"),
+                        Lang::Zh => format!("本地代理已启动：http://127.0.0.1:{port}"),
+                    };
+                    app.show_toast(msg, cx);
+                }
+                Err(err) => app.show_toast(err, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn stop_managed_proxy(&mut self, cx: &mut Context<Self>) {
+        if let Some(child) = self.managed_proxy.take() {
+            let port = self.proxy_port;
+            let lang = Ui::of(cx).lang;
+            cx.background_executor()
+                .spawn(async move {
+                    daemon::stop_proxy_gracefully(child, port);
+                })
+                .detach();
+            self.env_probe.running = false;
+            self.env_probe.managed = false;
+            let msg = match lang {
+                Lang::En => "Stopped managed local proxy".to_string(),
+                Lang::Zh => "已停止托管本地代理".to_string(),
+            };
+            self.show_toast(msg, cx);
+        }
+    }
+
+    fn install_cli(&mut self, cx: &mut Context<Self>) {
+        let h = home();
+        let lang = Ui::of(cx).lang;
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { daemon::install_cli_to_path(&h) })
+                .await;
+            this.update(cx, |app, cx| {
+                let msg = match (res, lang) {
+                    (Ok(dest), Lang::En) => format!("Installed `lenslet` to {}", dest.display()),
+                    (Ok(dest), Lang::Zh) => format!("已将 `lenslet` 安装至 {}", dest.display()),
+                    (Err(err), _) => err,
+                };
+                app.show_toast(msg, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         if self.session.read(cx).demo {
-            self.show_toast("Demo data is static".into(), cx);
+            let ui = Ui::of(cx);
+            self.show_toast(ui.t("Demo data is static", "演示数据为静态快照").into(), cx);
             return;
         }
         self.session.update(cx, |session, cx| session.reload(cx));
@@ -561,11 +865,15 @@ impl LensletApp {
             self.session.update(cx, |session, cx| {
                 session.switch(Source::Runs { dir, pinned }, cx)
             });
+        } else {
+            self.session
+                .update(cx, |session, cx| session.switch(Source::File(path), cx));
         }
     }
 
-    fn open_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = true;
+        self.composer_open = false;
         self.overlay = None;
         self.palette_open = false;
         self.storage = None;
@@ -616,6 +924,11 @@ impl LensletApp {
                 hint: Some(i18n::shortcut("⏎")),
                 cmd: Cmd::Replay,
             });
+            entries.push(MenuEntry {
+                title: ui.t("Edit & Replay…", "编辑并重放…").into(),
+                hint: Some(i18n::shortcut("⇧⏎")),
+                cmd: Cmd::OpenComposer,
+            });
         }
         entries.push(MenuEntry {
             title: format!("{} {}", ui.t("Only", "仅显示"), call.service_name()).into(),
@@ -633,7 +946,7 @@ impl LensletApp {
             entries.push(MenuEntry {
                 title: ui.t("Accept into lock", "写入 lock").into(),
                 hint: None,
-                cmd: Cmd::Accept(vec![row.access.clone()]),
+                cmd: Cmd::Accept(vec![(row.access.clone(), row.implied)]),
             });
         }
         if editable {
@@ -670,7 +983,7 @@ impl LensletApp {
     // -- Keyboard -------------------------------------------------------------
 
     fn select(&mut self, f: impl FnOnce(SelectTarget, &mut App), cx: &mut Context<Self>) {
-        if self.settings_open {
+        if self.settings_open || self.composer_open {
             return;
         }
         match self.mode {
@@ -681,6 +994,12 @@ impl LensletApp {
 
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlay.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.composer_open {
+            self.composer_open = false;
+            self.focus_list(window, cx);
             cx.notify();
             return;
         }
@@ -789,7 +1108,7 @@ impl LensletApp {
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(12.0))
+            .gap(px(10.0))
             .h(px(theme::HEADER_H))
             .pl(px(if mac { 80.0 } else { 12.0 }))
             .pr(px(8.0))
@@ -797,13 +1116,28 @@ impl LensletApp {
             .border_b_1()
             .border_color(rgb(t.border))
             .child(glyph::lens_mark(&t, 20.0))
+            .child(
+                widgets::icon_button(
+                    ui,
+                    "toggle-sidebar",
+                    self.prefs.sidebar_open,
+                    glyph::left_sidebar_icon(theme::h(t.text_dim, 1.0), self.prefs.sidebar_open),
+                )
+                .tooltip(widgets::tip(
+                    ui.t("Workspace Sidebar", "工作区侧栏"),
+                    Some(i18n::shortcut("0")),
+                ))
+                .on_click(
+                    cx.listener(|app, _, window, cx| app.run_cmd(Cmd::ToggleSidebar, window, cx)),
+                ),
+            )
             .child(self.render_run_button(ui, session, cx))
             .child(modes)
             .child(div().flex_1())
             .child(self.render_baseline_button(ui, session, cx))
             .child(
                 div()
-                    .w(px(if compact { 200.0 } else { 300.0 }))
+                    .w(px(if compact { 196.0 } else { 290.0 }))
                     .child(self.search.clone()),
             )
             .child(
@@ -817,6 +1151,7 @@ impl LensletApp {
                         .rounded(px(4.0))
                         .border_1()
                         .border_color(rgb(t.border))
+                        .font(fonts::mono_font())
                         .text_size(px(10.5))
                         .text_color(theme::h(t.text_dim, 1.0))
                         .child(if cfg!(target_os = "macos") {
@@ -917,7 +1252,7 @@ impl LensletApp {
             .items_center()
             .gap(px(8.0))
             .h(px(28.0))
-            .max_w(px(420.0))
+            .max_w(px(380.0))
             .px(px(8.0))
             .rounded(px(6.0))
             .when(open, |el| el.bg(theme::h(t.text, 0.08)))
@@ -943,7 +1278,7 @@ impl LensletApp {
             .child(
                 div()
                     .min_w(px(0.0))
-                    .font_family(fonts::mono())
+                    .font(fonts::mono_font())
                     .text_size(px(text::MD))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(t.text))
@@ -965,7 +1300,7 @@ impl LensletApp {
                 el.child(
                     div()
                         .flex_shrink_0()
-                        .font_family(fonts::mono())
+                        .font(fonts::mono_font())
                         .text_size(px(text::XS))
                         .text_color(rgb(t.text_muted))
                         .child(position),
@@ -994,6 +1329,17 @@ impl LensletApp {
                 app.overlay = None;
                 cx.notify();
             }));
+        card = card.child(
+            widgets::menu_item(
+                ui,
+                "open-trace-file",
+                ui.t("Open Trace File…", "打开追踪文件…"),
+                Some(i18n::shortcut("O")),
+                false,
+                false,
+            )
+            .on_click(cx.listener(|app, _, window, cx| app.run_cmd(Cmd::OpenFile, window, cx))),
+        );
         if session.source.runs_dir().is_some() {
             card = card.child(
                 widgets::menu_item(
@@ -1008,8 +1354,8 @@ impl LensletApp {
                     cx.listener(|app, _, window, cx| app.run_cmd(Cmd::FollowLatest, window, cx)),
                 ),
             );
-            card = card.child(widgets::separator(ui));
         }
+        card = card.child(widgets::separator(ui));
         if session.runs.is_empty() {
             card = card.child(
                 div()
@@ -1023,11 +1369,11 @@ impl LensletApp {
             let current = session.path.as_ref() == Some(&run.path);
             let (status, color) = match run.report.as_ref() {
                 Some(report) => match report.exit_code {
-                    Some(0) => ("pass".to_string(), t.green),
+                    Some(0) => (ui.t("pass", "通过").to_string(), t.green),
                     Some(code) => (format!("exit {code}"), t.red),
-                    None => ("ended".into(), t.text_muted),
+                    None => (ui.t("ended", "已结束").into(), t.text_muted),
                 },
-                None => ("live".into(), t.amber),
+                None => (ui.t("live", "实时").into(), t.amber),
             };
             let calls = run
                 .report
@@ -1035,6 +1381,7 @@ impl LensletApp {
                 .map(|r| r.calls.to_string())
                 .unwrap_or_default();
             let path = run.path.clone();
+            let pin_prefix = if run.pinned { "★ " } else { "" };
             card = card.child(
                 div()
                     .id(ElementId::named_usize("run", index))
@@ -1060,21 +1407,22 @@ impl LensletApp {
                             .flex_col()
                             .child(
                                 div()
-                                    .font_family(fonts::mono())
+                                    .font(fonts::mono_font())
                                     .text_size(px(text::MD))
                                     .text_color(rgb(t.text))
                                     .whitespace_nowrap()
                                     .overflow_hidden()
                                     .text_ellipsis()
-                                    .child(run.label()),
+                                    .child(format!("{pin_prefix}{}", run.label())),
                             )
                             .child(
                                 div()
-                                    .font_family(fonts::mono())
+                                    .font(fonts::mono_font())
                                     .text_size(px(text::XS))
                                     .text_color(rgb(t.text_muted))
                                     .child(format!(
-                                        "{} · {}",
+                                        "{} · {} · {}",
+                                        run.project_name(),
                                         run.id,
                                         format_bytes(run.bytes as usize)
                                     )),
@@ -1083,7 +1431,7 @@ impl LensletApp {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .font_family(fonts::mono())
+                            .font(fonts::mono_font())
                             .text_size(px(text::SM))
                             .text_color(rgb(t.text_muted))
                             .child(calls),
@@ -1117,13 +1465,25 @@ impl LensletApp {
             Some(diff) => {
                 let mut parts = Vec::new();
                 if !diff.new_failures.is_empty() {
-                    parts.push(format!("{} new fail", diff.new_failures.len()));
+                    parts.push(if ui.zh() {
+                        format!("{} 新增失败", diff.new_failures.len())
+                    } else {
+                        format!("{} new fail", diff.new_failures.len())
+                    });
                 }
                 if !diff.fixed_failures.is_empty() {
-                    parts.push(format!("{} fixed", diff.fixed_failures.len()));
+                    parts.push(if ui.zh() {
+                        format!("{} 已修复", diff.fixed_failures.len())
+                    } else {
+                        format!("{} fixed", diff.fixed_failures.len())
+                    });
                 }
                 if !diff.access_added.is_empty() {
-                    parts.push(format!("+{} access", diff.access_added.len()));
+                    parts.push(if ui.zh() {
+                        format!("+{} 新增权限", diff.access_added.len())
+                    } else {
+                        format!("+{} access", diff.access_added.len())
+                    });
                 }
                 if !diff.access_removed.is_empty() {
                     parts.push(format!("−{}", diff.access_removed.len()));
@@ -1145,7 +1505,7 @@ impl LensletApp {
                     .iter()
                     .filter(|row| row.delta == crate::store::AccessDelta::Added)
                     .count();
-                (added > 0).then(|| (format!("+{added} not in lock"), t.amber))
+                (added > 0).then(|| (i18n::not_in_lock_badge(added, ui.lang), t.amber))
             }
         };
         let open = matches!(self.overlay, Some(Overlay::Baseline));
@@ -1182,7 +1542,7 @@ impl LensletApp {
             )
             .child(
                 div()
-                    .font_family(fonts::mono())
+                    .font(fonts::mono_font())
                     .text_size(px(text::SM))
                     .text_color(rgb(t.text_soft))
                     .child(label),
@@ -1190,7 +1550,7 @@ impl LensletApp {
             .when_some(summary, |el, (summary, color)| {
                 el.child(
                     div()
-                        .font_family(fonts::mono())
+                        .font(fonts::mono_font())
                         .text_size(px(text::XS))
                         .text_color(rgb(color))
                         .child(summary),
@@ -1359,19 +1719,26 @@ impl Render for LensletApp {
         let ui = Ui::of(cx);
         let t = ui.p;
         let viewport = f32::from(window.viewport_size().width);
+        let sidebar_offset = if self.prefs.sidebar_open {
+            SIDEBAR_W
+        } else {
+            0.0
+        };
         let show_inspector = self.prefs.inspector_open;
         let inspector_w = self
             .prefs
             .inspector_width
-            .clamp(320.0, (viewport - 440.0).max(320.0));
+            .clamp(320.0, (viewport - sidebar_offset - 420.0).max(320.0));
 
-        // Cached: a child view re-renders only when it notifies, so a live
-        // batch that only touches the list does not rebuild the inspector.
         let (list, detail): (gpui::AnyView, gpui::AnyView) = match self.mode {
             Mode::Calls => (cached(&self.calls), cached(&self.inspector)),
             Mode::Access => (cached(&self.access), cached(&self.access_detail)),
         };
-        let mut workspace = div().flex().flex_row().flex_1().min_h(px(0.0)).child(list);
+        let mut workspace = div().flex().flex_row().flex_1().min_h(px(0.0));
+        if self.prefs.sidebar_open {
+            workspace = workspace.child(self.render_sidebar(&ui, cx));
+        }
+        workspace = workspace.child(list);
         if show_inspector {
             workspace = workspace.child(self.render_splitter(&ui, cx)).child(
                 div()
@@ -1392,6 +1759,9 @@ impl Render for LensletApp {
         };
         let palette = self.palette_open.then(|| self.render_palette(&ui, cx));
         let settings = self.settings_open.then(|| self.render_settings(&ui, cx));
+        let composer = self
+            .composer_open
+            .then(|| render_composer_overlay(&self.composer, cx));
         let toast = self.render_toast(&ui);
 
         div()
@@ -1420,8 +1790,26 @@ impl Render for LensletApp {
                     app.open_settings(cx);
                 }
             }))
+            .on_action(cx.listener(|app, _: &ToggleSidebar, window, cx| {
+                app.run_cmd(Cmd::ToggleSidebar, window, cx)
+            }))
             .on_action(cx.listener(|app, _: &ToggleInspector, window, cx| {
                 app.run_cmd(Cmd::ToggleInspector, window, cx)
+            }))
+            .on_action(
+                cx.listener(|app, _: &OpenFile, window, cx| app.run_cmd(Cmd::OpenFile, window, cx)),
+            )
+            .on_action(cx.listener(|app, _: &ExportReport, window, cx| {
+                app.run_cmd(Cmd::ExportReport, window, cx)
+            }))
+            .on_action(cx.listener(|app, _: &RevealTrace, window, cx| {
+                app.run_cmd(Cmd::RevealTrace, window, cx)
+            }))
+            .on_action(cx.listener(|app, _: &NextMatch, _, cx| {
+                app.inspector.update(cx, |insp, cx| insp.step_match(1, cx));
+            }))
+            .on_action(cx.listener(|app, _: &PrevMatch, _, cx| {
+                app.inspector.update(cx, |insp, cx| insp.step_match(-1, cx));
             }))
             .on_action(
                 cx.listener(|app, _: &ReloadRun, window, cx| app.run_cmd(Cmd::Reload, window, cx)),
@@ -1429,6 +1817,9 @@ impl Render for LensletApp {
             .on_action(
                 cx.listener(|app, _: &Replay, window, cx| app.run_cmd(Cmd::Replay, window, cx)),
             )
+            .on_action(cx.listener(|app, _: &OpenComposer, window, cx| {
+                app.run_cmd(Cmd::OpenComposer, window, cx)
+            }))
             .on_action(cx.listener(|app, _: &ShowCalls, window, cx| {
                 app.run_cmd(Cmd::Mode(Mode::Calls), window, cx)
             }))
@@ -1507,8 +1898,14 @@ impl Render for LensletApp {
             .on_drag_move(
                 cx.listener(|app, event: &DragMoveEvent<SplitDrag>, window, cx| {
                     let viewport = f32::from(window.viewport_size().width);
+                    let sidebar_offset = if app.prefs.sidebar_open {
+                        SIDEBAR_W
+                    } else {
+                        0.0
+                    };
                     let x = f32::from(event.event.position.x);
-                    let width = (viewport - x).clamp(320.0, (viewport - 440.0).max(320.0));
+                    let width =
+                        (viewport - x).clamp(320.0, (viewport - sidebar_offset - 420.0).max(320.0));
                     if (width - app.prefs.inspector_width).abs() >= 1.0 {
                         app.prefs.inspector_width = width;
                         app.save_prefs(cx);
@@ -1529,6 +1926,7 @@ impl Render for LensletApp {
             .child(workspace)
             .children(menu)
             .children(settings)
+            .children(composer)
             .children(palette)
             .children(toast)
     }

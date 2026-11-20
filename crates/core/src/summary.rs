@@ -229,6 +229,100 @@ pub(crate) fn causal_keys(
     out
 }
 
+/// Tracks temporary STS session credentials (`AccessKeyId` → normalized `RoleArn`)
+/// across calls in one run so multi-role workloads attribute permissions per role.
+#[derive(Clone, Debug, Default)]
+pub struct RoleTracker {
+    sessions: BTreeMap<String, String>,
+}
+
+impl RoleTracker {
+    /// Tag `trace.caller_role` if `access_key_id` belongs to a previously assumed
+    /// STS session, and register newly minted credentials on successful `AssumeRole*`.
+    pub fn observe_call(&mut self, access_key_id: Option<&str>, trace: &mut Trace) {
+        if trace.caller_role.is_none()
+            && let Some(akid) = access_key_id
+            && let Some(role) = self.sessions.get(akid)
+        {
+            trace.caller_role = Some(role.clone());
+        }
+        if !trace.pending
+            && trace.status < 400
+            && trace.service == "sts"
+            && trace.operation.starts_with("AssumeRole")
+            && let Some(role_arn) = extract_assumed_role_arn(trace)
+            && let Some(minted_akid) = extract_minted_access_key_id(trace)
+        {
+            self.sessions.insert(minted_akid, role_arn);
+        }
+    }
+
+    pub fn role_for_key(&self, access_key_id: &str) -> Option<&str> {
+        self.sessions.get(access_key_id).map(String::as_str)
+    }
+}
+
+fn normalize_role_arn(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix("arn:")
+        && let Some((partition, r1)) = rest.split_once(':')
+        && let Some((service, r2)) = r1.split_once(':')
+        && let Some((_region, r3)) = r2.split_once(':')
+        && let Some((_account, resource)) = r3.split_once(':')
+    {
+        return format!("arn:{partition}:{service}::*:{resource}");
+    }
+    raw.to_string()
+}
+
+fn extract_assumed_role_arn(trace: &Trace) -> Option<String> {
+    if let Some(q_arn) = crate::wire::query_param(&trace.path, "RoleArn")
+        && !q_arn.is_empty()
+    {
+        return Some(normalize_role_arn(&q_arn));
+    }
+    let body = trace.request.body.as_ref()?.text.as_deref()?.trim();
+    if body.starts_with('{') {
+        let json: serde_json::Value = serde_json::from_str(body).ok()?;
+        let arn = json.get("RoleArn").and_then(|v| v.as_str())?;
+        return (!arn.is_empty()).then(|| normalize_role_arn(arn));
+    }
+    for pair in body.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "RoleArn"
+        {
+            let dec = crate::wire::percent_decode_query(v);
+            if !dec.is_empty() {
+                return Some(normalize_role_arn(&dec));
+            }
+        }
+    }
+    None
+}
+
+fn extract_minted_access_key_id(trace: &Trace) -> Option<String> {
+    let body = trace.response.body.as_ref()?.text.as_deref()?.trim();
+    if body.starts_with('{') {
+        let json: serde_json::Value = serde_json::from_str(body).ok()?;
+        let akid = json
+            .get("Credentials")
+            .and_then(|c| c.get("AccessKeyId"))
+            .or_else(|| json.get("AccessKeyId"))
+            .and_then(|v| v.as_str())?
+            .trim();
+        return (!akid.is_empty()).then(|| akid.to_string());
+    }
+    // STS XML `<Credentials>...<AccessKeyId>ASIA...</AccessKeyId>...</Credentials>`
+    let scope = match body.find("<Credentials>") {
+        Some(idx) => &body[idx..],
+        None => body,
+    };
+    let start = scope.find("<AccessKeyId>")? + "<AccessKeyId>".len();
+    let end = scope[start..].find("</AccessKeyId>")? + start;
+    let akid = scope[start..end].trim();
+    (!akid.is_empty()).then(|| akid.to_string())
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Summary {
     pub calls: usize,
@@ -240,12 +334,15 @@ pub struct Summary {
     pub unmapped: BTreeMap<String, usize>,
     pub failures: Vec<Failure>,
     pub access: BTreeMap<Access, AccessUse>,
+    /// Permissions partitioned by `sts:AssumeRole*` caller role ARN.
+    pub roles: BTreeMap<String, BTreeMap<Access, AccessUse>>,
     /// Concrete or fail-closed permissions rejected by the active gate.
     pub denied_access: BTreeSet<Access>,
     /// Footprint keys that had at least one call rejected by the active gate.
     pub denied_footprints: BTreeSet<Access>,
     pub gate_evaluated: bool,
     pub causal: CausalTracker,
+    pub role_tracker: RoleTracker,
     pending: HashSet<String>,
     invocations: HashSet<String>,
 }
@@ -287,6 +384,20 @@ pub struct AccessUse {
 
 /// Distinct calls kept per permission in `via`.
 const VIA_LIMIT: usize = 3;
+
+fn record_access_use(entry: &mut AccessUse, own: bool, failed: bool, unverified: bool, via: &str) {
+    entry.unverified |= unverified;
+    entry.calls += 1;
+    entry.errors += usize::from(failed);
+    entry.implied = if entry.calls == 1 {
+        !own
+    } else {
+        entry.implied && !own
+    };
+    if entry.via.len() < VIA_LIMIT && !entry.via.iter().any(|v| v == via) {
+        entry.via.push(via.to_string());
+    }
+}
 
 impl Summary {
     /// Whether a call has started and not yet been recorded as finished.
@@ -331,21 +442,24 @@ impl Summary {
             }
         }
         for (index, item) in trace.access.iter().chain(trace.implied.iter()).enumerate() {
-            let entry = self.access.entry(item.key()).or_default();
-            entry.unverified |= item.unverified;
-            entry.calls += 1;
-            entry.errors += usize::from(failed);
-            // Own permissions come first, then implied ones. An entry is
-            // implied only if no call ever needed it directly.
             let own = index < trace.access.len();
-            entry.implied = if entry.calls == 1 {
-                !own
-            } else {
-                entry.implied && !own
-            };
             let via = format!("{} {}", trace.service.to_ascii_uppercase(), trace.operation);
-            if entry.via.len() < VIA_LIMIT && !entry.via.contains(&via) {
-                entry.via.push(via);
+            record_access_use(
+                self.access.entry(item.key()).or_default(),
+                own,
+                failed,
+                item.unverified,
+                &via,
+            );
+            if let Some(role) = trace.caller_role.as_ref() {
+                let role_map = self.roles.entry(role.clone()).or_default();
+                record_access_use(
+                    role_map.entry(item.key()).or_default(),
+                    own,
+                    failed,
+                    item.unverified,
+                    &via,
+                );
             }
         }
         if let Some(problem) = trace.problem.as_ref() {
@@ -427,6 +541,9 @@ pub struct Report {
     pub unmapped: BTreeMap<String, usize>,
     pub failures: Vec<Failure>,
     pub access: Vec<AccessEntry>,
+    /// Permissions partitioned by `sts:AssumeRole*` caller role ARN, when sessions were assumed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, Vec<AccessEntry>>,
     /// Compared with this lock file; `null` when there is none.
     pub lock: Option<String>,
     /// Compared/enforced with this IAM policy document, when `--policy` was set.
@@ -468,20 +585,26 @@ impl Report {
     /// Fill in the access table and compare against either a lock file or an IAM policy gate.
     pub fn set_access_with_gate(&mut self, summary: &Summary, gate: Option<&crate::lock::Gate>) {
         let policy_evaluated = gate.is_some_and(|g| g.is_policy()) && summary.gate_evaluated;
-        self.access = summary
-            .access
+        let to_entries = |map: &BTreeMap<Access, AccessUse>| -> Vec<AccessEntry> {
+            map.iter()
+                .map(|(access, used)| AccessEntry {
+                    action: access.action.clone(),
+                    resource: access.resource.clone(),
+                    used: used.clone(),
+                    new: if policy_evaluated {
+                        summary.denied_footprints.contains(access)
+                    } else {
+                        summary.denied_footprints.contains(access)
+                            || gate.is_some_and(|gate| !gate.allows(access))
+                    },
+                })
+                .collect()
+        };
+        self.access = to_entries(&summary.access);
+        self.roles = summary
+            .roles
             .iter()
-            .map(|(access, used)| AccessEntry {
-                action: access.action.clone(),
-                resource: access.resource.clone(),
-                used: used.clone(),
-                new: if policy_evaluated {
-                    summary.denied_footprints.contains(access)
-                } else {
-                    summary.denied_footprints.contains(access)
-                        || gate.is_some_and(|gate| !gate.allows(access))
-                },
-            })
+            .map(|(role, map)| (role.clone(), to_entries(map)))
             .collect();
         if let Some(gate) = gate {
             if policy_evaluated {
@@ -1307,6 +1430,8 @@ mod tests {
             blocked: false,
             replay_of: None,
             blocked_phase: None,
+            caller_role: None,
+            target: None,
             request: Message::default(),
             response: Message::default(),
         }
@@ -1645,5 +1770,76 @@ mod tests {
             md.contains("(resource unknown: request body not readable)"),
             "{md}"
         );
+    }
+
+    #[test]
+    fn tracks_sts_assumed_role_sessions_and_partitions_access_by_role() {
+        let mut summary = Summary::default();
+        let mut assume = Trace {
+            id: "1".into(),
+            method: "POST".into(),
+            path: "/".into(),
+            service: "sts".into(),
+            operation: "AssumeRole".into(),
+            status: 200,
+            request: crate::trace::Message {
+                body: Some(crate::trace::BodyTrace {
+                    text: Some(
+                        "Action=AssumeRole&RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fcheckout-api"
+                            .into(),
+                    ),
+                    bytes: 82,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            response: crate::trace::Message {
+                body: Some(crate::trace::BodyTrace {
+                    text: Some(
+                        "<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>ASIAWORKERTEST01</AccessKeyId></Credentials></AssumeRoleResult></AssumeRoleResponse>"
+                            .into(),
+                    ),
+                    bytes: 148,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        summary
+            .role_tracker
+            .observe_call(Some("AKIASTATIC"), &mut assume);
+        assert!(assume.caller_role.is_none());
+        summary.observe(&assume);
+
+        let mut ddb = Trace {
+            id: "2".into(),
+            method: "POST".into(),
+            path: "/".into(),
+            service: "dynamodb".into(),
+            operation: "PutItem".into(),
+            status: 200,
+            access: vec![crate::access::CallAccess {
+                action: "dynamodb:PutItem".into(),
+                resource: "arn:aws:dynamodb:*:*:table/orders".into(),
+                new: false,
+                unverified: false,
+            }],
+            ..Default::default()
+        };
+        summary
+            .role_tracker
+            .observe_call(Some("ASIAWORKERTEST01"), &mut ddb);
+        assert_eq!(
+            ddb.caller_role.as_deref(),
+            Some("arn:aws:iam::*:role/checkout-api")
+        );
+        summary.observe(&ddb);
+
+        let mut rep = report(&summary);
+        rep.set_access_with_gate(&summary, None);
+        let role_entries = rep.roles.get("arn:aws:iam::*:role/checkout-api").unwrap();
+        assert_eq!(role_entries.len(), 1);
+        assert_eq!(role_entries[0].action, "dynamodb:PutItem");
     }
 }

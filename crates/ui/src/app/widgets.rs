@@ -43,7 +43,7 @@ impl Render for Tip {
             .when_some(self.key.clone(), |el, key| {
                 el.child(
                     div()
-                        .font_family(fonts::mono())
+                        .font(fonts::mono_font())
                         .text_size(px(text::XS))
                         .text_color(rgb(t.text_muted))
                         .child(key),
@@ -283,7 +283,7 @@ pub fn badge(ui: &Ui, label: impl Into<SharedString>, color: u32) -> Div {
         .border_1()
         .border_color(theme::h(color, 0.38))
         .bg(theme::h(color, 0.10))
-        .font_family(fonts::mono())
+        .font(fonts::mono_font())
         .text_size(px(9.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(color))
@@ -300,11 +300,11 @@ pub fn label(ui: &Ui, text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// A monospace value that ellipsizes.
+/// A monospace value that ellipsizes (with contextual ligatures disabled for ARNs).
 pub fn mono(ui: &Ui, value: impl Into<SharedString>) -> Div {
     div()
         .min_w(px(0.0))
-        .font_family(fonts::mono())
+        .font(fonts::mono_font())
         .text_size(px(text::SM))
         .text_color(rgb(ui.p.text_body))
         .whitespace_nowrap()

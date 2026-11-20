@@ -71,192 +71,42 @@ pub fn lens_mark(t: &theme::Palette, size: f32) -> impl IntoElement {
 }
 
 pub fn search_icon(color: Hsla) -> impl IntoElement {
-    div()
-        .relative()
-        .flex_shrink_0()
-        .w(px(11.0))
-        .h(px(11.0))
-        .child(
-            div()
-                .absolute()
-                .left(px(0.5))
-                .top(px(0.5))
-                .w(px(7.0))
-                .h(px(7.0))
-                .rounded_full()
-                .border_1()
-                .border_color(color),
-        )
-        .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    let ox = bounds.left().to_f64() as f32;
-                    let oy = bounds.top().to_f64() as f32;
-                    paint_line(
-                        window,
-                        (ox + 6.4, oy + 6.4),
-                        (ox + 10.0, oy + 10.0),
-                        1.2,
-                        color,
-                    );
-                },
-            )
-            .absolute()
-            .inset_0(),
-        )
+    crate::icons::icon("icons/search.svg", 13.0, color)
 }
 
-/// Settings gear icon: precision ring with 6 radial teeth.
+/// Settings gear icon rendered via embedded vector SVG.
 pub fn gear_icon(color: Hsla) -> impl IntoElement {
-    div()
-        .relative()
-        .flex_shrink_0()
-        .w(px(13.0))
-        .h(px(13.0))
-        .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    let cx = bounds.left().to_f64() as f32 + 6.5;
-                    let cy = bounds.top().to_f64() as f32 + 6.5;
-                    for i in 0..6 {
-                        let a = i as f32 * PI / 3.0;
-                        paint_line(
-                            window,
-                            (cx + 3.6 * a.cos(), cy + 3.6 * a.sin()),
-                            (cx + 5.8 * a.cos(), cy + 5.8 * a.sin()),
-                            1.4,
-                            color,
-                        );
-                    }
-                },
-            )
-            .absolute()
-            .inset_0(),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(3.0))
-                .top(px(3.0))
-                .w(px(7.0))
-                .h(px(7.0))
-                .rounded_full()
-                .border_1()
-                .border_color(color),
-        )
+    crate::icons::icon("icons/settings.svg", 14.0, color)
 }
 
-/// Split-sidebar icon (`⌘B` toggle inspector).
+/// Split-sidebar icon (`⌘B` toggle right inspector).
 pub fn sidebar_icon(color: Hsla, active: bool) -> impl IntoElement {
-    let fill = if active {
-        Hsla { a: 0.25, ..color }
+    let c = if active {
+        Hsla { a: 1.0, ..color }
     } else {
-        Hsla { a: 0.0, ..color }
+        color
     };
-    div()
-        .relative()
-        .flex_shrink_0()
-        .w(px(13.0))
-        .h(px(11.0))
-        .rounded(px(2.0))
-        .border_1()
-        .border_color(color)
-        .child(
-            div()
-                .absolute()
-                .right_0()
-                .top_0()
-                .bottom_0()
-                .w(px(4.5))
-                .border_l_1()
-                .border_color(color)
-                .bg(fill),
-        )
+    crate::icons::icon("icons/sidebar-right.svg", 14.0, c)
 }
 
-/// Chevron down (`▾`) drawn cleanly without font fallback variance.
+/// Left workspace sidebar icon (`⌘0`).
+pub fn left_sidebar_icon(color: Hsla, active: bool) -> impl IntoElement {
+    let c = if active {
+        Hsla { a: 1.0, ..color }
+    } else {
+        color
+    };
+    crate::icons::icon("icons/sidebar-left.svg", 14.0, c)
+}
+
+/// Chevron down (`▾`) rendered via embedded vector SVG.
 pub fn chevron_down(color: Hsla) -> impl IntoElement {
-    div()
-        .relative()
-        .flex_shrink_0()
-        .w(px(8.0))
-        .h(px(6.0))
-        .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    let ox = bounds.left().to_f64() as f32;
-                    let oy = bounds.top().to_f64() as f32;
-                    paint_line(
-                        window,
-                        (ox + 1.0, oy + 1.5),
-                        (ox + 4.0, oy + 4.6),
-                        1.25,
-                        color,
-                    );
-                    paint_line(
-                        window,
-                        (ox + 4.0, oy + 4.6),
-                        (ox + 7.0, oy + 1.5),
-                        1.25,
-                        color,
-                    );
-                },
-            )
-            .absolute()
-            .inset_0(),
-        )
+    crate::icons::icon("icons/chevron-down.svg", 11.0, color)
 }
 
-/// Replay refresh glyph (`↻`).
+/// Replay refresh glyph (`↻`) rendered via embedded vector SVG.
 pub fn replay_icon(color: Hsla) -> impl IntoElement {
-    div()
-        .relative()
-        .flex_shrink_0()
-        .w(px(11.0))
-        .h(px(11.0))
-        .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
-                    let cx = bounds.left().to_f64() as f32 + 5.5;
-                    let cy = bounds.top().to_f64() as f32 + 5.5;
-                    let r = 3.8_f32;
-                    let steps = 10;
-                    for i in 0..steps {
-                        let a0 = -PI * 0.75 + (i as f32 / steps as f32) * (PI * 1.55);
-                        let a1 = -PI * 0.75 + ((i + 1) as f32 / steps as f32) * (PI * 1.55);
-                        paint_line(
-                            window,
-                            (cx + r * a0.cos(), cy + r * a0.sin()),
-                            (cx + r * a1.cos(), cy + r * a1.sin()),
-                            1.25,
-                            color,
-                        );
-                    }
-                    let tip_x = cx + r * (-PI * 0.75).cos();
-                    let tip_y = cy + r * (-PI * 0.75).sin();
-                    paint_line(
-                        window,
-                        (tip_x, tip_y),
-                        (tip_x + 2.5, tip_y - 0.3),
-                        1.25,
-                        color,
-                    );
-                    paint_line(
-                        window,
-                        (tip_x, tip_y),
-                        (tip_x + 0.4, tip_y + 2.5),
-                        1.25,
-                        color,
-                    );
-                },
-            )
-            .absolute()
-            .inset_0(),
-        )
+    crate::icons::icon("icons/refresh.svg", 12.0, color)
 }
 
 /// A tiny key silhouettes whether SigV4 authorization was present.

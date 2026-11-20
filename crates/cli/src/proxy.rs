@@ -13,6 +13,7 @@
 //! file is owner-only (0600) on Unix.
 
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     fs,
     net::{IpAddr, Ipv6Addr, SocketAddr},
@@ -28,11 +29,12 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::{Request, Response, StatusCode, header, server::conn::http1, service::service_fn};
+use hyper::{Request, Response, StatusCode, header, service::service_fn};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto as conn_auto,
 };
 use rustls::RootCertStore;
 use tokio::{
@@ -80,17 +82,44 @@ const REPLAY_HEADER: &str = "x-lenslet-replay-of";
 #[derive(Clone)]
 pub struct State {
     client: HttpsClient,
-    /// Upstream base URL without a trailing slash, e.g. `https://127.0.0.1:9298`.
+    /// Default upstream base URL without a trailing slash, e.g. `https://127.0.0.1:9298`.
     upstream: String,
+    /// Per-service local upstream overrides (`service` -> base URL), e.g. `s3` -> `http://127.0.0.1:9000`.
+    routes: BTreeMap<String, String>,
+    /// Bound proxy endpoint URL, e.g. `http://127.0.0.1:9297`.
+    endpoint: String,
     pub max_body: usize,
     pub enforce: bool,
     pub trace: Arc<TraceSink>,
+    pub shutdown_req: Arc<tokio::sync::Notify>,
+}
+
+impl State {
+    fn upstream_for(&self, service: &str) -> &str {
+        let low = service.to_ascii_lowercase();
+        if let Some(target) = self.routes.get(&low) {
+            return target.as_str();
+        }
+        let canonical = match low.as_str() {
+            "streams.dynamodb" | "dynamodbstreams" => "dynamodb",
+            "email" | "sesv2" => "ses",
+            "monitoring" => "cloudwatch",
+            "events" => "eventbridge",
+            "states" => "stepfunctions",
+            other => other,
+        };
+        self.routes
+            .get(canonical)
+            .map(String::as_str)
+            .unwrap_or(&self.upstream)
+    }
 }
 
 /// Everything needed to write one trace entry once the response body is done.
 struct Pending {
     state: Arc<State>,
     trace: Trace,
+    access_key_id: Option<String>,
     started: Instant,
     finished: Arc<AtomicBool>,
     /// Operation advertised by the wire protocol; when `None`, the request body
@@ -148,7 +177,9 @@ impl Pending {
                 })
             }
         };
-        self.state.trace.record(self.trace, evaluation);
+        self.state
+            .trace
+            .record_with_key(self.trace, self.access_key_id.as_deref(), evaluation);
     }
 }
 
@@ -223,6 +254,10 @@ pub struct Options {
     pub upstream: Upstream,
     /// Whether `--upstream` was explicitly passed on the command line.
     pub upstream_given: bool,
+    /// Per-service local upstream overrides (`--route s3=http://127.0.0.1:9000`).
+    pub routes: BTreeMap<String, Upstream>,
+    /// Accept connections from local Docker container bridge interfaces (`0.0.0.0` filtered to local/RFC1918 IPs).
+    pub allow_docker: bool,
     /// CA that signs the emulator's certificate; derived from the upstream
     /// port when not given (`~/.aws/emulator/PORT/ca.pem`).
     pub emulator_ca: Option<PathBuf>,
@@ -241,6 +276,8 @@ impl Options {
             listen,
             upstream: Upstream::parse("9298").expect("default upstream"),
             upstream_given: false,
+            routes: BTreeMap::new(),
+            allow_docker: false,
             emulator_ca: None,
             trace: None,
             max_body: capture::MAX_CAPTURE_BYTES,
@@ -260,8 +297,28 @@ impl Options {
             }
             "--upstream" => {
                 self.upstream = Upstream::parse(&value()?)?;
+                self.upstream.ensure_local_boundary("--upstream")?;
                 self.upstream_given = true;
             }
+            "--route" => {
+                let raw = value()?;
+                let Some((svcs, target)) = raw.split_once('=') else {
+                    bail!(
+                        "--route expects SERVICE=ADDRESS (e.g. `--route s3=http://127.0.0.1:9000`), got `{raw}`"
+                    );
+                };
+                let parsed = Upstream::parse(target.trim())?;
+                parsed.ensure_local_boundary("--route")?;
+                let mut added = 0usize;
+                for svc in svcs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    self.routes.insert(svc.to_ascii_lowercase(), parsed.clone());
+                    added += 1;
+                }
+                if added == 0 {
+                    bail!("--route `{raw}` must name at least one service before `=`");
+                }
+            }
+            "--allow-docker" => self.allow_docker = true,
             "--emulator-ca" => self.emulator_ca = Some(PathBuf::from(value()?)),
             "--trace" => self.trace = Some(PathBuf::from(value()?)),
             "--max-body" => self.max_body = capture::parse_size(&value()?)?,
@@ -272,12 +329,23 @@ impl Options {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.upstream.is_loopback() && self.upstream.port == self.listen {
+        self.upstream.ensure_local_boundary("--upstream")?;
+        if self.upstream.is_loopback() && self.upstream.port == self.listen && self.listen != 0 {
             bail!(
                 "--listen {} and --upstream {} are the same port; the proxy would forward to itself",
                 self.listen,
                 self.upstream.port
             );
+        }
+        for (svc, route) in &self.routes {
+            route.ensure_local_boundary("--route")?;
+            if route.is_loopback() && route.port == self.listen && self.listen != 0 {
+                bail!(
+                    "--listen {} and --route {svc}={} are the same port; the proxy would forward to itself",
+                    self.listen,
+                    route.port
+                );
+            }
         }
         Ok(())
     }
@@ -296,7 +364,36 @@ impl Options {
     }
 }
 
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// True only for loopback, link-local, RFC1918 (`10/8`, `172.16/12`, `192.168/16`),
+/// or IPv6 ULA (`fc00::/7`) addresses: never public internet IPs.
+fn is_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_loopback() || mapped.is_private() || mapped.is_link_local();
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 /// Where the proxy sends requests: `PORT` means `https://127.0.0.1:PORT`.
+#[derive(Clone, Debug)]
 pub struct Upstream {
     /// Base URL without a trailing slash, e.g. `https://127.0.0.1:9298`.
     pub base: String,
@@ -346,12 +443,35 @@ impl Upstream {
         matches!(self.host.as_str(), "127.0.0.1" | "localhost" | "::1")
     }
 
+    /// Enforce Lenslet's strict local boundary: never proxy traffic to real AWS
+    /// (`*.amazonaws.com`, `*.amazonaws.com.cn`, `*.api.aws`) or public IPs.
+    pub fn ensure_local_boundary(&self, flag: &str) -> Result<()> {
+        let h = self.host.to_ascii_lowercase();
+        if h.ends_with(".amazonaws.com")
+            || h == "amazonaws.com"
+            || h.ends_with(".amazonaws.com.cn")
+            || h.ends_with(".api.aws")
+        {
+            bail!(
+                "{flag} `{}` points at real AWS cloud; Lenslet only proxies to local emulators",
+                self.base
+            );
+        }
+        if let Ok(ip) = self.host.parse::<IpAddr>()
+            && !is_local_ip(ip)
+        {
+            bail!(
+                "{flag} `{}` is a public IP address; Lenslet only proxies to loopback or local container networks",
+                self.base
+            );
+        }
+        Ok(())
+    }
+
     /// Auto-resolve a local emulator when `--upstream` was omitted:
-    /// 1. Inherit a loopback `AWS_ENDPOINT_URL` from the parent environment so
-    ///    Lenslet transparently interposes itself in front of `.env` / Compose setups.
-    /// 2. If default `:9298` is not listening, probe LocalStack (`:4566`) and Moto
-    ///    (`:5000`) with protocol fingerprint verification (avoiding false positives
-    ///    on unrelated local HTTP servers such as AirPlay or Flask).
+    /// 1. Inherit a loopback `AWS_ENDPOINT_URL` from the parent environment.
+    /// 2. If default `:9298` is not listening, probe LocalStack (`:4566`), Moto
+    ///    (`:5000`), MinIO (`:9000`), DynamoDB Local (`:8000`), and ElasticMQ (`:9324`).
     pub async fn auto_discover(
         env_endpoint: Option<&str>,
         listen_port: u16,
@@ -372,6 +492,9 @@ impl Upstream {
         for (url, path, label) in [
             ("http://127.0.0.1:4566", "/_localstack/health", "LocalStack"),
             ("http://127.0.0.1:5000", "/moto-api/", "Moto"),
+            ("http://127.0.0.1:9000", "/minio/health/live", "MinIO"),
+            ("http://127.0.0.1:8000", "/", "DynamoDB Local"),
+            ("http://127.0.0.1:9324", "/", "ElasticMQ"),
         ] {
             let Ok(candidate) = Upstream::parse(url) else {
                 continue;
@@ -384,6 +507,33 @@ impl Upstream {
             }
         }
         None
+    }
+
+    /// Auto-discover standalone per-service emulators (MinIO `:9000` for `s3`,
+    /// DynamoDB Local `:8000` for `dynamodb`, ElasticMQ `:9324` for `sqs`) when
+    /// multiple standalone emulators are running side-by-side.
+    pub async fn auto_discover_service_routes(
+        listen_port: u16,
+        primary_port: u16,
+    ) -> BTreeMap<String, Upstream> {
+        let mut routes = BTreeMap::new();
+        for (svc, url, path) in [
+            ("s3", "http://127.0.0.1:9000", "/minio/health/live"),
+            ("dynamodb", "http://127.0.0.1:8000", "/"),
+            ("sqs", "http://127.0.0.1:9324", "/"),
+        ] {
+            let Ok(candidate) = Upstream::parse(url) else {
+                continue;
+            };
+            if candidate.port == primary_port || (listen_port != 0 && candidate.port == listen_port)
+            {
+                continue;
+            }
+            if candidate.verify_emulator_signature(path).await {
+                routes.insert(svc.to_string(), candidate);
+            }
+        }
+        routes
     }
 
     async fn verify_emulator_signature(&self, probe_path: &str) -> bool {
@@ -413,7 +563,11 @@ impl Upstream {
         reply.contains("localstack")
             || reply.contains("\"services\"")
             || reply.contains("moto")
+            || reply.contains("minio")
+            || reply.contains("x-amz-request-id")
             || reply.contains("x-amzn-requestid")
+            || reply.contains("missingauthenticationtoken")
+            || reply.contains("elasticmq")
             || reply.contains("<errorresponse")
     }
 
@@ -499,6 +653,7 @@ fn client(roots: RootCertStore) -> HttpsClient {
         .with_tls_config(tls)
         .https_or_http()
         .enable_http1()
+        .enable_http2()
         .build();
     Client::builder(TokioExecutor::new()).build(https)
 }
@@ -635,16 +790,30 @@ fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
     }
 }
 
+#[cfg(test)]
 async fn handle<B>(req: Request<B>, state: Arc<State>) -> Result<Response<Body>, Infallible>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    handle_with_inspect_limit(req, state, MAX_INSPECT_BYTES).await
+    handle_inner(req, state, MAX_INSPECT_BYTES, true).await
 }
 
+async fn handle_peer<B>(
+    req: Request<B>,
+    state: Arc<State>,
+    peer_loopback: bool,
+) -> Result<Response<Body>, Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    handle_inner(req, state, MAX_INSPECT_BYTES, peer_loopback).await
+}
+
+#[cfg(test)]
 async fn handle_with_inspect_limit<B>(
-    mut req: Request<B>,
+    req: Request<B>,
     state: Arc<State>,
     inspect_limit: usize,
 ) -> Result<Response<Body>, Infallible>
@@ -652,7 +821,20 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    if let Some(response) = lenslet_endpoint(&req, &state) {
+    handle_inner(req, state, inspect_limit, true).await
+}
+
+async fn handle_inner<B>(
+    mut req: Request<B>,
+    state: Arc<State>,
+    inspect_limit: usize,
+    peer_loopback: bool,
+) -> Result<Response<Body>, Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if let Some(response) = lenslet_endpoint(&req, &state, peer_loopback) {
         return Ok(response);
     }
     let started = Instant::now();
@@ -679,6 +861,7 @@ where
     let wire::Wire {
         service,
         region,
+        access_key_id,
         operation: advertised_operation,
         invocation_id,
         attempt,
@@ -701,7 +884,7 @@ where
         at: Utc::now().to_rfc3339(),
         method: method.to_string(),
         path: raw_path.clone(),
-        host,
+        host: host.clone(),
         service: service.clone(),
         operation,
         status: 0,
@@ -720,6 +903,8 @@ where
         blocked: false,
         blocked_phase: None,
         replay_of,
+        caller_role: None,
+        target: None,
         request: Message {
             headers: request_headers,
             content_type: request_content.content_type.clone(),
@@ -730,6 +915,14 @@ where
 
     let (mut parts, mut body) = req.into_parts();
     strip_hop_by_hop(&mut parts.headers);
+    // HTTP/2 `h2c` clients send `:authority` in the URI instead of a `Host`
+    // header; populate `Host` so HTTP/1.1 emulators validate SigV4 signatures.
+    if !parts.headers.contains_key(header::HOST)
+        && !host.is_empty()
+        && let Ok(hval) = header::HeaderValue::from_str(&host)
+    {
+        parts.headers.insert(header::HOST, hval);
+    }
     let forward_path = if raw_path.starts_with('/') {
         raw_path.as_str()
     } else if raw_path == "*" {
@@ -789,6 +982,7 @@ where
                 state.trace.start(&trace.id);
                 return Ok(reject_blocked(
                     trace,
+                    access_key_id.as_deref(),
                     checked,
                     &denied,
                     gate,
@@ -821,6 +1015,7 @@ where
                 state.trace.start(&trace.id);
                 return Ok(reject_blocked(
                     trace,
+                    access_key_id.as_deref(),
                     checked,
                     &denied,
                     gate,
@@ -846,7 +1041,8 @@ where
             .boxed()
     };
 
-    let upstream_uri = format!("{}{}", state.upstream, forward_path);
+    let target_base = state.upstream_for(&service).to_string();
+    let upstream_uri = format!("{target_base}{forward_path}");
     let mut upstream = match Request::builder()
         .method(parts.method)
         .uri(upstream_uri)
@@ -919,6 +1115,7 @@ where
                     trace.request.body = snapshot(&request_capture, &request_content);
                     return Ok(reject_blocked(
                         trace,
+                        access_key_id.as_deref(),
                         checked,
                         &denied,
                         gate,
@@ -934,6 +1131,7 @@ where
             let pending = Pending {
                 state: state.clone(),
                 trace,
+                access_key_id,
                 started,
                 finished,
                 advertised_operation,
@@ -961,7 +1159,7 @@ where
             let detail = error_chain(&error);
             trace.status = StatusCode::BAD_GATEWAY.as_u16();
             trace.ms = started.elapsed().as_millis() as u64;
-            trace.problem = Some(problem::unreachable(&state.upstream, &detail));
+            trace.problem = Some(problem::unreachable(&target_base, &detail));
             trace.error = Some(detail);
             trace.request.body = snapshot(&request_capture, &request_content);
             let operation_capture = derive_capture.as_deref().unwrap_or(&request_capture);
@@ -977,24 +1175,57 @@ where
                     .and_then(|capture| snapshot(capture, &request_content));
                 with_body(&mut trace, &mut full, |trace| state.trace.evaluate(trace))
             });
-            state.trace.record(trace, evaluation);
+            state
+                .trace
+                .record_with_key(trace, access_key_id.as_deref(), evaluation);
             Ok(error_response(StatusCode::BAD_GATEWAY, "upstream error"))
         }
     }
 }
 
-/// `GET /_lenslet/events` and `GET /_lenslet/health`: Lenslet's own
-/// endpoints on the proxy address. They never go upstream and are never
-/// recorded.
-fn lenslet_endpoint<B>(req: &Request<B>, state: &Arc<State>) -> Option<Response<Body>> {
+/// `GET /_lenslet/events`, `GET /_lenslet/health`, and loopback-only
+/// `POST /_lenslet/shutdown`: Lenslet's own endpoints on the proxy address.
+/// They never go upstream and are never recorded.
+fn lenslet_endpoint<B>(
+    req: &Request<B>,
+    state: &Arc<State>,
+    peer_loopback: bool,
+) -> Option<Response<Body>> {
+    if req.method() == hyper::Method::POST && req.uri().path() == "/_lenslet/shutdown" {
+        if !peer_loopback {
+            return Some(error_response(
+                StatusCode::FORBIDDEN,
+                "shutdown requires loopback peer",
+            ));
+        }
+        state.shutdown_req.notify_one();
+        let mut response = Response::new(
+            Full::new(Bytes::from_static(br#"{"stopping":true}"#))
+                .map_err(|never| match never {})
+                .boxed(),
+        );
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        return Some(response);
+    }
     if req.method() != hyper::Method::GET {
         return None;
     }
     match req.uri().path() {
         "/_lenslet/health" => {
+            let (calls, errors, blocked) = state.trace.live_counts();
             let body = serde_json::json!({
                 "run": state.trace.run(),
                 "pid": std::process::id(),
+                "endpoint": state.endpoint,
+                "upstream": state.upstream,
+                "routes": state.routes,
+                "enforce": state.enforce,
+                "calls": calls,
+                "errors": errors,
+                "blocked": blocked,
             })
             .to_string();
             let mut response = Response::new(
@@ -1115,8 +1346,10 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 
 /// Record a blocked call in the trace and return a protocol-accurate AWS
 /// `AccessDenied` / `AccessDeniedException` response.
+#[allow(clippy::too_many_arguments)]
 fn reject_blocked(
     mut trace: Trace,
+    access_key_id: Option<&str>,
     evaluation: Evaluation,
     denied: &Denial,
     gate: &Gate,
@@ -1174,7 +1407,9 @@ fn reject_blocked(
             sha256,
         }),
     };
-    state.trace.record(trace, evaluation);
+    state
+        .trace
+        .record_with_key(trace, access_key_id, evaluation);
 
     let mut response = Response::new(
         Full::new(Bytes::from(wire.body))
@@ -1230,22 +1465,39 @@ impl Server {
             // A plain-HTTP upstream has no TLS certificate to trust.
             RootCertStore::empty()
         };
-        let listener = TcpListener::bind((IpAddr::from([127, 0, 0, 1]), options.listen))
+        let bind_v4 = if options.allow_docker {
+            IpAddr::from([0, 0, 0, 0])
+        } else {
+            IpAddr::from([127, 0, 0, 1])
+        };
+        let listener = TcpListener::bind((bind_v4, options.listen))
             .await
-            .with_context(|| format!("bind 127.0.0.1:{}", options.listen))?;
-        let addr = listener.local_addr().context("read the bound address")?;
+            .with_context(|| format!("bind {bind_v4}:{}", options.listen))?;
+        let local = listener.local_addr().context("read the bound address")?;
+        // Always advertise `127.0.0.1:PORT` for host processes; Docker containers
+        // reach `0.0.0.0:PORT` via `host.docker.internal` or `172.17.0.1`.
+        let addr = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), local.port());
         let v6_listener = TcpListener::bind((IpAddr::V6(Ipv6Addr::LOCALHOST), addr.port()))
             .await
             .ok();
-        header.endpoint = format!("http://{addr}");
+        let endpoint = format!("http://{addr}");
+        header.endpoint = endpoint.clone();
         header.upstream = options.upstream.base.clone();
+        let routes: BTreeMap<String, String> = options
+            .routes
+            .iter()
+            .map(|(svc, up)| (svc.clone(), up.base.clone()))
+            .collect();
         let trace = Arc::new(TraceSink::new(trace_path, &header, gate)?);
         let state = Arc::new(State {
             client: client(roots),
             upstream: options.upstream.base.clone(),
+            routes,
+            endpoint,
             max_body: options.max_body,
             enforce: options.enforce,
             trace,
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
         let shutdown = watch::Sender::new(false);
         let tasks = std::iter::once(listener)
@@ -1263,6 +1515,11 @@ impl Server {
     /// The endpoint SDKs should use.
     pub fn endpoint(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// Notified when a loopback peer calls `POST /_lenslet/shutdown`.
+    pub fn shutdown_requested(&self) -> Arc<tokio::sync::Notify> {
+        self.state.shutdown_req.clone()
     }
 
     /// Give in-flight calls up to `grace` to finish, then stop accepting
@@ -1297,8 +1554,18 @@ async fn serve(listener: TcpListener, state: Arc<State>, mut shutdown: watch::Re
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                if let Ok((stream, _)) = accepted {
-                    connections.spawn(serve_connection(stream, state.clone(), shutdown.clone()));
+                if let Ok((stream, peer)) = accepted {
+                    // Enforce strict local/RFC1918 peer boundary even under `--allow-docker`.
+                    if !is_local_ip(peer.ip()) {
+                        drop(stream);
+                        continue;
+                    }
+                    connections.spawn(serve_connection(
+                        stream,
+                        is_loopback_ip(peer.ip()),
+                        state.clone(),
+                        shutdown.clone(),
+                    ));
                 }
             }
             () = stopped(&mut shutdown) => break,
@@ -1316,14 +1583,17 @@ async fn stopped(shutdown: &mut watch::Receiver<bool>) {
 
 async fn serve_connection(
     stream: TcpStream,
+    peer_loopback: bool,
     state: Arc<State>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let service = service_fn(move |req| handle(req, state.clone()));
-    let mut builder = http1::Builder::new();
+    let service = service_fn(move |req| handle_peer(req, state.clone(), peer_loopback));
+    let mut builder = conn_auto::Builder::new(TokioExecutor::new());
     builder
+        .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
+    builder.http2().timer(TokioTimer::new());
     let connection = builder.serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
     let result = tokio::select! {
@@ -1333,11 +1603,11 @@ async fn serve_connection(
             connection.await
         }
     };
-    if let Err(error) = result
-        && !error.is_incomplete_message()
-        && !error.is_timeout()
-    {
-        eprintln!("lenslet: connection error: {error}");
+    if let Err(error) = result {
+        let msg = error.to_string();
+        if !msg.contains("incomplete message") && !msg.contains("timed out") {
+            eprintln!("lenslet: connection error: {error}");
+        }
     }
 }
 
@@ -1483,7 +1753,7 @@ mod tests {
                             )
                         }
                     });
-                    let _ = http1::Builder::new()
+                    let _ = conn_auto::Builder::new(TokioExecutor::new())
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
                 });
@@ -1499,9 +1769,12 @@ mod tests {
         Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: upstream.to_string(),
+            routes: BTreeMap::new(),
+            endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce: false,
             trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), None).unwrap()),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -1986,6 +2259,8 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            routes: BTreeMap::new(),
+            endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce: false,
             trace: Arc::new(
@@ -1996,6 +2271,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
         for request in [
             sdk_request("GET", "/bucket/key?x-id=GetObject", b""),
@@ -2025,6 +2301,8 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            routes: BTreeMap::new(),
+            endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce: true,
             trace: Arc::new(
@@ -2035,6 +2313,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
 
         // Allowed S3 call reaches upstream normally.
@@ -2134,11 +2413,14 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            routes: BTreeMap::new(),
+            endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce: true,
             trace: Arc::new(
                 TraceSink::new(temp.trace(), &RunHeader::default(), Some(policy.clone())).unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
 
         // 1. Concrete key inside allowed prefix (`public/readme.txt`) succeeds and is NOT marked new.
@@ -2226,6 +2508,8 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            routes: BTreeMap::new(),
+            endpoint: String::new(),
             max_body: 64,
             enforce: true,
             trace: Arc::new(
@@ -2236,6 +2520,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
 
         let payload = br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"order-padding-0000000000000000000000000000"}}}}],"secret_orders":[{"PutRequest":{"Item":{"id":{"S":"2"}}}}]}}"#;
@@ -2314,11 +2599,14 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            routes: BTreeMap::new(),
+            endpoint: String::new(),
             max_body: 64,
             enforce: true,
             trace: Arc::new(
                 TraceSink::new(temp.trace(), &RunHeader::default(), Some(admin)).unwrap(),
             ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
 
         let polled = Arc::new(AtomicUsize::new(0));
@@ -2369,9 +2657,12 @@ mod tests {
         Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{upstream}"),
+            routes: BTreeMap::new(),
+            endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
             enforce,
             trace: Arc::new(TraceSink::new(trace, &RunHeader::default(), Some(gate)).unwrap()),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -2650,9 +2941,12 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            routes: BTreeMap::new(),
+            endpoint: String::new(),
             max_body: 64,
             enforce: false,
             trace: Arc::new(TraceSink::new(temp.trace(), &RunHeader::default(), None).unwrap()),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
         });
         let payload = br#"{"RequestItems":{"orders":[{"PutRequest":{"Item":{"id":{"S":"order-padding-0000000000000000000000000000"}}}}],"secret_orders":[{"PutRequest":{"Item":{"id":{"S":"2"}}}}]}}"#;
         let request = Request::builder()
@@ -2741,5 +3035,88 @@ mod tests {
         assert!(upstream.try_recv().is_ok());
         let written = traces(&temp.trace());
         assert!(!written[0].new && written[0].access[0].unverified);
+    }
+
+    #[tokio::test]
+    async fn routes_services_to_multiple_local_emulators_and_serves_http2_h2c() {
+        // Strict local boundary rejects real AWS endpoints and public IPs.
+        assert!(options(&["--upstream", "https://s3.amazonaws.com:443"]).is_err());
+        assert!(options(&["--route", "s3=http://8.8.8.8:9000"]).is_err());
+        assert!(options(&["--route", "s3=http://127.0.0.1:9000"]).is_ok());
+
+        let (default_port, mut default_rx) = spawn_upstream().await;
+        let (minio_port, mut minio_rx) = spawn_upstream().await;
+        let temp = TempDir::new("routes-h2c");
+        fs::create_dir_all(&temp.0).unwrap();
+        let mut opts = Options::new(&temp.0, 0);
+        opts.upstream = Upstream::parse(&format!("http://127.0.0.1:{default_port}")).unwrap();
+        opts.routes.insert(
+            "s3".into(),
+            Upstream::parse(&format!("http://127.0.0.1:{minio_port}")).unwrap(),
+        );
+        let server = Server::start(&opts, temp.trace(), RunHeader::default(), None)
+            .await
+            .unwrap();
+        let addr = server.addr;
+
+        // Connect an explicit HTTP/2 `h2c` client to the Lenslet proxy.
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut h2_sender, h2_conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let s3_req = Request::builder()
+            .method("PUT")
+            .uri(format!("http://{addr}/assets/logo.svg?x-id=PutObject"))
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .body(Full::new(Bytes::from_static(b"<svg/>")))
+            .unwrap();
+        let resp = h2_sender.send_request(s3_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.into_body().collect().await.unwrap();
+        assert!(
+            minio_rx.try_recv().is_ok(),
+            "S3 call routed to MinIO upstream over HTTP/2 h2c"
+        );
+        assert!(
+            default_rx.try_recv().is_err(),
+            "default upstream did not receive S3 call"
+        );
+
+        let sqs_req = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/"))
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "AmazonSQS.SendMessage")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(Full::new(Bytes::from_static(
+                br#"{"QueueUrl":"http://127.0.0.1:9297/000000000000/jobs","MessageBody":"ok"}"#,
+            )))
+            .unwrap();
+        let resp2 = h2_sender.send_request(sqs_req).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let _ = resp2.into_body().collect().await.unwrap();
+        assert!(
+            default_rx.try_recv().is_ok(),
+            "SQS call routed to default upstream"
+        );
+
+        server.stop(Duration::from_millis(200)).await;
+        server.join(Duration::from_secs(2)).await;
+
+        let written = traces(&temp.trace());
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].target.as_deref(), Some("s3://assets/logo.svg"));
+        assert_eq!(written[1].target.as_deref(), Some("queue/jobs"));
     }
 }

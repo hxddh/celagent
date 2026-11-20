@@ -54,16 +54,17 @@ not compatible with earlier files.
 | `blocked` | `true` when `--enforce` denied the call at the proxy with an AWS `AccessDenied` reply |
 | `blocked_phase` | `request` (the call never reached the emulator) or `response` (the emulator had already run it; only its response revealed the denied permission, e.g. the SSE-KMS key of an S3 object) |
 | `replay_of` | the id of the recorded call this one re-sends (`x-lenslet-replay-of`) |
+| `caller_role` | normalized IAM role ARN (`arn:aws:iam::*:role/...`) when the call used temporary session credentials from an earlier `sts:AssumeRole*` call in the run |
+| `target` | human-readable semantic target summary (e.g. `table/orders · orderId="ord-42"`, `s3://bucket/key`, `queue/jobs`) |
 | `request`, `response` | `{headers, content_type?, body?}` |
 
 `body` is `{text?, hex?, encoding?, bytes, truncated, binary, sha256}`. Headers,
 query strings and bodies are preserved verbatim with **zero redaction**. `text`
 holds up to 1 MiB by default (`--max-body` to change) of decoded text (`identity`,
-`aws-chunked`, `application/vnd.amazon.eventstream`, `gzip` or `deflate`
-unframed/decompressed for reading, including readable UTF-8 payloads without an
-explicit text `content-type`; wire bytes are forwarded untouched). Binary payloads
-record `hex` (first 512 bytes) alongside `bytes` and `sha256` over the whole wire
-body.
+`aws-chunked`, `application/vnd.amazon.eventstream`, `gzip`, `deflate`, `zstd`,
+and Smithy RPCv2 / AWS CBOR decoded into JSON for reading; wire bytes are
+forwarded untouched). Binary payloads record `hex` (first 512 bytes) alongside
+`bytes` and `sha256` over the whole wire body.
 
 ### Access derivation
 
@@ -119,6 +120,7 @@ summaries.
 | `calls`, `retries`, `errors`, `blocked`, `unfinished`, `services`, `unmapped` | counts (`retries`, `blocked` and `unmapped` omitted when empty) |
 | `failures` | `[{id, service, operation, status, code, message?, hint?, attempt?, max_attempts?, blocked?}]` |
 | `access` | `[{action, resource, calls, errors, implied?, new?, via?}]`, sorted; `via` names the first calls that needed it, e.g. `DYNAMODB DeleteItem` |
+| `roles` | `{ "<role arn>": [access entries...] }` per-role permission breakdown when `sts:AssumeRole*` session credentials were used (omitted when empty) |
 | `lock`, `policy` | the lock file or IAM policy JSON compared/enforced with, or `null` |
 | `access_added` | used by this run, not in the lock/policy |
 | `access_unused` | in the lock, not used by this run |
@@ -141,7 +143,7 @@ summaries.
 While a run is going, the proxy also answers two requests of its own on the
 run's `endpoint`. They never reach the emulator and are never recorded.
 
-- `GET /_lenslet/health` → `200 {"run": "<run id>", "pid": <lenslet's pid>}`.
+- `GET /_lenslet/health` → `200 {"run": "<run id>", "pid": <pid>, "endpoint": "...", "upstream": "...", "routes": {...}, "enforce": <bool>, "calls": <n>, "errors": <n>, "blocked": <n>}`.
 - `GET /_lenslet/events` → `200`, `content-type: text/event-stream`: every
   line already in the run file, in order (the `run` header first), then each
   new line as it is written, each as one event `data: <the exact JSONL
@@ -184,5 +186,7 @@ top of the file; other comments are not kept. `--lock PATH` uses another file.
 
 ## Retention
 
-Lenslet keeps the newest 20 finished runs. A run without an `end` line whose
-process is still alive is never deleted.
+Lenslet keeps the newest 20 finished runs, while always preserving active runs,
+runs pinned in `~/.lenslet/runs/pinned.json`, and up to 2 recent runs per
+secondary project workspace so one busy repository does not evict another's
+baseline.

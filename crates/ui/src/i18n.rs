@@ -52,6 +52,35 @@ pub fn copied(item: &str, lang: Lang) -> String {
     }
 }
 
+pub fn calls_count(n: usize, lang: Lang) -> String {
+    match (n, lang) {
+        (_, Lang::Zh) => format!("{n} 次调用"),
+        (1, Lang::En) => "1 call".to_string(),
+        (n, Lang::En) => format!("{n} calls"),
+    }
+}
+
+pub fn hits_count(n: usize, lang: Lang) -> String {
+    match lang {
+        Lang::Zh => format!("{n} 处匹配"),
+        Lang::En => format!("{n} hits"),
+    }
+}
+
+pub fn not_in_lock_badge(n: usize, lang: Lang) -> String {
+    match lang {
+        Lang::Zh => format!("+{n} 未入锁"),
+        Lang::En => format!("+{n} not in lock"),
+    }
+}
+
+pub fn more_count(n: usize, lang: Lang) -> String {
+    match lang {
+        Lang::Zh => format!("+{n} 更多"),
+        Lang::En => format!("+{n} more"),
+    }
+}
+
 /// `⌘K` on macOS, `Ctrl+K` elsewhere.
 pub fn shortcut(key: &str) -> String {
     if cfg!(target_os = "macos") {

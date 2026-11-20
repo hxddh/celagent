@@ -4,7 +4,7 @@
 //! kept; a run that is still going is never deleted.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -133,11 +133,76 @@ pub fn resolve(dir: &Path, spec: &str) -> Result<PathBuf> {
     }
 }
 
+pub fn pinned_file(dir: &Path) -> PathBuf {
+    dir.join("pinned.json")
+}
+
+pub fn read_pinned(dir: &Path) -> BTreeSet<String> {
+    let Ok(text) = fs::read_to_string(pinned_file(dir)) else {
+        return BTreeSet::new();
+    };
+    serde_json::from_str::<BTreeSet<String>>(&text).unwrap_or_default()
+}
+
+pub fn set_pinned(dir: &Path, id: &str, pin: bool) -> Result<bool> {
+    if !dir.exists() {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        set_mode(dir, 0o700)?;
+    }
+    let mut set = read_pinned(dir);
+    let changed = if pin {
+        set.insert(id.to_string())
+    } else {
+        set.remove(id)
+    };
+    if changed {
+        let dest = pinned_file(dir);
+        let tmp = dir.join(format!(".pinned.{}.tmp", std::process::id()));
+        let body = serde_json::to_string_pretty(&set)?;
+        fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+        set_mode(&tmp, 0o600)?;
+        fs::rename(&tmp, &dest).with_context(|| format!("rename {}", dest.display()))?;
+    }
+    Ok(changed)
+}
+
 fn prune(dir: &Path, keep: usize) {
     let runs = list(dir);
     let excess = runs.len().saturating_sub(keep);
-    let finished = runs.into_iter().filter(|run| !is_active(run));
-    for run in finished.take(excess) {
+    if excess == 0 {
+        return;
+    }
+    let pinned = read_pinned(dir);
+    // Protect active and pinned runs unconditionally, plus up to 2 newest
+    // finished runs per distinct workspace `cwd` when multiple projects share
+    // `~/.lenslet/runs` so one noisy test loop never wipes another repo's history.
+    let mut per_cwd_seen: HashMap<String, usize> = HashMap::new();
+    let mut distinct_cwds: BTreeSet<String> = BTreeSet::new();
+    let mut run_cwds: HashMap<PathBuf, String> = HashMap::new();
+    for path in &runs {
+        if let Some(h) = header(path)
+            && !h.cwd.is_empty()
+        {
+            distinct_cwds.insert(h.cwd.clone());
+            run_cwds.insert(path.clone(), h.cwd);
+        }
+    }
+    let mut protected: BTreeSet<PathBuf> = BTreeSet::new();
+    if distinct_cwds.len() > 1 {
+        for path in runs.iter().rev() {
+            if let Some(cwd) = run_cwds.get(path) {
+                let count = per_cwd_seen.entry(cwd.clone()).or_default();
+                if *count < 2 {
+                    *count += 1;
+                    protected.insert(path.clone());
+                }
+            }
+        }
+    }
+    let candidates = runs.into_iter().filter(|run| {
+        !is_active(run) && !pinned.contains(&run_id(run)) && !protected.contains(run)
+    });
+    for run in candidates.take(excess) {
         let _ = fs::remove_file(run);
     }
 }
@@ -361,6 +426,54 @@ mod tests {
         assert_ne!(first, second);
         assert!(first < second, "{first:?} should sort before {second:?}");
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pinned_runs_and_other_workspaces_survive_pruning() {
+        let dir = temp_dir("pinned");
+        let pinned_path = write_run(&dir, "20261110-000000-1", 0, &["baseline"], Some(0));
+        assert!(set_pinned(&dir, "20261110-000000-1", true).unwrap());
+        assert!(read_pinned(&dir).contains("20261110-000000-1"));
+
+        // Write one finished run in `/repo-a`, then 25 finished runs in `/w`.
+        let other_repo = dir.join("20261111-000000-1.jsonl");
+        fs::write(
+            &other_repo,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "run", "version": 3, "run": "20261111-000000-1",
+                    "command": ["cargo", "test"], "cwd": "/repo-a", "pid": 0,
+                    "endpoint": "http://127.0.0.1:1", "upstream": "u", "started": "s",
+                }),
+                serde_json::json!({
+                    "type": "end", "version": 3, "run": "20261111-000000-1", "exit_code": 0,
+                    "ended": "e", "duration_ms": 1, "calls": 0, "errors": 0, "unfinished": 0,
+                    "services": {}, "failures": [], "access": [], "lock": null,
+                    "access_added": [], "access_unused": [], "regressions": null,
+                    "trace": "", "endpoint": "", "upstream": ""
+                }),
+            ),
+        )
+        .unwrap();
+        for index in 0..25 {
+            write_run(
+                &dir,
+                &format!("20261115-0000{index:02}-1"),
+                0,
+                &["t"],
+                Some(0),
+            );
+        }
+        let _ = create(&dir).unwrap();
+        assert!(pinned_path.exists(), "pinned run must never be pruned");
+        assert!(
+            other_repo.exists(),
+            "secondary workspace run survives noisy loop"
+        );
+        assert!(set_pinned(&dir, "20261110-000000-1", false).unwrap());
+        assert!(!read_pinned(&dir).contains("20261110-000000-1"));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

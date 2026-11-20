@@ -1,13 +1,13 @@
 //! The call inspector: what the call was, why it failed, and its payloads.
-//! Three tabs — Exchange (diagnosis, replay, retries and one body view with a
-//! single Decoded/Raw toggle), Headers and Access. Bodies are hydrated and
-//! highlighted off the main thread, cached, and shown in a virtualized view.
+//! Three tabs — Exchange (diagnosis, replay, retries, body & unified diff view
+//! with Decoded/Raw toggle + search match stepper), Headers (structured SigV4 &
+//! query/header table or raw wire text), and Access.
 
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Render, Stateful, Task, Window, div, prelude::*, px, rgb,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Div, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, Render, Stateful, Task, Window, div, prelude::*, px, rgb,
 };
 
 use super::{
@@ -17,10 +17,11 @@ use super::{
 };
 use crate::{
     body::{self, BodyDoc, BodyMode, DocCache, DocKey},
-    fonts, glyph,
+    fonts, glyph, i18n,
     model::{
-        Access, Body, Exchange, Trace, display_path, format_bytes, format_latency, full_time,
-        operation_label, short_clock, status_label, status_text, to_curl,
+        Access, Body, Exchange, Header, Trace, decode_aws_semantic, decode_sigv4_header,
+        decoded_query_params, display_path, format_bytes, format_latency, full_time,
+        operation_label, pretty_body, short_clock, status_label, status_text, to_curl,
     },
     replay::{self, ReplayOutcome, ReplayState, ReplayTarget},
     syntax::SyntaxKind,
@@ -42,6 +43,7 @@ pub enum Side {
     Request,
     Response,
     Replay,
+    Diff,
 }
 
 pub enum InspectorEvent {
@@ -49,6 +51,8 @@ pub enum InspectorEvent {
     OpenAccess(Access),
     /// Select another call (a retry attempt).
     Select(String),
+    /// Open the interactive Request Composer for this call & target.
+    OpenComposer(Arc<Trace>, ReplayTarget),
     Toast(String),
 }
 
@@ -61,6 +65,7 @@ pub struct Inspector {
     pub tab: Tab,
     side: Side,
     mode: BodyMode,
+    headers_raw: bool,
     tokens: Vec<String>,
     body: Entity<BodyView>,
     docs: DocCache,
@@ -85,9 +90,10 @@ impl Inspector {
         let body = cx.new(|cx| BodyView::new("body", cx));
         let subscription = cx.subscribe(&body, |_, _, event, cx| match event {
             BodyViewEvent::Copied(bytes) => {
-                cx.emit(InspectorEvent::Toast(format!(
-                    "Copied {}",
-                    format_bytes(*bytes)
+                let lang = Ui::of(cx).lang;
+                cx.emit(InspectorEvent::Toast(i18n::copied(
+                    &format_bytes(*bytes),
+                    lang,
                 )));
             }
         });
@@ -100,6 +106,7 @@ impl Inspector {
             tab: Tab::Exchange,
             side: Side::Response,
             mode: BodyMode::Decoded,
+            headers_raw: false,
             tokens: Vec::new(),
             body,
             docs: DocCache::default(),
@@ -135,7 +142,7 @@ impl Inspector {
         self.generation += 1;
         if new_call {
             self.side = default_side(call.as_deref());
-            if self.side == Side::Replay {
+            if matches!(self.side, Side::Replay | Side::Diff) {
                 self.side = Side::Response;
             }
         }
@@ -183,6 +190,10 @@ impl Inspector {
             self.tokens = tokens;
             self.rebuild(cx);
         }
+    }
+
+    pub fn step_match(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.body.update(cx, |body, cx| body.step_match(delta, cx));
     }
 
     /// The look changed: cached highlights are stale.
@@ -235,8 +246,9 @@ impl Inspector {
             }
             (_, Side::Response) => (1, ui.t("No response body", "没有响应体")),
             (_, Side::Replay) => (2, ui.t("Replay has no body", "重放没有响应体")),
+            (_, Side::Diff) => (3, ui.t("No diff available", "暂无差异")),
         };
-        if self.tab == Tab::Access {
+        if self.tab == Tab::Access || (self.tab == Tab::Headers && !self.headers_raw) {
             return;
         }
         let key = DocKey {
@@ -279,10 +291,10 @@ impl Inspector {
         }));
     }
 
-    // -- Replay ----------------------------------------------------------------
+    // -- Replay & Composer -----------------------------------------------------
 
     /// Through the live proxy when the run is live, else straight to the emulator.
-    fn replay_target(&self, cx: &App) -> Option<ReplayTarget> {
+    pub fn replay_target(&self, cx: &App) -> Option<ReplayTarget> {
         let session = self.session.read(cx);
         if session.demo {
             return None;
@@ -307,6 +319,31 @@ impl Inspector {
         }
     }
 
+    pub fn open_composer(&mut self, cx: &mut Context<Self>) {
+        if let (Some(call), Some(target)) = (self.full.clone(), self.replay_target(cx))
+            && replay::can_replay(&call, Some(&target.url))
+        {
+            cx.emit(InspectorEvent::OpenComposer(call, target));
+        }
+    }
+
+    pub fn apply_composed_replay(
+        &mut self,
+        call_id: String,
+        state: ReplayState,
+        cx: &mut Context<Self>,
+    ) {
+        let done = matches!(state, ReplayState::Done(_));
+        self.replays.insert(call_id.clone(), state);
+        self.tab = Tab::Exchange;
+        if done && self.call.as_ref().is_some_and(|c| c.id == call_id) {
+            self.side = Side::Replay;
+        }
+        self.docs.clear();
+        self.rebuild(cx);
+        cx.notify();
+    }
+
     pub fn replay(&mut self, cx: &mut Context<Self>) {
         let (Some(call), Some(target)) = (self.full.clone(), self.replay_target(cx)) else {
             return;
@@ -329,14 +366,7 @@ impl Inspector {
                     Ok(done) => ReplayState::Done(done),
                     Err(error) => ReplayState::Failed(error),
                 };
-                let done = matches!(state, ReplayState::Done(_));
-                inspector.replays.insert(id.clone(), state);
-                if done && inspector.call.as_ref().is_some_and(|c| c.id == id) {
-                    inspector.side = Side::Replay;
-                }
-                inspector.docs.clear();
-                inspector.rebuild(cx);
-                cx.notify();
+                inspector.apply_composed_replay(id, state, cx);
             })
             .ok();
         })
@@ -353,11 +383,12 @@ impl Inspector {
 
     fn render_header(&self, ui: &Ui, call: &Trace, cx: &mut Context<Self>) -> Div {
         let t = ui.p;
+        let lang = ui.lang;
         let color = ui.service_color(call.service_name());
         let mut top = div()
             .flex()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(6.0))
             .child(
                 div()
                     .flex()
@@ -395,48 +426,61 @@ impl Inspector {
             let live = self
                 .replay_target(cx)
                 .is_some_and(|target| target.via_proxy);
-            top = top.child(
-                widgets::primary_button(
-                    ui,
-                    "replay",
-                    if running {
-                        ui.t("Replaying…", "重放中…")
-                    } else {
-                        ui.t("Replay", "重放")
-                    },
+            top = top
+                .child(
+                    widgets::primary_button(
+                        ui,
+                        "replay",
+                        if running {
+                            ui.t("Replaying…", "重放中…")
+                        } else {
+                            ui.t("Replay", "重放")
+                        },
+                    )
+                    .tooltip(widgets::tip(
+                        if live {
+                            ui.t(
+                                "Send again through the live proxy (recorded in this run)",
+                                "通过运行中的代理重新发送（会记录到本次运行）",
+                            )
+                        } else {
+                            ui.t(
+                                "Send again to the emulator (shown here, not recorded)",
+                                "直接重新发送到模拟器（仅在此显示，不记录）",
+                            )
+                        },
+                        Some(i18n::shortcut("⏎")),
+                    ))
+                    .on_click(cx.listener(|inspector, _, _, cx| inspector.replay(cx))),
                 )
-                .tooltip(widgets::tip(
-                    if live {
-                        ui.t(
-                            "Send again through the live proxy (recorded in this run)",
-                            "通过运行中的代理重新发送（会记录到本次运行）",
-                        )
-                    } else {
-                        ui.t(
-                            "Send again to the emulator (shown here, not recorded)",
-                            "直接重新发送到模拟器（仅在此显示，不记录）",
-                        )
-                    },
-                    Some(crate::i18n::shortcut("⏎")),
-                ))
-                .on_click(cx.listener(|inspector, _, _, cx| inspector.replay(cx))),
-            );
+                .child(
+                    widgets::button(ui, "edit-replay", ui.t("Edit", "编辑"))
+                        .tooltip(widgets::tip(
+                            ui.t(
+                                "Edit payload/headers & auto re-sign SigV4",
+                                "编辑请求参数与报文并自动重签 SigV4",
+                            ),
+                            Some(i18n::shortcut("⇧⏎")),
+                        ))
+                        .on_click(cx.listener(|inspector, _, _, cx| inspector.open_composer(cx))),
+                );
         }
         if let Some(curl) = self.curl(cx) {
             top = top.child(
                 widgets::button(ui, "copy-curl", "curl")
                     .tooltip(widgets::tip(
                         ui.t("Copy as curl", "复制为 curl"),
-                        Some(crate::i18n::shortcut("⇧C")),
+                        Some(i18n::shortcut("⇧C")),
                     ))
                     .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(curl.clone()));
-                        cx.emit(InspectorEvent::Toast("Copied curl".into()));
+                        cx.write_to_clipboard(ClipboardItem::new_string(curl.clone()));
+                        cx.emit(InspectorEvent::Toast(i18n::copied("curl", lang)));
                     })),
             );
         }
 
         let path = call.path.clone();
+        let semantic = call.semantic_target();
         let path_row = div()
             .id("inspector-path")
             .flex()
@@ -449,13 +493,13 @@ impl Inspector {
                 Some(ui.t("click to copy", "点击复制").into()),
             ))
             .on_click(cx.listener(move |_, _, _, cx| {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
-                cx.emit(InspectorEvent::Toast("Copied path".into()));
+                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                cx.emit(InspectorEvent::Toast(i18n::copied("path", lang)));
             }))
             .child(
                 div()
                     .flex_shrink_0()
-                    .font_family(fonts::mono())
+                    .font(fonts::mono_font())
                     .text_size(px(text::SM))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(t.accent))
@@ -465,13 +509,17 @@ impl Inspector {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
-                    .font_family(fonts::mono())
+                    .font(fonts::mono_font())
                     .text_size(px(text::SM))
                     .text_color(rgb(t.text_dim))
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(display_path(call).to_string()),
+                    .child(if !semantic.is_empty() {
+                        semantic
+                    } else {
+                        display_path(call).to_string()
+                    }),
             );
 
         let status_tint = if call.pending {
@@ -484,7 +532,7 @@ impl Inspector {
             .items_center()
             .gap(px(12.0))
             .mt(px(6.0))
-            .font_family(fonts::mono())
+            .font(fonts::mono_font())
             .text_size(px(text::SM))
             .child(
                 div()
@@ -506,7 +554,7 @@ impl Inspector {
                         ui.latency_color(call.ms)
                     })
                     .child(if call.pending {
-                        "running".to_string()
+                        ui.t("running", "进行中").to_string()
                     } else {
                         format_latency(call.ms)
                     }),
@@ -596,7 +644,7 @@ impl Inspector {
                     .when_some(count.filter(|n| *n > 0), |el, count| {
                         el.child(
                             div()
-                                .font_family(fonts::mono())
+                                .font(fonts::mono_font())
                                 .text_size(px(text::XS))
                                 .text_color(rgb(t.text_muted))
                                 .child(count.to_string()),
@@ -629,7 +677,7 @@ impl Inspector {
             ))
             .child(
                 div()
-                    .font_family(fonts::mono())
+                    .font(fonts::mono_font())
                     .text_size(px(text::LG))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(t.red))
@@ -674,7 +722,7 @@ impl Inspector {
         let dismiss = widgets::button(ui, "dismiss-replay", ui.t("Dismiss", "关闭")).on_click(
             cx.listener(move |inspector, _, _, cx| {
                 inspector.replays.remove(&id);
-                if inspector.side == Side::Replay {
+                if matches!(inspector.side, Side::Replay | Side::Diff) {
                     inspector.side = Side::Response;
                     inspector.rebuild(cx);
                 }
@@ -717,6 +765,10 @@ impl Inspector {
             ReplayState::Done(out) => {
                 let ok = out.status < 400;
                 let color = if ok { t.green } else { t.red };
+                let diff_btn = widgets::button(ui, "show-replay-diff", ui.t("Diff", "对比差异"))
+                    .on_click(cx.listener(|inspector, _, _, cx| {
+                        inspector.set_side(Side::Diff, cx);
+                    }));
                 card.border_color(theme::h(color, 0.4))
                     .bg(theme::h(color, 0.05))
                     .child(
@@ -726,6 +778,7 @@ impl Inspector {
                             .gap(px(8.0))
                             .child(widgets::label(ui, ui.t("REPLAY", "重放结果")))
                             .child(div().flex_1())
+                            .child(diff_btn)
                             .child(dismiss),
                     )
                     .child(
@@ -793,7 +846,7 @@ impl Inspector {
                         theme::h(color, 0.4)
                     })
                     .bg(theme::h(color, 0.08))
-                    .font_family(fonts::mono())
+                    .font(fonts::mono_font())
                     .text_size(px(text::SM))
                     .text_color(rgb(color))
                     .cursor_pointer()
@@ -847,20 +900,28 @@ impl Inspector {
                 active: self.side == Side::Replay,
                 tooltip: None,
             });
+            segments.push(widgets::Segment {
+                id: "side-diff",
+                label: ui.t("Diff", "差异").into(),
+                active: self.side == Side::Diff,
+                tooltip: None,
+            });
         }
         let entity = cx.entity();
         let sides = widgets::segmented(ui, segments, move |index, _, cx| {
-            let side = [Side::Request, Side::Response, Side::Replay][index];
+            let side = [Side::Request, Side::Response, Side::Replay, Side::Diff][index];
             entity.update(cx, |inspector, cx| inspector.set_side(side, cx));
         });
 
-        let doc = self.body.read(cx).doc().clone();
-        let meta = self.body_meta(call);
-        let mut toolbar = div().flex().items_center().gap(px(8.0)).child(sides).child(
+        let body_ref = self.body.read(cx);
+        let doc = body_ref.doc().clone();
+        let match_pos = body_ref.match_status();
+        let meta = self.body_meta(call, ui);
+        let mut toolbar = div().flex().items_center().gap(px(6.0)).child(sides).child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .font_family(fonts::mono())
+                .font(fonts::mono_font())
                 .text_size(px(text::XS))
                 .text_color(rgb(t.text_muted))
                 .whitespace_nowrap()
@@ -868,14 +929,40 @@ impl Inspector {
                 .text_ellipsis()
                 .child(meta),
         );
-        if doc.matches > 0 {
-            toolbar = toolbar.child(widgets::badge(
-                ui,
-                format!("{} hits", doc.matches),
-                t.accent,
-            ));
+        if let Some((cur_m, total_m)) = match_pos {
+            let body_prev = self.body.clone();
+            let body_next = self.body.clone();
+            toolbar = toolbar.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(widgets::badge(ui, format!("{cur_m}/{total_m}"), t.accent))
+                    .child(
+                        widgets::button(ui, "match-prev", "▲")
+                            .px(px(5.0))
+                            .tooltip(widgets::tip(
+                                i18n::hits_count(doc.matches, ui.lang),
+                                Some(i18n::shortcut("⇧G")),
+                            ))
+                            .on_click(move |_, _, cx| {
+                                body_prev.update(cx, |b, cx| b.step_match(-1, cx))
+                            }),
+                    )
+                    .child(
+                        widgets::button(ui, "match-next", "▼")
+                            .px(px(5.0))
+                            .tooltip(widgets::tip(
+                                i18n::hits_count(doc.matches, ui.lang),
+                                Some(i18n::shortcut("G")),
+                            ))
+                            .on_click(move |_, _, cx| {
+                                body_next.update(cx, |b, cx| b.step_match(1, cx))
+                            }),
+                    ),
+            );
         }
-        if doc.decodable {
+        if doc.decodable && self.side != Side::Diff {
             let decoded = self.mode == BodyMode::Decoded;
             let label = match (decoded, doc.decoder) {
                 (true, Some(decoder)) => format!("{} · {decoder}", ui.t("Decoded", "已解码")),
@@ -905,9 +992,9 @@ impl Inspector {
                     .tooltip(widgets::tip(
                         ui.t(
                             "Copy the selection, or the whole body",
-                            "复制选中行或整个报文",
+                            "复制选中字符或整个报文",
                         ),
-                        Some(crate::i18n::shortcut("C")),
+                        Some(i18n::shortcut("C")),
                     ))
                     .on_click(move |_, _, cx| body.update(cx, |body, cx| body.copy(cx))),
             );
@@ -927,11 +1014,19 @@ impl Inspector {
             .child(super::cached(&self.body))
     }
 
-    fn body_meta(&self, call: &Trace) -> String {
+    fn body_meta(&self, call: &Trace, ui: &Ui) -> String {
+        if self.side == Side::Diff {
+            return ui
+                .t(
+                    "Unified diff (Recorded → Replay)",
+                    "统一差异对比（原始 → 重放）",
+                )
+                .into();
+        }
         let exchange: Option<&Exchange> = match self.side {
             Side::Request => call.request.as_ref(),
             Side::Response => call.response.as_ref(),
-            Side::Replay => None,
+            Side::Replay | Side::Diff => None,
         };
         if self.side == Side::Replay {
             if let Some(ReplayState::Done(out)) = self.replays.get(&call.id) {
@@ -954,10 +1049,10 @@ impl Inspector {
                 parts.push(encoding.to_string());
             }
             if body.truncated {
-                parts.push("truncated".into());
+                parts.push(ui.t("truncated", "已截断").into());
             }
             if body.binary {
-                parts.push("binary".into());
+                parts.push(ui.t("binary", "二进制").into());
             }
         }
         if let Some(ct) = exchange.content_type.as_deref() {
@@ -966,8 +1061,148 @@ impl Inspector {
         parts.join(" · ")
     }
 
-    fn render_headers(&self, ui: &Ui) -> Div {
+    fn render_headers(&self, ui: &Ui, call: &Trace, cx: &mut Context<Self>) -> Div {
+        let t = ui.p;
+        let lang = ui.lang;
+        let entity = cx.entity();
+        let mode_seg = widgets::segmented(
+            ui,
+            vec![
+                widgets::Segment {
+                    id: "hdr-table",
+                    label: ui.t("Structured", "结构化").into(),
+                    active: !self.headers_raw,
+                    tooltip: None,
+                },
+                widgets::Segment {
+                    id: "hdr-raw",
+                    label: ui.t("Raw", "原始文本").into(),
+                    active: self.headers_raw,
+                    tooltip: None,
+                },
+            ],
+            move |ix, _, cx| {
+                entity.update(cx, |insp, cx| {
+                    insp.headers_raw = ix == 1;
+                    insp.rebuild(cx);
+                    cx.notify();
+                });
+            },
+        );
+
         let body = self.body.clone();
+        let top_bar = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(mode_seg)
+            .child(div().flex_1())
+            .when(self.headers_raw, |bar| {
+                bar.child(
+                    widgets::button(ui, "copy-headers", ui.t("Copy", "复制"))
+                        .on_click(move |_, _, cx| body.update(cx, |body, cx| body.copy(cx))),
+                )
+            });
+
+        if self.headers_raw {
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .gap(px(12.0))
+                .p(px(16.0))
+                .child(top_bar)
+                .child(super::cached(&self.body));
+        }
+
+        let mut scroll = div()
+            .id("headers-structured-scroll")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .gap(px(14.0));
+
+        // 1. SigV4 Authorization Scope breakdown
+        if let Some(auth_val) = call
+            .request
+            .as_ref()
+            .and_then(|r| r.header("authorization"))
+            .and_then(decode_sigv4_header)
+        {
+            let mut sig_box = div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .p(px(10.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(theme::h(t.accent, 0.30))
+                .bg(theme::h(t.accent, 0.05))
+                .child(widgets::label(
+                    ui,
+                    ui.t("SIGV4 CREDENTIAL SCOPE", "SIGV4 签名凭证域"),
+                ));
+            for (k, v) in [
+                ("Algorithm", "AWS4-HMAC-SHA256".to_string()),
+                ("AccessKeyId", auth_val.access_key_id),
+                (
+                    "Scope",
+                    format!("{}/{}/{}", auth_val.date, auth_val.region, auth_val.service),
+                ),
+                ("SignedHeaders", auth_val.signed_headers),
+            ] {
+                sig_box = sig_box.child(widgets::meta_row(ui, k, widgets::mono(ui, v)));
+            }
+            scroll = scroll.child(sig_box);
+        }
+
+        // 2. Decoded Query Parameters
+        let query_params = decoded_query_params(&call.path);
+        if !query_params.is_empty() {
+            scroll = scroll.child(
+                self.render_kv_section(
+                    ui,
+                    ui.t("QUERY PARAMETERS", "URL 查询参数"),
+                    "qp",
+                    &query_params
+                        .into_iter()
+                        .map(|(name, value)| Header { name, value })
+                        .collect::<Vec<_>>(),
+                    lang,
+                    cx,
+                ),
+            );
+        }
+
+        // 3. Request & Response Headers
+        if let Some(req) = call.request.as_ref()
+            && !req.headers.is_empty()
+        {
+            scroll = scroll.child(self.render_kv_section(
+                ui,
+                ui.t("REQUEST HEADERS", "请求 Headers"),
+                "req-h",
+                &req.headers,
+                lang,
+                cx,
+            ));
+        }
+        if let Some(res) = call.response.as_ref()
+            && !res.headers.is_empty()
+        {
+            scroll = scroll.child(self.render_kv_section(
+                ui,
+                ui.t("RESPONSE HEADERS", "响应 Headers"),
+                "res-h",
+                &res.headers,
+                lang,
+                cx,
+            ));
+        }
+
         div()
             .flex()
             .flex_col()
@@ -975,21 +1210,86 @@ impl Inspector {
             .min_h(px(0.0))
             .gap(px(12.0))
             .p(px(16.0))
-            .child(
+            .child(top_bar)
+            .child(scroll)
+    }
+
+    fn render_kv_section(
+        &self,
+        ui: &Ui,
+        title: &str,
+        prefix: &'static str,
+        items: &[Header],
+        lang: crate::prefs::Lang,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let t = ui.p;
+        let mut table = div()
+            .flex()
+            .flex_col()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgb(t.border_subtle))
+            .bg(rgb(t.code))
+            .overflow_hidden();
+        for (ix, h) in items.iter().enumerate() {
+            let line = format!("{}: {}", h.name, h.value);
+            let name_label = h.name.clone();
+            table = table.child(
                 div()
+                    .id(ElementId::Name(format!("{prefix}-{ix}").into()))
                     .flex()
                     .items_center()
-                    .child(widgets::label(
-                        ui,
-                        ui.t("REQUEST & RESPONSE HEADERS", "请求与响应 Headers"),
+                    .gap(px(10.0))
+                    .min_h(px(26.0))
+                    .px(px(10.0))
+                    .py(px(3.0))
+                    .when(ix > 0, |el| {
+                        el.border_t_1().border_color(rgb(t.border_subtle))
+                    })
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(t.row_hover)))
+                    .tooltip(widgets::tip(
+                        line.clone(),
+                        Some(ui.t("click to copy", "点击复制").into()),
                     ))
-                    .child(div().flex_1())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(line.clone()));
+                        cx.emit(InspectorEvent::Toast(i18n::copied(&name_label, lang)));
+                    }))
                     .child(
-                        widgets::button(ui, "copy-headers", ui.t("Copy", "复制"))
-                            .on_click(move |_, _, cx| body.update(cx, |body, cx| body.copy(cx))),
+                        div()
+                            .w(px(148.0))
+                            .flex_shrink_0()
+                            .font(fonts::mono_font())
+                            .text_size(px(text::XS))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(t.accent))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(h.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .font(fonts::mono_font())
+                            .text_size(px(text::XS))
+                            .text_color(rgb(t.text_body))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(h.value.clone()),
                     ),
-            )
-            .child(super::cached(&self.body))
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(widgets::label(ui, title.to_string()))
+            .child(table)
     }
 
     fn render_access(&self, ui: &Ui, call: &Trace, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1011,7 +1311,7 @@ impl Inspector {
             let key = access.key();
             let mut name = div().flex().items_center().gap(px(6.0)).child(
                 div()
-                    .font_family(fonts::mono())
+                    .font(fonts::mono_font())
                     .text_size(px(text::MD))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(t.text))
@@ -1058,9 +1358,23 @@ impl Inspector {
             })
             .unwrap_or("—")
             .to_string();
-        let mut meta = div()
-            .flex()
-            .flex_col()
+        let mut meta = div().flex().flex_col();
+        let semantic = call.semantic_target();
+        if !semantic.is_empty() {
+            meta = meta.child(widgets::meta_row(
+                ui,
+                ui.t("Target", "目标资源"),
+                widgets::mono(ui, semantic),
+            ));
+        }
+        if let Some(role) = call.caller_role.as_deref() {
+            meta = meta.child(widgets::meta_row(
+                ui,
+                ui.t("Assumed Role", "调用角色"),
+                widgets::mono(ui, role.to_string()),
+            ));
+        }
+        meta = meta
             .child(widgets::meta_row(
                 ui,
                 "Started",
@@ -1154,7 +1468,7 @@ impl Inspector {
                     div()
                         .min_w(px(56.0))
                         .text_right()
-                        .font_family(fonts::mono())
+                        .font(fonts::mono_font())
                         .text_size(px(text::SM))
                         .text_color(rgb(t.text_dim))
                         .child(k.to_string()),
@@ -1181,10 +1495,7 @@ impl Inspector {
             )
             .child(key("j / k", ui.t("next / previous", "下一个 / 上一个")))
             .child(key("/", ui.t("search", "搜索")))
-            .child(key(
-                &crate::i18n::shortcut("K"),
-                ui.t("commands", "命令面板"),
-            ))
+            .child(key(&i18n::shortcut("K"), ui.t("commands", "命令面板")))
             .into_any_element()
     }
 }
@@ -1205,7 +1516,7 @@ fn compare_column(ui: &Ui, title: &str, status: u16, ms: u64, bytes: usize) -> D
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .font_family(fonts::mono())
+                .font(fonts::mono_font())
                 .text_size(px(text::MD))
                 .child(
                     div()
@@ -1237,11 +1548,37 @@ fn default_side(call: Option<&Trace>) -> Side {
     }
 }
 
+fn format_for_diff(body: Option<&Body>, content_type: &str, mode: BodyMode) -> String {
+    let Some(body) = body else {
+        return String::new();
+    };
+    let Some(text) = body.text.as_deref() else {
+        return String::new();
+    };
+    if mode == BodyMode::Decoded {
+        if let Some((_, decoded, _)) =
+            decode_aws_semantic(text, content_type, body.encoding.as_deref())
+        {
+            return decoded;
+        }
+        if let Some(pretty) = pretty_body(text, content_type) {
+            return pretty;
+        }
+    }
+    text.to_string()
+}
+
 /// What a document is built from (owned, so it can move to a background task).
 enum DocSource {
     Body {
         body: Option<Body>,
         content_type: String,
+    },
+    Diff {
+        rec_body: Option<Body>,
+        rec_ct: String,
+        rep_body: Option<Body>,
+        rep_ct: String,
     },
     Text(String),
 }
@@ -1291,6 +1628,28 @@ impl DocSource {
                 },
                 _ => DocSource::Text(String::new()),
             },
+            Side::Diff => match replay {
+                Some(ReplayState::Done(ReplayOutcome {
+                    body_text,
+                    content_type,
+                    body_bytes,
+                    ..
+                })) => DocSource::Diff {
+                    rec_body: call.response.as_ref().and_then(|e| e.body.clone()),
+                    rec_ct: call
+                        .response
+                        .as_ref()
+                        .and_then(|e| e.content_type.clone())
+                        .unwrap_or_default(),
+                    rep_body: body_text.clone().map(|text| Body {
+                        text: Some(text),
+                        bytes: *body_bytes,
+                        ..Body::default()
+                    }),
+                    rep_ct: content_type.clone().unwrap_or_default(),
+                },
+                _ => DocSource::Text(String::new()),
+            },
         }
     }
 
@@ -1299,6 +1658,18 @@ impl DocSource {
             DocSource::Body { body, .. } => body.as_ref().map_or(0, |body| {
                 body.text.as_ref().map_or(0, String::len) + body.hex.as_ref().map_or(0, String::len)
             }),
+            DocSource::Diff {
+                rec_body, rep_body, ..
+            } => {
+                rec_body
+                    .as_ref()
+                    .and_then(|b| b.text.as_ref())
+                    .map_or(0, String::len)
+                    + rep_body
+                        .as_ref()
+                        .and_then(|b| b.text.as_ref())
+                        .map_or(0, String::len)
+            }
             DocSource::Text(text) => text.len(),
         }
     }
@@ -1307,6 +1678,17 @@ impl DocSource {
         match self {
             DocSource::Body { body, content_type } => {
                 body::build(body.as_ref(), content_type, mode, tokens, palette)
+            }
+            DocSource::Diff {
+                rec_body,
+                rec_ct,
+                rep_body,
+                rep_ct,
+            } => {
+                let a = format_for_diff(rec_body.as_ref(), rec_ct, mode);
+                let b = format_for_diff(rep_body.as_ref(), rep_ct, mode);
+                let unified = body::diff_text(&a, &b);
+                BodyDoc::from_text(unified, SyntaxKind::Diff, tokens, palette)
             }
             DocSource::Text(text) => {
                 BodyDoc::from_text(text.clone(), SyntaxKind::Plain, tokens, palette)
@@ -1334,7 +1716,7 @@ impl Render for Inspector {
         };
         let content: AnyElement = match self.tab {
             Tab::Exchange => self.render_exchange(&ui, &call, cx).into_any_element(),
-            Tab::Headers => self.render_headers(&ui).into_any_element(),
+            Tab::Headers => self.render_headers(&ui, &call, cx).into_any_element(),
             Tab::Access => self.render_access(&ui, &call, cx).into_any_element(),
         };
         container

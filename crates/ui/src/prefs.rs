@@ -91,6 +91,8 @@ pub struct UiPrefs {
     pub inspector_width: f32,
     #[serde(default = "default_true")]
     pub inspector_open: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sidebar_open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_width: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +109,7 @@ impl Default for UiPrefs {
             reduce_motion: false,
             inspector_width: default_inspector_width(),
             inspector_open: true,
+            sidebar_open: false,
             window_width: None,
             window_height: None,
         }
@@ -213,6 +216,7 @@ mod tests {
             reduce_motion: true,
             inspector_width: 520.0,
             inspector_open: false,
+            sidebar_open: true,
             window_width: Some(1440.0),
             window_height: Some(900.0),
         };

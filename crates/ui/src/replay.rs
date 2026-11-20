@@ -126,6 +126,21 @@ pub struct ReplayTarget {
     pub via_proxy: bool,
 }
 
+/// An interactive request edited in the Request Composer.
+#[derive(Clone, Debug)]
+pub struct ComposedRequest {
+    pub call_id: Option<String>,
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub service: String,
+    pub region: String,
+    pub encoding: Option<String>,
+    pub headers: Vec<Header>,
+    pub body: String,
+    pub resign_sigv4: bool,
+}
+
 pub fn replay_call(
     trace: &Trace,
     replay_target: &ReplayTarget,
@@ -144,8 +159,267 @@ pub fn replay_call(
 
     let req_wire = build_http_request(trace, &target, &extra)?;
     let is_head = trace.method.eq_ignore_ascii_case("HEAD");
-    let started = Instant::now();
+    send_wire(&target, &req_wire, is_head, home)
+}
 
+pub fn send_composed(
+    req: &ComposedRequest,
+    replay_target: &ReplayTarget,
+    home: &Path,
+) -> Result<ReplayOutcome, String> {
+    crate::fsguard::assert_io_allowed();
+    let upstream_url = replay_target.url.as_str();
+    let target = parse_loopback_target(upstream_url).ok_or_else(|| {
+        format!("Replay refused: `{upstream_url}` is not a loopback emulator endpoint")
+    })?;
+
+    let method = req.method.trim().to_ascii_uppercase();
+    if method.is_empty() || method.bytes().any(|b| !b.is_ascii_alphabetic()) {
+        return Err(format!("Invalid HTTP method `{method}`"));
+    }
+    let path = if req.path.trim().is_empty() {
+        "/".to_string()
+    } else if req.path.trim().starts_with('/') {
+        req.path.trim().replace(['\r', '\n'], "")
+    } else {
+        format!("/{}", req.path.trim().replace(['\r', '\n'], ""))
+    };
+    let host_val = if req.host.trim().is_empty() {
+        format!("{}:{}", target.host, target.port)
+    } else {
+        req.host.trim().replace(['\r', '\n'], "")
+    };
+
+    let decoded_wire = req.encoding.is_some();
+    let mut clean_headers: Vec<Header> = Vec::with_capacity(req.headers.len() + 2);
+    let mut saw_host = false;
+    for h in &req.headers {
+        let low = h.name.trim().to_ascii_lowercase();
+        if low.is_empty()
+            || matches!(
+                low.as_str(),
+                "content-length" | "transfer-encoding" | "connection" | "expect"
+            )
+            || low.eq_ignore_ascii_case(REPLAY_OF_HEADER)
+        {
+            continue;
+        }
+        if decoded_wire
+            && (matches!(
+                low.as_str(),
+                "content-encoding"
+                    | "x-amz-decoded-content-length"
+                    | "x-amz-trailer"
+                    | "x-amz-sdk-checksum-algorithm"
+                    | "content-md5"
+            ) || low.starts_with("x-amz-checksum-"))
+        {
+            continue;
+        }
+        if low == "host" {
+            saw_host = true;
+        }
+        let val = if !req.resign_sigv4
+            && decoded_wire
+            && low == "x-amz-content-sha256"
+            && h.value.trim().starts_with("STREAMING-")
+        {
+            "UNSIGNED-PAYLOAD".to_string()
+        } else {
+            h.value.replace(['\r', '\n'], " ")
+        };
+        clean_headers.push(Header {
+            name: h.name.trim().replace(['\r', '\n'], ""),
+            value: val,
+        });
+    }
+    if !saw_host {
+        clean_headers.insert(
+            0,
+            Header {
+                name: "host".into(),
+                value: host_val.clone(),
+            },
+        );
+    }
+
+    let cbor_wire = is_cbor_wire(req.encoding.as_deref(), &clean_headers);
+    let wire_body = encode_wire_body(&req.body, cbor_wire)?;
+
+    if req.resign_sigv4 {
+        let svc = if req.service.trim().is_empty() {
+            "s3"
+        } else {
+            req.service.trim()
+        };
+        let reg = if req.region.trim().is_empty() {
+            "us-east-1"
+        } else {
+            req.region.trim()
+        };
+        let existing_ak = clean_headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+            .and_then(|h| crate::model::decode_sigv4_header(&h.value))
+            .map(|d| d.access_key_id)
+            .filter(|k| !k.is_empty());
+        let (ak, sk, tok) = resolve_local_signing_creds(existing_ak.as_deref(), target.port, home);
+        if tok.is_some() || existing_ak.as_deref() != Some(ak.as_str()) {
+            clean_headers.retain(|h| !h.name.eq_ignore_ascii_case("x-amz-security-token"));
+        }
+        crate::sigv4::sign_headers(
+            &mut clean_headers,
+            &wire_body,
+            &crate::sigv4::SignParams {
+                method: &method,
+                path_and_query: &path,
+                host: &host_val,
+                service: svc,
+                region: reg,
+                access_key: &ak,
+                secret_key: &sk,
+                session_token: tok.as_deref(),
+            },
+        );
+    }
+    let final_headers = clean_headers;
+
+    let mut wire = Vec::with_capacity(512 + wire_body.len());
+    wire.extend_from_slice(format!("{method} {path} HTTP/1.1\r\n").as_bytes());
+    for h in &final_headers {
+        wire.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
+    }
+    if replay_target.via_proxy
+        && let Some(id) = req.call_id.as_deref()
+    {
+        let clean = id.replace(['\r', '\n'], " ");
+        wire.extend_from_slice(format!("{REPLAY_OF_HEADER}: {clean}\r\n").as_bytes());
+    }
+    wire.extend_from_slice(format!("Content-Length: {}\r\n", wire_body.len()).as_bytes());
+    wire.extend_from_slice(b"Connection: close\r\n\r\n");
+    wire.extend_from_slice(&wire_body);
+
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    send_wire(&target, &wire, is_head, home)
+}
+
+fn is_cbor_wire(encoding: Option<&str>, headers: &[Header]) -> bool {
+    if encoding.is_some_and(|e| e.to_ascii_lowercase().contains("cbor")) {
+        return true;
+    }
+    headers.iter().any(|h| {
+        (h.name.eq_ignore_ascii_case("content-type")
+            || h.name.eq_ignore_ascii_case("smithy-protocol"))
+            && h.value.to_ascii_lowercase().contains("cbor")
+    })
+}
+
+fn encode_wire_body(text: &str, cbor: bool) -> Result<Vec<u8>, String> {
+    if !cbor {
+        return Ok(text.as_bytes().to_vec());
+    }
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let val: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("CBOR request body must be valid JSON: {e}"))?;
+    Ok(lenslet_core::cbor::encode_cbor(&val))
+}
+
+fn resolve_local_signing_creds(
+    existing_ak: Option<&str>,
+    port: u16,
+    home: &Path,
+) -> (String, String, Option<String>) {
+    // 1. Check AWS Emulator credentials files (`~/.aws/emulator/<port>/emulator_credentials`),
+    // matching `existing_ak` when present or consulting the target/default emulator port.
+    let emu_root = home.join(".aws/emulator");
+    let mut fallback_emu_creds = None;
+    for candidate_port in [port, 9298] {
+        let cred_file = emu_root
+            .join(candidate_port.to_string())
+            .join("emulator_credentials");
+        if let Ok(text) = fs::read_to_string(&cred_file)
+            && let Some(creds) = parse_ini_creds(&text)
+        {
+            if existing_ak.is_none_or(|ak| ak == creds.0) {
+                return creds;
+            }
+            if fallback_emu_creds.is_none() {
+                fallback_emu_creds = Some(creds);
+            }
+        }
+    }
+    if let Some(target_ak) = existing_ak
+        && let Ok(entries) = fs::read_dir(&emu_root)
+    {
+        for entry in entries.flatten() {
+            let cred_file = entry.path().join("emulator_credentials");
+            if let Ok(text) = fs::read_to_string(&cred_file)
+                && let Some(creds) = parse_ini_creds(&text)
+                && creds.0 == target_ak
+            {
+                return creds;
+            }
+        }
+    }
+
+    // 2. Match well-known local placeholder / emulator credential pairs.
+    match existing_ak {
+        Some("lenslet-local") => ("lenslet-local".into(), "lenslet-local".into(), None),
+        Some("test") | None => ("test".into(), "test".into(), None),
+        Some("minioadmin") => ("minioadmin".into(), "minioadmin".into(), None),
+        Some("dummy") => ("dummy".into(), "dummy".into(), None),
+        Some("x") => ("x".into(), "x".into(), None),
+        Some("AKIAIOSFODNN7EXAMPLE") => (
+            "AKIAIOSFODNN7EXAMPLE".into(),
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            None,
+        ),
+        // 3. Unknown or ephemeral STS key without a local secret: use discovered
+        // emulator credentials or fall back to a coherent `lenslet-local` pair.
+        Some(_) => fallback_emu_creds
+            .unwrap_or_else(|| ("lenslet-local".into(), "lenslet-local".into(), None)),
+    }
+}
+
+fn parse_ini_creds(text: &str) -> Option<(String, String, Option<String>)> {
+    let mut ak = None;
+    let mut sk = None;
+    let mut tok = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with(';')
+            || line.starts_with('[')
+        {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim().trim_matches(['"', '\'']).to_string();
+            if val.is_empty() {
+                continue;
+            }
+            match key.as_str() {
+                "aws_access_key_id" if ak.is_none() => ak = Some(val),
+                "aws_secret_access_key" if sk.is_none() => sk = Some(val),
+                "aws_session_token" if tok.is_none() => tok = Some(val),
+                _ => {}
+            }
+        }
+    }
+    Some((ak?, sk?, tok))
+}
+
+fn send_wire(
+    target: &LoopbackTarget,
+    req_wire: &[u8],
+    is_head: bool,
+    home: &Path,
+) -> Result<ReplayOutcome, String> {
+    let started = Instant::now();
     let raw_response = if target.tls {
         let stream = connect_loopback(&target.host, target.port)?;
         let tls_cfg = build_tls_config(target.port, home)?;
@@ -155,14 +429,14 @@ pub fn replay_call(
             .map_err(|e| format!("TLS handshake init failed: {e}"))?;
         let mut tls_stream = StreamOwned::new(conn, stream);
         tls_stream
-            .write_all(&req_wire)
+            .write_all(req_wire)
             .map_err(|e| format!("TLS write failed: {e}"))?;
         tls_stream.flush().ok();
         read_bounded(&mut tls_stream, is_head)?
     } else {
         let mut stream = connect_loopback(&target.host, target.port)?;
         stream
-            .write_all(&req_wire)
+            .write_all(req_wire)
             .map_err(|e| format!("HTTP write failed: {e}"))?;
         stream.flush().ok();
         read_bounded(&mut stream, is_head)?
@@ -227,7 +501,26 @@ fn build_http_request(
         format!("/{}", trace.path)
     };
 
-    let body_bytes: &[u8] = trace
+    let body_encoding = trace
+        .request
+        .as_ref()
+        .and_then(|r| r.body.as_ref())
+        .and_then(|b| b.encoding.as_deref());
+    let decoded_wire = body_encoding.is_some();
+    let compressed_wire = body_encoding.is_some_and(|enc| {
+        let low = enc.to_ascii_lowercase();
+        low.contains("gzip") || low.contains("deflate") || low.contains("zstd")
+    });
+    let cbor_wire = decoded_wire
+        && is_cbor_wire(
+            body_encoding,
+            trace
+                .request
+                .as_ref()
+                .map(|r| r.headers.as_slice())
+                .unwrap_or(&[]),
+        );
+    let body_text = trace
         .request
         .as_ref()
         .and_then(|r| r.body.as_ref())
@@ -235,26 +528,12 @@ fn build_http_request(
             if b.binary || b.truncated {
                 None
             } else {
-                Some(b.text.as_deref().unwrap_or("").as_bytes())
+                Some(b.text.as_deref().unwrap_or(""))
             }
         })
-        .unwrap_or(&[]);
-
-    let decoded_wire = trace
-        .request
-        .as_ref()
-        .and_then(|r| r.body.as_ref())
-        .and_then(|b| b.encoding.as_deref())
-        .is_some();
-    let compressed_wire = trace
-        .request
-        .as_ref()
-        .and_then(|r| r.body.as_ref())
-        .and_then(|b| b.encoding.as_deref())
-        .is_some_and(|enc| {
-            let low = enc.to_ascii_lowercase();
-            low.contains("gzip") || low.contains("deflate")
-        });
+        .unwrap_or("");
+    let owned_body = encode_wire_body(body_text, cbor_wire)?;
+    let body_bytes: &[u8] = &owned_body;
 
     let mut req = Vec::with_capacity(512 + body_bytes.len());
     req.extend_from_slice(format!("{} {} HTTP/1.1\r\n", trace.method, path).as_bytes());
@@ -493,12 +772,24 @@ fn parse_http_response(raw: &[u8], is_head: bool, ms: u64) -> Result<ReplayOutco
             Some("deflate") => decompress_bytes(ZlibDecoder::new(&unchunked[..]))
                 .or_else(|| decompress_bytes(DeflateDecoder::new(&unchunked[..])))
                 .unwrap_or(unchunked),
+            Some("zstd") => decompress_bytes(
+                zstd::stream::read::Decoder::new(&unchunked[..])
+                    .map_err(|_| ())
+                    .unwrap_or_else(|_| zstd::stream::read::Decoder::new(&[][..]).unwrap()),
+            )
+            .unwrap_or(unchunked),
             _ => unchunked,
         };
 
         let body_bytes = decoded_bytes.len();
         let body_text = if decoded_bytes.is_empty() {
             None
+        } else if content_type
+            .as_deref()
+            .is_some_and(|ct| ct.contains("cbor"))
+            && let Some(json) = lenslet_core::cbor::decode_cbor_pretty(&decoded_bytes)
+        {
+            Some(json)
         } else if let Ok(valid) = std::str::from_utf8(&decoded_bytes) {
             Some(valid.to_string())
         } else {
@@ -656,6 +947,132 @@ mod tests {
         let out = replay_call(&call, &target, Path::new(".")).unwrap();
         assert_eq!(out.status, 200);
         assert_eq!(out.body_text.as_deref(), Some("<ok/>"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn send_composed_resigns_sigv4_and_delivers_mutated_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 4096];
+            let n = sock.read(&mut req_buf).unwrap();
+            let req_text = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(
+                req_text.contains("AWS4-HMAC-SHA256 Credential=test/"),
+                "{req_text}"
+            );
+            assert!(
+                req_text.contains("{\"TableName\":\"mutated\"}"),
+                "{req_text}"
+            );
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+            )
+            .unwrap();
+        });
+
+        let composed = ComposedRequest {
+            call_id: Some("r3".into()),
+            method: "POST".into(),
+            path: "/".into(),
+            host: format!("127.0.0.1:{port}"),
+            service: "dynamodb".into(),
+            region: "us-east-1".into(),
+            encoding: None,
+            headers: vec![Header {
+                name: "x-amz-target".into(),
+                value: "DynamoDB_20120810.PutItem".into(),
+            }],
+            body: "{\"TableName\":\"mutated\"}".into(),
+            resign_sigv4: true,
+        };
+        let out = send_composed(
+            &composed,
+            &direct(&format!("http://127.0.0.1:{port}")),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(out.status, 200);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn send_composed_reencodes_cbor_and_matches_local_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 4096];
+            let n = sock.read(&mut req_buf).unwrap();
+            let split = req_buf[..n]
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .unwrap();
+            let hdr_text = String::from_utf8_lossy(&req_buf[..split]);
+            let wire_body = &req_buf[split + 4..n];
+            assert!(
+                hdr_text.contains("AWS4-HMAC-SHA256 Credential=lenslet-local/"),
+                "{hdr_text}"
+            );
+            assert!(
+                !hdr_text.to_ascii_lowercase().contains("content-encoding:"),
+                "{hdr_text}"
+            );
+            let decoded = lenslet_core::cbor::decode_cbor(wire_body).expect("wire body is CBOR");
+            assert_eq!(decoded["QueueName"], "orders-v2");
+            let resp_cbor = lenslet_core::cbor::encode_cbor(&serde_json::json!({"QueueUrl": "ok"}));
+            let resp_hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/cbor\r\nContent-Length: {}\r\n\r\n",
+                resp_cbor.len()
+            );
+            sock.write_all(resp_hdr.as_bytes()).unwrap();
+            sock.write_all(&resp_cbor).unwrap();
+        });
+
+        let composed = ComposedRequest {
+            call_id: Some("r4".into()),
+            method: "POST".into(),
+            path: "/service/AmazonSQS/operation/CreateQueue".into(),
+            host: format!("127.0.0.1:{port}"),
+            service: "sqs".into(),
+            region: "us-east-1".into(),
+            encoding: Some("gzip+cbor".into()),
+            headers: vec![
+                Header {
+                    name: "authorization".into(),
+                    value: "AWS4-HMAC-SHA256 Credential=lenslet-local/20261119/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=00".into(),
+                },
+                Header {
+                    name: "content-type".into(),
+                    value: "application/cbor".into(),
+                },
+                Header {
+                    name: "smithy-protocol".into(),
+                    value: "rpc-v2-cbor".into(),
+                },
+                Header {
+                    name: "content-encoding".into(),
+                    value: "gzip".into(),
+                },
+            ],
+            body: "{\"QueueName\":\"orders-v2\"}".into(),
+            resign_sigv4: true,
+        };
+        let out = send_composed(
+            &composed,
+            &direct(&format!("http://127.0.0.1:{port}")),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(out.status, 200);
+        assert!(
+            out.body_text
+                .as_deref()
+                .unwrap()
+                .contains("\"QueueUrl\": \"ok\"")
+        );
         server.join().unwrap();
     }
 }

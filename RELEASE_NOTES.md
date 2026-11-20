@@ -1,120 +1,80 @@
-# Lenslet 8.0.0
+# Lenslet 9.0.0
 
-Lenslet 8.0 is a rebuild around one idea: every fact is computed once, in one
-place, and every surface shows the same thing. The CLI, the PR comment, the
-JSON report and the window now share one core. The window was rewritten to
-be instant and to read in a straight line.
+Lenslet 9.0 turns Lenslet from a passive HTTP/1.1 trace viewer into an active,
+protocol-complete local AWS flight recorder, interactive SigV4 workbench, and
+multi-format IaC policy compiler — while preserving strict local-only safety
+boundaries (`127.0.0.1` / `localhost` / local Docker bridge only, zero cloud
+forwarding, zero payload redaction).
 
 ```bash
 curl -fsSL https://github.com/hxddh/lenslet/releases/latest/download/install.sh | sh
 lenslet init -- npm test
 ```
 
-## New
+## Highlights
 
-- **Findings.** Each run ends with one ranked list of what is worth a look:
-  - failures, with their cause;
-  - permissions not in the lock;
-  - serial bursts a batch API would collapse (eight `GetItem` in a row →
-    `BatchGetItem`);
-  - SDK retries;
-  - resources the run created and left behind.
-
-  The terminal, the PR comment, `report.findings` and the window all lead
-  with this list. Leftover test fixtures take a single line, not one line each.
-- **`lenslet check --policy role.json [RUN]`.** It re-evaluates a recorded run
-  against a real IAM policy, or a lock, without re-running your tests. For
-  each denied permission it names the statement that denies it, or says that
-  nothing allows it. Repeats of the same permission are grouped. Exit code 3
-  means something was denied; `--json` and `--markdown` are available for CI.
-- **Live events.** A running proxy streams its run file at
-  `GET <endpoint>/_lenslet/events` (server-sent events: the backlog first,
-  then each new line, ending after the report). `GET /_lenslet/health` says
-  which run it is. The window uses this stream, and so can agents.
-- **Replay through the proxy.** Replaying a call from the window now sends it
-  through the live proxy. The replay is recorded with `replay_of`, checked
-  against the lock or policy, and kept out of retries and findings.
-
-## The window
-
-- **Two views, Calls and Access**, plus **Compared with ▾**: `lenslet.lock`,
-  the previous run, or any recorded run. The separate Diff page is gone;
-  every view shows what changed against the chosen baseline.
-- **Findings at the top of Calls.** Click one to jump to its calls.
-- **One body view**: Decoded or Raw. Bodies of any size are virtualized line
-  by line, so the old Clip/Full toggle is gone. Lines are selectable and
-  copyable.
-- **Instant.** Nothing reads the disk while drawing. Loading, search,
-  decoding and the lock and baseline comparisons run in the background, and
-  a live run updates by push instead of polling. Measured on a 5,000-call run:
-  - rows ready in 44 ms;
-  - a 10-call append in 0.3 ms;
-  - search in 0.3 ms;
-  - median 1 ms to build a frame.
-- **Native.**
-  - Right-click menus on calls and permissions, tooltips with shortcuts,
-    anchored popovers, a splitter that cannot stick.
-  - Context-aware shortcuts: `⌘⏎` does not replay while you type, and every
-    `⌘` is `Ctrl` on Linux.
-  - `j`/`k`, PageUp/PageDown/Home/End, `Esc` to back out.
-  - Normal window decorations on Linux; the unified title bar stays on macOS.
-- **Leaner Settings**: appearance, accent, density, language and run storage.
-- **Lock edits from the window** use the same atomic writer as
-  `lenslet run --update`.
+- **Universal AWS Wire Coverage (HTTP/2 `h2c`, Smithy RPCv2 CBOR & `zstd`).**
+  - Dual-stack HTTP/1.1 and HTTP/2 (`h2c`) proxy listener on the same port, plus
+    HTTP/2 upstream negotiation.
+  - Native RFC 8949 CBOR decoder (`application/cbor`, `application/x-amz-cbor-1.1`,
+    `smithy-protocol: rpc-v2-cbor`) and `zstd` decompression, so modern AWS SDK
+    v2/v3 calls (CloudWatch, DynamoDB, Kinesis, Smithy RPCv2) decode into
+    human-readable JSON and derive exact resource ARNs instead of falling back
+    to `unverified: *`.
+- **Multi-Upstream Local Routing & Container Support.**
+  - Route individual AWS services to dedicated local emulators with repeatable
+    `--route SERVICE=ADDRESS` (e.g. `--route s3=http://127.0.0.1:9000 --route dynamodb=http://127.0.0.1:8000`)
+    and automatic standalone discovery for MinIO (`:9000`), DynamoDB Local (`:8000`),
+    and ElasticMQ (`:9324`) alongside AWS Emulator (`:9298`), LocalStack (`:4566`),
+    and Moto (`:5000`).
+  - `--allow-docker` binds `0.0.0.0` while enforcing a strict local/container-bridge
+    IP filter and refusing non-local upstreams (`*.amazonaws.com` or public IPs).
+  - `lenslet env [--shell sh|fish|pwsh|dotenv|docker]` prints copy-ready SDK
+    environment configuration for any shell or container.
+- **Interactive Desktop Workbench (`lenslet ui` / `Lenslet.app`).**
+  - **Workspace Sidebar (`⌘0`)**: live local proxy status (`/_lenslet/health`),
+    detected emulators, 1-click **Start / Stop Proxy**, **Copy Env**, **Open
+    Trace File (`⌘O`)**, and project-grouped run history with `★` pin protection.
+  - **Semantic Call Stream**: extracts human-meaningful targets (`table/orders · id="ord-42"`,
+    `s3://bucket/key`, `queue/jobs`, `fn/worker`) on every row (including Compact
+    density), plus clickable column sorting, SDK retry-chain grouping (`↻ ×N`),
+    dual-scale waterfall bars, and timeline brush-drag range selection.
+  - **Request Composer & Local SigV4 Re-signer (`⇧⌘⏎`)**: edit HTTP method, path,
+    headers, and JSON/XML/Form body, automatically re-sign `AWS4-HMAC-SHA256`
+    locally, dispatch to your emulator, and inspect **Replay** alongside a
+    syntax-highlighted **Unified Diff** against the recorded response.
+  - **Structured Headers & Payload Viewer**: SigV4 credential-scope card, decoded
+    query parameters, character-accurate text selection (double-click to copy an
+    ARN or token), collapsible multi-line JSON folding (`▾`/`▸`), search match
+    stepping (`⌘G` / `⇧⌘G`), crisp embedded SVG icons, and disabled contextual
+    ligatures so S3 ARNs (`arn:aws:s3:::bucket`) never render with `:::` ligature
+    artifacts.
+- **Role-Aware Access, Policy Simulator & Multi-Format IaC Compiler.**
+  - Tracks `sts:AssumeRole*` session credentials across a run to attribute calls
+    and permissions per assumed role (`caller_role` on calls, `roles` in reports)
+    and supports `--role ROLE` filtering in `lenslet policy`.
+  - Expanded REST URI & ARN catalog covering 35+ AWS services (ECS, EKS,
+    CloudFormation, Glue, Athena, RDS, API Gateway v1/v2, CloudFront, Route 53,
+    SES/SESv2, SageMaker, OpenSearch, EventBridge Pipes, AWS Backup, and more).
+  - Synthesizes least-privilege `iam:PassedToService` and `kms:ViaService`
+    conditions automatically and compiles directly to **IAM JSON**, **Terraform
+    (`aws_iam_policy_document`)**, **CloudFormation**, **AWS SAM**, and **AWS
+    CDK TypeScript** from both `lenslet policy --format ...` and the Access UI.
+  - Wire-level ABAC condition extraction (`aws:RequestTag/*`, `aws:TagKeys`,
+    `dynamodb:LeadingKeys`, `kms:EncryptionContext:*`), explicit `needs_context`
+    diagnostics with `--context KEY=VAL` overrides in `lenslet check`, and
+    interactive **Check policy…** simulation directly inside the Access view.
 
 ## Fixed
 
-- **Policy evaluation is fail-closed.** A `Deny` now applies to a call whose
-  resource could not be derived. An `Allow` for one resource no longer grants
-  an unknown one.
-- **The lock is exact.** A lock line with a `*` (from a generated name) no
-  longer matches other names.
-- **IAM action names**:
-  - SQS/SNS batches need the single action (`sqs:SendMessage`, not
-    `sqs:SendMessageBatch`; `sns:Publish`);
-  - S3 calls with `versionId` need the `*Version` actions;
-  - `GetObjectAttributes`, S3 bucket configuration deletes, and the
-    analytics, inventory, metrics and tiering configurations are mapped;
-  - DynamoDB PartiQL maps to `dynamodb:PartiQL*` on the parsed table.
-- **Implied permissions** now read nested request fields:
-  - KMS for SQS/SNS `Attributes.KmsMasterKeyId` and DynamoDB
-    `SSESpecification`, plus SSM `PutParameter` keys;
-  - `iam:PassRole` for EventBridge `Targets[].RoleArn`, Scheduler
-    `Target.RoleArn`, every Firehose `RoleARN` and Glue `JobUpdate.Role`.
-
-  Claims Lenslet could not back are gone. The key of an existing encrypted
-  queue, topic or secret is not in the request that uses it, so it is not
-  derived.
-- **Unreadable request bodies** (binary such as CBOR, or over the inspection
-  limit) give the action on `*`, marked `unverified`. Before, they gave a
-  permission that could never be accepted, so `--check` failed forever.
-- **`--enforce`** checks request-visible KMS keys before the call is
-  forwarded. Only an S3 key revealed by the response is checked after the
-  call; the trace marks it `blocked_phase: "response"`.
-- **Shutdown and files.**
-  - A call that finishes after the run ends is no longer written after the
-    report.
-  - `--trace PATH` replaces the file instead of appending to it.
-  - Lock writes are atomic, keep file permissions and keep the comment block
-    at the top.
-  - `--ui` opens this run, not whichever is newest.
-- **Proxy.**
-  - Hop-by-hop headers are recorded but not forwarded.
-  - A blocked upload's body is drained, so the SDK sees the `AccessDenied`
-    instead of a reset.
-  - Trailers are kept, and reading request headers times out.
-  - Each call's access is derived once. The trace lock now covers only the
-    write.
-  - Bodies are buffered for inspection only when their access depends on the
-    body.
-
-## Upgrading
-
-- The fixed IAM action names and the exact lock matching can change what
-  `--check` reports against an existing lock. Run
-  `lenslet run --update -- <tests>` once, review the diff, and commit it.
-- Hand-written wildcard lines in `lenslet.lock` now grant only that literal
-  resource. Use `--policy` with an IAM policy document for real patterns.
-- Code that reads run files gets new optional fields: `findings` in the
-  report; `replay_of`, `blocked_phase` and `unverified` on calls. The format
-  version stays 3, and readers ignore unknown fields.
+- Streaming `BufReader` trace hydration when inspecting calls in large multi-MB
+  run files (eliminating full-file `fs::read_to_string` memory spikes).
+- Cumulative live-session permission retention in `CallStore` so runs exceeding
+  5,000 live calls never drop early permissions from the Access workbench.
+- Preserved `# implied` annotations when accepting permissions from the desktop
+  UI into `lenslet.lock`.
+- Eliminated search placeholder/cursor overlap against the shortcut badge and
+  localized 100% of remaining UI strings in `中文` mode.
+- Workspace-aware and pin-aware run retention (`~/.lenslet/runs/pinned.json`),
+  plus resilient retry logic in `scripts/package-macos.sh` for macOS `.dmg`
+  packaging.

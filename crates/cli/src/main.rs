@@ -13,9 +13,10 @@ mod capture;
 mod proxy;
 mod trace;
 
-pub(crate) use lenslet_core::{access, findings, lock, problem, runs, summary, wire};
+pub(crate) use lenslet_core::{access, findings, iac, lock, problem, runs, summary, wire};
 
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
@@ -54,12 +55,15 @@ Usage:
       List recorded runs in ~/.lenslet/runs (newest first).
   lenslet diff [BASE] [TARGET] [--json] [--markdown PATH]
       Compare two runs (defaults to the previous finished run vs the latest).
-  lenslet check [--policy PATH | --lock PATH] [RUN] [--json] [--markdown PATH]
+  lenslet check [--policy PATH | --lock PATH] [--context KEY=VAL] [RUN] [--json] [--markdown PATH]
       Re-check a recorded run (default: the newest finished one) against a
       policy or lock without re-running it: each denied permission and the
       statement that denied it. Exit {changed} if anything is denied.
-  lenslet policy [--lock PATH]
-      An IAM policy document granting exactly what lenslet.lock lists.
+  lenslet policy [--lock PATH | --run RUN] [--format iam|terraform|cfn|sam|cdk] [--role ROLE]
+      Compile least-privilege IAM JSON, Terraform HCL, CloudFormation, SAM, or CDK
+      TypeScript from lenslet.lock or a recorded run.
+  lenslet env [--shell sh|fish|pwsh|dotenv|docker] [--listen PORT]
+      Print shell environment exports pointing SDKs at a running Lenslet proxy.
   lenslet ui
       Open the window (same as `lenslet` with no arguments).
 
@@ -78,6 +82,8 @@ Run options:
   --no-env             set only AWS_ENDPOINT_URL, leave credentials/config alone
   --listen PORT        loopback port (default: a free port; 9297 without COMMAND)
   --upstream ADDRESS   AWS Emulator port or http(s) URL (default 9298)
+  --route SVC=ADDRESS  route specific service(s) to another local emulator (e.g. s3=http://127.0.0.1:9000)
+  --allow-docker       also accept connections from local Docker container bridge interfaces
   --emulator-ca PATH   emulator CA (default ~/.aws/emulator/PORT/ca.pem)
   --trace PATH         run file (default: a new file in ~/.lenslet/runs)
 
@@ -120,6 +126,7 @@ fn main() -> ExitCode {
         "diff" => diff_cmd(args),
         "check" => check_cmd(args),
         "policy" => policy(args),
+        "env" => env_cmd(args),
         "ui" => open_ui(None).map(|()| 0),
         "-V" | "--version" | "version" => {
             println!("lenslet {}", env!("CARGO_PKG_VERSION"));
@@ -333,6 +340,21 @@ async fn run(args: Vec<String>) -> Result<i32> {
                 );
             }
             options.upstream = discovered;
+            if options.routes.is_empty() && matches!(options.upstream.port, 9000 | 8000 | 9324) {
+                let extra = proxy::Upstream::auto_discover_service_routes(
+                    options.listen,
+                    options.upstream.port,
+                )
+                .await;
+                if !extra.is_empty() && !quiet {
+                    let list: Vec<String> = extra
+                        .iter()
+                        .map(|(s, u)| format!("{s}={}", u.base))
+                        .collect();
+                    eprintln!("lenslet: auto-routed services {}", list.join(", "));
+                }
+                options.routes.extend(extra);
+            }
             options.validate()?;
         }
     }
@@ -538,7 +560,22 @@ async fn run_child(command: &[String], env: &ChildEnv) -> Result<i32> {
     Ok(exit_code(status))
 }
 
+#[cfg(unix)]
+async fn wait_for_sigterm() {
+    if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        sig.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm() {
+    std::future::pending::<()>().await;
+}
+
 async fn serve_until_interrupted(server: &Server, options: &Options, home: &Path) {
+    let stop_notify = server.shutdown_requested();
     println!("lenslet {} · proxy until Ctrl-C", env!("CARGO_PKG_VERSION"));
     println!("  endpoint  {}", server.endpoint());
     println!("  upstream  {}", options.upstream.base);
@@ -548,7 +585,11 @@ async fn serve_until_interrupted(server: &Server, options: &Options, home: &Path
         tilde(&options.emulator_dir().join("emulator_credentials"), home),
         tilde(&options.emulator_dir().join("config"), home),
     );
-    tokio::signal::ctrl_c().await.ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = stop_notify.notified() => {}
+        () = wait_for_sigterm() => {}
+    }
     eprintln!();
 }
 
@@ -769,12 +810,187 @@ fn last(args: Vec<String>) -> Result<i32> {
     }
 }
 
-/// `lenslet policy [--lock PATH]`: the locked access as an IAM policy.
+/// `lenslet env [--shell sh|fish|pwsh|dotenv|docker] [--listen PORT]`:
+/// print environment configuration pointing SDKs at a running Lenslet proxy.
+fn env_cmd(args: Vec<String>) -> Result<i32> {
+    let mut shell: Option<String> = None;
+    let mut port: u16 = 9297;
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--shell" | "-s" => {
+                shell = Some(
+                    it.next()
+                        .context("--shell requires sh, fish, pwsh, dotenv, or docker")?,
+                );
+            }
+            "--listen" | "-p" => {
+                let raw = it.next().context("--listen requires a port")?;
+                port = raw
+                    .parse::<u16>()
+                    .with_context(|| format!("--listen expects a port number, got `{raw}`"))?;
+            }
+            _ => bail!("usage: lenslet env [--shell sh|fish|pwsh|dotenv|docker] [--listen PORT]"),
+        }
+    }
+    let detected = shell.unwrap_or_else(|| {
+        let env_shell = std::env::var("SHELL").unwrap_or_default();
+        if env_shell.ends_with("/fish") {
+            "fish".to_string()
+        } else {
+            "sh".to_string()
+        }
+    });
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let unset_keys = [
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_SESSION_TOKEN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+    ];
+    match detected.to_ascii_lowercase().as_str() {
+        "sh" | "bash" | "zsh" => {
+            println!("unset {}", unset_keys.join(" "));
+            println!("export AWS_ENDPOINT_URL={endpoint}");
+            println!("export AWS_ACCESS_KEY_ID={}", LOCAL_KEYS.0);
+            println!("export AWS_SECRET_ACCESS_KEY={}", LOCAL_KEYS.1);
+            println!("export AWS_DEFAULT_REGION=us-east-1");
+        }
+        "fish" => {
+            for k in unset_keys {
+                println!("set -e {k}");
+            }
+            println!("set -gx AWS_ENDPOINT_URL {endpoint}");
+            println!("set -gx AWS_ACCESS_KEY_ID {}", LOCAL_KEYS.0);
+            println!("set -gx AWS_SECRET_ACCESS_KEY {}", LOCAL_KEYS.1);
+            println!("set -gx AWS_DEFAULT_REGION us-east-1");
+        }
+        "pwsh" | "powershell" => {
+            for k in unset_keys {
+                println!("Remove-Item Env:{k} -ErrorAction SilentlyContinue");
+            }
+            println!("$env:AWS_ENDPOINT_URL = \"{endpoint}\"");
+            println!("$env:AWS_ACCESS_KEY_ID = \"{}\"", LOCAL_KEYS.0);
+            println!("$env:AWS_SECRET_ACCESS_KEY = \"{}\"", LOCAL_KEYS.1);
+            println!("$env:AWS_DEFAULT_REGION = \"us-east-1\"");
+        }
+        "dotenv" | "env" => {
+            println!("AWS_ENDPOINT_URL={endpoint}");
+            println!("AWS_ACCESS_KEY_ID={}", LOCAL_KEYS.0);
+            println!("AWS_SECRET_ACCESS_KEY={}", LOCAL_KEYS.1);
+            println!("AWS_DEFAULT_REGION=us-east-1");
+        }
+        "docker" => {
+            println!(
+                "-e AWS_ENDPOINT_URL=http://host.docker.internal:{port} -e AWS_ACCESS_KEY_ID={} -e AWS_SECRET_ACCESS_KEY={} -e AWS_DEFAULT_REGION=us-east-1",
+                LOCAL_KEYS.0, LOCAL_KEYS.1
+            );
+        }
+        other => bail!("unknown --shell `{other}`; expected sh, fish, pwsh, dotenv, or docker"),
+    }
+    Ok(0)
+}
+
+const POLICY_USAGE: &str = "usage: lenslet policy [--lock PATH | --run RUN] [--format iam|terraform|cfn|sam|cdk] [--role ROLE] [--region REG] [--account ACC]";
+
+/// `lenslet policy`: compile least-privilege IAM JSON or IaC (Terraform, CloudFormation,
+/// SAM, CDK) from `lenslet.lock` or a recorded run.
 fn policy(args: Vec<String>) -> Result<i32> {
-    let path = match args.as_slice() {
-        [] => lock::path_in(&std::env::current_dir().context("read the current directory")?),
-        [flag, path] if flag == "--lock" => PathBuf::from(path),
-        _ => bail!("usage: lenslet policy [--lock PATH]"),
+    let mut lock_path: Option<PathBuf> = None;
+    let mut run_spec: Option<String> = None;
+    let mut format = iac::PolicyFormat::IamJson;
+    let mut role_filter: Option<String> = None;
+    let mut region: Option<String> = None;
+    let mut account: Option<String> = None;
+
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--lock" => lock_path = Some(PathBuf::from(it.next().context(POLICY_USAGE)?)),
+            "--run" => run_spec = Some(it.next().context(POLICY_USAGE)?),
+            "--format" | "-f" => {
+                let raw = it.next().context(POLICY_USAGE)?;
+                format = iac::PolicyFormat::parse(&raw).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown --format `{raw}`; expected iam, terraform, cfn, sam, or cdk"
+                    )
+                })?;
+            }
+            "--role" => role_filter = Some(it.next().context(POLICY_USAGE)?),
+            "--region" => region = Some(it.next().context(POLICY_USAGE)?),
+            "--account" => account = Some(it.next().context(POLICY_USAGE)?),
+            _ => bail!("{POLICY_USAGE}"),
+        }
+    }
+    if lock_path.is_some() && run_spec.is_some() {
+        bail!("use --lock or --run, not both\n{POLICY_USAGE}");
+    }
+
+    let opts = iac::CompileOptions {
+        format,
+        region,
+        account,
+    };
+
+    if let Some(spec) = run_spec.as_deref() {
+        let dir = runs::dir(&home());
+        let run_path = runs::resolve(&dir, spec)?;
+        let report = runs::report(&run_path)
+            .with_context(|| format!("run {} has not finished yet", runs::run_id(&run_path)))?;
+        let entries: &[summary::AccessEntry] = if let Some(filter) = role_filter.as_deref() {
+            let matched = report
+                .roles
+                .iter()
+                .find(|(role_arn, _)| {
+                    *role_arn == filter
+                        || role_arn.ends_with(&format!("/{filter}"))
+                        || role_arn.ends_with(&format!(":{filter}"))
+                })
+                .map(|(_, list)| list.as_slice());
+            let Some(list) = matched else {
+                let available: Vec<&str> = report.roles.keys().map(String::as_str).collect();
+                if available.is_empty() {
+                    bail!(
+                        "run {} did not record any `sts:AssumeRole` sessions",
+                        report.run
+                    );
+                }
+                bail!(
+                    "role `{filter}` not found in run {} (observed roles: {})",
+                    report.run,
+                    available.join(", ")
+                );
+            };
+            list
+        } else {
+            &report.access
+        };
+        let inputs: Vec<iac::PolicyInput> = entries
+            .iter()
+            .map(|e| iac::PolicyInput {
+                access: access::Access::new(e.action.clone(), e.resource.clone()),
+                implied: e.used.implied,
+                via: e.used.via.clone(),
+            })
+            .collect();
+        println!("{}", iac::compile(&inputs, &opts));
+        eprintln!(
+            "lenslet: compiled {} ({} permissions from run {}). Review before attaching it to a role.",
+            format.label(),
+            inputs.len(),
+            report.run
+        );
+        return Ok(0);
+    }
+
+    if role_filter.is_some() {
+        bail!("--role requires `--run RUN` (e.g. `lenslet policy --run latest --role worker`)");
+    }
+
+    let path = match lock_path {
+        Some(p) => p,
+        None => lock::path_in(&std::env::current_dir().context("read the current directory")?),
     };
     let Some(locked) = lock::read(&path)? else {
         bail!(
@@ -782,7 +998,16 @@ fn policy(args: Vec<String>) -> Result<i32> {
             path.display()
         );
     };
-    println!("{}", serde_json::to_string_pretty(&lock::policy(&locked))?);
+    let inputs: Vec<iac::PolicyInput> = locked
+        .access
+        .difference(&locked.test)
+        .map(|acc| iac::PolicyInput {
+            access: acc.clone(),
+            implied: locked.implied.contains(acc),
+            via: Vec::new(),
+        })
+        .collect();
+    println!("{}", iac::compile(&inputs, &opts));
     eprintln!(
         "lenslet: observed access from {} ({} permissions, {} marked `# test` left out). \
          Review before attaching it to a role.",
@@ -942,8 +1167,7 @@ fn diff_cmd(args: Vec<String>) -> Result<i32> {
     Ok(0)
 }
 
-const CHECK_USAGE: &str =
-    "usage: lenslet check [--policy PATH | --lock PATH] [RUN] [--json] [--markdown PATH]";
+const CHECK_USAGE: &str = "usage: lenslet check [--policy PATH | --lock PATH] [--context KEY=VAL] [RUN] [--json] [--markdown PATH]";
 
 /// One denied permission of one recorded call.
 #[derive(serde::Serialize)]
@@ -973,6 +1197,16 @@ impl CheckReport {
         let mut text = match (denial.decision.reason, denial.decision.by.as_deref()) {
             (lock::Reason::ExplicitDeny, Some(statement)) => {
                 format!("denied by statement `{statement}`")
+            }
+            (lock::Reason::NeedsContext, Some(statement)) => {
+                let keys = denial.decision.missing_context.join(", ");
+                let example = denial
+                    .decision
+                    .missing_context
+                    .first()
+                    .map(|k| format!("; pass `--context {k}=...`"))
+                    .unwrap_or_default();
+                format!("statement `{statement}` needs cloud context ({keys}{example})")
             }
             _ if self.policy => "no statement allows it".to_string(),
             _ => format!("not in {}", self.gate),
@@ -1088,6 +1322,7 @@ fn check_cmd(args: Vec<String>) -> Result<i32> {
     let mut markdown: Option<String> = None;
     let mut policy_path: Option<PathBuf> = None;
     let mut lock_path: Option<PathBuf> = None;
+    let mut context_overrides: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut run: Option<String> = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -1096,6 +1331,22 @@ fn check_cmd(args: Vec<String>) -> Result<i32> {
             "--markdown" => markdown = Some(it.next().context(CHECK_USAGE)?),
             "--policy" => policy_path = Some(PathBuf::from(it.next().context(CHECK_USAGE)?)),
             "--lock" => lock_path = Some(PathBuf::from(it.next().context(CHECK_USAGE)?)),
+            "--context" | "-c" => {
+                let raw = it.next().context(CHECK_USAGE)?;
+                let Some((k, v)) = raw.split_once('=') else {
+                    bail!(
+                        "--context expects KEY=VALUE (e.g. `--context aws:PrincipalOrgID=o-123`), got `{raw}`"
+                    );
+                };
+                let key = k.trim();
+                if key.is_empty() {
+                    bail!("--context `{raw}` must name a non-empty IAM condition key");
+                }
+                context_overrides
+                    .entry(key.to_string())
+                    .or_default()
+                    .push(v.to_string());
+            }
             flag if flag.starts_with('-') => bail!("{CHECK_USAGE}"),
             _ if run.is_none() => run = Some(arg),
             _ => bail!("{CHECK_USAGE}"),
@@ -1108,7 +1359,7 @@ fn check_cmd(args: Vec<String>) -> Result<i32> {
     let (gate, policy) = match policy_path {
         Some(path) => {
             let label = relative_to(&path, &cwd);
-            (lock::Gate::from_policy_file(&path, label)?, true)
+            (lock::Gate::from_policy_file_simulating(&path, label)?, true)
         }
         None => {
             let path = lock_path.unwrap_or_else(|| lock::path_in(&cwd));
@@ -1132,7 +1383,7 @@ fn check_cmd(args: Vec<String>) -> Result<i32> {
     let denied = calls
         .iter()
         .flat_map(|call| {
-            lock::evaluate(call, Some(&gate))
+            lock::evaluate_with_context(call, Some(&gate), &context_overrides)
                 .denied
                 .into_iter()
                 .map(|denial| CheckDenial {

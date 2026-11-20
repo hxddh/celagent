@@ -21,7 +21,9 @@ pub struct Wire {
     pub service: String,
     /// Signing region from the SigV4 credential scope, when signed.
     pub region: Option<String>,
-    /// Operation advertised by `x-amz-target` or `x-id`, if any.
+    /// Access key ID from the SigV4/SigV2 credential scope (used for `AssumeRole` session tracking).
+    pub access_key_id: Option<String>,
+    /// Operation advertised by `x-amz-target`, Smithy RPCv2 path, or `x-id`, if any.
     pub operation: Option<String>,
     /// SDK invocation identifier (`amz-sdk-invocation-id`), constant across retries.
     pub invocation_id: Option<String>,
@@ -44,7 +46,13 @@ pub fn wire_info(headers: &HeaderMap, path: &str) -> Wire {
         .map(|scope| scope.split([',', ' ']).next().unwrap_or(scope).to_string())
         .or_else(|| query_param(path, "X-Amz-Credential"));
     let mut parts = scope.as_deref().unwrap_or("").split('/');
-    let region = parts.nth(2).filter(|region| !region.is_empty());
+    let access_key_id = parts
+        .next()
+        .filter(|ak| !ak.is_empty())
+        .map(str::to_string)
+        .or_else(|| query_param(path, "AWSAccessKeyId").filter(|ak| !ak.is_empty()));
+    let _date = parts.next();
+    let region = parts.next().filter(|region| !region.is_empty());
     let service = parts.next().filter(|service| !service.is_empty());
     // Legacy SigV2 (`AWS AKID:sig` or `?AWSAccessKeyId=..&Signature=..`) is S3-only.
     let sigv2 = headers
@@ -53,7 +61,8 @@ pub fn wire_info(headers: &HeaderMap, path: &str) -> Wire {
         .is_some_and(|value| value.starts_with("AWS "))
         || (query_param(path, "AWSAccessKeyId").is_some()
             && query_param(path, "Signature").is_some());
-    let service = service.or(sigv2.then_some("s3"));
+    let (rpc_service, rpc_operation) = rpcv2_target(headers, path);
+    let service = service.or(sigv2.then_some("s3")).or(rpc_service.as_deref());
     let invocation_id = headers
         .get("amz-sdk-invocation-id")
         .and_then(|value| value.to_str().ok())
@@ -68,7 +77,8 @@ pub fn wire_info(headers: &HeaderMap, path: &str) -> Wire {
     Wire {
         service: service.unwrap_or("aws").to_string(),
         region: region.map(str::to_string),
-        operation: operation(headers, path),
+        access_key_id,
+        operation: operation(headers, path).or(rpc_operation),
         invocation_id,
         attempt,
         max_attempts,
@@ -104,6 +114,38 @@ fn operation(headers: &HeaderMap, path: &str) -> Option<String> {
         .or_else(|| query_param(path, "x-id").filter(|operation| !operation.is_empty()))
 }
 
+/// Smithy RPCv2 CBOR protocol (`smithy-protocol: rpc-v2-cbor`, path
+/// `/service/{ServiceShapeName}/operation/{OperationName}`), used by modern AWS
+/// SDKs for CloudWatch (`GraniteServiceVersion20100801`), SQS (`AmazonSQS`), SSM, etc.
+fn rpcv2_target(headers: &HeaderMap, path: &str) -> (Option<String>, Option<String>) {
+    let bare = path.split('?').next().unwrap_or(path);
+    let segs: Vec<&str> = bare.split('/').filter(|s| !s.is_empty()).collect();
+    let [s_kw, raw_svc, o_kw, raw_op] = segs.as_slice() else {
+        return (None, None);
+    };
+    if *s_kw != "service" || *o_kw != "operation" {
+        return (None, None);
+    }
+    let has_cbor_hint = headers.contains_key("smithy-protocol")
+        || headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.to_ascii_lowercase().contains("cbor"));
+    let _ = has_cbor_hint;
+    if raw_op.is_empty() || !raw_op.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return (None, None);
+    }
+    let inferred_svc = match *raw_svc {
+        "GraniteServiceVersion20100801" => Some("monitoring".to_string()),
+        "AmazonSQS" => Some("sqs".to_string()),
+        "AmazonSSM" => Some("ssm".to_string()),
+        s if s.starts_with("DynamoDB_") => Some("dynamodb".to_string()),
+        s if s.starts_with("Kinesis_") => Some("kinesis".to_string()),
+        _ => None,
+    };
+    (inferred_svc, Some((*raw_op).to_string()))
+}
+
 /// One query parameter, percent-decoded. Matches the exact parameter name.
 pub fn query_param(path: &str, name: &str) -> Option<String> {
     let (_, query) = path.split_once('?')?;
@@ -114,6 +156,11 @@ pub fn query_param(path: &str, name: &str) -> Option<String> {
 }
 
 fn percent_decode(value: &str) -> String {
+    percent_decode_inner(value, true)
+}
+
+/// Percent-decode a query parameter or form-urlencoded field (`+` → space, `%XX`).
+pub fn percent_decode_query(value: &str) -> String {
     percent_decode_inner(value, true)
 }
 
@@ -161,7 +208,7 @@ pub fn fallback_operation(service: &str, method: &str, path: &str, headers: &Hea
         "bedrock" | "bedrock-runtime" => bedrock_operation(method, path),
         "execute-api" => Some("Invoke".to_string()),
         "appconfig" | "appconfigdata" => appconfig_operation(method, path),
-        _ => None,
+        _ => crate::catalog::resolve_rest_operation(service, method, path, headers),
     };
     shaped.unwrap_or_else(|| method.to_string())
 }

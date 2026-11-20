@@ -65,11 +65,21 @@ codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 
 # The disk image: the app and a shortcut to drag it onto.
+# Retry hdiutil up to 3 times to survive transient macOS runner EAGAIN flakes.
 ln -s /Applications "$STAGE/Applications"
 DMG="$OUT/Lenslet-${VERSION}.dmg"
-rm -f "$DMG"
-hdiutil create -volname "Lenslet ${VERSION}" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
-hdiutil verify "$DMG"
+for attempt in 1 2 3; do
+  rm -f "$DMG"
+  if hdiutil create -volname "Lenslet ${VERSION}" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null \
+    && hdiutil verify "$DMG"; then
+    break
+  fi
+  if [ "$attempt" -eq 3 ]; then
+    echo "package-macos.sh: hdiutil failed after 3 attempts" >&2
+    exit 1
+  fi
+  sleep 2
+done
 
 # The CLI alone.
 CLI="$OUT/cli"

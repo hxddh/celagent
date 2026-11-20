@@ -125,6 +125,12 @@ impl TraceSink {
         self.lock().summary.unfinished
     }
 
+    /// Live call counters `(calls, errors, blocked)` for `/_lenslet/health`.
+    pub fn live_counts(&self) -> (usize, usize, usize) {
+        let s = self.lock();
+        (s.summary.calls, s.summary.errors, s.summary.blocked)
+    }
+
     /// A copy of the calls seen so far.
     #[cfg(test)]
     pub fn summary(&self) -> Summary {
@@ -150,28 +156,48 @@ impl TraceSink {
     /// caller: trace problems are logged to stderr and the proxy keeps
     /// forwarding. After [`TraceSink::seal`] the call is dropped and stays
     /// counted as unfinished.
-    pub fn record(&self, mut trace: Trace, evaluation: Evaluation) {
+    #[cfg(test)]
+    pub fn record(&self, trace: Trace, evaluation: Evaluation) {
+        self.record_with_key(trace, None, evaluation);
+    }
+
+    pub fn record_with_key(
+        &self,
+        mut trace: Trace,
+        access_key_id: Option<&str>,
+        evaluation: Evaluation,
+    ) {
         trace.pending = false;
         trace.access = evaluation.access;
         trace.implied = evaluation.implied;
+        if trace.target.is_none() {
+            trace.target = Some(lenslet_core::catalog::target_summary(&trace));
+        }
         if self.gate.is_some() {
             trace.new = !evaluation.denied.is_empty();
         }
-        // Encode before locking; only a cross-call hint (rare) re-encodes.
+        // Encode before locking; only a cross-call hint or AssumeRole session re-encodes.
         let mut line = encode("call", &trace);
         let mut essentials = lenslet_core::findings::essentials(&trace);
         let mut state = self.lock();
         if state.sealed {
             return;
         }
-        let call_no = state.summary.calls + 1;
-        if state
+        let prev_role = trace.caller_role.clone();
+        state
             .summary
-            .causal
-            .observe_and_enrich(&mut trace, &evaluation.concrete_own, call_no)
-        {
+            .role_tracker
+            .observe_call(access_key_id, &mut trace);
+        let role_changed = trace.caller_role != prev_role;
+        let call_no = state.summary.calls + 1;
+        let hint_changed =
+            state
+                .summary
+                .causal
+                .observe_and_enrich(&mut trace, &evaluation.concrete_own, call_no);
+        if role_changed || hint_changed {
             line = encode("call", &trace);
-            essentials.problem = trace.problem.clone();
+            essentials = lenslet_core::findings::essentials(&trace);
         }
         if self.gate.is_some() {
             state.summary.gate_evaluated = true;
@@ -329,6 +355,8 @@ mod tests {
             blocked: false,
             replay_of: None,
             blocked_phase: None,
+            caller_role: None,
+            target: None,
             request: Message {
                 headers: headers(&request_headers),
                 content_type: Some("application/json".to_string()),

@@ -100,9 +100,57 @@ impl LensletApp {
             Cmd::FocusSearch,
         );
         add(
+            ui.t("Toggle Workspace Sidebar", "显示/隐藏工作区侧栏")
+                .into(),
+            Some(i18n::shortcut("0")),
+            Cmd::ToggleSidebar,
+        );
+        add(
             ui.t("Toggle Inspector", "显示/隐藏详情栏").into(),
             Some(i18n::shortcut("B")),
             Cmd::ToggleInspector,
+        );
+        add(
+            ui.t("Open Trace File…", "打开追踪文件 (.jsonl)…").into(),
+            Some(i18n::shortcut("O")),
+            Cmd::OpenFile,
+        );
+        add(
+            ui.t("Export Run Summary JSON…", "导出运行摘要 JSON…")
+                .into(),
+            Some(i18n::shortcut("S")),
+            Cmd::ExportReport,
+        );
+        if session.path.is_some() {
+            add(
+                ui.t(
+                    "Reveal Trace File in File Manager",
+                    "在文件管理器中显示追踪文件",
+                )
+                .into(),
+                Some(i18n::shortcut("⇧R")),
+                Cmd::RevealTrace,
+            );
+        }
+        if self.managed_proxy.is_some() {
+            add(
+                ui.t("Stop Managed Local Proxy", "停止托管本地代理").into(),
+                None,
+                Cmd::StopProxy,
+            );
+        } else if !self.env_probe.running {
+            add(
+                ui.t("Start Local Proxy (:9297)", "启动本地代理 (:9297)")
+                    .into(),
+                None,
+                Cmd::StartProxy,
+            );
+        }
+        add(
+            ui.t("Copy Proxy Shell Environment", "复制代理终端环境变量")
+                .into(),
+            None,
+            Cmd::CopyProxyEnv,
         );
         add(
             ui.t("Reload Run", "重新加载运行").into(),
@@ -114,6 +162,15 @@ impl LensletApp {
                 ui.t("Replay Selected Call", "重放选中的请求").into(),
                 Some(i18n::shortcut("⏎")),
                 Cmd::Replay,
+            );
+            add(
+                ui.t(
+                    "Edit & Replay Selected Call (SigV4 Composer)",
+                    "编辑并重放选中的请求 (SigV4 Composer)",
+                )
+                .into(),
+                Some(i18n::shortcut("⇧⏎")),
+                Cmd::OpenComposer,
             );
         }
         if let Some(call) = self.inspector.read(cx).call().cloned() {
@@ -133,7 +190,7 @@ impl LensletApp {
             .access_rows
             .iter()
             .filter(|row| row.used && !row.in_lock)
-            .map(|row| row.access.clone())
+            .map(|row| (row.access.clone(), row.implied))
             .collect();
         if session.can_edit_lock() && !not_in_lock.is_empty() {
             add(
@@ -257,6 +314,15 @@ impl LensletApp {
         add("Language: English".into(), None, Cmd::Lang(Lang::En));
         add("语言：中文".into(), None, Cmd::Lang(Lang::Zh));
         add(
+            ui.t(
+                "Install CLI to PATH (~/.local/bin)",
+                "安装 CLI 到 PATH (~/.local/bin)",
+            )
+            .into(),
+            None,
+            Cmd::InstallCli,
+        );
+        add(
             ui.t("Settings…", "设置…").into(),
             Some(i18n::shortcut(",")),
             Cmd::OpenSettings,
@@ -330,9 +396,9 @@ impl LensletApp {
                     .text_size(px(text::XS))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(t.text_muted))
-                    .child("↑↓  navigate")
-                    .child("⏎  run")
-                    .child("esc  close"),
+                    .child(ui.t("↑↓  navigate", "↑↓  选择"))
+                    .child(ui.t("⏎  run", "⏎  执行"))
+                    .child(ui.t("esc  close", "esc  关闭")),
             );
         div()
             .absolute()

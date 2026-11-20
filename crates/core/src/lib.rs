@@ -6,7 +6,10 @@
 //! writes it down; readers parse the same types, so they always agree.
 
 pub mod access;
+pub mod catalog;
+pub mod cbor;
 pub mod findings;
+pub mod iac;
 pub mod lock;
 pub mod problem;
 pub mod runs;

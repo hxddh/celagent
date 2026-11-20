@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::{trace::Trace, wire};
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Access {
     pub action: String,
     pub resource: String,
@@ -173,7 +173,9 @@ fn resource_in_body(prefix: &str, operation: &str, trace: &Trace) -> bool {
     match prefix {
         "sqs" | "sns" | "secretsmanager" | "ssm" | "logs" | "kinesis" | "kms" | "sts" | "iam"
         | "events" | "states" | "cognito-idp" | "ecr" | "firehose" | "scheduler" | "rds-data"
-        | "dynamodb" | "pipes" | "glue" => true,
+        | "dynamodb" | "pipes" | "glue" | "ecs" | "cloudformation" | "athena" | "rds" | "ses" => {
+            true
+        }
         "lambda" => {
             lambda_function(&trace.path).is_none()
                 || matches!(operation, "CreateFunction" | "UpdateFunctionConfiguration")
@@ -429,6 +431,10 @@ fn iam_prefix(service: &str) -> &str {
         "logs" => "logs",
         "execute-api" => "execute-api",
         "s3-object-lambda" => "s3-object-lambda",
+        "sagemaker-runtime" => "sagemaker",
+        "bedrock-agent-runtime" => "bedrock",
+        "iotdata" | "iot-data" => "iot",
+        "opensearch" => "es",
         other => other,
     }
 }
@@ -1458,7 +1464,27 @@ fn resource(mode: Mode, prefix: &str, operation: &str, trace: &Trace, body: &Bod
                 }
             })
             .unwrap_or_else(|| "*".to_string()),
-        _ => "*".to_string(),
+        _ => {
+            let json_ref = match body {
+                Body::Json(v) => Some(v),
+                _ => None,
+            };
+            let form_ref = match body {
+                Body::Form(f) => Some(f.as_slice()),
+                _ => None,
+            };
+            crate::catalog::derive_extra_resources(
+                prefix,
+                operation,
+                trace,
+                json_ref,
+                form_ref,
+                |svc, rest| arn_for(mode, trace, svc, rest),
+                |name| norm(mode, name),
+            )
+            .and_then(|mut v| v.drain(..).next())
+            .unwrap_or_else(|| "*".to_string())
+        }
     }
 }
 
@@ -2116,6 +2142,8 @@ mod tests {
             blocked: false,
             replay_of: None,
             blocked_phase: None,
+            caller_role: None,
+            target: None,
             request: Message {
                 headers: Vec::new(),
                 content_type: Some(if body.is_some_and(|b| b.starts_with('{')) {
