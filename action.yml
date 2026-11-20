@@ -10,8 +10,8 @@ inputs:
     description: The test command, e.g. `npm test`. Runs under bash in working-directory.
     required: true
   upstream:
-    description: The emulator, as a port (HTTPS on 127.0.0.1) or an http(s) URL.
-    default: '9298'
+    description: The emulator, as a port (HTTPS on 127.0.0.1), an http(s) URL, `auto`, or `sandbox` for Lenslet's built-in stateful AWS sandbox.
+    default: 'auto'
   emulator:
     description: Optional command that starts the emulator in the background. The action then waits for `upstream` to accept connections.
     default: ''
@@ -80,7 +80,7 @@ runs:
         echo "LENSLET_BIN=$bin" >> "$GITHUB_ENV"
 
     - name: Start the emulator
-      if: inputs.emulator != ''
+      if: inputs.emulator != '' && inputs.upstream != 'sandbox' && inputs.upstream != 'built-in'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
@@ -89,6 +89,9 @@ runs:
       run: |
         set -euo pipefail
         nohup bash -c "$EMULATOR" > "$RUNNER_TEMP/lenslet-emulator.log" 2>&1 &
+        if [ "$UPSTREAM" = "auto" ] || [ "$UPSTREAM" = "sandbox" ] || [ "$UPSTREAM" = "built-in" ]; then
+          UPSTREAM="9298"
+        fi
         address="${UPSTREAM#*://}"
         address="${address%%/*}"
         case "$address" in *:*) ;; *) address="127.0.0.1:$address" ;; esac
@@ -113,6 +116,7 @@ runs:
       env:
         COMMAND: ${{ inputs.command }}
         UPSTREAM: ${{ inputs.upstream }}
+        EMULATOR: ${{ inputs.emulator }}
         LOCK: ${{ inputs.lock }}
         POLICY: ${{ inputs.policy }}
         CHECK: ${{ inputs.check }}
@@ -127,7 +131,17 @@ runs:
         dir=$(mktemp -d "$RUNNER_TEMP/lenslet.XXXXXX")
         report="$dir/report.json"
         markdown="$dir/report.md"
-        args=(run --upstream "$UPSTREAM" --json "$report" --markdown "$markdown")
+        if [ "$UPSTREAM" = "sandbox" ] || [ "$UPSTREAM" = "built-in" ]; then
+          args=(run --sandbox --json "$report" --markdown "$markdown")
+        elif [ "$UPSTREAM" = "auto" ]; then
+          if [ -n "$EMULATOR" ]; then
+            args=(run --upstream 9298 --json "$report" --markdown "$markdown")
+          else
+            args=(run --json "$report" --markdown "$markdown")
+          fi
+        else
+          args=(run --upstream "$UPSTREAM" --json "$report" --markdown "$markdown")
+        fi
         lock="${LOCK:-lenslet.lock}"
         if [ -n "$POLICY" ]; then
           args+=(--policy "$POLICY")

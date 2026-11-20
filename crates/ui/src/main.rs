@@ -348,7 +348,12 @@ pub(crate) fn menus(lang: Lang) -> Vec<Menu> {
         Menu {
             name: t("Run", "运行").into(),
             items: vec![
-                MenuItem::action(t("Run Command…", "发起运行…"), OpenLauncher),
+                MenuItem::action(t("Quick Run Project", "一键运行当前项目"), QuickRun),
+                MenuItem::action(t("Run Command…", "自定义运行…"), OpenLauncher),
+                MenuItem::action(
+                    t("Open Lenslet Terminal", "打开抓包终端"),
+                    OpenTerminalAction,
+                ),
                 MenuItem::action(t("Stop Active Run", "停止当前运行"), StopActiveRun),
                 MenuItem::separator(),
                 MenuItem::action(t("Start Local Proxy", "启动本地代理"), StartProxyAction),
@@ -357,6 +362,10 @@ pub(crate) fn menus(lang: Lang) -> Vec<Menu> {
                 MenuItem::action(t("Replay Selected Call", "重放选中请求"), Replay),
                 MenuItem::action(t("Edit & Replay Call…", "编辑并重放请求…"), OpenComposer),
                 MenuItem::separator(),
+                MenuItem::action(
+                    t("Toggle Interactive Demo", "切换交互示例模式"),
+                    ToggleDemoAction,
+                ),
                 MenuItem::action(t("Previous Run", "上一个运行"), PrevRun),
                 MenuItem::action(t("Next Run", "下一个运行"), NextRun),
                 MenuItem::action(t("Follow Newest Run", "跟随最新运行"), FollowLatest),

@@ -71,6 +71,7 @@ pub struct Inspector {
     docs: DocCache,
     replays: HashMap<String, ReplayState>,
     peers: Vec<Arc<Trace>>,
+    fallback_proxy_url: Option<String>,
     focus: FocusHandle,
     home: std::path::PathBuf,
     _build: Option<Task<()>>,
@@ -112,6 +113,7 @@ impl Inspector {
             docs: DocCache::default(),
             replays: HashMap::new(),
             peers: Vec::new(),
+            fallback_proxy_url: None,
             focus: cx.focus_handle(),
             home,
             _build: None,
@@ -300,7 +302,15 @@ impl Inspector {
 
     // -- Replay & Composer -----------------------------------------------------
 
-    /// Through the live proxy when the run is live, else straight to the emulator.
+    pub fn set_fallback_proxy(&mut self, url: Option<String>, cx: &mut Context<Self>) {
+        if self.fallback_proxy_url != url {
+            self.fallback_proxy_url = url;
+            cx.notify();
+        }
+    }
+
+    /// Through the live proxy when the run is live, else straight to the emulator
+    /// (or the running managed proxy when the run used the built-in sandbox).
     pub fn replay_target(&self, cx: &App) -> Option<ReplayTarget> {
         let session = self.session.read(cx);
         if session.demo {
@@ -311,6 +321,12 @@ impl Inspector {
             return Some(ReplayTarget {
                 url: header.endpoint.clone(),
                 via_proxy: true,
+            });
+        }
+        if header.upstream.starts_with("sandbox://") {
+            return self.fallback_proxy_url.as_ref().map(|url| ReplayTarget {
+                url: url.clone(),
+                via_proxy: false,
             });
         }
         (!header.upstream.is_empty()).then(|| ReplayTarget {

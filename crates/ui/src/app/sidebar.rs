@@ -8,12 +8,16 @@
 
 use std::collections::BTreeMap;
 
-use gpui::{AnyElement, Context, ElementId, FontWeight, MouseButton, div, prelude::*, px, rgb};
+use gpui::{
+    AnyElement, Context, ElementId, FontWeight, MouseButton, MouseDownEvent, div, prelude::*, px,
+    rgb,
+};
 
-use super::{Cmd, LensletApp, widgets};
+use super::{Cmd, LensletApp, MenuEntry, widgets};
 use crate::{
     daemon::ShellFormat,
     fonts, glyph, i18n, icons,
+    model::ellipsize,
     theme::{self, Ui, text},
 };
 
@@ -88,7 +92,7 @@ impl LensletApp {
         let mut ws_actions = div().flex().flex_wrap().items_center().gap(px(6.0));
         if active_cmd_running {
             ws_actions = ws_actions.child(
-                widgets::danger_button(ui, "sb-stop-run", ui.t("Stop Run", "停止运行"))
+                widgets::danger_button(ui, "sb-stop-run", ui.t("■ Stop", "■ 停止运行"))
                     .tooltip(widgets::tip(
                         ui.t("Stop active command cleanly", "平滑终止当前运行"),
                         Some(i18n::shortcut(".")),
@@ -98,19 +102,53 @@ impl LensletApp {
                     })),
             );
         } else {
+            let short_cmd = ellipsize(&self.detected_cmd, 16);
             ws_actions =
-                ws_actions.child(
-                    widgets::primary_button(ui, "sb-new-run", ui.t("New Run…", "新建运行…"))
-                        .tooltip(widgets::tip(
-                            ui.t("Launch a test suite or command", "发起命令或测试套件运行"),
-                            Some(i18n::shortcut("N")),
-                        ))
-                        .on_click(cx.listener(|app, _, window, cx| {
-                            app.run_cmd(Cmd::OpenLauncher, window, cx)
-                        })),
-                );
+                ws_actions
+                    .child(
+                        widgets::primary_button(ui, "sb-quick-run", format!("▶ {}", short_cmd))
+                            .tooltip(widgets::tip(
+                                format!(
+                                    "{}: `{}`",
+                                    ui.t("1-click run in workspace", "一键运行当前项目命令"),
+                                    self.detected_cmd
+                                ),
+                                None,
+                            ))
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.run_cmd(Cmd::QuickRun, window, cx)
+                            })),
+                    )
+                    .child(
+                        widgets::button(ui, "sb-new-run", ui.t("Options…", "选项…"))
+                            .tooltip(widgets::tip(
+                                ui.t("Customize command or lock mode", "自定义运行命令或模式"),
+                                Some(i18n::shortcut("N")),
+                            ))
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.run_cmd(Cmd::OpenLauncher, window, cx)
+                            })),
+                    );
         }
-        ws_actions = ws_actions
+
+        let term_row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                widgets::button(ui, "sb-open-term", ui.t("Open Terminal", "打开抓包终端"))
+                    .tooltip(widgets::tip(
+                        ui.t(
+                            "Auto-start proxy & open a terminal pre-configured with AWS_ENDPOINT_URL",
+                            "自动启动本地代理并打开已配置 AWS_ENDPOINT_URL 的系统终端",
+                        ),
+                        None,
+                    ))
+                    .on_click(cx.listener(|app, _, window, cx| {
+                        app.run_cmd(Cmd::OpenTerminal, window, cx)
+                    })),
+            )
             .child(
                 widgets::button(ui, "sb-new-req", ui.t("Request…", "发包…"))
                     .tooltip(widgets::tip(
@@ -137,16 +175,30 @@ impl LensletApp {
                         app.run_cmd(Cmd::InitCiWorkflow, window, cx)
                     })),
             );
-        ws_card = ws_card.child(ws_actions);
+        ws_card = ws_card.child(ws_actions).child(term_row);
 
-        // 2. Local Proxy & Emulator Card
+        // 2. Local Proxy & Built-in Sandbox Card
+        let is_sandbox_live = env
+            .upstream
+            .as_deref()
+            .is_some_and(|u| u.starts_with("sandbox://"));
         let (status_label, status_color) = if env.running {
+            let suffix = if is_sandbox_live {
+                ui.t(" · Sandbox", " · 内置沙盒")
+            } else {
+                ""
+            };
             (
                 format!(
-                    "{} :{}{}",
-                    ui.t("PROXY LIVE", "代理运行中"),
+                    "{} :{}{}{}",
+                    ui.t("Proxy Live", "代理运行中"),
                     self.proxy_port,
-                    if env.enforce { " · 403" } else { "" }
+                    suffix,
+                    if env.enforce {
+                        ui.t(" · Enforcing", " · 门禁开启")
+                    } else {
+                        ""
+                    }
                 ),
                 t.green,
             )
@@ -154,13 +206,17 @@ impl LensletApp {
             (
                 format!(
                     "{} ({})",
-                    ui.t("READY", "模拟器就绪"),
+                    ui.t("Emulator Ready", "模拟器就绪"),
                     env.emulators[0].name
                 ),
-                t.amber,
+                t.green,
             )
         } else {
-            (ui.t("PROXY IDLE", "代理空闲").into(), t.text_muted)
+            (
+                ui.t("Built-in AWS Sandbox Ready", "内置 AWS 沙盒就绪")
+                    .into(),
+                t.accent,
+            )
         };
 
         let mut proxy_card = div()
@@ -191,11 +247,13 @@ impl LensletApp {
             );
 
         if env.running {
-            let upstream = env
-                .upstream
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("auto");
+            let upstream = match env.upstream.as_deref() {
+                Some(u) if u.starts_with("sandbox://") => {
+                    ui.t("Built-in AWS Sandbox", "内置 AWS 沙盒")
+                }
+                Some(u) if !u.is_empty() => u,
+                _ => "auto",
+            };
             proxy_card = proxy_card.child(
                 div()
                     .font(fonts::mono_font())
@@ -204,7 +262,13 @@ impl LensletApp {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(format!("→ {upstream} · {}c/{}e", env.calls, env.errors)),
+                    .child(format!(
+                        "→ {upstream} · {} {} / {} {}",
+                        env.calls,
+                        ui.t("calls", "调用"),
+                        env.errors,
+                        ui.t("err", "错误")
+                    )),
             );
         } else if !env.emulators.is_empty() {
             let emu_line = env
@@ -223,44 +287,31 @@ impl LensletApp {
                     .text_ellipsis()
                     .child(emu_line),
             );
-        } else if let Some((_, kind)) = self.managed_emulator.as_ref() {
-            let k = *kind;
+        } else {
             proxy_card = proxy_card.child(
-                widgets::danger_button(
-                    ui,
-                    "sb-stop-emu",
-                    format!("{} {}", ui.t("Stop", "停止"), k.label()),
-                )
-                .on_click(
-                    cx.listener(|app, _, window, cx| app.run_cmd(Cmd::StopEmulator, window, cx)),
-                ),
-            );
-        } else if let Some(&first_emu) = env.installed_emulators.first() {
-            proxy_card = proxy_card.child(
-                widgets::button(
-                    ui,
-                    "sb-start-emu",
-                    format!("{} {}", ui.t("Start", "启动"), first_emu.label()),
-                )
-                .on_click(cx.listener(move |app, _, window, cx| {
-                    app.run_cmd(Cmd::StartEmulator(first_emu), window, cx)
-                })),
+                div()
+                    .text_size(px(text::XS))
+                    .text_color(rgb(t.text_muted))
+                    .child(ui.t(
+                        "S3 · DynamoDB · SQS · SNS · STS · Secrets · KMS (zero setup)",
+                        "免装模拟器，直接支持 S3 / DynamoDB / SQS / STS 等状态调用",
+                    )),
             );
         }
 
         let mut controls = div().flex().flex_wrap().items_center().gap(px(6.0));
         if managed_running {
             controls = controls.child(
-                widgets::danger_button(ui, "sb-stop-proxy", ui.t("Stop", "停止")).on_click(
-                    cx.listener(|app, _, window, cx| app.run_cmd(Cmd::StopProxy, window, cx)),
-                ),
+                widgets::danger_button(ui, "sb-stop-proxy", ui.t("Stop Proxy", "停止代理"))
+                    .on_click(
+                        cx.listener(|app, _, window, cx| app.run_cmd(Cmd::StopProxy, window, cx)),
+                    ),
             );
         } else if !env.running {
             controls = controls.child(
-                widgets::primary_button(ui, "sb-start-proxy", ui.t("Start Proxy", "启动代理"))
-                    .on_click(
-                        cx.listener(|app, _, window, cx| app.run_cmd(Cmd::StartProxy, window, cx)),
-                    ),
+                widgets::button(ui, "sb-start-proxy", ui.t("Start Proxy", "后台代理")).on_click(
+                    cx.listener(|app, _, window, cx| app.run_cmd(Cmd::StartProxy, window, cx)),
+                ),
             );
         }
         controls = controls
@@ -268,15 +319,15 @@ impl LensletApp {
                 widgets::chip(
                     ui,
                     "sb-proxy-enforce",
-                    "403",
+                    ui.t("Enforce Lock", "拦截未授权"),
                     None,
                     self.prefs.proxy_enforce,
                     t.purple,
                 )
                 .tooltip(widgets::tip(
                     ui.t(
-                        "Enforce lenslet.lock on managed proxy (--enforce)",
-                        "托管代理开启实时权限门禁 (--enforce)",
+                        "Block AWS actions not in lenslet.lock with AccessDenied (--enforce)",
+                        "对不在 lenslet.lock 中的 AWS 调用实时返回拒绝 (--enforce)",
                     ),
                     None,
                 ))
@@ -286,32 +337,34 @@ impl LensletApp {
                 })),
             )
             .child(
-                widgets::button(
-                    ui,
-                    "sb-copy-env",
-                    format!("{} ({})", ui.t("Env", "环境"), self.shell_format.label()),
-                )
-                .tooltip(widgets::tip(
-                    ui.t(
-                        "Click to copy AWS_ENDPOINT_URL snippet; right-click to switch shell",
-                        "左键复制环境变量；右键切换终端格式 (sh/fish/pwsh/.env/docker)",
+                widgets::button(ui, "sb-copy-env", ui.t("Copy Env ▾", "环境变量 ▾"))
+                    .tooltip(widgets::tip(
+                        ui.t(
+                            "Copy AWS_ENDPOINT_URL snippet for sh/zsh, fish, PowerShell, .env, or Docker",
+                            "复制终端环境变量（支持 sh/zsh、fish、PowerShell、.env、Docker）",
+                        ),
+                        None,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|app, event: &MouseDownEvent, _, cx| {
+                            let ui = Ui::of(cx);
+                            let items: Vec<MenuEntry> = ShellFormat::ALL
+                                .iter()
+                                .map(|&fmt| MenuEntry {
+                                    title: format!(
+                                        "{} {}",
+                                        ui.t("Copy", "复制"),
+                                        fmt.label()
+                                    )
+                                    .into(),
+                                    hint: None,
+                                    cmd: Cmd::CopyProxyEnv(fmt),
+                                })
+                                .collect();
+                            super::this_menu_open(app, event.position, items, cx);
+                        }),
                     ),
-                    None,
-                ))
-                .on_click(cx.listener(|app, _, window, cx| {
-                    app.run_cmd(Cmd::CopyProxyEnv(app.shell_format), window, cx)
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|app, _, _, cx| {
-                        let ix = ShellFormat::ALL
-                            .iter()
-                            .position(|f| *f == app.shell_format)
-                            .unwrap_or(0);
-                        app.shell_format = ShellFormat::ALL[(ix + 1) % ShellFormat::ALL.len()];
-                        cx.notify();
-                    }),
-                ),
             );
         proxy_card = proxy_card.child(controls);
 

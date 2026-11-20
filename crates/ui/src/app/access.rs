@@ -285,13 +285,22 @@ impl AccessView {
                 AccessFilter::Implied,
                 t.accent,
             ))
-            .child(chip(
-                "a-test",
-                "# test".into(),
-                count(AccessFilter::Test),
-                AccessFilter::Test,
-                t.text_muted,
-            ))
+            .child(
+                chip(
+                    "a-test",
+                    ui.t("Test-only", "仅测试").into(),
+                    count(AccessFilter::Test),
+                    AccessFilter::Test,
+                    t.text_muted,
+                )
+                .tooltip(widgets::tip(
+                    ui.t(
+                        "Fixture-only permissions (`# test` in lenslet.lock) — excluded when exporting IAM / Terraform policies",
+                        "测试夹具专用权限（lenslet.lock 中的 `# test`），导出生产 IAM / Terraform 策略时自动排除",
+                    ),
+                    None,
+                )),
+            )
             .child(div().flex_1());
 
         if let Some(label) = sim_label {
@@ -906,9 +915,9 @@ impl Render for AccessDetail {
                     &ui,
                     "mark-test",
                     if row.test {
-                        ui.t("Unmark # test", "取消 # test")
+                        ui.t("Unmark Test-only", "取消仅测试标记")
                     } else {
-                        ui.t("Mark # test", "标记 # test")
+                        ui.t("Mark Test-only", "标记为仅测试")
                     },
                 )
                 .tooltip(widgets::tip(

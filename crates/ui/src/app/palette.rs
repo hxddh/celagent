@@ -85,11 +85,42 @@ impl LensletApp {
             });
         };
         add(
-            ui.t("Run Command Through Lenslet…", "在 Lenslet 中发起运行…")
+            format!(
+                "▶ {}: `{}`",
+                ui.t("Quick Run", "一键运行"),
+                self.detected_cmd
+            ),
+            None,
+            Cmd::QuickRun,
+        );
+        add(
+            ui.t("Run Command Through Lenslet…", "自定义运行命令…")
                 .into(),
             Some(i18n::shortcut("N")),
             Cmd::OpenLauncher,
         );
+        add(
+            ui.t(
+                "Open Lenslet Terminal (Pre-configured AWS_ENDPOINT_URL)",
+                "打开抓包终端（自动配置 AWS_ENDPOINT_URL）",
+            )
+            .into(),
+            None,
+            Cmd::OpenTerminal,
+        );
+        if session.demo {
+            add(
+                ui.t("Exit Interactive Demo", "退出交互示例").into(),
+                None,
+                Cmd::ExitDemo,
+            );
+        } else {
+            add(
+                ui.t("Explore Interactive Demo", "浏览交互示例").into(),
+                None,
+                Cmd::EnterDemo,
+            );
+        }
         add(
             ui.t("Compose New Local AWS Request…", "新建本地 AWS 请求…")
                 .into(),
@@ -187,6 +218,21 @@ impl LensletApp {
                 None,
                 Cmd::StartProxy,
             );
+        }
+        if let Some((_, kind)) = self.managed_emulator.as_ref() {
+            add(
+                format!("{} {}", ui.t("Stop", "停止"), kind.label()),
+                None,
+                Cmd::StopEmulator,
+            );
+        } else {
+            for &kind in &self.env_probe.installed_emulators {
+                add(
+                    format!("{} {}", ui.t("Start", "启动"), kind.label()),
+                    None,
+                    Cmd::StartEmulator(kind),
+                );
+            }
         }
         add(
             ui.t("Copy Proxy Shell Environment", "复制代理终端环境变量")

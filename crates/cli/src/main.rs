@@ -11,6 +11,7 @@
 
 mod capture;
 mod proxy;
+mod sandbox;
 mod trace;
 
 pub(crate) use lenslet_core::{access, findings, iac, lock, problem, runs, summary, wire};
@@ -40,15 +41,21 @@ fn usage() -> String {
         "lenslet {version} — what your code does against local AWS, and what it needs
 
 Usage:
+  lenslet COMMAND [ARGS...]
+      Zero-ceremony shorthand: run any command (`lenslet pytest`, `lenslet npm test`)
+      with AWS_ENDPOINT_URL pointing at Lenslet (auto-using a local emulator or
+      Lenslet's built-in stateful AWS sandbox when no emulator is running).
   lenslet run [options] [--] COMMAND [ARGS...]
-      Run COMMAND with AWS_ENDPOINT_URL pointing at Lenslet. Prints every
-      failed call with its cause, the AWS access the run used, and what changed
-      since the last run and since lenslet.lock.
+      Run COMMAND with options (`--update`, `--check`, `--enforce`, `--sandbox`, …).
   lenslet run [options]
       No command: keep a proxy running on 127.0.0.1:9297 until Ctrl-C.
-  lenslet init [--upstream ADDRESS] -- COMMAND
-      First run: check the emulator, write lenslet.lock from COMMAND, and add
-      .github/workflows/lenslet.yml so pull requests show their AWS access.
+  lenslet shell [options]
+      Open an interactive shell pre-configured for Lenslet; prints summary on `exit`.
+  lenslet init [--sandbox | --upstream ADDRESS] [-- COMMAND]
+      Zero-setup onboarding: auto-detect your test command, write lenslet.lock, and
+      add .github/workflows/lenslet.yml (works out of the box with no emulator).
+  lenslet doctor [--json]
+      Check CLI, desktop app, local emulators, built-in sandbox, lock, and CI setup.
   lenslet last [--json]
       The report of the newest run.
   lenslet runs [--json] [--limit N]
@@ -68,6 +75,7 @@ Usage:
       Open the window (same as `lenslet` with no arguments).
 
 Run options:
+  --sandbox            use Lenslet's built-in stateful AWS sandbox (auto-enabled when no emulator is up)
   --enforce            block calls outside lenslet.lock (or --policy) with AWS AccessDenied
   --check              exit {changed} if the run used access not in the lock (or --policy)
   --strict             with --check: also exit {changed} for locked access the run did not use
@@ -120,7 +128,9 @@ fn main() -> ExitCode {
     };
     let result = match command.as_str() {
         "run" => runtime().and_then(|runtime| runtime.block_on(run(args))),
+        "shell" => runtime().and_then(|runtime| runtime.block_on(shell_cmd(args))),
         "init" => runtime().and_then(|runtime| runtime.block_on(init(args))),
+        "doctor" => runtime().and_then(|runtime| runtime.block_on(doctor_cmd(args))),
         "last" => last(args),
         "runs" => runs_cmd(args),
         "diff" => diff_cmd(args),
@@ -135,6 +145,13 @@ fn main() -> ExitCode {
         "-h" | "--help" | "help" => {
             println!("{}", usage());
             Ok(0)
+        }
+        other if other != "lenslet" && !other.starts_with('-') && command_exists_on_path(other) => {
+            let mut forwarded = Vec::with_capacity(args.len() + 2);
+            forwarded.push("--".to_string());
+            forwarded.push(other.to_string());
+            forwarded.extend(args);
+            runtime().and_then(|runtime| runtime.block_on(run(forwarded)))
         }
         other => Err(anyhow::anyhow!(
             "unknown command `{other}`; try `lenslet --help`"
@@ -162,6 +179,7 @@ struct RunArgs {
     json: Option<String>,
     markdown: Option<String>,
     log: Option<PathBuf>,
+    interactive_shell: bool,
     quiet: bool,
     ui: bool,
     no_env: bool,
@@ -179,6 +197,7 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
         json: None,
         markdown: None,
         log: None,
+        interactive_shell: false,
         quiet: false,
         ui: false,
         no_env: false,
@@ -200,6 +219,7 @@ fn parse_run(args: Vec<String>, home: &Path) -> Result<RunArgs> {
             "--json" => parsed.json = Some(value()?),
             "--markdown" => parsed.markdown = Some(value()?),
             "--log" => parsed.log = Some(PathBuf::from(value()?)),
+            "--interactive-shell" => parsed.interactive_shell = true,
             "--lock" => parsed.lock = Some(PathBuf::from(value()?)),
             "--policy" => parsed.policy = Some(PathBuf::from(value()?)),
             "--strict" => parsed.strict = true,
@@ -323,6 +343,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
         json,
         markdown,
         log,
+        interactive_shell,
         quiet,
         ui,
         no_env,
@@ -332,7 +353,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
         lock,
         policy,
     } = parse_run(args, &home)?;
-    if !options.upstream_given {
+    if !options.upstream_given && !options.sandbox {
         let env_ep = std::env::var("AWS_ENDPOINT_URL").ok();
         if let Some((discovered, source_label)) =
             proxy::Upstream::auto_discover(env_ep.as_deref(), options.listen).await
@@ -360,6 +381,17 @@ async fn run(args: Vec<String>) -> Result<i32> {
                 options.routes.extend(extra);
             }
             options.validate()?;
+        } else {
+            let default_ready = options.upstream.reachable().await
+                && (!options.upstream.tls || options.emulator_ca().is_file());
+            if !default_ready {
+                options.sandbox = true;
+                if !quiet {
+                    eprintln!(
+                        "lenslet: using built-in local AWS sandbox (no external emulator needed)"
+                    );
+                }
+            }
         }
     }
     let cwd = std::env::current_dir().context("read the current directory")?;
@@ -392,13 +424,18 @@ async fn run(args: Vec<String>) -> Result<i32> {
         Some(path) => path,
         None => runs::create(&runs_dir)?,
     };
-    if !options.upstream.reachable().await {
+    if !options.sandbox && !options.upstream.reachable().await {
         eprintln!(
             "lenslet: warning: nothing is listening on {} — start AWS Emulator first:\n  \
              EMULATOR_TELEMETRY=off aws-emulator --telemetry off --port {}",
             options.upstream.base, options.upstream.port
         );
     }
+    let upstream_label = if options.sandbox {
+        proxy::SANDBOX_UPSTREAM.to_string()
+    } else {
+        options.upstream.base.clone()
+    };
     let header_routes = options
         .routes
         .iter()
@@ -439,7 +476,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
             eprintln!(
                 "lenslet: {} → {} · trace {}{enforce_note}",
                 endpoint,
-                options.upstream.base,
+                upstream_label,
                 tilde(&trace_path, &home)
             );
             for (name, value) in &env.set {
@@ -451,7 +488,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
                     env.remove.join(", ")
                 );
             }
-            if env.set.iter().any(|(name, _)| name == "AWS_ACCESS_KEY_ID") {
+            if !options.sandbox && env.set.iter().any(|(name, _)| name == "AWS_ACCESS_KEY_ID") {
                 eprintln!(
                     "lenslet: note: no emulator credentials in {}; using placeholder keys",
                     tilde(&options.emulator_dir(), &home)
@@ -461,7 +498,16 @@ async fn run(args: Vec<String>) -> Result<i32> {
         if ui && let Err(error) = open_ui(Some(&trace_path)) {
             eprintln!("lenslet: {error:#}");
         }
-        Some(run_child(&command, &env, log.as_deref(), server.shutdown_requested()).await?)
+        Some(
+            run_child(
+                &command,
+                &env,
+                log.as_deref(),
+                !interactive_shell,
+                server.shutdown_requested(),
+            )
+            .await?,
+        )
     };
 
     let state = server.state.clone();
@@ -489,7 +535,7 @@ async fn run(args: Vec<String>) -> Result<i32> {
         policy: policy_label,
         trace: trace_path.display().to_string(),
         endpoint: endpoint.clone(),
-        upstream: options.upstream.base.clone(),
+        upstream: upstream_label,
         findings: findings::analyze_against(
             &calls,
             gate_label.as_deref().unwrap_or(lock::FILE_NAME),
@@ -552,6 +598,7 @@ async fn run_child(
     command: &[String],
     env: &ChildEnv,
     log_path: Option<&Path>,
+    isolate_pgroup: bool,
     stop_notify: std::sync::Arc<tokio::sync::Notify>,
 ) -> Result<i32> {
     use tokio::io::AsyncReadExt as _;
@@ -578,9 +625,10 @@ async fn run_child(
     let mut child = tokio::process::Command::new(&command[0]);
     child.args(&command[1..]).stdin(Stdio::inherit());
     #[cfg(unix)]
-    {
-        // Isolate the child and all its descendants (`sh -c`, `npm test`, dev servers)
-        // in their own process group so stopping or terminating reaps the whole tree.
+    if isolate_pgroup {
+        // Isolate managed commands and all their descendants (`sh -c`, `npm test`, dev servers)
+        // in their own process group so stopping or terminating reaps the whole tree, while
+        // interactive `lenslet shell` sessions stay in the controlling TTY's foreground group.
         child.process_group(0);
     }
     if log_sink.is_some() {
@@ -735,15 +783,27 @@ async fn wait_for_sigterm() {
 
 async fn serve_until_interrupted(server: &Server, options: &Options, home: &Path) {
     let stop_notify = server.shutdown_requested();
+    let up_str = if options.sandbox {
+        "sandbox://local (built-in stateful AWS sandbox)".to_string()
+    } else {
+        options.upstream.base.clone()
+    };
     println!("lenslet {} · proxy until Ctrl-C", env!("CARGO_PKG_VERSION"));
     println!("  endpoint  {}", server.endpoint());
-    println!("  upstream  {}", options.upstream.base);
-    println!(
-        "  sdk env   AWS_ENDPOINT_URL={} AWS_SHARED_CREDENTIALS_FILE={} AWS_CONFIG_FILE={}",
-        server.endpoint(),
-        tilde(&options.emulator_dir().join("emulator_credentials"), home),
-        tilde(&options.emulator_dir().join("config"), home),
-    );
+    println!("  upstream  {up_str}");
+    if options.sandbox {
+        println!(
+            "  sdk env   AWS_ENDPOINT_URL={} AWS_ACCESS_KEY_ID=lenslet-local AWS_SECRET_ACCESS_KEY=lenslet-local AWS_DEFAULT_REGION=us-east-1",
+            server.endpoint(),
+        );
+    } else {
+        println!(
+            "  sdk env   AWS_ENDPOINT_URL={} AWS_SHARED_CREDENTIALS_FILE={} AWS_CONFIG_FILE={}",
+            server.endpoint(),
+            tilde(&options.emulator_dir().join("emulator_credentials"), home),
+            tilde(&options.emulator_dir().join("config"), home),
+        );
+    }
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         () = stop_notify.notified() => {}
@@ -837,19 +897,31 @@ fn render_workflow(
         .replace("{emulator}", &emulator_yaml)
 }
 
-/// `lenslet init [--upstream ADDRESS] [--force] -- COMMAND`: from nothing to
-/// an enforced lock in one step.
+/// `lenslet init [--sandbox | --upstream ADDRESS] [--force] [-- COMMAND]`:
+/// from nothing to an enforced lock + GitHub Actions workflow in one step.
 async fn init(args: Vec<String>) -> Result<i32> {
     let mut upstream = "9298".to_string();
     let mut upstream_given = false;
+    let mut sandbox = false;
     let mut force = false;
     let mut command = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--sandbox" => {
+                sandbox = true;
+                upstream_given = false;
+            }
             "--upstream" => {
-                upstream = it.next().context("--upstream requires a value")?;
-                upstream_given = true;
+                let val = it.next().context("--upstream requires a value")?;
+                if matches!(val.trim(), "sandbox" | "built-in" | "sandbox://local") {
+                    sandbox = true;
+                    upstream_given = false;
+                } else {
+                    upstream = val;
+                    upstream_given = true;
+                    sandbox = false;
+                }
             }
             "--force" => force = true,
             "--" => {
@@ -866,36 +938,62 @@ async fn init(args: Vec<String>) -> Result<i32> {
             }
         }
     }
+    let cwd = std::env::current_dir().context("read the current directory")?;
     if command.is_empty() {
-        bail!(
-            "usage: lenslet init [--upstream ADDRESS] -- <test command>, e.g. `lenslet init -- npm test`"
-        );
+        if let Some(detected_cmd) = detect_project_test_command(&cwd) {
+            eprintln!(
+                "lenslet: auto-detected test command `{}`",
+                shell_join(&detected_cmd)
+            );
+            command = detected_cmd;
+        } else {
+            bail!(
+                "could not auto-detect a test command in {}; pass one after `--`, e.g. `lenslet init -- pytest`",
+                cwd.display()
+            );
+        }
     }
+
     let mut target = proxy::Upstream::parse(&upstream)?;
-    if !upstream_given {
+    if !upstream_given && !sandbox {
         let env_ep = std::env::var("AWS_ENDPOINT_URL").ok();
         if let Some((discovered, _)) = proxy::Upstream::auto_discover(env_ep.as_deref(), 0).await {
             upstream = discovered.base.clone();
             target = discovered;
+        } else {
+            let home_dir = home();
+            let ca = home_dir
+                .join(".aws/emulator")
+                .join(target.port.to_string())
+                .join("ca.pem");
+            let default_ready = target.reachable().await && (!target.tls || ca.is_file());
+            if !default_ready {
+                sandbox = true;
+            }
         }
     }
-    eprintln!("lenslet: 1/3 emulator at {}", target.base);
-    if !target.reachable().await {
-        bail!(
-            "nothing is listening on {}. Start your emulator first, e.g.\n  \
-             EMULATOR_TELEMETRY=off aws-emulator --telemetry off --port {}\n\
-             or point at another one with --upstream (moto: --upstream http://127.0.0.1:5000)",
-            target.base,
-            target.port
-        );
-    }
 
-    let detected_emulator = target.detect_emulator().await;
-    if let Some(emulator) = detected_emulator.as_deref() {
-        eprintln!("lenslet:   detected `{emulator}`");
-    }
+    let (workflow_upstream, detected_emulator) = if sandbox {
+        eprintln!("lenslet: 1/3 built-in AWS sandbox ready (no external emulator needed)");
+        ("sandbox".to_string(), None)
+    } else {
+        eprintln!("lenslet: 1/3 emulator at {}", target.base);
+        if !target.reachable().await {
+            bail!(
+                "nothing is listening on {}. Start your emulator first, e.g.\n  \
+                 EMULATOR_TELEMETRY=off aws-emulator --telemetry off --port {}\n\
+                 or run `lenslet init` without `--upstream` to use the built-in AWS sandbox",
+                target.base,
+                target.port
+            );
+        }
+        let emu = target.detect_emulator().await;
+        if let Some(emulator) = emu.as_deref() {
+            eprintln!("lenslet:   detected `{emulator}`");
+        }
+        (target.base.clone(), emu)
+    };
 
-    let cwd = std::env::current_dir().context("read the current directory")?;
     let workflow = cwd.join(".github/workflows/lenslet.yml");
     eprintln!("lenslet: 2/3 workflow {}", workflow.display());
     if workflow.exists() && !force {
@@ -904,7 +1002,7 @@ async fn init(args: Vec<String>) -> Result<i32> {
         let text = render_workflow(
             env!("CARGO_PKG_VERSION"),
             &command,
-            &target.base,
+            &workflow_upstream,
             detected_emulator.as_deref(),
         );
         std::fs::create_dir_all(workflow.parent().unwrap_or(&cwd))
@@ -913,12 +1011,20 @@ async fn init(args: Vec<String>) -> Result<i32> {
     }
 
     eprintln!("lenslet: 3/3 lenslet.lock from `{}`", shell_join(&command));
-    let mut run_args = vec!["--update".to_string(), "--upstream".to_string(), upstream];
+    let mut run_args = vec!["--update".to_string()];
+    if sandbox {
+        run_args.push("--sandbox".to_string());
+    } else {
+        run_args.push("--upstream".to_string());
+        run_args.push(upstream);
+    }
     run_args.push("--".to_string());
     run_args.extend(command);
     let code = Box::pin(run(run_args)).await?;
     if code == 0 {
-        let emulator_note = if detected_emulator.is_some() {
+        let emulator_note = if sandbox {
+            "CI runs out of the box using Lenslet's built-in AWS sandbox."
+        } else if detected_emulator.is_some() {
             "and make sure the workflow installs your emulator and test dependencies."
         } else {
             "and set `emulator:` in the workflow to start your emulator in CI."
@@ -930,6 +1036,276 @@ async fn init(args: Vec<String>) -> Result<i32> {
         );
     }
     Ok(code)
+}
+
+/// `lenslet shell [options]`: start an interactive shell pre-configured with
+/// `AWS_ENDPOINT_URL` pointing at Lenslet, and print the run report on `exit`.
+async fn shell_cmd(args: Vec<String>) -> Result<i32> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", usage());
+        return Ok(0);
+    }
+    let shell_bin = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "cmd.exe".to_string()
+            } else {
+                "/bin/sh".to_string()
+            }
+        });
+    let mut forwarded = Vec::with_capacity(args.len() + 4);
+    forwarded.push("--interactive-shell".to_string());
+    let has_sep = args.iter().any(|a| a == "--");
+    forwarded.extend(args);
+    if !has_sep {
+        forwarded.push("--".to_string());
+        forwarded.push(shell_bin);
+        if !cfg!(windows) {
+            forwarded.push("-i".to_string());
+        }
+    }
+    eprintln!("lenslet: starting interactive Lenslet shell (`exit` or Ctrl-D to finish)...");
+    Box::pin(run(forwarded)).await
+}
+
+/// `lenslet doctor [--json]`: verify CLI, desktop UI, local emulators, built-in
+/// AWS sandbox, `lenslet.lock`, and GitHub Actions workflow status.
+async fn doctor_cmd(args: Vec<String>) -> Result<i32> {
+    let json = match args.as_slice() {
+        [] => false,
+        [flag] if flag == "--json" => true,
+        _ => bail!("usage: lenslet doctor [--json]"),
+    };
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .unwrap_or_else(|_| PathBuf::from("lenslet"));
+    let in_path = command_exists_on_path("lenslet");
+    let ui_installed = find_ui_binary(&exe).is_some();
+
+    let mut active_emulators = Vec::new();
+    for (name, url) in [
+        ("AWS Emulator", "https://127.0.0.1:9298"),
+        ("LocalStack", "http://127.0.0.1:4566"),
+        ("Moto", "http://127.0.0.1:5000"),
+        ("MinIO", "http://127.0.0.1:9000"),
+        ("DynamoDB Local", "http://127.0.0.1:8000"),
+        ("ElasticMQ", "http://127.0.0.1:9324"),
+    ] {
+        if let Ok(up) = proxy::Upstream::parse(url)
+            && up.reachable().await
+        {
+            active_emulators.push(format!("{name} ({url})"));
+        }
+    }
+
+    let mut installed_emulators = Vec::new();
+    for bin in ["aws-emulator", "localstack", "moto_server", "minio"] {
+        if command_exists_on_path(bin) {
+            installed_emulators.push(bin.to_string());
+        }
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let detected_test = detect_project_test_command(&cwd).map(|c| shell_join(&c));
+    let lock_path = lock::path_in(&cwd);
+    let lock_count = lock::read(&lock_path)
+        .ok()
+        .flatten()
+        .map(|l| l.access.len());
+    let workflow_exists = cwd.join(".github/workflows/lenslet.yml").is_file();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "cli_binary": exe.display().to_string(),
+                "cli_in_path": in_path,
+                "desktop_ui_installed": ui_installed,
+                "builtin_sandbox_ready": true,
+                "active_emulators": active_emulators,
+                "installed_emulators": installed_emulators,
+                "workspace": cwd.display().to_string(),
+                "detected_test_command": detected_test,
+                "lock_permissions": lock_count,
+                "ci_workflow": workflow_exists,
+            }))?
+        );
+        return Ok(0);
+    }
+
+    println!("lenslet doctor · v{}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  ✓ CLI binary          {} ({})",
+        exe.display(),
+        if in_path { "on PATH" } else { "not on PATH" }
+    );
+    println!(
+        "  {} Desktop window      {}",
+        if ui_installed { "✓" } else { "·" },
+        if ui_installed {
+            "installed (`lenslet ui`)"
+        } else {
+            "CLI-only install (install full app with `install.sh --app`)"
+        }
+    );
+    println!(
+        "  ✓ Built-in sandbox    ready (S3, DynamoDB, SQS, SNS, STS, Secrets, SSM, KMS, Logs, Lambda)"
+    );
+    if active_emulators.is_empty() {
+        println!("  · External emulators  none running (Lenslet will auto-use built-in sandbox)");
+    } else {
+        println!("  ✓ External emulators  {}", active_emulators.join(", "));
+    }
+    if let Some(cmd) = detected_test {
+        println!("  ✓ Project command     `{cmd}` (run with `lenslet {cmd}`)");
+    } else {
+        println!("  · Project command     none detected in {}", cwd.display());
+    }
+    match lock_count {
+        Some(n) => println!("  ✓ Permission lock     lenslet.lock ({n} permissions)"),
+        None => {
+            println!("  · Permission lock     no lenslet.lock yet (run `lenslet init` to create)")
+        }
+    }
+    println!(
+        "  {} GitHub Actions CI   {}",
+        if workflow_exists { "✓" } else { "·" },
+        if workflow_exists {
+            ".github/workflows/lenslet.yml"
+        } else {
+            "not configured yet (run `lenslet init`)"
+        }
+    );
+    Ok(0)
+}
+
+fn command_exists_on_path(cmd: &str) -> bool {
+    if cmd.is_empty() {
+        return false;
+    }
+    let direct = Path::new(cmd);
+    if cmd.contains('/') || (cfg!(windows) && cmd.contains('\\')) {
+        return is_executable_file(direct);
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(cmd);
+        if is_executable_file(&candidate) {
+            return true;
+        }
+        #[cfg(windows)]
+        for ext in ["exe", "cmd", "bat"] {
+            if is_executable_file(&dir.join(format!("{cmd}.{ext}"))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn find_ui_binary(cli_exe: &Path) -> Option<PathBuf> {
+    let dir = cli_exe.parent()?;
+    let ui_name = if cfg!(windows) {
+        "lenslet-ui.exe"
+    } else {
+        "lenslet-ui"
+    };
+    if dir.join(ui_name).is_file() {
+        return Some(dir.join(ui_name));
+    }
+    if cfg!(target_os = "macos") {
+        for app in [
+            dir.ancestors()
+                .nth(2)
+                .filter(|p| p.extension().is_some_and(|e| e == "app"))
+                .map(Path::to_path_buf),
+            Some(PathBuf::from("/Applications/Lenslet.app")),
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Applications/Lenslet.app")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if app.is_dir() {
+                return Some(app);
+            }
+        }
+    }
+    None
+}
+
+fn detect_project_test_command(cwd: &Path) -> Option<Vec<String>> {
+    let pkg_json = cwd.join("package.json");
+    if let Ok(text) = std::fs::read_to_string(&pkg_json)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+        && val
+            .get("scripts")
+            .and_then(|s| s.get("test"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        if cwd.join("pnpm-lock.yaml").is_file() {
+            return Some(vec!["pnpm".into(), "test".into()]);
+        } else if cwd.join("yarn.lock").is_file() {
+            return Some(vec!["yarn".into(), "test".into()]);
+        } else if cwd.join("bun.lockb").is_file() || cwd.join("bun.lock").is_file() {
+            return Some(vec!["bun".into(), "test".into()]);
+        }
+        return Some(vec!["npm".into(), "test".into()]);
+    }
+    if cwd.join("Cargo.toml").is_file() {
+        return Some(vec!["cargo".into(), "test".into()]);
+    }
+    if cwd.join("go.mod").is_file() {
+        return Some(vec!["go".into(), "test".into(), "./...".into()]);
+    }
+    if cwd.join("pyproject.toml").is_file()
+        || cwd.join("pytest.ini").is_file()
+        || cwd.join("requirements.txt").is_file()
+    {
+        if cwd.join("uv.lock").is_file() && command_exists_on_path("uv") {
+            return Some(vec!["uv".into(), "run".into(), "pytest".into()]);
+        }
+        if !command_exists_on_path("pytest")
+            && command_exists_on_path("python3")
+            && let Ok(entries) = std::fs::read_dir(cwd)
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if s.starts_with("test_") && s.ends_with(".py") {
+                    return Some(vec!["python3".into(), s.into_owned()]);
+                }
+            }
+        }
+        return Some(vec!["pytest".into()]);
+    }
+    if cwd.join("Makefile").is_file() {
+        return Some(vec!["make".into(), "test".into()]);
+    }
+    None
 }
 
 /// `lenslet last [--json]`: the newest run's report, without running anything.
