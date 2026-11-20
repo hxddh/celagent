@@ -574,6 +574,30 @@ fn decode_payload(prefix: &[u8], content: &Content, limit: usize) -> Option<(Vec
     Some((decompressed.into_owned(), comp_capped))
 }
 
+/// Strip `aws-chunked` framing when present, preserving inner payload bytes untouched.
+pub fn unframe_aws_chunked_bytes(raw: &[u8], aws_chunked: bool, limit: usize) -> Vec<u8> {
+    if !aws_chunked || raw.is_empty() {
+        return raw.to_vec();
+    }
+    decode_aws_chunked(raw, limit)
+        .map(|(bytes, _)| bytes)
+        .unwrap_or_else(|| raw.to_vec())
+}
+
+/// Unframe `aws-chunked` and decompress `gzip`/`deflate`/`zstd` wire bytes for RPC/JSON/Query handlers.
+pub fn decode_wire_bytes(raw: &[u8], content: &Content, limit: usize) -> Vec<u8> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let unframed = unframe_aws_chunked_bytes(raw, content.aws_chunked, limit);
+    match content.encoding {
+        Some(Encoding::Identity) | None => unframed,
+        Some(other) => decode_compressed(&unframed, other, limit)
+            .map(|(bytes, _)| bytes)
+            .unwrap_or(unframed),
+    }
+}
+
 /// Unframe AWS `application/vnd.amazon.eventstream` binary messages into readable
 /// newline-delimited JSON objects (used by Bedrock `ConverseStream` /
 /// `InvokeModelWithResponseStream`, S3 `SelectObjectContent`, Lambda response streams).

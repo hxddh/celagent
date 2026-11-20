@@ -79,11 +79,16 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 /// Stripped before forwarding, and not recorded among the request headers.
 const REPLAY_HEADER: &str = "x-lenslet-replay-of";
 
+/// Upstream URI recorded when Lenslet serves AWS calls from its built-in sandbox.
+pub const SANDBOX_UPSTREAM: &str = "sandbox://local";
+
 #[derive(Clone)]
 pub struct State {
     client: HttpsClient,
-    /// Default upstream base URL without a trailing slash, e.g. `https://127.0.0.1:9298`.
+    /// Default upstream base URL without a trailing slash, e.g. `https://127.0.0.1:9298` or `sandbox://local`.
     upstream: String,
+    /// Built-in stateful local AWS sandbox when `--sandbox` or automatic fallback is active.
+    sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     /// Per-service local upstream overrides (`service` -> base URL), e.g. `s3` -> `http://127.0.0.1:9000`.
     routes: BTreeMap<String, String>,
     /// Bound proxy endpoint URL, e.g. `http://127.0.0.1:9297`.
@@ -136,6 +141,7 @@ struct Pending {
     derive_capture: Option<Arc<Mutex<Capture>>>,
     /// The gate evaluation already made for this call (under `--enforce`).
     evaluation: Option<Evaluation>,
+    request_incomplete: bool,
     response_capture: Arc<Mutex<Capture>>,
     response_content: Content,
 }
@@ -144,7 +150,11 @@ impl Pending {
     fn finish(mut self) {
         self.finished.store(true, Ordering::SeqCst);
         self.trace.ms = self.started.elapsed().as_millis() as u64;
-        self.trace.request.body = snapshot(&self.request_capture, &self.request_content);
+        self.trace.request.body =
+            snapshot(&self.request_capture, &self.request_content).map(|mut body| {
+                body.truncated |= self.request_incomplete;
+                body
+            });
         self.trace.request.trailers =
             snapshot_trailers(&self.request_capture, &self.request_content);
         self.trace.response.body = snapshot(&self.response_capture, &self.response_content);
@@ -172,11 +182,18 @@ impl Pending {
         let evaluation = match self.evaluation.take() {
             Some(evaluation) => evaluation,
             None => {
-                let mut full = self.full_body.take().or_else(|| {
-                    self.derive_capture
-                        .as_deref()
-                        .and_then(|capture| snapshot(capture, &self.request_content))
-                });
+                let mut full = self
+                    .full_body
+                    .take()
+                    .or_else(|| {
+                        self.derive_capture
+                            .as_deref()
+                            .and_then(|capture| snapshot(capture, &self.request_content))
+                    })
+                    .map(|mut body| {
+                        body.truncated |= self.request_incomplete;
+                        body
+                    });
                 with_body(&mut self.trace, &mut full, |trace| {
                     self.state.trace.evaluate(trace)
                 })
@@ -277,6 +294,8 @@ pub struct Options {
     pub upstream: Upstream,
     /// Whether `--upstream` was explicitly passed on the command line.
     pub upstream_given: bool,
+    /// Serve unrouted AWS calls directly from Lenslet's built-in stateful local sandbox.
+    pub sandbox: bool,
     /// Per-service local upstream overrides (`--route s3=http://127.0.0.1:9000`).
     pub routes: BTreeMap<String, Upstream>,
     /// Accept connections from local Docker container bridge interfaces (`0.0.0.0` filtered to local/RFC1918 IPs).
@@ -299,6 +318,7 @@ impl Options {
             listen,
             upstream: Upstream::parse("9298").expect("default upstream"),
             upstream_given: false,
+            sandbox: false,
             routes: BTreeMap::new(),
             allow_docker: false,
             emulator_ca: None,
@@ -318,10 +338,24 @@ impl Options {
                     .parse::<u16>()
                     .with_context(|| format!("--listen expects a port number, got `{raw}`"))?;
             }
+            "--sandbox" => {
+                self.sandbox = true;
+                self.upstream_given = false;
+            }
             "--upstream" => {
-                self.upstream = Upstream::parse(&value()?)?;
-                self.upstream.ensure_local_boundary("--upstream")?;
-                self.upstream_given = true;
+                let raw = value()?;
+                if matches!(
+                    raw.trim(),
+                    "sandbox" | "built-in" | "sandbox://local" | "sandbox://built-in"
+                ) {
+                    self.sandbox = true;
+                    self.upstream_given = false;
+                } else {
+                    self.upstream = Upstream::parse(&raw)?;
+                    self.upstream.ensure_local_boundary("--upstream")?;
+                    self.upstream_given = true;
+                    self.sandbox = false;
+                }
             }
             "--route" => {
                 let raw = value()?;
@@ -352,13 +386,16 @@ impl Options {
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.upstream.ensure_local_boundary("--upstream")?;
-        if self.upstream.is_loopback() && self.upstream.port == self.listen && self.listen != 0 {
-            bail!(
-                "--listen {} and --upstream {} are the same port; the proxy would forward to itself",
-                self.listen,
-                self.upstream.port
-            );
+        if !self.sandbox {
+            self.upstream.ensure_local_boundary("--upstream")?;
+            if self.upstream.is_loopback() && self.upstream.port == self.listen && self.listen != 0
+            {
+                bail!(
+                    "--listen {} and --upstream {} are the same port; the proxy would forward to itself",
+                    self.listen,
+                    self.upstream.port
+                );
+            }
         }
         for (svc, route) in &self.routes {
             route.ensure_local_boundary("--route")?;
@@ -503,6 +540,7 @@ impl Upstream {
             && let Ok(parsed) = Upstream::parse(raw)
             && parsed.is_loopback()
             && (listen_port == 0 || parsed.port != listen_port)
+            && parsed.reachable().await
         {
             return Some((parsed, "AWS_ENDPOINT_URL"));
         }
@@ -1084,27 +1122,15 @@ where
 
     let target_base = state.upstream_for(&service).to_string();
     trace.upstream = Some(target_base.clone());
-    let upstream_uri = format!("{target_base}{forward_path}");
-    let mut upstream = match Request::builder()
-        .method(parts.method)
-        .uri(upstream_uri)
-        .body(upstream_body)
-    {
-        Ok(request) => request,
-        Err(error) => {
-            return Ok(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
-        }
-    };
-    // End-to-end headers (including Host and Authorization) are forwarded
-    // verbatim so SigV4 signatures remain valid.
-    *upstream.headers_mut() = parts.headers;
+    let mut upstream_body = upstream_body;
+    let use_sandbox = target_base == SANDBOX_UPSTREAM && state.sandbox.is_some();
 
     // A slow call (long poll, large transfer, a hung emulator) shows up as
     // pending—with its full request headers and captured body—instead of
     // being invisible until it ends.
     state.trace.start(&trace.id);
     let finished = Arc::new(AtomicBool::new(false));
-    {
+    if !use_sandbox {
         let state = state.clone();
         let finished = finished.clone();
         let pending_capture = request_capture.clone();
@@ -1129,12 +1155,77 @@ where
         });
     }
 
-    match state.client.request(upstream).await {
-        Ok(response) => {
+    let mut request_incomplete = false;
+    let exchange: Result<(StatusCode, String, hyper::HeaderMap, Body), String> = if use_sandbox {
+        let sb = state.sandbox.as_ref().expect("sandbox checked");
+        match collect_bounded(&mut upstream_body, inspect_limit).await {
+            Ok(collected) if collected.complete => {
+                let resp = sb.handle(
+                    &parts.method,
+                    &raw_path,
+                    &parts.headers,
+                    &service,
+                    trace.region.as_deref(),
+                    advertised_operation.as_deref(),
+                    &trace.operation,
+                    &request_content,
+                    &collected.data,
+                );
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                Ok((status, "sandbox".to_string(), headers, resp.into_body()))
+            }
+            Ok(_incomplete) => {
+                let drained = tokio::time::timeout(
+                    DRAIN_TIME,
+                    collect_bounded(&mut upstream_body, DRAIN_BYTES),
+                )
+                .await;
+                request_incomplete = !matches!(drained, Ok(Ok(ref rest)) if rest.complete);
+                let resp =
+                    sb.payload_too_large(&service, &parts.headers, &request_content, inspect_limit);
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                Ok((status, "sandbox".to_string(), headers, resp.into_body()))
+            }
+            Err(detail) => {
+                finished.store(true, Ordering::SeqCst);
+                return Ok(error_response(StatusCode::BAD_REQUEST, &detail));
+            }
+        }
+    } else {
+        let upstream_uri = format!("{target_base}{forward_path}");
+        let mut upstream = match Request::builder()
+            .method(parts.method)
+            .uri(upstream_uri)
+            .body(upstream_body)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                finished.store(true, Ordering::SeqCst);
+                return Ok(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
+            }
+        };
+        // End-to-end headers (including Host and Authorization) are forwarded
+        // verbatim so SigV4 signatures remain valid.
+        *upstream.headers_mut() = parts.headers;
+        state
+            .client
+            .request(upstream)
+            .await
+            .map(|response| {
+                let status = response.status();
+                let proto = http_version_label(response.version()).to_string();
+                let headers = response.headers().clone();
+                let body = response.into_body().map_err(std::io::Error::other).boxed();
+                (status, proto, headers, body)
+            })
+            .map_err(|e| error_chain(&e))
+    };
+
+    match exchange {
+        Ok((status, resp_proto, mut headers, resp_body)) => {
             let ttfb = started.elapsed().as_millis() as u64;
-            let status = response.status();
-            let resp_proto = http_version_label(response.version()).to_string();
-            let mut headers = response.headers().clone();
             let response_content = capture::content(&headers);
             trace.status = status.as_u16();
             trace.ttfb_ms = Some(ttfb);
@@ -1159,7 +1250,7 @@ where
                 });
                 if let Some(denied) = checked.denied.first().cloned() {
                     finished.store(true, Ordering::SeqCst);
-                    drop(response);
+                    drop(resp_body);
                     trace.request.body = snapshot(&request_capture, &request_content);
                     return Ok(reject_blocked(
                         trace,
@@ -1191,23 +1282,22 @@ where
                 full_body,
                 derive_capture,
                 evaluation,
+                request_incomplete,
                 response_capture: response_capture.clone(),
                 response_content,
             };
             // The trace entry is written when the response body ends (or the
             // client goes away), so `ms` covers the whole exchange:
-            let body = TeeBody::new(response.into_body(), response_capture)
+            let body = TeeBody::new(resp_body, response_capture)
                 .on_end(move || pending.finish())
-                .map_err(std::io::Error::other)
                 .boxed();
             let mut out = Response::new(body);
             *out.status_mut() = status;
             *out.headers_mut() = headers;
             Ok(out)
         }
-        Err(error) => {
+        Err(detail) => {
             finished.store(true, Ordering::SeqCst);
-            let detail = error_chain(&error);
             trace.status = StatusCode::BAD_GATEWAY.as_u16();
             trace.ms = started.elapsed().as_millis() as u64;
             trace.problem = Some(problem::unreachable(&target_base, &detail));
@@ -1519,10 +1609,10 @@ impl Server {
             .install_default()
             .ok();
         // Read and validate everything before creating any files.
-        let roots = if options.upstream.tls {
+        let roots = if !options.sandbox && options.upstream.tls {
             emulator_roots(&options.emulator_ca())?
         } else {
-            // A plain-HTTP upstream has no TLS certificate to trust.
+            // Plain-HTTP upstreams and the built-in sandbox need no TLS CA.
             RootCertStore::empty()
         };
         let bind_v4 = if options.allow_docker {
@@ -1541,8 +1631,16 @@ impl Server {
             .await
             .ok();
         let endpoint = format!("http://{addr}");
+        let upstream_base = if options.sandbox {
+            SANDBOX_UPSTREAM.to_string()
+        } else {
+            options.upstream.base.clone()
+        };
+        let sandbox = options
+            .sandbox
+            .then(|| Arc::new(crate::sandbox::Sandbox::new(&endpoint)));
         header.endpoint = endpoint.clone();
-        header.upstream = options.upstream.base.clone();
+        header.upstream = upstream_base.clone();
         let routes: BTreeMap<String, String> = options
             .routes
             .iter()
@@ -1552,7 +1650,8 @@ impl Server {
         let trace = Arc::new(TraceSink::new(trace_path, &header, gate)?);
         let state = Arc::new(State {
             client: client(roots),
-            upstream: options.upstream.base.clone(),
+            upstream: upstream_base,
+            sandbox,
             routes,
             endpoint,
             max_body: options.max_body,
@@ -1833,6 +1932,7 @@ mod tests {
         Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: upstream.to_string(),
+            sandbox: None,
             routes: BTreeMap::new(),
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
@@ -2324,6 +2424,7 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            sandbox: None,
             routes: BTreeMap::new(),
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
@@ -2367,6 +2468,7 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            sandbox: None,
             routes: BTreeMap::new(),
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
@@ -2480,6 +2582,7 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            sandbox: None,
             routes: BTreeMap::new(),
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
@@ -2576,6 +2679,7 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            sandbox: None,
             routes: BTreeMap::new(),
             endpoint: String::new(),
             max_body: 64,
@@ -2668,6 +2772,7 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            sandbox: None,
             routes: BTreeMap::new(),
             endpoint: String::new(),
             max_body: 64,
@@ -2727,6 +2832,7 @@ mod tests {
         Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{upstream}"),
+            sandbox: None,
             routes: BTreeMap::new(),
             endpoint: String::new(),
             max_body: MAX_CAPTURE_BYTES,
@@ -3012,6 +3118,7 @@ mod tests {
         let state = Arc::new(State {
             client: client(RootCertStore::empty()),
             upstream: format!("http://127.0.0.1:{port}"),
+            sandbox: None,
             routes: BTreeMap::new(),
             endpoint: String::new(),
             max_body: 64,
@@ -3190,5 +3297,113 @@ mod tests {
         assert_eq!(written.len(), 2);
         assert_eq!(written[0].target.as_deref(), Some("s3://assets/logo.svg"));
         assert_eq!(written[1].target.as_deref(), Some("queue/jobs"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_rejects_incomplete_oversized_request_bodies_without_mutating_state() {
+        let temp = TempDir::new("sandbox-oversized");
+        let trace_path = temp.trace();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let sb = Arc::new(crate::sandbox::Sandbox::new("http://127.0.0.1:9297"));
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: SANDBOX_UPSTREAM.to_string(),
+            sandbox: Some(sb),
+            routes: BTreeMap::new(),
+            endpoint: "http://127.0.0.1:9297".to_string(),
+            max_body: 512,
+            enforce: false,
+            blobs_dir: None,
+            trace: Arc::new(
+                TraceSink::new(trace_path.clone(), &RunHeader::default(), None).unwrap(),
+            ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        // 1. Oversized S3 PutObject (1024 bytes > 32-byte inspect_limit) returns 413 EntityTooLarge
+        //    and does NOT publish a truncated object into the sandbox bucket.
+        let oversized_put = Request::builder()
+            .method("PUT")
+            .uri("/uploads/report.bin?x-id=PutObject")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("content-type", "application/octet-stream")
+            .body(Full::new(Bytes::from(vec![b'A'; 1024])))
+            .unwrap();
+        let resp = handle_with_inspect_limit(oversized_put, state.clone(), 32)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let err_xml = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(err_xml.contains("<Code>EntityTooLarge</Code>"), "{err_xml}");
+
+        // Verify the bucket/object was NOT created or mutated in the sandbox.
+        let check_get = sdk_request("GET", "/uploads/report.bin?x-id=GetObject", b"");
+        let get_resp = handle_with_inspect_limit(check_get, state.clone(), 32)
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+        let _ = get_resp.into_body().collect().await.unwrap();
+
+        // 2. Oversized JSON RPC request returns 413 RequestEntityTooLargeException.
+        let oversized_ddb = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.PutItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(Full::new(Bytes::from(
+                r#"{"TableName":"orders","Item":{"id":{"S":"oversized-item-payload"}}}"#,
+            )))
+            .unwrap();
+        let ddb_resp = handle_with_inspect_limit(oversized_ddb, state.clone(), 32)
+            .await
+            .unwrap();
+        assert_eq!(ddb_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let ddb_err = String::from_utf8(
+            ddb_resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            ddb_err.contains("RequestEntityTooLargeException"),
+            "{ddb_err}"
+        );
+
+        let written = traces(&trace_path);
+        assert_eq!(written.len(), 3);
+        assert_eq!(written[0].status, 413);
+        assert_eq!(
+            written[0].problem.as_ref().map(|p| p.code.as_str()),
+            Some("EntityTooLarge")
+        );
+        assert!(written[0].request.body.as_ref().unwrap().truncated);
+        assert_eq!(written[2].status, 413);
+        assert_eq!(
+            written[2].problem.as_ref().map(|p| p.code.as_str()),
+            Some("RequestEntityTooLargeException")
+        );
     }
 }

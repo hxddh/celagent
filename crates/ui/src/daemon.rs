@@ -660,16 +660,19 @@ pub fn generate_ci_workflow(
     } else {
         command_line.trim()
     };
-    let up_trimmed = if upstream.trim().is_empty() {
-        "https://127.0.0.1:9298"
-    } else {
-        upstream.trim()
-    };
+    let up_trimmed = upstream.trim();
+    let is_sandbox =
+        up_trimmed.is_empty() || up_trimmed == "sandbox" || up_trimmed.starts_with("sandbox://");
+    let up_yaml_raw = if is_sandbox { "sandbox" } else { up_trimmed };
     let yaml_quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let emu_val = emulator_cmd
-        .filter(|s| !s.trim().is_empty())
-        .map(yaml_quote)
-        .unwrap_or_else(|| "'moto_server -p 5000'".to_string());
+    let emu_val = if is_sandbox {
+        "''".to_string()
+    } else {
+        emulator_cmd
+            .filter(|s| !s.trim().is_empty())
+            .map(yaml_quote)
+            .unwrap_or_else(|| "'moto_server -p 5000'".to_string())
+    };
     let version = env!("CARGO_PKG_VERSION");
     let content = format!(
         "# Lenslet: show the AWS access each pull request needs, and fail when it grows.\n\
@@ -685,7 +688,7 @@ pub fn generate_ci_workflow(
          \x20         upstream: {}\n\
          \x20         emulator: {emu_val}\n",
         yaml_quote(cmd_trimmed),
-        yaml_quote(up_trimmed),
+        yaml_quote(up_yaml_raw),
     );
     fs::write(&wf_path, content).map_err(|e| format!("cannot write {}: {e}", wf_path.display()))?;
     Ok(wf_path)
@@ -860,6 +863,104 @@ pub fn shell_env_snippet_for(port: u16, fmt: ShellFormat) -> String {
     }
 }
 
+/// Write an owner-only shell launcher script pre-configured with `AWS_ENDPOINT_URL`
+/// and local placeholder credentials, then open the user's native OS terminal in `cwd`.
+pub fn open_configured_terminal(home: &Path, cwd: &Path, port: u16) -> Result<(), String> {
+    fsguard::assert_io_allowed();
+    let script_path = write_terminal_launcher_script(home, cwd, port)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .args(["-a", "Terminal"])
+            .arg(&script_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to open Terminal.app: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let script_str = script_path.to_string_lossy().into_owned();
+        let candidates: &[(&str, &[&str])] = &[
+            ("x-terminal-emulator", &["-e"]),
+            ("gnome-terminal", &["--"]),
+            ("kgx", &["--"]),
+            ("konsole", &["-e"]),
+            ("xfce4-terminal", &["-x"]),
+            ("kitty", &[]),
+            ("alacritty", &["-e"]),
+            ("wezterm", &["start", "--"]),
+        ];
+        for (bin, prefix_args) in candidates {
+            if let Some(exe) = find_in_path(bin) {
+                let mut cmd = Command::new(exe);
+                cmd.env("PATH", augmented_path())
+                    .args(*prefix_args)
+                    .arg(&script_str)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if cmd.spawn().is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        Err("No desktop terminal emulator found; run `lenslet shell` in your terminal".into())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = script_path;
+        Err("Run `lenslet shell` in your terminal".into())
+    }
+}
+
+pub fn write_terminal_launcher_script(
+    home: &Path,
+    cwd: &Path,
+    port: u16,
+) -> Result<PathBuf, String> {
+    let dir = home.join(".lenslet");
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let script_path = dir.join("lenslet-terminal.command");
+    let escaped_cwd = cwd.to_string_lossy().replace('\'', r"'\''");
+    let content = format!(
+        "#!/bin/sh\n\
+         cd '{escaped_cwd}' 2>/dev/null || cd \"$HOME\"\n\
+         unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN\n\
+         export AWS_ENDPOINT_URL=\"http://127.0.0.1:{port}\"\n\
+         export AWS_ACCESS_KEY_ID=\"lenslet-local\"\n\
+         export AWS_SECRET_ACCESS_KEY=\"lenslet-local\"\n\
+         export AWS_DEFAULT_REGION=\"us-east-1\"\n\
+         export LENSLET_ACTIVE=\"1\"\n\
+         printf '\\033[1;36m● Lenslet terminal ready\\033[0m · AWS_ENDPOINT_URL=%s\\n' \"$AWS_ENDPOINT_URL\"\n\
+         printf '  Every AWS CLI / SDK / test command here is captured live in Lenslet.\\n\\n'\n\
+         exec \"${{SHELL:-/bin/sh}}\" -i\n"
+    );
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o700);
+    }
+    let mut file = opts
+        .open(&script_path)
+        .map_err(|e| format!("cannot write {}: {e}", script_path.display()))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", script_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700));
+    }
+    Ok(script_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,6 +1000,16 @@ mod tests {
         let yaml = fs::read_to_string(&wf).unwrap();
         assert!(yaml.contains("command: 'pnpm test'"));
         assert!(yaml.contains("upstream: 'http://127.0.0.1:4566'"));
+
+        let wf_sandbox = generate_ci_workflow(&dir, "pnpm test", "sandbox", None).unwrap();
+        let yaml_sb = fs::read_to_string(&wf_sandbox).unwrap();
+        assert!(yaml_sb.contains("upstream: 'sandbox'"), "{yaml_sb}");
+        assert!(yaml_sb.contains("emulator: ''"), "{yaml_sb}");
+
+        let term_script = write_terminal_launcher_script(&dir, &dir, 9297).unwrap();
+        let script_body = fs::read_to_string(&term_script).unwrap();
+        assert!(script_body.contains("AWS_ENDPOINT_URL=\"http://127.0.0.1:9297\""));
+        assert!(script_body.contains("AWS_ACCESS_KEY_ID=\"lenslet-local\""));
 
         let log_path = dir.join("sample.log");
         fs::write(&log_path, "line1\nline2\n").unwrap();

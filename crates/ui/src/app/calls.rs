@@ -43,7 +43,7 @@ pub enum SortCol {
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(60);
 const PAGE_ROWS: isize = 20;
-const START_COMMAND: &str = "lenslet run -- npm test";
+const START_COMMAND: &str = "lenslet pytest";
 
 pub enum CallsEvent {
     /// The selected call changed (or was replaced by its finished line).
@@ -1066,10 +1066,10 @@ impl CallsList {
             Health::Loading => widgets::skeleton_rows(ui, 10).into_any_element(),
             Health::Missing => widgets::empty_state(
                 ui,
-                ui.t("No runs yet", "还没有运行记录"),
+                ui.t("Welcome to Lenslet", "欢迎使用 Lenslet"),
                 ui.t(
-                    "Launch your test suite directly inside Lenslet (⌘N), start the local proxy, or run from your terminal. Every AWS call appears live with zero payload loss.",
-                    "按 ⌘N 直接在应用内启动测试套件、一键开启本地代理，或在终端运行。每一个 AWS 请求都会零丢失实时呈现。",
+                    "Open your project folder to run tests in 1 click (powered by Lenslet's built-in AWS sandbox — no external emulator required), or explore an interactive demo first.",
+                    "打开你的项目目录即可一键运行测试（内置有状态 AWS 沙盒，无需安装 LocalStack / Moto 等外部模拟器），也可以先一键体验交互示例。",
                 ),
                 Some(
                     div()
@@ -1080,37 +1080,42 @@ impl CallsList {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
+                                .justify_center()
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
                                     widgets::primary_button(
                                         ui,
-                                        "empty-launch-run",
-                                        ui.t("Run Command… (⌘N)", "发起运行… (⌘N)"),
+                                        "empty-open-project",
+                                        ui.t("Open Project Folder…", "打开项目文件夹…"),
                                     )
                                     .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(super::OpenLauncher), cx);
+                                        window.dispatch_action(Box::new(super::OpenWorkspace), cx);
                                     }),
                                 )
                                 .child(
                                     widgets::button(
                                         ui,
-                                        "empty-start-proxy",
-                                        ui.t("Start Local Proxy", "启动本地代理"),
+                                        "empty-explore-demo",
+                                        ui.t("Explore Interactive Demo", "浏览交互示例"),
                                     )
                                     .on_click(|_, window, cx| {
                                         window
-                                            .dispatch_action(Box::new(super::StartProxyAction), cx);
+                                            .dispatch_action(Box::new(super::ToggleDemoAction), cx);
                                     }),
                                 )
                                 .child(
                                     widgets::button(
                                         ui,
-                                        "empty-open-trace",
-                                        ui.t("Open Trace…", "打开追踪文件…"),
+                                        "empty-open-term",
+                                        ui.t("Open Lenslet Terminal", "打开抓包终端"),
                                     )
                                     .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(super::OpenFile), cx);
+                                        window.dispatch_action(
+                                            Box::new(super::OpenTerminalAction),
+                                            cx,
+                                        );
                                     }),
                                 ),
                         )
@@ -1245,6 +1250,137 @@ impl Render for CallsList {
         let start_ms = session.run_start_ms();
         let span_ms = session.run_span_ms().max(1);
         let changes = session.changes.clone();
+        let is_demo = session.demo;
+        let editable_lock = session.can_edit_lock();
+        let has_policy_gate = session
+            .run
+            .as_ref()
+            .is_some_and(|r| r.header.policy.is_some());
+        let vs_lock = session.baseline == super::session::Baseline::Lock && !has_policy_gate;
+        let not_in_lock: Vec<(crate::model::Access, bool, bool)> = if !is_demo && vs_lock {
+            session
+                .access_rows
+                .iter()
+                .filter(|r| r.used && !r.in_lock)
+                .map(|r| (r.access.clone(), false, r.implied))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let guided_banner: Option<Div> = if is_demo {
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .h(px(34.0))
+                    .px(px(theme::ROW_PAD_X))
+                    .border_b_1()
+                    .border_color(theme::h(t.accent, 0.30))
+                    .bg(theme::h(t.accent, 0.08))
+                    .child(glyph::dot(theme::h(t.accent, 1.0), 6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(text::SM))
+                            .text_color(rgb(t.text))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(ui.t(
+                                "Interactive Demo · Inspect sample AWS calls, causal failure hints, and derived IAM permissions",
+                                "示例模式 · 正在浏览订单服务 AWS 调用、跨请求故障原因诊断与自动推导的最小 IAM 权限",
+                            )),
+                    )
+                    .child(
+                        widgets::primary_button(
+                            &ui,
+                            "demo-open-ws",
+                            ui.t("Open My Project…", "打开我的项目…"),
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(super::OpenWorkspace), cx);
+                        }),
+                    )
+                    .child(
+                        widgets::button(&ui, "demo-exit", ui.t("Exit Demo", "退出示例")).on_click(
+                            |_, window, cx| {
+                                window.dispatch_action(Box::new(super::ToggleDemoAction), cx);
+                            },
+                        ),
+                    ),
+            )
+        } else if !not_in_lock.is_empty() {
+            let n = not_in_lock.len();
+            let sess_ent = self.session.clone();
+            let accept_entries = not_in_lock;
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .h(px(34.0))
+                    .px(px(theme::ROW_PAD_X))
+                    .border_b_1()
+                    .border_color(theme::h(t.amber, 0.30))
+                    .bg(theme::h(t.amber, 0.08))
+                    .child(glyph::dot(theme::h(t.amber, 1.0), 6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(text::SM))
+                            .text_color(rgb(t.text))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(if ui.zh() {
+                                format!("本次运行使用了 {n} 项尚未锁定的 AWS 权限")
+                            } else {
+                                format!(
+                                    "This run used {n} unlocked AWS permission{}",
+                                    if n == 1 { "" } else { "s" }
+                                )
+                            }),
+                    )
+                    .child(if editable_lock {
+                        widgets::primary_button(
+                            &ui,
+                            "banner-save-lock",
+                            ui.t("Save to lenslet.lock", "一键保存至 lenslet.lock"),
+                        )
+                        .on_click(move |_, _, cx| {
+                            let entries = accept_entries.clone();
+                            sess_ent.update(cx, |s, cx| s.accept(entries, cx));
+                        })
+                        .into_any_element()
+                    } else {
+                        widgets::primary_button(
+                            &ui,
+                            "banner-pick-ws",
+                            ui.t("Choose Folder for lenslet.lock…", "选择项目目录保存 lock…"),
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(super::OpenWorkspace), cx);
+                        })
+                        .into_any_element()
+                    })
+                    .child(
+                        widgets::button(
+                            &ui,
+                            "banner-review-access",
+                            ui.t("Review & Export Policy →", "查看并导出 IAM 策略 →"),
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(super::ShowAccess), cx);
+                        }),
+                    ),
+            )
+        } else {
+            None
+        };
 
         let body: AnyElement = if self.view.is_empty() {
             self.render_empty(&ui, &health, cx)
@@ -1299,6 +1435,7 @@ impl Render for CallsList {
             .min_h(px(0.0))
             .bg(rgb(t.panel))
             .child(self.render_subbar(&ui, cx))
+            .children(guided_banner)
             .children(self.render_findings(&ui, &findings, cx))
             .children(self.render_timeline(&ui, start_ms, span_ms, cx))
             .child(self.render_head(&ui, cx))

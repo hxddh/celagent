@@ -784,3 +784,166 @@ fn env_iac_formats_and_context_simulation_work_end_to_end() {
         String::from_utf8_lossy(&with_ctx.stdout)
     );
 }
+
+#[test]
+fn builtin_sandbox_zero_arg_init_shorthand_and_doctor_work_without_external_emulator() {
+    if !has_curl() {
+        eprintln!("skipping: curl is not installed");
+        return;
+    }
+    let home = temp_dir();
+    let work = home.join("zero-config-app");
+    std::fs::create_dir_all(&work).unwrap();
+
+    // Create a realistic project with a Makefile (`make` or `sh` test script)
+    // and `package.json` so zero-arg `lenslet init` auto-detects the command.
+    let test_script = r#"#!/bin/sh
+set -eu
+test -n "$AWS_ENDPOINT_URL"
+
+# 1. S3 CreateBucket + PutObject + GetObject round-trip
+curl -fsS -X PUT "$AWS_ENDPOINT_URL/receipts-bucket" \
+  -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=x' >/dev/null
+
+curl -fsS -X PUT "$AWS_ENDPOINT_URL/receipts-bucket/orders/ord-1.json" \
+  -H 'content-type: application/json' \
+  -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=x' \
+  -d '{"order":"ord-1","paid":true}' >/dev/null
+
+got_s3=$(curl -fsS "$AWS_ENDPOINT_URL/receipts-bucket/orders/ord-1.json" \
+  -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=x')
+test "$got_s3" = '{"order":"ord-1","paid":true}'
+
+# 2. DynamoDB CreateTable + PutItem + GetItem round-trip
+curl -fsS -X POST "$AWS_ENDPOINT_URL/" \
+  -H 'x-amz-target: DynamoDB_20120810.CreateTable' \
+  -H 'content-type: application/x-amz-json-1.0' \
+  -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x' \
+  -d '{"TableName":"orders","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}' >/dev/null
+
+curl -fsS -X POST "$AWS_ENDPOINT_URL/" \
+  -H 'x-amz-target: DynamoDB_20120810.PutItem' \
+  -H 'content-type: application/x-amz-json-1.0' \
+  -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x' \
+  -d '{"TableName":"orders","Item":{"id":{"S":"ord-1"},"status":{"S":"paid"}}}' >/dev/null
+
+got_ddb=$(curl -fsS -X POST "$AWS_ENDPOINT_URL/" \
+  -H 'x-amz-target: DynamoDB_20120810.GetItem' \
+  -H 'content-type: application/x-amz-json-1.0' \
+  -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x' \
+  -d '{"TableName":"orders","Key":{"id":{"S":"ord-1"}}}')
+echo "$got_ddb" | grep -q '"paid"'
+
+# 3. STS AssumeRole + role-attributed SQS CreateQueue & SendMessage
+sts_xml=$(curl -fsS -X POST "$AWS_ENDPOINT_URL/" \
+  -H 'content-type: application/x-www-form-urlencoded' \
+  -H 'authorization: AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=x' \
+  -d 'Action=AssumeRole&RoleArn=arn%3Aaws%3Aiam%3A%3A000000000000%3Arole%2Ffulfilment-worker&RoleSessionName=s1')
+akid=$(printf '%s' "$sts_xml" | sed -n 's:.*<AccessKeyId>\([^<]*\)</AccessKeyId>.*:\1:p')
+test -n "$akid"
+
+curl -fsS -X POST "$AWS_ENDPOINT_URL/" \
+  -H 'x-amz-target: AmazonSQS.CreateQueue' \
+  -H 'content-type: application/x-amz-json-1.0' \
+  -H "authorization: AWS4-HMAC-SHA256 Credential=$akid/20261120/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=x" \
+  -d '{"QueueName":"fulfilment"}' >/dev/null
+
+curl -fsS -X POST "$AWS_ENDPOINT_URL/" \
+  -H 'x-amz-target: AmazonSQS.SendMessage' \
+  -H 'content-type: application/x-amz-json-1.0' \
+  -H "authorization: AWS4-HMAC-SHA256 Credential=$akid/20261120/us-east-1/sqs/aws4_request, SignedHeaders=host, Signature=x" \
+  -d '{"QueueUrl":"http://127.0.0.1/000000000000/fulfilment","MessageBody":"ship-ord-1"}' >/dev/null
+"#;
+    let script_path = work.join("test_app.sh");
+    std::fs::write(&script_path, test_script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Put a fake `pytest` wrapper on a custom PATH dir so zero-arg `lenslet init`
+    // and shorthand `lenslet pytest` work deterministically on any machine.
+    let bin_dir = home.join("fake-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let pytest_shim = bin_dir.join("pytest");
+    std::fs::write(
+        &pytest_shim,
+        format!("#!/bin/sh\nexec sh '{}'\n", script_path.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pytest_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(work.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run_lenslet = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_lenslet"))
+            .args(args)
+            .current_dir(&work)
+            .env("HOME", &home)
+            .env("PATH", &path_env)
+            .env_remove("AWS_ENDPOINT_URL")
+            .env_remove("AWS_SHARED_CREDENTIALS_FILE")
+            .env_remove("AWS_CONFIG_FILE")
+            .output()
+            .unwrap()
+    };
+
+    // A. Zero-arg `lenslet init` (with `--sandbox` so even if a developer port happens to be open on the host, it tests the sandbox)
+    let init_out = run_lenslet(&["init", "--sandbox"]);
+    assert_eq!(init_out.status.code(), Some(0), "{}", stderr(&init_out));
+    let wf = std::fs::read_to_string(work.join(".github/workflows/lenslet.yml")).unwrap();
+    assert!(wf.contains("command: 'pytest'"), "{wf}");
+    assert!(wf.contains("upstream: 'sandbox'"), "{wf}");
+
+    let lock_text = std::fs::read_to_string(work.join("lenslet.lock")).unwrap();
+    for (action, resource) in [
+        ("s3:CreateBucket", "arn:aws:s3:::receipts-bucket"),
+        ("s3:PutObject", "arn:aws:s3:::receipts-bucket/*"),
+        ("s3:GetObject", "arn:aws:s3:::receipts-bucket/*"),
+        ("dynamodb:CreateTable", "arn:aws:dynamodb:*:*:table/orders"),
+        ("dynamodb:PutItem", "arn:aws:dynamodb:*:*:table/orders"),
+        ("dynamodb:GetItem", "arn:aws:dynamodb:*:*:table/orders"),
+        ("sts:AssumeRole", "arn:aws:iam::*:role/fulfilment-worker"),
+        ("sqs:CreateQueue", "arn:aws:sqs:*:*:fulfilment"),
+        ("sqs:SendMessage", "arn:aws:sqs:*:*:fulfilment"),
+    ] {
+        let matched = lock_text.lines().any(|line| {
+            let mut cols = line.split_whitespace();
+            cols.next() == Some(action) && cols.next() == Some(resource)
+        });
+        assert!(matched, "missing `{action} {resource}` in:\n{lock_text}");
+    }
+
+    // Verify AssumeRole session role tracking worked against the sandbox!
+    let last_out = run_lenslet(&["last", "--json"]);
+    let last_report: serde_json::Value = serde_json::from_slice(&last_out.stdout).unwrap();
+    assert_eq!(last_report["upstream"], "sandbox://local");
+    assert!(
+        last_report["roles"]["arn:aws:iam::*:role/fulfilment-worker"].is_array(),
+        "AssumeRole session attributed SQS calls:\n{last_report}"
+    );
+
+    // B. Zero-ceremony CLI shorthand: `lenslet pytest` runs directly!
+    let short_out = run_lenslet(&["pytest"]);
+    assert_eq!(short_out.status.code(), Some(0), "{}", stderr(&short_out));
+
+    // C. `lenslet doctor --json` reports full readiness.
+    let doc_out = run_lenslet(&["doctor", "--json"]);
+    assert_eq!(doc_out.status.code(), Some(0), "{}", stderr(&doc_out));
+    let doc_json: serde_json::Value = serde_json::from_slice(&doc_out.stdout).unwrap();
+    assert_eq!(doc_json["builtin_sandbox_ready"], true);
+    assert_eq!(doc_json["detected_test_command"], "pytest");
+    assert_eq!(doc_json["ci_workflow"], true);
+    assert_eq!(doc_json["lock_permissions"], 9);
+
+    let _ = std::fs::remove_dir_all(&home);
+}

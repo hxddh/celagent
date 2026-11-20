@@ -3,11 +3,13 @@
 **See, in every pull request, what AWS access your code needs, and why its
 AWS calls failed.**
 
-Lenslet runs your tests against a local AWS emulator. It records every AWS
-call, explains failures, and works out the IAM permissions the code uses. It
-keeps those permissions in `lenslet.lock`, a file you commit. When a pull
-request widens AWS access, the PR says so, call by call, and CI fails until
-someone accepts the change.
+Lenslet runs your tests against local AWS — using any running local emulator
+(`AWS Emulator`, `LocalStack`, `Moto`, `MinIO`) **or Lenslet's built-in
+zero-dependency stateful AWS sandbox when no emulator is running**. It records
+every AWS call, explains failures, and works out the IAM permissions the code
+uses. It keeps those permissions in `lenslet.lock`, a file you commit. When a
+pull request widens AWS access, the PR says so, call by call, and CI fails
+until someone accepts the change.
 
 AWS Emulator does not evaluate IAM, so code that works locally can still be
 denied on AWS. Lenslet covers that gap in code review. With `--enforce` it
@@ -26,23 +28,26 @@ policy and which statement would deny it.
 > |---|---|---|---|
 > | + | `dynamodb:DeleteItem` | `arn:aws:dynamodb:*:*:table/orders` | DYNAMODB DeleteItem |
 
-## Start
+## Start (Zero Setup)
 
 ```bash
+# CLI only (Linux & macOS):
 curl -fsSL https://github.com/hxddh/lenslet/releases/latest/download/install.sh | sh
 
-# with your emulator running (e.g. AWS Emulator on 9298):
-lenslet init -- npm test
+# Or Desktop App + CLI together (macOS /Applications/Lenslet.app + ~/.local/bin/lenslet):
+curl -fsSL https://github.com/hxddh/lenslet/releases/latest/download/install.sh | sh -s -- --app
+
+# Run your tests immediately — no external emulator required:
+lenslet pytest          # or: lenslet npm test / lenslet cargo test
+lenslet init            # auto-detects tests, writes lenslet.lock + GitHub Actions workflow
 ```
 
-`lenslet init` checks that the emulator answers, runs your tests once to
-write `lenslet.lock`, and adds `.github/workflows/lenslet.yml`. Review the
-lock, mark lines that only your test fixtures need with `# test`, then commit
-both files. From then on every pull request gets the report.
-
-On a Mac, [Lenslet.dmg](https://github.com/hxddh/lenslet/releases/latest) also
-gives you the window. The app is not notarized yet, so the first time you open
-it go to System Settings → Privacy & Security → Open Anyway.
+`lenslet init` auto-detects your test command (`pytest`, `npm`/`pnpm`/`yarn`/`bun`,
+`cargo test`, `go test ./...`, `make test`), uses a running local emulator or
+Lenslet's built-in stateful AWS sandbox (S3, DynamoDB, SQS, SNS, STS, Secrets
+Manager, SSM, KMS, Logs, EventBridge, Kinesis, Lambda, Step Functions), writes
+`lenslet.lock`, and adds `.github/workflows/lenslet.yml`. Review the lock, mark
+fixture-only lines with `# test`, and commit both files.
 
 ## In CI
 
@@ -55,11 +60,9 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   # install your test dependencies
-  - uses: hxddh/lenslet@lenslet-v10.0.0
+  - uses: hxddh/lenslet@lenslet-v11.0.0
     with:
-      command: npm test
-      emulator: moto_server -p 9298           # or however you start your emulator
-      upstream: http://127.0.0.1:9298
+      command: pytest           # works out of the box with Lenslet's built-in AWS sandbox
 ```
 
 The action does five things:
@@ -252,7 +255,11 @@ The format is in [docs/trace.md](docs/trace.md).
 ## Commands
 
 ```text
-lenslet init [--upstream ADDRESS] -- COMMAND   first run: lock + CI workflow
+lenslet COMMAND [ARGS...]                      shorthand: run COMMAND under Lenslet (`lenslet pytest`)
+lenslet init [--sandbox | --upstream URL] [-- COMMAND]
+                                               zero-setup onboarding: lock + CI workflow
+lenslet shell [options]                        interactive shell pre-configured with AWS_ENDPOINT_URL
+lenslet doctor [--json]                        check CLI, desktop app, emulators, lock, and CI
 lenslet run [options] [--] COMMAND             run under Lenslet; report at the end
 lenslet run [options]                          no command: a proxy on 127.0.0.1:9297
 lenslet env [--shell sh|fish|pwsh|dotenv|docker] [--listen PORT]
@@ -267,7 +274,7 @@ lenslet policy [--lock PATH | --run RUN] [--format iam|terraform|cfn|sam|cdk] [-
                                                compile least-privilege IaC policy (without `# test`)
 lenslet ui                                     the window
 
-run: --enforce  --check  --strict  --update  --lock PATH  --policy PATH
+run: --sandbox  --enforce  --check  --strict  --update  --lock PATH  --policy PATH
      --max-body SIZE  --json PATH  --markdown PATH  --quiet  --ui  --no-env
      --listen PORT  --upstream ADDRESS  --route SERVICE=ADDRESS  --allow-docker
      --emulator-ca PATH  --trace PATH

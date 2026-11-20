@@ -40,6 +40,7 @@ pub struct RunLauncher {
     presets: Vec<(String, String)>,
     gate_mode: RunGateMode,
     allow_docker: bool,
+    advanced_open: bool,
     env_probe: ProxyHealth,
     runs_dir: PathBuf,
     command_input: Entity<SearchInput>,
@@ -79,6 +80,7 @@ impl RunLauncher {
             presets: Vec::new(),
             gate_mode: RunGateMode::Record,
             allow_docker: false,
+            advanced_open: false,
             env_probe: ProxyHealth::default(),
             runs_dir,
             command_input,
@@ -105,6 +107,11 @@ impl RunLauncher {
         self.recent_workspaces = recent_workspaces;
         self.allow_docker = allow_docker;
         self.env_probe = env_probe;
+        self.advanced_open = allow_docker
+            || default_upstream
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            || !default_routes.is_empty();
         if let Some(cmd) = last_command.filter(|s| !s.trim().is_empty()) {
             self.command_input.update(cx, |i, cx| i.set_text(cmd, cx));
         }
@@ -488,7 +495,7 @@ impl Render for RunLauncher {
                             .child(self.command_input.clone())
                             .when(!self.presets.is_empty(), |el| el.child(preset_row)),
                     )
-                    // 3. Upstream Local Emulator
+                    // 3. IAM Gate Mode
                     .child(
                         div()
                             .flex()
@@ -496,38 +503,80 @@ impl Render for RunLauncher {
                             .gap(px(6.0))
                             .child(widgets::label(
                                 &ui,
-                                ui.t(
-                                    "LOCAL EMULATOR UPSTREAM (STRICTLY LOOPBACK / LOCAL)",
-                                    "本地模拟器上游地址（仅限本地回环 / 容器网桥）",
-                                ),
+                                ui.t("PERMISSION MODE", "AWS 权限记录与校验模式"),
                             ))
-                            .child(emu_row)
-                            .child(self.upstream_input.clone())
-                            .child(self.routes_input.clone()),
+                            .child(gate_seg),
                     )
-                    // 4. IAM Gate Mode & Docker Bridge
+                    // 4. Collapsible Advanced Network Options
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(10.0))
-                            .pt(px(4.0))
-                            .child(gate_seg)
+                            .flex_col()
+                            .gap(px(8.0))
                             .child(
-                                widgets::chip(
-                                    &ui,
-                                    "launcher-docker",
-                                    ui.t("Allow Docker containers", "允许 Docker 容器接入"),
-                                    None,
-                                    self.allow_docker,
-                                    t.accent,
+                                div()
+                                    .id("launcher-adv-toggle")
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .cursor_pointer()
+                                    .text_size(px(text::SM))
+                                    .text_color(rgb(t.text_muted))
+                                    .hover(move |s| s.text_color(rgb(t.text)))
+                                    .on_click(cx.listener(|l, _, _, cx| {
+                                        l.advanced_open = !l.advanced_open;
+                                        cx.notify();
+                                    }))
+                                    .child(if self.advanced_open { "▾" } else { "▸" })
+                                    .child(if self.env_probe.emulators.is_empty() {
+                                        ui.t(
+                                            "Advanced options (default: Built-in AWS Sandbox — zero setup required)",
+                                            "高级选项（默认自动启用内置 AWS 沙盒，无需安装外部模拟器）",
+                                        )
+                                        .to_string()
+                                    } else {
+                                        format!(
+                                            "{} ({})",
+                                            ui.t("Advanced options", "高级选项"),
+                                            self.env_probe.emulators[0].name
+                                        )
+                                    }),
+                            )
+                            .when(self.advanced_open, |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(8.0))
+                                        .p(px(10.0))
+                                        .rounded(px(8.0))
+                                        .border_1()
+                                        .border_color(rgb(t.border_subtle))
+                                        .bg(rgb(t.panel))
+                                        .child(emu_row)
+                                        .child(self.upstream_input.clone())
+                                        .child(self.routes_input.clone())
+                                        .child(
+                                            div().flex().items_center().child(
+                                                widgets::chip(
+                                                    &ui,
+                                                    "launcher-docker",
+                                                    ui.t(
+                                                        "Allow Docker containers",
+                                                        "允许 Docker 容器接入",
+                                                    ),
+                                                    None,
+                                                    self.allow_docker,
+                                                    t.accent,
+                                                )
+                                                .on_click(cx.listener(|l, _, _, cx| {
+                                                    l.allow_docker = !l.allow_docker;
+                                                    cx.notify();
+                                                })),
+                                            ),
+                                        ),
                                 )
-                                .on_click(cx.listener(|l, _, _, cx| {
-                                    l.allow_docker = !l.allow_docker;
-                                    cx.notify();
-                                })),
-                            ),
+                            }),
                     )
                     // 5. Launch Footer
                     .child(

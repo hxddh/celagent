@@ -162,6 +162,60 @@ impl Session {
         }
     }
 
+    /// Switch into the interactive sample run in one click (no `LENSLET_DEMO=1` needed).
+    pub fn enter_demo(&mut self, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
+        self.generation += 1;
+        self.demo = true;
+        self.feed_task = None;
+        self.log_task = None;
+        self.feed_mode = None;
+        self.path = None;
+        self.evicted = 0;
+        self.skipped = 0;
+        self.console_log = Arc::from(
+            "$ pytest tests/test_checkout.py -q\n\
+             collected 4 items\n\
+             tests/test_checkout.py ...F                                              [100%]\n\n\
+             FAILED tests/test_checkout.py::test_place_order - ClientError: An error occurred (ResourceNotFoundException) when calling the GetItem operation: Requested resource not found\n",
+        );
+        let run = demo::demo_run();
+        let calls = demo::demo_rows();
+        self.run = Some(run);
+        self.store.reset(calls);
+        self.health = Health::Ready;
+        self.lock_path = None;
+        self.lock = None;
+        self.baseline_run = None;
+        self.diff = None;
+        cx.emit(SessionEvent::RunChanged);
+        self.recompute(cx);
+        self.schedule_findings(cx);
+        cx.notify();
+    }
+
+    /// Exit interactive demo mode back to the user's real runs directory.
+    pub fn exit_demo(&mut self, cx: &mut Context<Self>) {
+        if !self.demo {
+            return;
+        }
+        self.demo = false;
+        self.store.reset(Vec::new());
+        self.run = None;
+        self.path = None;
+        self.diff = None;
+        self.console_log = Arc::from("");
+        self.findings = Arc::new(Vec::new());
+        self.access_rows = Arc::new(Vec::new());
+        if self._watch_task.is_none() {
+            self._watch_task = Some(self.watch_newest(cx));
+        }
+        cx.emit(SessionEvent::RunChanged);
+        self.reload(cx);
+    }
+
     pub fn is_live(&self) -> bool {
         self.run.as_ref().is_some_and(|run| run.report.is_none())
             && matches!(self.feed_mode, Some(FeedMode::Push | FeedMode::Tail))
