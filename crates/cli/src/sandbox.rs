@@ -41,6 +41,7 @@ pub struct Sandbox {
 #[derive(Default)]
 struct SandboxStore {
     s3_buckets: BTreeMap<String, S3Bucket>,
+    s3_uploads: BTreeMap<String, S3MultipartUpload>,
     ddb_tables: BTreeMap<(String, String), DdbTable>,
     sqs_queues: BTreeMap<(String, String), SqsQueue>,
     sns_topics: BTreeMap<(String, String), SnsTopic>,
@@ -75,10 +76,31 @@ struct S3Object {
 }
 
 #[derive(Clone)]
+struct S3MultipartUpload {
+    bucket: String,
+    key: String,
+    content_type: String,
+    sse: Option<String>,
+    kms_key_id: Option<String>,
+    meta: Vec<(String, String)>,
+    initiated_at: String,
+    parts: BTreeMap<u32, S3UploadPart>,
+}
+
+#[derive(Clone)]
+struct S3UploadPart {
+    bytes: Bytes,
+    etag: String,
+    md5: [u8; 16],
+    last_modified: String,
+}
+
+#[derive(Clone)]
 struct DdbTable {
     name: String,
     arn: String,
     key_attrs: Vec<String>,
+    indexes: BTreeMap<String, Vec<String>>,
     attr_defs: Value,
     created_epoch: f64,
     items: BTreeMap<String, Value>,
@@ -255,6 +277,63 @@ impl Sandbox {
         self.store.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Reject a request whose wire body exceeded the proxy's bounded inspection
+    /// limit before any truncated payload can mutate sandbox state.
+    pub fn payload_too_large(
+        &self,
+        service: &str,
+        headers: &HeaderMap,
+        content: &Content,
+        limit: usize,
+    ) -> Response<BoxBody> {
+        let req_id = self.next_uuid();
+        let message = format!(
+            "Request body exceeds the built-in local sandbox limit ({limit} bytes); start a local emulator (e.g. MinIO or LocalStack) for larger uploads."
+        );
+        if matches!(service, "s3" | "s3-object-lambda") {
+            return s3_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "EntityTooLarge",
+                &message,
+                &req_id,
+            );
+        }
+        let is_query = !headers.contains_key("x-amz-target")
+            && content.content_type.as_deref() == Some("application/x-www-form-urlencoded");
+        if is_query {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ErrorResponse><Error><Type>Sender</Type><Code>RequestEntityTooLarge</Code>\
+                 <Message>{}</Message></Error><RequestId>{}</RequestId></ErrorResponse>",
+                xml_escape(&message),
+                xml_escape(&req_id),
+            );
+            return s3_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "text/xml; charset=utf-8",
+                Bytes::from(xml),
+                &req_id,
+                &[],
+            );
+        }
+        let dummy_ctx = ReqCtx {
+            method: &Method::POST,
+            path: "/",
+            headers,
+            region: "us-east-1",
+            operation: "",
+            content,
+            raw_body: &[],
+            req_id,
+        };
+        rpc_error(
+            &dummy_ctx,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "RequestEntityTooLargeException",
+            &message,
+        )
+    }
+
     // =========================================================================
     // S3 (REST XML / Object Storage)
     // =========================================================================
@@ -372,7 +451,7 @@ impl Sandbox {
                     }
                 }
             }
-            "PutObject" | "UploadPart" => {
+            "PutObject" => {
                 let (Some(bucket), Some(key)) = (bucket, key) else {
                     return s3_error(
                         StatusCode::BAD_REQUEST,
@@ -381,9 +460,7 @@ impl Sandbox {
                         &ctx.req_id,
                     );
                 };
-                // Auto-provision bucket on PutObject if not yet created so quick one-liner scripts work effortlessly,
-                // UNLESS the bucket was explicitly deleted or never existed? Wait: auto-provisioning on PutObject
-                // eliminates friction for 1-line `aws s3 cp` / `s3.put_object` scripts!
+                // Auto-provision bucket on PutObject so 1-line scripts work effortlessly.
                 let b = store.s3_buckets.entry(bucket).or_insert_with(|| S3Bucket {
                     created_at: Utc::now().to_rfc3339(),
                     objects: BTreeMap::new(),
@@ -397,16 +474,7 @@ impl Sandbox {
                 let kms_key_id =
                     header_str(ctx.headers, "x-amz-server-side-encryption-aws-kms-key-id")
                         .map(str::to_string);
-                let meta: Vec<(String, String)> = ctx
-                    .headers
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        let name = k.as_str().to_ascii_lowercase();
-                        name.starts_with("x-amz-meta-")
-                            .then(|| Some((name, v.to_str().ok()?.to_string())))
-                            .flatten()
-                    })
-                    .collect();
+                let meta = extract_s3_meta(ctx.headers);
                 let obj = S3Object {
                     bytes: Bytes::copy_from_slice(ctx.raw_body),
                     content_type: ct,
@@ -651,14 +719,244 @@ impl Sandbox {
                 )
             }
             "CreateMultipartUpload" => {
-                let b = bucket.unwrap_or_else(|| "bucket".into());
-                let k = key.unwrap_or_else(|| "key".into());
+                let (Some(bucket), Some(key)) = (bucket, key) else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Bucket and key required.",
+                        &ctx.req_id,
+                    );
+                };
+                store
+                    .s3_buckets
+                    .entry(bucket.clone())
+                    .or_insert_with(|| S3Bucket {
+                        created_at: Utc::now().to_rfc3339(),
+                        objects: BTreeMap::new(),
+                    });
                 let upload_id = self.next_uuid();
+                let ct = header_str(ctx.headers, "content-type")
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let sse =
+                    header_str(ctx.headers, "x-amz-server-side-encryption").map(str::to_string);
+                let kms_key_id =
+                    header_str(ctx.headers, "x-amz-server-side-encryption-aws-kms-key-id")
+                        .map(str::to_string);
+                let meta = extract_s3_meta(ctx.headers);
+                store.s3_uploads.insert(
+                    upload_id.clone(),
+                    S3MultipartUpload {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        content_type: ct,
+                        sse: sse.clone(),
+                        kms_key_id: kms_key_id.clone(),
+                        meta,
+                        initiated_at: Utc::now().to_rfc3339(),
+                        parts: BTreeMap::new(),
+                    },
+                );
+                let mut extra = Vec::new();
+                if let Some(s) = sse {
+                    extra.push(("x-amz-server-side-encryption", s));
+                }
+                if let Some(k) = kms_key_id {
+                    extra.push(("x-amz-server-side-encryption-aws-kms-key-id", k));
+                }
+                let refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 let xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                     <InitiateMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>",
-                    xml_escape(&b),
-                    xml_escape(&k)
+                     <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload_id}</UploadId>\
+                     </InitiateMultipartUploadResult>",
+                    xml_escape(&bucket),
+                    xml_escape(&key)
+                );
+                s3_response(
+                    StatusCode::OK,
+                    "application/xml",
+                    Bytes::from(xml),
+                    &ctx.req_id,
+                    &refs,
+                )
+            }
+            "UploadPart" => {
+                let (Some(bucket), Some(key)) = (bucket, key) else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Bucket and key required.",
+                        &ctx.req_id,
+                    );
+                };
+                let Some(upload_id) =
+                    wire::query_param(ctx.path, "uploadId").filter(|s| !s.is_empty())
+                else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        "Missing uploadId query parameter.",
+                        &ctx.req_id,
+                    );
+                };
+                let Some(part_number) = wire::query_param(ctx.path, "partNumber")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|n| (1..=10_000).contains(n))
+                else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        "partNumber must be an integer between 1 and 10000.",
+                        &ctx.req_id,
+                    );
+                };
+                let Some(upload) = store
+                    .s3_uploads
+                    .get_mut(&upload_id)
+                    .filter(|u| u.bucket == bucket && u.key == key)
+                else {
+                    return s3_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchUpload",
+                        "The specified multipart upload does not exist.",
+                        &ctx.req_id,
+                    );
+                };
+                let md5 = md5_bytes(ctx.raw_body);
+                let etag = format!("\"{}\"", capture::hex(&md5));
+                let sse = upload.sse.clone();
+                let kms_key_id = upload.kms_key_id.clone();
+                upload.parts.insert(
+                    part_number,
+                    S3UploadPart {
+                        bytes: Bytes::copy_from_slice(ctx.raw_body),
+                        etag: etag.clone(),
+                        md5,
+                        last_modified: Utc::now().to_rfc3339(),
+                    },
+                );
+                let mut extra = vec![("etag", etag)];
+                if let Some(s) = sse {
+                    extra.push(("x-amz-server-side-encryption", s));
+                }
+                if let Some(k) = kms_key_id {
+                    extra.push(("x-amz-server-side-encryption-aws-kms-key-id", k));
+                }
+                let refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                s3_response(
+                    StatusCode::OK,
+                    "application/xml",
+                    Bytes::new(),
+                    &ctx.req_id,
+                    &refs,
+                )
+            }
+            "UploadPartCopy" => {
+                let (Some(bucket), Some(key)) = (bucket, key) else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Bucket and key required.",
+                        &ctx.req_id,
+                    );
+                };
+                let Some(upload_id) =
+                    wire::query_param(ctx.path, "uploadId").filter(|s| !s.is_empty())
+                else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        "Missing uploadId query parameter.",
+                        &ctx.req_id,
+                    );
+                };
+                let Some(part_number) = wire::query_param(ctx.path, "partNumber")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|n| (1..=10_000).contains(n))
+                else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        "partNumber must be an integer between 1 and 10000.",
+                        &ctx.req_id,
+                    );
+                };
+                let copy_src = header_str(ctx.headers, "x-amz-copy-source").unwrap_or("");
+                let clean_src =
+                    wire::percent_decode_path(copy_src.split('?').next().unwrap_or(copy_src));
+                let clean_src = clean_src.trim_start_matches('/');
+                let Some((src_bucket, src_key)) = clean_src.split_once('/') else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        "Invalid x-amz-copy-source.",
+                        &ctx.req_id,
+                    );
+                };
+                let Some(src_bytes) = store
+                    .s3_buckets
+                    .get(src_bucket)
+                    .and_then(|b| b.objects.get(src_key))
+                    .map(|o| o.bytes.clone())
+                else {
+                    return s3_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchKey",
+                        "The specified source key does not exist.",
+                        &ctx.req_id,
+                    );
+                };
+                let slice =
+                    if let Some(range_hdr) = header_str(ctx.headers, "x-amz-copy-source-range") {
+                        let Some((start, end)) = range_hdr
+                            .strip_prefix("bytes=")
+                            .and_then(|r| r.split_once('-'))
+                            .and_then(|(s, e)| {
+                                Some((s.parse::<usize>().ok()?, e.parse::<usize>().ok()?))
+                            })
+                            .filter(|(s, e)| s <= e && *e < src_bytes.len())
+                        else {
+                            return s3_error(
+                                StatusCode::BAD_REQUEST,
+                                "InvalidArgument",
+                                "Invalid x-amz-copy-source-range.",
+                                &ctx.req_id,
+                            );
+                        };
+                        src_bytes.slice(start..=end)
+                    } else {
+                        src_bytes
+                    };
+                let Some(upload) = store
+                    .s3_uploads
+                    .get_mut(&upload_id)
+                    .filter(|u| u.bucket == bucket && u.key == key)
+                else {
+                    return s3_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchUpload",
+                        "The specified multipart upload does not exist.",
+                        &ctx.req_id,
+                    );
+                };
+                let md5 = md5_bytes(&slice);
+                let etag = format!("\"{}\"", capture::hex(&md5));
+                let last_modified = Utc::now().to_rfc3339();
+                upload.parts.insert(
+                    part_number,
+                    S3UploadPart {
+                        bytes: slice,
+                        etag: etag.clone(),
+                        md5,
+                        last_modified: last_modified.clone(),
+                    },
+                );
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <CopyPartResult><LastModified>{}</LastModified><ETag>{}</ETag></CopyPartResult>",
+                    xml_escape(&last_modified),
+                    xml_escape(&etag)
                 );
                 s3_response(
                     StatusCode::OK,
@@ -668,16 +966,45 @@ impl Sandbox {
                     &[],
                 )
             }
-            "CompleteMultipartUpload" => {
-                let b = bucket.unwrap_or_else(|| "bucket".into());
-                let k = key.unwrap_or_else(|| "key".into());
-                let etag = format!("\"{}\"", md5_hex(ctx.raw_body));
+            "ListParts" => {
+                let (Some(bucket), Some(key)) = (bucket, key) else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Bucket and key required.",
+                        &ctx.req_id,
+                    );
+                };
+                let upload_id = wire::query_param(ctx.path, "uploadId").unwrap_or_default();
+                let Some(upload) = store
+                    .s3_uploads
+                    .get(&upload_id)
+                    .filter(|u| u.bucket == bucket && u.key == key)
+                else {
+                    return s3_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchUpload",
+                        "The specified multipart upload does not exist.",
+                        &ctx.req_id,
+                    );
+                };
+                let mut parts_xml = String::new();
+                for (pn, part) in &upload.parts {
+                    parts_xml.push_str(&format!(
+                        "<Part><PartNumber>{pn}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size></Part>",
+                        xml_escape(&part.last_modified),
+                        xml_escape(&part.etag),
+                        part.bytes.len()
+                    ));
+                }
                 let xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                     <CompleteMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
-                    xml_escape(&b),
-                    xml_escape(&k),
-                    xml_escape(&etag)
+                     <ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId>\
+                     <IsTruncated>false</IsTruncated>{parts_xml}</ListPartsResult>",
+                    xml_escape(&bucket),
+                    xml_escape(&key),
+                    xml_escape(&upload_id)
                 );
                 s3_response(
                     StatusCode::OK,
@@ -685,6 +1012,194 @@ impl Sandbox {
                     Bytes::from(xml),
                     &ctx.req_id,
                     &[],
+                )
+            }
+            "ListMultipartUploads" => {
+                let Some(bucket) = bucket else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidBucketName",
+                        "Missing bucket name.",
+                        &ctx.req_id,
+                    );
+                };
+                let mut uploads_xml = String::new();
+                for (uid, up) in store.s3_uploads.iter().filter(|(_, u)| u.bucket == bucket) {
+                    uploads_xml.push_str(&format!(
+                        "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiated>{}</Initiated></Upload>",
+                        xml_escape(&up.key),
+                        xml_escape(uid),
+                        xml_escape(&up.initiated_at)
+                    ));
+                }
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Bucket>{}</Bucket><IsTruncated>false</IsTruncated>{uploads_xml}\
+                     </ListMultipartUploadsResult>",
+                    xml_escape(&bucket)
+                );
+                s3_response(
+                    StatusCode::OK,
+                    "application/xml",
+                    Bytes::from(xml),
+                    &ctx.req_id,
+                    &[],
+                )
+            }
+            "AbortMultipartUpload" => {
+                let (Some(bucket), Some(key)) = (bucket, key) else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Bucket and key required.",
+                        &ctx.req_id,
+                    );
+                };
+                let upload_id = wire::query_param(ctx.path, "uploadId").unwrap_or_default();
+                let matches_target = store
+                    .s3_uploads
+                    .get(&upload_id)
+                    .is_some_and(|u| u.bucket == bucket && u.key == key);
+                if !matches_target {
+                    return s3_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchUpload",
+                        "The specified multipart upload does not exist.",
+                        &ctx.req_id,
+                    );
+                }
+                store.s3_uploads.remove(&upload_id);
+                s3_response(
+                    StatusCode::NO_CONTENT,
+                    "application/xml",
+                    Bytes::new(),
+                    &ctx.req_id,
+                    &[],
+                )
+            }
+            "CompleteMultipartUpload" => {
+                let (Some(bucket), Some(key)) = (bucket, key) else {
+                    return s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Bucket and key required.",
+                        &ctx.req_id,
+                    );
+                };
+                let upload_id = wire::query_param(ctx.path, "uploadId").unwrap_or_default();
+                let Some(upload) = store
+                    .s3_uploads
+                    .get(&upload_id)
+                    .filter(|u| u.bucket == bucket && u.key == key)
+                else {
+                    return s3_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchUpload",
+                        "The specified multipart upload does not exist.",
+                        &ctx.req_id,
+                    );
+                };
+                let body_xml = String::from_utf8_lossy(ctx.raw_body);
+                let requested_parts = parse_complete_multipart_parts(&body_xml);
+                let selected: Vec<(u32, Option<String>)> = match requested_parts {
+                    Ok(list) if !list.is_empty() => list,
+                    Ok(_) => upload.parts.keys().map(|&pn| (pn, None)).collect(),
+                    Err((code, msg)) => {
+                        return s3_error(StatusCode::BAD_REQUEST, code, msg, &ctx.req_id);
+                    }
+                };
+                let mut prev_pn = 0u32;
+                let mut total_len = 0usize;
+                for (pn, expected_etag) in &selected {
+                    if *pn <= prev_pn {
+                        return s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidPartOrder",
+                            "The list of parts was not in ascending order.",
+                            &ctx.req_id,
+                        );
+                    }
+                    prev_pn = *pn;
+                    let Some(part) = upload.parts.get(pn) else {
+                        return s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidPart",
+                            "One or more of the specified parts could not be found.",
+                            &ctx.req_id,
+                        );
+                    };
+                    if let Some(exp) = expected_etag
+                        && !etags_match(exp, &part.etag)
+                    {
+                        return s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidPart",
+                            "One or more of the specified parts had a mismatched ETag.",
+                            &ctx.req_id,
+                        );
+                    }
+                    total_len += part.bytes.len();
+                }
+
+                let mut assembled = Vec::with_capacity(total_len);
+                let mut md5_concat = Vec::with_capacity(selected.len() * 16);
+                for (pn, _) in &selected {
+                    let part = &upload.parts[pn];
+                    assembled.extend_from_slice(&part.bytes);
+                    md5_concat.extend_from_slice(&part.md5);
+                }
+                let etag = if selected.is_empty() {
+                    format!("\"{}\"", md5_hex(&[]))
+                } else {
+                    format!("\"{}-{}\"", md5_hex(&md5_concat), selected.len())
+                };
+                let completed = store.s3_uploads.remove(&upload_id).expect("checked upload");
+                let sse = completed.sse.clone();
+                let kms_key_id = completed.kms_key_id.clone();
+                let obj = S3Object {
+                    bytes: Bytes::from(assembled),
+                    content_type: completed.content_type,
+                    etag: etag.clone(),
+                    last_modified: Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                    sse: sse.clone(),
+                    kms_key_id: kms_key_id.clone(),
+                    meta: completed.meta,
+                };
+                store
+                    .s3_buckets
+                    .entry(bucket.clone())
+                    .or_insert_with(|| S3Bucket {
+                        created_at: Utc::now().to_rfc3339(),
+                        objects: BTreeMap::new(),
+                    })
+                    .objects
+                    .insert(key.clone(), obj);
+                let mut extra = Vec::new();
+                if let Some(s) = sse {
+                    extra.push(("x-amz-server-side-encryption", s));
+                }
+                if let Some(k) = kms_key_id {
+                    extra.push(("x-amz-server-side-encryption-aws-kms-key-id", k));
+                }
+                let refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let location = format!("{}/{}/{}", self.endpoint, bucket, key);
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Location>{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>\
+                     </CompleteMultipartUploadResult>",
+                    xml_escape(&location),
+                    xml_escape(&bucket),
+                    xml_escape(&key),
+                    xml_escape(&etag)
+                );
+                s3_response(
+                    StatusCode::OK,
+                    "application/xml",
+                    Bytes::from(xml),
+                    &ctx.req_id,
+                    &refs,
                 )
             }
             "GetBucketLocation" => {
@@ -744,6 +1259,27 @@ impl Sandbox {
                     })
                     .filter(|v: &Vec<String>| !v.is_empty())
                     .unwrap_or_else(|| vec!["id".to_string()]);
+                let mut indexes = BTreeMap::new();
+                for field in ["GlobalSecondaryIndexes", "LocalSecondaryIndexes"] {
+                    if let Some(arr) = body.get(field).and_then(|v| v.as_array()) {
+                        for idx in arr {
+                            if let Some(iname) = str_field(idx, "IndexName") {
+                                let ikeys: Vec<String> = idx
+                                    .get("KeySchema")
+                                    .and_then(|v| v.as_array())
+                                    .map(|ks| {
+                                        ks.iter()
+                                            .filter_map(|el| str_field(el, "AttributeName"))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                if !ikeys.is_empty() {
+                                    indexes.insert(iname, ikeys);
+                                }
+                            }
+                        }
+                    }
+                }
                 let attr_defs = body
                     .get("AttributeDefinitions")
                     .cloned()
@@ -754,6 +1290,7 @@ impl Sandbox {
                     name: name.clone(),
                     arn: arn.clone(),
                     key_attrs: key_attrs.clone(),
+                    indexes,
                     attr_defs: attr_defs.clone(),
                     created_epoch: epoch,
                     items: BTreeMap::new(),
@@ -897,21 +1434,12 @@ impl Sandbox {
                         "Requested resource not found",
                     );
                 };
-                let limit = body
-                    .get("Limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(1000);
-                let items: Vec<Value> = t.items.values().take(limit).cloned().collect();
-                let count = items.len();
-                rpc_ok(
-                    ctx,
-                    json!({
-                        "Items": items,
-                        "Count": count,
-                        "ScannedCount": t.items.len()
-                    }),
-                )
+                match execute_ddb_query_or_scan(t, &body, ctx.operation == "Query") {
+                    Ok(payload) => rpc_ok(ctx, payload),
+                    Err(msg) => {
+                        rpc_error(ctx, StatusCode::BAD_REQUEST, "ValidationException", &msg)
+                    }
+                }
             }
             "BatchGetItem" => {
                 let mut responses = Map::new();
@@ -2821,9 +3349,1000 @@ fn extract_xml_tags(xml: &str, tag: &str) -> Vec<String> {
     out
 }
 
+fn extract_s3_meta(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            let name = k.as_str().to_ascii_lowercase();
+            name.starts_with("x-amz-meta-")
+                .then(|| Some((name, v.to_str().ok()?.to_string())))
+                .flatten()
+        })
+        .collect()
+}
+
+type CompletePartSpec = (u32, Option<String>);
+
+fn parse_complete_multipart_parts(
+    xml: &str,
+) -> Result<Vec<CompletePartSpec>, (&'static str, &'static str)> {
+    let blocks = extract_xml_tags(xml, "Part");
+    if blocks.is_empty() {
+        if xml.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let nums = extract_xml_tags(xml, "PartNumber");
+        if nums.is_empty() {
+            return Err((
+                "MalformedXML",
+                "CompleteMultipartUpload body did not contain valid <Part> elements.",
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let Some(raw_pn) = extract_xml_tags(&block, "PartNumber").into_iter().next() else {
+            return Err(("MalformedXML", "Missing <PartNumber> in <Part>."));
+        };
+        let Ok(pn) = raw_pn.trim().parse::<u32>() else {
+            return Err(("InvalidArgument", "Invalid <PartNumber> value."));
+        };
+        if !(1..=10_000).contains(&pn) {
+            return Err(("InvalidArgument", "PartNumber must be between 1 and 10000."));
+        }
+        let etag = extract_xml_tags(&block, "ETag")
+            .into_iter()
+            .next()
+            .map(|s| normalize_etag(&s))
+            .filter(|s| !s.is_empty());
+        out.push((pn, etag));
+    }
+    Ok(out)
+}
+
+fn normalize_etag(raw: &str) -> String {
+    raw.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn etags_match(expected: &str, actual: &str) -> bool {
+    normalize_etag(expected) == normalize_etag(actual)
+}
+
+// =============================================================================
+// DynamoDB Query & Scan Predicate Evaluator
+// =============================================================================
+
+fn execute_ddb_query_or_scan(
+    table: &DdbTable,
+    req: &Value,
+    is_query: bool,
+) -> Result<Value, String> {
+    let active_keys: &[String] = match str_field(req, "IndexName") {
+        Some(idx_name) => table
+            .indexes
+            .get(&idx_name)
+            .map(Vec::as_slice)
+            .ok_or_else(|| format!("The table does not have the specified index: {idx_name}"))?,
+        None => table.key_attrs.as_slice(),
+    };
+
+    let names = req
+        .get("ExpressionAttributeNames")
+        .and_then(|v| v.as_object());
+    let values = req
+        .get("ExpressionAttributeValues")
+        .and_then(|v| v.as_object());
+
+    let key_expr = str_field(req, "KeyConditionExpression")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let key_conds = req.get("KeyConditions").and_then(|v| v.as_object());
+    if is_query && key_expr.is_none() && key_conds.is_none_or(|m| m.is_empty()) {
+        return Err(
+            "Either the KeyConditions or KeyConditionExpression parameter must be specified in the request."
+                .to_string(),
+        );
+    }
+
+    let parsed_key_expr = match key_expr {
+        Some(ref src) => Some(parse_ddb_expr(src)?),
+        None => None,
+    };
+    let filter_expr = match str_field(req, "FilterExpression")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(src) => Some(parse_ddb_expr(&src)?),
+        None => None,
+    };
+    let legacy_filter = req
+        .get(if is_query {
+            "QueryFilter"
+        } else {
+            "ScanFilter"
+        })
+        .and_then(|v| v.as_object());
+    let legacy_or =
+        str_field(req, "ConditionalOperator").is_some_and(|op| op.eq_ignore_ascii_case("OR"));
+
+    let mut candidates: Vec<&Value> = Vec::with_capacity(table.items.len());
+    for item in table.items.values() {
+        // Sparse index semantics: items missing an index key attribute are not projected.
+        if active_keys.iter().any(|k| item.get(k).is_none()) {
+            continue;
+        }
+        if is_query {
+            if let Some(ref ast) = parsed_key_expr
+                && !eval_ddb_expr(ast, item, names, values)?
+            {
+                continue;
+            }
+            if let Some(kc) = key_conds
+                && !eval_ddb_condition_map(kc, false, item)?
+            {
+                continue;
+            }
+        }
+        candidates.push(item);
+    }
+
+    // Sort deterministically by active HASH + RANGE key attributes (numeric `N` sorted numerically).
+    candidates.sort_by(|a, b| compare_ddb_items_by_keys(a, b, active_keys));
+    if is_query && req.get("ScanIndexForward").and_then(|v| v.as_bool()) == Some(false) {
+        candidates.reverse();
+    }
+
+    // Resume after `ExclusiveStartKey` if pagination cursor was provided.
+    if let Some(start_key) = req.get("ExclusiveStartKey").filter(|v| v.is_object()) {
+        let target = ddb_item_key(start_key, &table.key_attrs);
+        if let Some(pos) = candidates
+            .iter()
+            .position(|it| ddb_item_key(it, &table.key_attrs) == target)
+        {
+            candidates.drain(..=pos);
+        }
+    }
+
+    let limit = req
+        .get("Limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let has_more = limit.is_some_and(|lim| candidates.len() > lim);
+    let examined_slice = match limit {
+        Some(lim) => &candidates[..candidates.len().min(lim)],
+        None => &candidates[..],
+    };
+    let scanned_count = examined_slice.len();
+    let last_evaluated_key = if has_more {
+        examined_slice
+            .last()
+            .map(|last| extract_ddb_key_object(last, &table.key_attrs, active_keys))
+    } else {
+        None
+    };
+
+    let mut matched: Vec<Value> = Vec::with_capacity(scanned_count);
+    for item in examined_slice {
+        if let Some(ref ast) = filter_expr
+            && !eval_ddb_expr(ast, item, names, values)?
+        {
+            continue;
+        }
+        if let Some(lf) = legacy_filter
+            && !eval_ddb_condition_map(lf, legacy_or, item)?
+        {
+            continue;
+        }
+        matched.push((*item).clone());
+    }
+
+    let count = matched.len();
+    let count_only = str_field(req, "Select").is_some_and(|s| s.eq_ignore_ascii_case("COUNT"));
+    let mut out = if count_only {
+        json!({
+            "Count": count,
+            "ScannedCount": scanned_count,
+        })
+    } else {
+        json!({
+            "Items": matched,
+            "Count": count,
+            "ScannedCount": scanned_count,
+        })
+    };
+    if let Some(lek) = last_evaluated_key
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert("LastEvaluatedKey".to_string(), lek);
+    }
+    Ok(out)
+}
+
+fn extract_ddb_key_object(item: &Value, table_keys: &[String], index_keys: &[String]) -> Value {
+    let mut map = Map::new();
+    for k in table_keys.iter().chain(index_keys.iter()) {
+        if let Some(v) = item.get(k) {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    Value::Object(map)
+}
+
+fn compare_ddb_items_by_keys(a: &Value, b: &Value, keys: &[String]) -> std::cmp::Ordering {
+    for k in keys {
+        let ord = match (a.get(k), b.get(k)) {
+            (Some(va), Some(vb)) => ddb_compare_attr(va, vb).unwrap_or(std::cmp::Ordering::Equal),
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DdbToken {
+    LParen,
+    RParen,
+    Comma,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Ident(String),
+}
+
+#[derive(Clone, Debug)]
+enum DdbOperand {
+    Path(String),
+    ValueRef(String),
+    Size(String),
+}
+
+#[derive(Clone, Debug, Copy)]
+enum DdbCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Debug)]
+enum DdbExpr {
+    Or(Box<DdbExpr>, Box<DdbExpr>),
+    And(Box<DdbExpr>, Box<DdbExpr>),
+    Not(Box<DdbExpr>),
+    Compare(DdbOperand, DdbCmpOp, DdbOperand),
+    Between(DdbOperand, DdbOperand, DdbOperand),
+    In(DdbOperand, Vec<DdbOperand>),
+    AttrExists(String),
+    AttrNotExists(String),
+    BeginsWith(DdbOperand, DdbOperand),
+    Contains(DdbOperand, DdbOperand),
+    AttrType(DdbOperand, DdbOperand),
+}
+
+fn tokenize_ddb_expr(src: &str) -> Result<Vec<DdbToken>, String> {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut out = Vec::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match b {
+            b'(' => {
+                out.push(DdbToken::LParen);
+                i += 1;
+            }
+            b')' => {
+                out.push(DdbToken::RParen);
+                i += 1;
+            }
+            b',' => {
+                out.push(DdbToken::Comma);
+                i += 1;
+            }
+            b'=' => {
+                out.push(DdbToken::Eq);
+                i += 1;
+            }
+            b'!' if bytes.get(i + 1) == Some(&b'=') => {
+                out.push(DdbToken::Ne);
+                i += 2;
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'>') => {
+                out.push(DdbToken::Ne);
+                i += 2;
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'=') => {
+                out.push(DdbToken::Le);
+                i += 2;
+            }
+            b'<' => {
+                out.push(DdbToken::Lt);
+                i += 1;
+            }
+            b'>' if bytes.get(i + 1) == Some(&b'=') => {
+                out.push(DdbToken::Ge);
+                i += 2;
+            }
+            b'>' => {
+                out.push(DdbToken::Gt);
+                i += 1;
+            }
+            c if is_ddb_ident_char(c) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_ddb_ident_char(bytes[i]) {
+                    i += 1;
+                }
+                out.push(DdbToken::Ident(src[start..i].to_string()));
+            }
+            _ => {
+                return Err(format!(
+                    "Invalid condition expression syntax near `{}`",
+                    &src[i..]
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn is_ddb_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'#' | b':' | b'.' | b'[' | b']')
+}
+
+struct DdbParser {
+    tokens: Vec<DdbToken>,
+    pos: usize,
+}
+
+impl DdbParser {
+    fn peek(&self) -> Option<&DdbToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<DdbToken> {
+        let tok = self.tokens.get(self.pos).cloned()?;
+        self.pos += 1;
+        Some(tok)
+    }
+
+    fn eat_kw(&mut self, kw: &str) -> bool {
+        if matches!(self.peek(), Some(DdbToken::Ident(s)) if s.eq_ignore_ascii_case(kw)) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, expected: &DdbToken) -> Result<(), String> {
+        match self.next() {
+            Some(ref tok) if tok == expected => Ok(()),
+            other => Err(format!(
+                "Invalid condition expression: expected {expected:?}, got {other:?}"
+            )),
+        }
+    }
+
+    fn parse_or(&mut self) -> Result<DdbExpr, String> {
+        let mut lhs = self.parse_and()?;
+        while self.eat_kw("OR") {
+            let rhs = self.parse_and()?;
+            lhs = DdbExpr::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<DdbExpr, String> {
+        let mut lhs = self.parse_not()?;
+        while self.eat_kw("AND") {
+            let rhs = self.parse_not()?;
+            lhs = DdbExpr::And(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_not(&mut self) -> Result<DdbExpr, String> {
+        if self.eat_kw("NOT") {
+            return Ok(DdbExpr::Not(Box::new(self.parse_not()?)));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<DdbExpr, String> {
+        if self.peek() == Some(&DdbToken::LParen) {
+            self.pos += 1;
+            let inner = self.parse_or()?;
+            self.expect(&DdbToken::RParen)?;
+            return Ok(inner);
+        }
+        let Some(DdbToken::Ident(head)) = self.next() else {
+            return Err("Invalid condition expression: expected identifier or `(`".to_string());
+        };
+        if self.peek() == Some(&DdbToken::LParen) {
+            self.pos += 1;
+            match head.as_str() {
+                "attribute_exists" => {
+                    let path = self.expect_ident()?;
+                    self.expect(&DdbToken::RParen)?;
+                    return Ok(DdbExpr::AttrExists(path));
+                }
+                "attribute_not_exists" => {
+                    let path = self.expect_ident()?;
+                    self.expect(&DdbToken::RParen)?;
+                    return Ok(DdbExpr::AttrNotExists(path));
+                }
+                "begins_with" => {
+                    let lhs = self.parse_operand()?;
+                    self.expect(&DdbToken::Comma)?;
+                    let rhs = self.parse_operand()?;
+                    self.expect(&DdbToken::RParen)?;
+                    return Ok(DdbExpr::BeginsWith(lhs, rhs));
+                }
+                "contains" => {
+                    let lhs = self.parse_operand()?;
+                    self.expect(&DdbToken::Comma)?;
+                    let rhs = self.parse_operand()?;
+                    self.expect(&DdbToken::RParen)?;
+                    return Ok(DdbExpr::Contains(lhs, rhs));
+                }
+                "attribute_type" => {
+                    let lhs = self.parse_operand()?;
+                    self.expect(&DdbToken::Comma)?;
+                    let rhs = self.parse_operand()?;
+                    self.expect(&DdbToken::RParen)?;
+                    return Ok(DdbExpr::AttrType(lhs, rhs));
+                }
+                "size" => {
+                    let path = self.expect_ident()?;
+                    self.expect(&DdbToken::RParen)?;
+                    return self.parse_predicate_tail(DdbOperand::Size(path));
+                }
+                other => {
+                    return Err(format!(
+                        "Invalid condition expression: unsupported function `{other}`"
+                    ));
+                }
+            }
+        }
+        let lhs = classify_ddb_ident(head);
+        self.parse_predicate_tail(lhs)
+    }
+
+    fn parse_predicate_tail(&mut self, lhs: DdbOperand) -> Result<DdbExpr, String> {
+        if self.eat_kw("BETWEEN") {
+            let lo = self.parse_operand()?;
+            if !self.eat_kw("AND") {
+                return Err("Invalid BETWEEN expression: missing `AND`".to_string());
+            }
+            let hi = self.parse_operand()?;
+            return Ok(DdbExpr::Between(lhs, lo, hi));
+        }
+        if self.eat_kw("IN") {
+            self.expect(&DdbToken::LParen)?;
+            let mut list = vec![self.parse_operand()?];
+            while self.peek() == Some(&DdbToken::Comma) {
+                self.pos += 1;
+                list.push(self.parse_operand()?);
+            }
+            self.expect(&DdbToken::RParen)?;
+            return Ok(DdbExpr::In(lhs, list));
+        }
+        let op = match self.next() {
+            Some(DdbToken::Eq) => DdbCmpOp::Eq,
+            Some(DdbToken::Ne) => DdbCmpOp::Ne,
+            Some(DdbToken::Lt) => DdbCmpOp::Lt,
+            Some(DdbToken::Le) => DdbCmpOp::Le,
+            Some(DdbToken::Gt) => DdbCmpOp::Gt,
+            Some(DdbToken::Ge) => DdbCmpOp::Ge,
+            other => {
+                return Err(format!(
+                    "Invalid condition expression: expected comparison operator, got {other:?}"
+                ));
+            }
+        };
+        let rhs = self.parse_operand()?;
+        Ok(DdbExpr::Compare(lhs, op, rhs))
+    }
+
+    fn parse_operand(&mut self) -> Result<DdbOperand, String> {
+        let ident = self.expect_ident()?;
+        if ident == "size" && self.peek() == Some(&DdbToken::LParen) {
+            self.pos += 1;
+            let path = self.expect_ident()?;
+            self.expect(&DdbToken::RParen)?;
+            return Ok(DdbOperand::Size(path));
+        }
+        Ok(classify_ddb_ident(ident))
+    }
+
+    fn expect_ident(&mut self) -> Result<String, String> {
+        match self.next() {
+            Some(DdbToken::Ident(s)) => Ok(s),
+            other => Err(format!(
+                "Invalid condition expression: expected identifier, got {other:?}"
+            )),
+        }
+    }
+}
+
+fn classify_ddb_ident(ident: String) -> DdbOperand {
+    if ident.starts_with(':') {
+        DdbOperand::ValueRef(ident)
+    } else {
+        DdbOperand::Path(ident)
+    }
+}
+
+fn parse_ddb_expr(src: &str) -> Result<DdbExpr, String> {
+    let tokens = tokenize_ddb_expr(src)?;
+    if tokens.is_empty() {
+        return Err("Condition expression must not be empty.".to_string());
+    }
+    let mut parser = DdbParser { tokens, pos: 0 };
+    let ast = parser.parse_or()?;
+    if parser.pos != parser.tokens.len() {
+        return Err(format!(
+            "Invalid condition expression: unexpected trailing token `{:?}`",
+            parser.tokens[parser.pos]
+        ));
+    }
+    Ok(ast)
+}
+
+fn resolve_ddb_path<'a>(
+    item: &'a Value,
+    raw_path: &str,
+    names: Option<&Map<String, Value>>,
+) -> Result<Option<&'a Value>, String> {
+    let mut cur = item;
+    let mut first = true;
+    for seg in raw_path.split('.') {
+        if seg.is_empty() {
+            return Err(format!("Invalid document path `{raw_path}`"));
+        }
+        let (field_part, rest_indices) = match seg.find('[') {
+            Some(idx) => (&seg[..idx], &seg[idx..]),
+            None => (seg, ""),
+        };
+        let attr_name = if field_part.starts_with('#') {
+            names
+                .and_then(|m| m.get(field_part))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "An expression attribute name used in the document path is not defined; attribute name: {field_part}"
+                    )
+                })?
+        } else if let Some(mapped) = names
+            .and_then(|m| m.get(field_part))
+            .and_then(|v| v.as_str())
+        {
+            mapped
+        } else {
+            field_part
+        };
+
+        let container = if first {
+            first = false;
+            cur.as_object()
+        } else {
+            cur.get("M").and_then(|m| m.as_object())
+        };
+        let Some(next) = container.and_then(|m| m.get(attr_name)) else {
+            return Ok(None);
+        };
+        cur = next;
+
+        let mut idx_slice = rest_indices;
+        while !idx_slice.is_empty() {
+            let Some(after_open) = idx_slice.strip_prefix('[') else {
+                return Err(format!("Invalid list index in `{raw_path}`"));
+            };
+            let Some((num_str, rem)) = after_open.split_once(']') else {
+                return Err(format!("Unclosed list index in `{raw_path}`"));
+            };
+            let index: usize = num_str
+                .parse()
+                .map_err(|_| format!("Invalid list index `{num_str}` in `{raw_path}`"))?;
+            let Some(elem) = cur
+                .get("L")
+                .and_then(|l| l.as_array())
+                .and_then(|arr| arr.get(index))
+            else {
+                return Ok(None);
+            };
+            cur = elem;
+            idx_slice = rem;
+        }
+    }
+    Ok(Some(cur))
+}
+
+fn resolve_ddb_operand(
+    op: &DdbOperand,
+    item: &Value,
+    names: Option<&Map<String, Value>>,
+    values: Option<&Map<String, Value>>,
+) -> Result<Option<Value>, String> {
+    match op {
+        DdbOperand::ValueRef(placeholder) => {
+            let v = values.and_then(|m| m.get(placeholder)).ok_or_else(|| {
+                format!(
+                    "Value provided in ExpressionAttributeValues unused or missing: {placeholder}"
+                )
+            })?;
+            Ok(Some(v.clone()))
+        }
+        DdbOperand::Path(p) => Ok(resolve_ddb_path(item, p, names)?.cloned()),
+        DdbOperand::Size(p) => {
+            let Some(val) = resolve_ddb_path(item, p, names)? else {
+                return Ok(None);
+            };
+            let sz = ddb_attr_size(val)?;
+            Ok(Some(json!({ "N": sz.to_string() })))
+        }
+    }
+}
+
+fn ddb_attr_size(val: &Value) -> Result<usize, String> {
+    if let Some(s) = val.get("S").and_then(|v| v.as_str()) {
+        return Ok(s.len());
+    }
+    if let Some(b64) = val.get("B").and_then(|v| v.as_str()) {
+        return Ok(decode_b64_len(b64));
+    }
+    for set_key in ["SS", "NS", "BS", "L"] {
+        if let Some(arr) = val.get(set_key).and_then(|v| v.as_array()) {
+            return Ok(arr.len());
+        }
+    }
+    if let Some(m) = val.get("M").and_then(|v| v.as_object()) {
+        return Ok(m.len());
+    }
+    Err("The function `size` is not supported for this attribute type.".to_string())
+}
+
+fn eval_ddb_expr(
+    expr: &DdbExpr,
+    item: &Value,
+    names: Option<&Map<String, Value>>,
+    values: Option<&Map<String, Value>>,
+) -> Result<bool, String> {
+    match expr {
+        DdbExpr::Or(a, b) => {
+            Ok(eval_ddb_expr(a, item, names, values)? || eval_ddb_expr(b, item, names, values)?)
+        }
+        DdbExpr::And(a, b) => {
+            Ok(eval_ddb_expr(a, item, names, values)? && eval_ddb_expr(b, item, names, values)?)
+        }
+        DdbExpr::Not(inner) => Ok(!eval_ddb_expr(inner, item, names, values)?),
+        DdbExpr::AttrExists(p) => Ok(resolve_ddb_path(item, p, names)?.is_some()),
+        DdbExpr::AttrNotExists(p) => Ok(resolve_ddb_path(item, p, names)?.is_none()),
+        DdbExpr::Compare(lhs, op, rhs) => {
+            let lval = resolve_ddb_operand(lhs, item, names, values)?;
+            let rval = resolve_ddb_operand(rhs, item, names, values)?;
+            let (Some(lv), Some(rv)) = (lval, rval) else {
+                return Ok(false);
+            };
+            Ok(ddb_eval_cmp(&lv, *op, &rv))
+        }
+        DdbExpr::Between(val_op, lo_op, hi_op) => {
+            let v = resolve_ddb_operand(val_op, item, names, values)?;
+            let lo = resolve_ddb_operand(lo_op, item, names, values)?;
+            let hi = resolve_ddb_operand(hi_op, item, names, values)?;
+            let (Some(v), Some(lo), Some(hi)) = (v, lo, hi) else {
+                return Ok(false);
+            };
+            Ok(
+                ddb_compare_attr(&v, &lo).is_some_and(|o| o != std::cmp::Ordering::Less)
+                    && ddb_compare_attr(&v, &hi).is_some_and(|o| o != std::cmp::Ordering::Greater),
+            )
+        }
+        DdbExpr::In(lhs, list) => {
+            let mut resolved_list = Vec::with_capacity(list.len());
+            for el in list {
+                resolved_list.push(resolve_ddb_operand(el, item, names, values)?);
+            }
+            let Some(lv) = resolve_ddb_operand(lhs, item, names, values)? else {
+                return Ok(false);
+            };
+            Ok(resolved_list
+                .into_iter()
+                .flatten()
+                .any(|rv| ddb_eval_cmp(&lv, DdbCmpOp::Eq, &rv)))
+        }
+        DdbExpr::BeginsWith(lhs, rhs) => {
+            let lval = resolve_ddb_operand(lhs, item, names, values)?;
+            let rval = resolve_ddb_operand(rhs, item, names, values)?;
+            let (Some(lv), Some(rv)) = (lval, rval) else {
+                return Ok(false);
+            };
+            Ok(ddb_begins_with(&lv, &rv))
+        }
+        DdbExpr::Contains(lhs, rhs) => {
+            let lval = resolve_ddb_operand(lhs, item, names, values)?;
+            let rval = resolve_ddb_operand(rhs, item, names, values)?;
+            let (Some(lv), Some(rv)) = (lval, rval) else {
+                return Ok(false);
+            };
+            Ok(ddb_contains(&lv, &rv))
+        }
+        DdbExpr::AttrType(lhs, rhs) => {
+            let lval = resolve_ddb_operand(lhs, item, names, values)?;
+            let rval = resolve_ddb_operand(rhs, item, names, values)?;
+            let (Some(lv), Some(rv)) = (lval, rval) else {
+                return Ok(false);
+            };
+            let Some(expected_type) = rv.get("S").and_then(|v| v.as_str()) else {
+                return Err(
+                    "attribute_type second argument must be a string type descriptor.".into(),
+                );
+            };
+            Ok(lv
+                .as_object()
+                .is_some_and(|m| m.contains_key(expected_type)))
+        }
+    }
+}
+
+fn eval_ddb_condition_map(
+    conds: &Map<String, Value>,
+    combine_or: bool,
+    item: &Value,
+) -> Result<bool, String> {
+    if conds.is_empty() {
+        return Ok(true);
+    }
+    let mut any_match = false;
+    for (attr, spec) in conds {
+        let op = str_field(spec, "ComparisonOperator").unwrap_or_else(|| "EQ".to_string());
+        let vals = spec
+            .get("AttributeValueList")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let actual = item.get(attr);
+        let matched = match op.as_str() {
+            "NULL" => actual.is_none(),
+            "NOT_NULL" => actual.is_some(),
+            "EQ" => actual
+                .zip(vals.first())
+                .is_some_and(|(a, b)| ddb_eval_cmp(a, DdbCmpOp::Eq, b)),
+            "NE" => match (actual, vals.first()) {
+                (Some(a), Some(b)) => ddb_eval_cmp(a, DdbCmpOp::Ne, b),
+                (None, Some(_)) => true,
+                _ => false,
+            },
+            "LT" => actual
+                .zip(vals.first())
+                .is_some_and(|(a, b)| ddb_eval_cmp(a, DdbCmpOp::Lt, b)),
+            "LE" => actual
+                .zip(vals.first())
+                .is_some_and(|(a, b)| ddb_eval_cmp(a, DdbCmpOp::Le, b)),
+            "GT" => actual
+                .zip(vals.first())
+                .is_some_and(|(a, b)| ddb_eval_cmp(a, DdbCmpOp::Gt, b)),
+            "GE" => actual
+                .zip(vals.first())
+                .is_some_and(|(a, b)| ddb_eval_cmp(a, DdbCmpOp::Ge, b)),
+            "BEGINS_WITH" => actual
+                .zip(vals.first())
+                .is_some_and(|(a, b)| ddb_begins_with(a, b)),
+            "CONTAINS" => actual
+                .zip(vals.first())
+                .is_some_and(|(a, b)| ddb_contains(a, b)),
+            "NOT_CONTAINS" => actual
+                .zip(vals.first())
+                .is_some_and(|(a, b)| !ddb_contains(a, b)),
+            "BETWEEN" if vals.len() >= 2 => actual.is_some_and(|a| {
+                ddb_compare_attr(a, &vals[0]).is_some_and(|o| o != std::cmp::Ordering::Less)
+                    && ddb_compare_attr(a, &vals[1])
+                        .is_some_and(|o| o != std::cmp::Ordering::Greater)
+            }),
+            "IN" => actual.is_some_and(|a| vals.iter().any(|v| ddb_eval_cmp(a, DdbCmpOp::Eq, v))),
+            other => {
+                return Err(format!("Unsupported DynamoDB ComparisonOperator `{other}`"));
+            }
+        };
+        if combine_or {
+            if matched {
+                any_match = true;
+            }
+        } else if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(if combine_or { any_match } else { true })
+}
+
+fn ddb_eval_cmp(lhs: &Value, op: DdbCmpOp, rhs: &Value) -> bool {
+    match op {
+        DdbCmpOp::Eq => ddb_attr_eq(lhs, rhs),
+        DdbCmpOp::Ne => !ddb_attr_eq(lhs, rhs),
+        DdbCmpOp::Lt => ddb_compare_attr(lhs, rhs) == Some(std::cmp::Ordering::Less),
+        DdbCmpOp::Le => {
+            matches!(
+                ddb_compare_attr(lhs, rhs),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            )
+        }
+        DdbCmpOp::Gt => ddb_compare_attr(lhs, rhs) == Some(std::cmp::Ordering::Greater),
+        DdbCmpOp::Ge => {
+            matches!(
+                ddb_compare_attr(lhs, rhs),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            )
+        }
+    }
+}
+
+fn ddb_attr_eq(a: &Value, b: &Value) -> bool {
+    if let (Some(na), Some(nb)) = (
+        a.get("N")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok()),
+        b.get("N")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok()),
+    ) {
+        return na == nb;
+    }
+    a == b
+}
+
+fn ddb_compare_attr(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(sa), Some(sb)) = (
+        a.get("S").and_then(|v| v.as_str()),
+        b.get("S").and_then(|v| v.as_str()),
+    ) {
+        return Some(sa.cmp(sb));
+    }
+    if let (Some(na), Some(nb)) = (
+        a.get("N")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok()),
+        b.get("N")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok()),
+    ) {
+        return na.partial_cmp(&nb);
+    }
+    if let (Some(ba), Some(bb)) = (
+        a.get("B").and_then(|v| v.as_str()),
+        b.get("B").and_then(|v| v.as_str()),
+    ) {
+        return Some(decode_b64_bytes(ba).cmp(&decode_b64_bytes(bb)));
+    }
+    None
+}
+
+fn ddb_begins_with(a: &Value, b: &Value) -> bool {
+    if let (Some(sa), Some(sb)) = (
+        a.get("S").and_then(|v| v.as_str()),
+        b.get("S").and_then(|v| v.as_str()),
+    ) {
+        return sa.starts_with(sb);
+    }
+    if let (Some(ba), Some(bb)) = (
+        a.get("B").and_then(|v| v.as_str()),
+        b.get("B").and_then(|v| v.as_str()),
+    ) {
+        return decode_b64_bytes(ba).starts_with(&decode_b64_bytes(bb));
+    }
+    false
+}
+
+fn ddb_contains(container: &Value, target: &Value) -> bool {
+    if let (Some(sa), Some(sb)) = (
+        container.get("S").and_then(|v| v.as_str()),
+        target.get("S").and_then(|v| v.as_str()),
+    ) {
+        return sa.contains(sb);
+    }
+    if let (Some(ss), Some(sb)) = (
+        container.get("SS").and_then(|v| v.as_array()),
+        target.get("S").and_then(|v| v.as_str()),
+    ) {
+        return ss.iter().any(|el| el.as_str() == Some(sb));
+    }
+    if let (Some(ns), Some(nb)) = (
+        container.get("NS").and_then(|v| v.as_array()),
+        target
+            .get("N")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok()),
+    ) {
+        return ns
+            .iter()
+            .filter_map(|el| el.as_str()?.parse::<f64>().ok())
+            .any(|n| n == nb);
+    }
+    if let (Some(bs), Some(bb)) = (
+        container.get("BS").and_then(|v| v.as_array()),
+        target.get("B").and_then(|v| v.as_str()),
+    ) {
+        let target_bytes = decode_b64_bytes(bb);
+        return bs
+            .iter()
+            .filter_map(|el| el.as_str())
+            .any(|el| decode_b64_bytes(el) == target_bytes);
+    }
+    if let Some(list) = container.get("L").and_then(|v| v.as_array()) {
+        return list.iter().any(|el| ddb_attr_eq(el, target));
+    }
+    false
+}
+
+fn decode_b64_bytes(input: &str) -> Vec<u8> {
+    fn sextet(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        let Some(s0) = chunk.first().copied().and_then(sextet) else {
+            return input.as_bytes().to_vec();
+        };
+        let Some(s1) = chunk.get(1).copied().and_then(sextet) else {
+            return input.as_bytes().to_vec();
+        };
+        out.push((s0 << 2) | (s1 >> 4));
+        if let Some(b2) = chunk.get(2).copied() {
+            let Some(s2) = sextet(b2) else {
+                return input.as_bytes().to_vec();
+            };
+            out.push((s1 << 4) | (s2 >> 2));
+            if let Some(b3) = chunk.get(3).copied() {
+                let Some(s3) = sextet(b3) else {
+                    return input.as_bytes().to_vec();
+                };
+                out.push((s2 << 6) | s3);
+            }
+        }
+    }
+    out
+}
+
+fn decode_b64_len(input: &str) -> usize {
+    decode_b64_bytes(input).len()
+}
+
 /// Pure safe Rust RFC 1321 MD5 digest (lowercase hex) so S3 `ETag` and SQS
 /// `MD5OfMessageBody` pass strict AWS SDK client-side checksum validation.
 pub(crate) fn md5_hex(data: &[u8]) -> String {
+    capture::hex(&md5_bytes(data))
+}
+
+fn md5_bytes(data: &[u8]) -> [u8; 16] {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
@@ -2887,7 +4406,7 @@ pub(crate) fn md5_hex(data: &[u8]) -> String {
     digest[4..8].copy_from_slice(&b0.to_le_bytes());
     digest[8..12].copy_from_slice(&c0.to_le_bytes());
     digest[12..16].copy_from_slice(&d0.to_le_bytes());
-    capture::hex(&digest)
+    digest
 }
 
 #[cfg(test)]
@@ -3085,5 +4604,276 @@ mod tests {
                 .unwrap();
         assert!(sts_xml.contains("<AccessKeyId>ASIALENSLET"));
         assert!(sts_xml.contains("assumed-role/worker/test"));
+    }
+
+    #[tokio::test]
+    async fn s3_multipart_upload_stages_parts_and_assembles_on_complete() {
+        let sb = Sandbox::new("http://127.0.0.1:9297");
+        let call = |method: Method, path: &str, extra: &[(&str, &str)], body: &[u8]| {
+            let mut h = HeaderMap::new();
+            h.insert("content-type", "application/octet-stream".parse().unwrap());
+            for (k, v) in extra {
+                h.insert(
+                    header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            let c = capture::content(&h);
+            let fb = wire::fallback_operation("s3", method.as_str(), path, &h);
+            sb.handle(
+                &method,
+                path,
+                &h,
+                "s3",
+                Some("us-east-1"),
+                None,
+                &fb,
+                &c,
+                body,
+            )
+        };
+
+        // Initiate multipart upload with metadata + SSE headers.
+        let init = call(
+            Method::POST,
+            "/media-bucket/videos/demo.bin?uploads",
+            &[
+                ("content-type", "video/mp4"),
+                ("x-amz-meta-author", "alice"),
+            ],
+            b"",
+        );
+        assert_eq!(init.status(), StatusCode::OK);
+        let init_xml = String::from_utf8(
+            init.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let upload_id = extract_xml_tags(&init_xml, "UploadId").pop().unwrap();
+
+        // Upload part 2 first, then part 1 (out-of-order arrival must assemble in partNumber order).
+        let p2 = call(
+            Method::PUT,
+            &format!("/media-bucket/videos/demo.bin?partNumber=2&uploadId={upload_id}"),
+            &[],
+            b"-world-part-two",
+        );
+        assert_eq!(p2.status(), StatusCode::OK);
+        let etag2 = p2
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let p1 = call(
+            Method::PUT,
+            &format!("/media-bucket/videos/demo.bin?partNumber=1&uploadId={upload_id}"),
+            &[],
+            b"hello-part-one",
+        );
+        assert_eq!(p1.status(), StatusCode::OK);
+        let etag1 = p1
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Object MUST NOT be visible via GetObject before CompleteMultipartUpload.
+        let premature = call(Method::GET, "/media-bucket/videos/demo.bin", &[], b"");
+        assert_eq!(premature.status(), StatusCode::NOT_FOUND);
+
+        // CompleteMultipartUpload with XML-escaped &quot; ETags assembles parts 1 + 2 in order.
+        let complete_xml = format!(
+            "<CompleteMultipartUpload>\
+               <Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+               <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part>\
+             </CompleteMultipartUpload>",
+            xml_escape(&etag1),
+            xml_escape(&etag2),
+        );
+        let done = call(
+            Method::POST,
+            &format!("/media-bucket/videos/demo.bin?uploadId={upload_id}"),
+            &[("content-type", "application/xml")],
+            complete_xml.as_bytes(),
+        );
+        assert_eq!(done.status(), StatusCode::OK);
+        let done_xml = String::from_utf8(
+            done.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(done_xml.contains("-2&quot;</ETag>"), "{done_xml}");
+
+        let got = call(Method::GET, "/media-bucket/videos/demo.bin", &[], b"");
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(got.headers().get("content-type").unwrap(), "video/mp4");
+        assert_eq!(got.headers().get("x-amz-meta-author").unwrap(), "alice");
+        let bytes = got.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"hello-part-one-world-part-two");
+    }
+
+    #[tokio::test]
+    async fn dynamodb_query_and_scan_evaluate_key_and_filter_predicates() {
+        let sb = Sandbox::new("http://127.0.0.1:9297");
+        let ddb = |op: &str, payload: Value| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                "content-type",
+                "application/x-amz-json-1.0".parse().unwrap(),
+            );
+            h.insert(
+                "x-amz-target",
+                format!("DynamoDB_20120810.{op}").parse().unwrap(),
+            );
+            let c = capture::content(&h);
+            let raw = payload.to_string();
+            sb.handle(
+                &Method::POST,
+                "/",
+                &h,
+                "dynamodb",
+                Some("us-east-1"),
+                Some(op),
+                op,
+                &c,
+                raw.as_bytes(),
+            )
+        };
+
+        let created = ddb(
+            "CreateTable",
+            json!({
+                "TableName": "tenant_orders",
+                "KeySchema": [
+                    { "AttributeName": "pk", "KeyType": "HASH" },
+                    { "AttributeName": "seq", "KeyType": "RANGE" }
+                ]
+            }),
+        );
+        assert_eq!(created.status(), StatusCode::OK);
+
+        for (pk, seq, status, total) in [
+            ("tenant#acme", "2", "paid", "45.5"),
+            ("tenant#acme", "10", "paid", "120.0"),
+            ("tenant#acme", "25", "draft", "999.0"),
+            ("tenant#other", "10", "paid", "500.0"),
+        ] {
+            let r = ddb(
+                "PutItem",
+                json!({
+                    "TableName": "tenant_orders",
+                    "Item": {
+                        "pk": { "S": pk },
+                        "seq": { "N": seq },
+                        "status": { "S": status },
+                        "total": { "N": total }
+                    }
+                }),
+            );
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+
+        // Query isolates tenant#acme, evaluates numeric BETWEEN (2..=25 includes 10),
+        // applies FilterExpression (`#st = :paid AND total >= :min`), and reverses order (`ScanIndexForward: false`).
+        let q = ddb(
+            "Query",
+            json!({
+                "TableName": "tenant_orders",
+                "KeyConditionExpression": "#pk = :t AND seq BETWEEN :lo AND :hi",
+                "FilterExpression": "#st = :paid AND total >= :min",
+                "ExpressionAttributeNames": {
+                    "#pk": "pk",
+                    "#st": "status"
+                },
+                "ExpressionAttributeValues": {
+                    ":t": { "S": "tenant#acme" },
+                    ":lo": { "N": "1" },
+                    ":hi": { "N": "30" },
+                    ":paid": { "S": "paid" },
+                    ":min": { "N": "50" }
+                },
+                "ScanIndexForward": false
+            }),
+        );
+        assert_eq!(q.status(), StatusCode::OK);
+        let q_json: Value =
+            serde_json::from_slice(&q.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            q_json["ScannedCount"], 3,
+            "3 items matched key condition for tenant#acme"
+        );
+        assert_eq!(
+            q_json["Count"], 1,
+            "only seq=10 passed FilterExpression total >= 50 & status=paid"
+        );
+        assert_eq!(q_json["Items"][0]["pk"]["S"], "tenant#acme");
+        assert_eq!(q_json["Items"][0]["seq"]["N"], "10");
+
+        // Verify numeric sort order on `ScanIndexForward: false` without filter (25 -> 10 -> 2).
+        let q_order = ddb(
+            "Query",
+            json!({
+                "TableName": "tenant_orders",
+                "KeyConditionExpression": "pk = :t",
+                "ExpressionAttributeValues": { ":t": { "S": "tenant#acme" } },
+                "ScanIndexForward": false
+            }),
+        );
+        let order_json: Value =
+            serde_json::from_slice(&q_order.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let seqs: Vec<&str> = order_json["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|it| it["seq"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(seqs, vec!["25", "10", "2"]);
+
+        // Scan with `begins_with` + `attribute_not_exists` works across partitions.
+        let scan = ddb(
+            "Scan",
+            json!({
+                "TableName": "tenant_orders",
+                "FilterExpression": "begins_with(pk, :prefix) AND NOT #st = :draft",
+                "ExpressionAttributeNames": { "#st": "status" },
+                "ExpressionAttributeValues": {
+                    ":prefix": { "S": "tenant#other" },
+                    ":draft": { "S": "draft" }
+                }
+            }),
+        );
+        let scan_json: Value =
+            serde_json::from_slice(&scan.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(scan_json["ScannedCount"], 4);
+        assert_eq!(scan_json["Count"], 1);
+        assert_eq!(scan_json["Items"][0]["pk"]["S"], "tenant#other");
+
+        // Malformed expression fails explicitly with 400 ValidationException instead of returning unfiltered items.
+        let bad = ddb(
+            "Query",
+            json!({
+                "TableName": "tenant_orders",
+                "KeyConditionExpression": "pk = :missing_placeholder"
+            }),
+        );
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            bad.headers().get("x-amzn-errortype").unwrap(),
+            "ValidationException"
+        );
     }
 }

@@ -141,6 +141,7 @@ struct Pending {
     derive_capture: Option<Arc<Mutex<Capture>>>,
     /// The gate evaluation already made for this call (under `--enforce`).
     evaluation: Option<Evaluation>,
+    request_incomplete: bool,
     response_capture: Arc<Mutex<Capture>>,
     response_content: Content,
 }
@@ -149,7 +150,11 @@ impl Pending {
     fn finish(mut self) {
         self.finished.store(true, Ordering::SeqCst);
         self.trace.ms = self.started.elapsed().as_millis() as u64;
-        self.trace.request.body = snapshot(&self.request_capture, &self.request_content);
+        self.trace.request.body =
+            snapshot(&self.request_capture, &self.request_content).map(|mut body| {
+                body.truncated |= self.request_incomplete;
+                body
+            });
         self.trace.request.trailers =
             snapshot_trailers(&self.request_capture, &self.request_content);
         self.trace.response.body = snapshot(&self.response_capture, &self.response_content);
@@ -177,11 +182,18 @@ impl Pending {
         let evaluation = match self.evaluation.take() {
             Some(evaluation) => evaluation,
             None => {
-                let mut full = self.full_body.take().or_else(|| {
-                    self.derive_capture
-                        .as_deref()
-                        .and_then(|capture| snapshot(capture, &self.request_content))
-                });
+                let mut full = self
+                    .full_body
+                    .take()
+                    .or_else(|| {
+                        self.derive_capture
+                            .as_deref()
+                            .and_then(|capture| snapshot(capture, &self.request_content))
+                    })
+                    .map(|mut body| {
+                        body.truncated |= self.request_incomplete;
+                        body
+                    });
                 with_body(&mut self.trace, &mut full, |trace| {
                     self.state.trace.evaluate(trace)
                 })
@@ -1143,10 +1155,11 @@ where
         });
     }
 
+    let mut request_incomplete = false;
     let exchange: Result<(StatusCode, String, hyper::HeaderMap, Body), String> = if use_sandbox {
         let sb = state.sandbox.as_ref().expect("sandbox checked");
         match collect_bounded(&mut upstream_body, inspect_limit).await {
-            Ok(collected) => {
+            Ok(collected) if collected.complete => {
                 let resp = sb.handle(
                     &parts.method,
                     &raw_path,
@@ -1158,6 +1171,19 @@ where
                     &request_content,
                     &collected.data,
                 );
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                Ok((status, "sandbox".to_string(), headers, resp.into_body()))
+            }
+            Ok(_incomplete) => {
+                let drained = tokio::time::timeout(
+                    DRAIN_TIME,
+                    collect_bounded(&mut upstream_body, DRAIN_BYTES),
+                )
+                .await;
+                request_incomplete = !matches!(drained, Ok(Ok(ref rest)) if rest.complete);
+                let resp =
+                    sb.payload_too_large(&service, &parts.headers, &request_content, inspect_limit);
                 let status = resp.status();
                 let headers = resp.headers().clone();
                 Ok((status, "sandbox".to_string(), headers, resp.into_body()))
@@ -1256,6 +1282,7 @@ where
                 full_body,
                 derive_capture,
                 evaluation,
+                request_incomplete,
                 response_capture: response_capture.clone(),
                 response_content,
             };
@@ -3270,5 +3297,113 @@ mod tests {
         assert_eq!(written.len(), 2);
         assert_eq!(written[0].target.as_deref(), Some("s3://assets/logo.svg"));
         assert_eq!(written[1].target.as_deref(), Some("queue/jobs"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_rejects_incomplete_oversized_request_bodies_without_mutating_state() {
+        let temp = TempDir::new("sandbox-oversized");
+        let trace_path = temp.trace();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let sb = Arc::new(crate::sandbox::Sandbox::new("http://127.0.0.1:9297"));
+        let state = Arc::new(State {
+            client: client(RootCertStore::empty()),
+            upstream: SANDBOX_UPSTREAM.to_string(),
+            sandbox: Some(sb),
+            routes: BTreeMap::new(),
+            endpoint: "http://127.0.0.1:9297".to_string(),
+            max_body: 512,
+            enforce: false,
+            blobs_dir: None,
+            trace: Arc::new(
+                TraceSink::new(trace_path.clone(), &RunHeader::default(), None).unwrap(),
+            ),
+            shutdown_req: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        // 1. Oversized S3 PutObject (1024 bytes > 32-byte inspect_limit) returns 413 EntityTooLarge
+        //    and does NOT publish a truncated object into the sandbox bucket.
+        let oversized_put = Request::builder()
+            .method("PUT")
+            .uri("/uploads/report.bin?x-id=PutObject")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("content-type", "application/octet-stream")
+            .body(Full::new(Bytes::from(vec![b'A'; 1024])))
+            .unwrap();
+        let resp = handle_with_inspect_limit(oversized_put, state.clone(), 32)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let err_xml = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(err_xml.contains("<Code>EntityTooLarge</Code>"), "{err_xml}");
+
+        // Verify the bucket/object was NOT created or mutated in the sandbox.
+        let check_get = sdk_request("GET", "/uploads/report.bin?x-id=GetObject", b"");
+        let get_resp = handle_with_inspect_limit(check_get, state.clone(), 32)
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+        let _ = get_resp.into_body().collect().await.unwrap();
+
+        // 2. Oversized JSON RPC request returns 413 RequestEntityTooLargeException.
+        let oversized_ddb = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "127.0.0.1:9297")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20261120/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=x",
+            )
+            .header("x-amz-target", "DynamoDB_20120810.PutItem")
+            .header("content-type", "application/x-amz-json-1.0")
+            .body(Full::new(Bytes::from(
+                r#"{"TableName":"orders","Item":{"id":{"S":"oversized-item-payload"}}}"#,
+            )))
+            .unwrap();
+        let ddb_resp = handle_with_inspect_limit(oversized_ddb, state.clone(), 32)
+            .await
+            .unwrap();
+        assert_eq!(ddb_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let ddb_err = String::from_utf8(
+            ddb_resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            ddb_err.contains("RequestEntityTooLargeException"),
+            "{ddb_err}"
+        );
+
+        let written = traces(&trace_path);
+        assert_eq!(written.len(), 3);
+        assert_eq!(written[0].status, 413);
+        assert_eq!(
+            written[0].problem.as_ref().map(|p| p.code.as_str()),
+            Some("EntityTooLarge")
+        );
+        assert!(written[0].request.body.as_ref().unwrap().truncated);
+        assert_eq!(written[2].status, 413);
+        assert_eq!(
+            written[2].problem.as_ref().map(|p| p.code.as_str()),
+            Some("RequestEntityTooLargeException")
+        );
     }
 }
