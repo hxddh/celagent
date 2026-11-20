@@ -84,6 +84,7 @@ pub struct Session {
     pub console_log: Arc<str>,
     pub workspace_fallback: Option<PathBuf>,
     feed_task: Option<Task<()>>,
+    log_task: Option<Task<()>>,
     _watch_task: Option<Task<()>>,
 
     pub lock_path: Option<PathBuf>,
@@ -121,6 +122,7 @@ impl Session {
             console_log: Arc::from(""),
             workspace_fallback: None,
             feed_task: None,
+            log_task: None,
             _watch_task: None,
             lock_path: None,
             lock: None,
@@ -205,6 +207,7 @@ impl Session {
         self.generation += 1;
         let generation = self.generation;
         self.feed_task = None;
+        self.log_task = None;
         self.feed_mode = None;
         self.health = Health::Loading;
         cx.notify();
@@ -364,15 +367,19 @@ impl Session {
         .detach();
     }
 
-    /// Keep the run current: event stream when live, file tail otherwise.
+    /// Keep the run current: event stream when live, file tail otherwise, plus
+    /// independent companion `.log` tailing so stdout/stderr updates even when
+    /// no AWS calls are made.
     fn start_feed(&mut self, path: PathBuf, tail: feed::TailState, cx: &mut Context<Self>) {
         let ended = self.run.as_ref().is_none_or(|run| run.report.is_some());
         if ended {
             self.feed_mode = Some(FeedMode::Done);
+            self.log_task = None;
             return;
         }
         let endpoint = self.header_endpoint().map(str::to_string);
         let generation = self.generation;
+        self.log_task = Some(Self::spawn_live_log_poller(generation, cx));
         let mut rx = feed::start(path, endpoint, tail);
         self.feed_task = Some(cx.spawn(async move |this, cx| {
             while let Some(first) = rx.next().await {
@@ -393,6 +400,70 @@ impl Session {
                 cx.background_executor().timer(FRAME).await;
             }
         }));
+    }
+
+    fn spawn_live_log_poller(generation: u64, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let mut last_len: Option<u64> = None;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let Ok(Some(log_path)) = this.update(cx, |session, _| {
+                    if session.generation != generation
+                        || session.feed_mode == Some(FeedMode::Done)
+                        || session.run.as_ref().is_none_or(|r| r.report.is_some())
+                    {
+                        return None;
+                    }
+                    session
+                        .run
+                        .as_ref()
+                        .and_then(|r| r.header.log.as_deref())
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            session
+                                .path
+                                .as_deref()
+                                .map(lenslet_core::runs::log_path_for)
+                        })
+                }) else {
+                    break;
+                };
+                let polled = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::fsguard::assert_io_allowed();
+                        let len = std::fs::metadata(&log_path).ok()?.len();
+                        if Some(len) == last_len {
+                            return Some((len, None));
+                        }
+                        let text = crate::daemon::read_run_log(&log_path, 512 * 1024);
+                        Some((len, text))
+                    })
+                    .await;
+                if let Some((len, maybe_text)) = polled {
+                    last_len = Some(len);
+                    if let Some(next) = maybe_text {
+                        let gone = this
+                            .update(cx, |session, cx| {
+                                if session.generation == generation
+                                    && session.console_log.as_ref() != next
+                                {
+                                    session.console_log = Arc::from(next);
+                                    cx.emit(SessionEvent::Derived);
+                                    cx.notify();
+                                }
+                            })
+                            .is_err();
+                        if gone {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Apply one frame's worth of feed messages.
@@ -442,6 +513,7 @@ impl Session {
         }
         if ended {
             self.feed_mode = Some(FeedMode::Done);
+            self.log_task = None;
             self.refresh_console_log(cx);
             self.refresh_runs(cx);
             self.recompute(cx);

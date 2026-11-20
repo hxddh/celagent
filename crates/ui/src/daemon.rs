@@ -404,6 +404,11 @@ pub fn spawn_proxy_verified(opts: &ProxyLaunchOpts) -> Result<Child, String> {
     if let Some(dir) = opts.cwd.as_deref().filter(|d| d.is_dir()) {
         cmd.current_dir(dir);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd
         .spawn()
@@ -497,6 +502,11 @@ pub fn spawn_command_run(opts: &CommandRunOpts) -> Result<ManagedRun, String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let child = cmd
         .spawn()
@@ -523,6 +533,11 @@ pub fn spawn_local_emulator(kind: EmulatorKind, home: &Path) -> Result<(Child, u
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     match kind {
         EmulatorKind::AwsEmulator => {
             cmd.env("EMULATOR_TELEMETRY", "off")
@@ -715,14 +730,17 @@ pub fn stop_proxy_on_exit(child: Child, port: u16) {
 }
 
 pub fn stop_child_on_exit(mut child: Child) {
-    send_sigterm(&child);
+    let pid = child.id();
+    send_group_signal(pid, "TERM");
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
         if child.try_wait().ok().flatten().is_some() {
+            send_group_signal(pid, "KILL");
             return;
         }
         std::thread::sleep(Duration::from_millis(15));
     }
+    send_group_signal(pid, "KILL");
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -731,6 +749,7 @@ fn stop_proxy_inner(mut child: Child, port: Option<u16>, grace: Duration) {
     if child.try_wait().ok().flatten().is_some() {
         return;
     }
+    let pid = child.id();
     if let Some(port) = port.filter(|p| *p > 0) {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
@@ -746,24 +765,28 @@ fn stop_proxy_inner(mut child: Child, port: Option<u16>, grace: Duration) {
             }
         }
     }
-    send_sigterm(&child);
+    send_group_signal(pid, "TERM");
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         if child.try_wait().ok().flatten().is_some() {
+            send_group_signal(pid, "KILL");
             return;
         }
         std::thread::sleep(Duration::from_millis(15));
     }
+    send_group_signal(pid, "KILL");
     let _ = child.kill();
     let _ = child.wait();
 }
 
 #[cfg(unix)]
-fn send_sigterm(child: &Child) {
-    let pid = child.id();
+fn send_group_signal(pid: u32, sig: &str) {
     if pid > 0 {
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
+        let _ = Command::new("sh")
+            .args([
+                "-c",
+                &format!("kill -{sig} -{pid} 2>/dev/null || kill -{sig} {pid} 2>/dev/null || true"),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -772,7 +795,7 @@ fn send_sigterm(child: &Child) {
 }
 
 #[cfg(not(unix))]
-fn send_sigterm(_child: &Child) {}
+fn send_group_signal(_pid: u32, _sig: &str) {}
 
 /// Symlink (or copy on Windows) the bundled `lenslet` CLI into `~/.local/bin/lenslet`
 /// (or `/usr/local/bin/lenslet` when already writable).

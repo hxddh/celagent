@@ -577,6 +577,12 @@ async fn run_child(
 
     let mut child = tokio::process::Command::new(&command[0]);
     child.args(&command[1..]).stdin(Stdio::inherit());
+    #[cfg(unix)]
+    {
+        // Isolate the child and all its descendants (`sh -c`, `npm test`, dev servers)
+        // in their own process group so stopping or terminating reaps the whole tree.
+        child.process_group(0);
+    }
     if log_sink.is_some() {
         child.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
@@ -646,18 +652,24 @@ async fn run_child(
         }
     }
 
-    // Ctrl-C reaches the child through the terminal; `SIGTERM` or `/_lenslet/shutdown`
-    // terminates the child cleanly so the `end` report is still written.
-    let interrupts = tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
+    // Forward Ctrl-C (`SIGINT`) to the child's process group, and on `SIGTERM` or
+    // `/_lenslet/shutdown` terminate the entire child process group (`SIGTERM` → grace → `SIGKILL`)
+    // so no descendant runner or dev server survives after Lenslet seals the report.
+    let child_pid = child.id();
+    let interrupts = tokio::spawn(async move {
+        while tokio::signal::ctrl_c().await.is_ok() {
+            if let Some(pid) = child_pid {
+                signal_process_group(pid, "INT");
+            }
+        }
+    });
     let status = tokio::select! {
         res = child.wait() => res.context("wait for the command")?,
         () = stop_notify.notified() => {
-            let _ = child.start_kill();
-            child.wait().await.context("wait for stopped command")?
+            terminate_child_tree(&mut child).await?
         }
         () = wait_for_sigterm() => {
-            let _ = child.start_kill();
-            child.wait().await.context("wait for terminated command")?
+            terminate_child_tree(&mut child).await?
         }
     };
     interrupts.abort();
@@ -666,6 +678,46 @@ async fn run_child(
     }
     Ok(exit_code(status))
 }
+
+async fn terminate_child_tree(
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus> {
+    let pid = child.id();
+    if let Some(pid) = pid {
+        signal_process_group(pid, "TERM");
+    }
+    if let Ok(res) = tokio::time::timeout(Duration::from_millis(400), child.wait()).await {
+        if let Some(pid) = pid {
+            signal_process_group(pid, "KILL");
+        }
+        return res.context("wait for stopped command");
+    }
+    if let Some(pid) = pid {
+        signal_process_group(pid, "KILL");
+    }
+    let _ = child.start_kill();
+    child.wait().await.context("wait for killed command")
+}
+
+#[cfg(unix)]
+fn signal_process_group(pgid: u32, sig: &str) {
+    if pgid > 0 {
+        let _ = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "kill -{sig} -{pgid} 2>/dev/null || kill -{sig} {pgid} 2>/dev/null || true"
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_pgid: u32, _sig: &str) {}
 
 #[cfg(unix)]
 async fn wait_for_sigterm() {

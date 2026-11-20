@@ -57,18 +57,18 @@ pub fn can_replay(trace: &Trace, upstream_url: Option<&str>) -> bool {
         return false;
     }
     if let Some(body) = trace.request.as_ref().and_then(|r| r.body.as_ref()) {
-        let has_lossless_wire = body.raw_b64.is_some() || body.blob.is_some();
-        if has_lossless_wire {
-            return true;
-        }
-        if body.binary || body.truncated {
-            return false;
-        }
         if body
             .encoding
             .as_deref()
             .is_some_and(|e| e.contains("aws-eventstream"))
         {
+            return false;
+        }
+        let has_lossless_wire = body.raw_b64.is_some() || body.blob.is_some();
+        if has_lossless_wire {
+            return true;
+        }
+        if body.binary || body.truncated {
             return false;
         }
         if body.bytes > 0 && body.text.is_none() {
@@ -341,6 +341,56 @@ fn encode_wire_body(text: &str, cbor: bool) -> Result<Vec<u8>, String> {
     Ok(lenslet_core::cbor::encode_cbor(&val))
 }
 
+/// Unframe an `aws-chunked` request payload (`<hex>[;chunk-signature=...]\r\n<bytes>\r\n...0...`)
+/// into its exact raw payload bytes (supporting arbitrary binary content).
+fn unframe_aws_chunked_wire(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let line_end = bytes[pos..].windows(2).position(|w| w == b"\r\n")?;
+        let header = std::str::from_utf8(&bytes[pos..pos + line_end]).ok()?;
+        let size_hex = header.split(';').next()?.trim();
+        let chunk_len = usize::from_str_radix(size_hex, 16).ok()?;
+        pos += line_end + 2;
+        if chunk_len == 0 {
+            return Some(out);
+        }
+        let end = pos.checked_add(chunk_len)?;
+        if end + 2 > bytes.len() || &bytes[end..end + 2] != b"\r\n" {
+            return None;
+        }
+        out.extend_from_slice(&bytes[pos..end]);
+        pos = end + 2;
+    }
+    None
+}
+
+fn decompress_wire_payload(bytes: &[u8], encoding: &str) -> Result<Vec<u8>, String> {
+    let low = encoding.to_ascii_lowercase();
+    let mut out = Vec::new();
+    if low.contains("gzip") {
+        GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .map_err(|e| format!("failed to decompress gzip replay body: {e}"))?;
+        Ok(out)
+    } else if low.contains("zstd") {
+        zstd::stream::decode_all(bytes)
+            .map_err(|e| format!("failed to decompress zstd replay body: {e}"))
+    } else if low.contains("deflate") {
+        if ZlibDecoder::new(bytes).read_to_end(&mut out).is_ok() {
+            Ok(out)
+        } else {
+            out.clear();
+            DeflateDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("failed to decompress deflate replay body: {e}"))?;
+            Ok(out)
+        }
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
 fn resolve_local_signing_creds(
     existing_ak: Option<&str>,
     port: u16,
@@ -517,23 +567,32 @@ fn build_http_request(
         format!("/{}", trace.path)
     };
 
-    let exact_raw_wire = trace
-        .request
-        .as_ref()
-        .and_then(|r| r.body.as_ref())
+    let req_body = trace.request.as_ref().and_then(|r| r.body.as_ref());
+    let exact_raw_wire = req_body
         .filter(|b| b.binary || b.truncated || b.encoding.is_some())
         .and_then(|b| b.raw_wire_bytes(trace_path));
 
-    let body_encoding = trace
-        .request
-        .as_ref()
-        .and_then(|r| r.body.as_ref())
-        .and_then(|b| b.encoding.as_deref());
+    if let Some(b) = req_body {
+        if b.blob.is_some() && exact_raw_wire.is_none() {
+            return Err(
+                "Request payload sidecar blob could not be read from blobs/; cannot replay incomplete payload"
+                    .to_string(),
+            );
+        }
+        if exact_raw_wire.is_none()
+            && (b.binary || b.truncated || (b.bytes > 0 && b.text.is_none()))
+        {
+            return Err("Complete request payload is unavailable for replay".to_string());
+        }
+    }
+
+    let body_encoding = req_body.and_then(|b| b.encoding.as_deref());
+    let is_aws_chunked = body_encoding.is_some_and(|e| e.contains("aws-chunked"));
     // When `exact_raw_wire` is available (from `raw_b64` or sidecar `blob`), we
     // transmit the untouched compressed/binary/CBOR wire payload (preserving original
-    // Content-Encoding & SigV4 body hash!), only unframing `aws-chunked` if needed.
-    let using_raw_wire =
-        exact_raw_wire.is_some() && !body_encoding.is_some_and(|e| e.contains("aws-chunked"));
+    // Content-Encoding & SigV4 body hash!), and for `aws-chunked` we unframe the
+    // retained wire bytes directly so binary S3 uploads replay byte-for-byte intact.
+    let using_raw_wire = exact_raw_wire.is_some() && !is_aws_chunked;
     let decoded_wire = body_encoding.is_some() && !using_raw_wire;
     let compressed_wire = decoded_wire
         && body_encoding.is_some_and(|enc| {
@@ -549,21 +608,21 @@ fn build_http_request(
                 .map(|r| r.headers.as_slice())
                 .unwrap_or(&[]),
         );
-    let owned_body = if let Some(raw) = exact_raw_wire.filter(|_| using_raw_wire) {
-        raw
+    let owned_body = if let Some(raw) = exact_raw_wire {
+        if using_raw_wire {
+            raw
+        } else {
+            let unframed = unframe_aws_chunked_wire(&raw).ok_or_else(|| {
+                "Malformed aws-chunked request wire frame cannot be replayed".to_string()
+            })?;
+            if compressed_wire {
+                decompress_wire_payload(&unframed, body_encoding.unwrap_or_default())?
+            } else {
+                unframed
+            }
+        }
     } else {
-        let body_text = trace
-            .request
-            .as_ref()
-            .and_then(|r| r.body.as_ref())
-            .and_then(|b| {
-                if b.binary || b.truncated {
-                    None
-                } else {
-                    Some(b.text.as_deref().unwrap_or(""))
-                }
-            })
-            .unwrap_or("");
+        let body_text = req_body.and_then(|b| b.text.as_deref()).unwrap_or("");
         encode_wire_body(body_text, cbor_wire)?
     };
     let body_bytes: &[u8] = &owned_body;
@@ -1108,5 +1167,69 @@ mod tests {
                 .contains("\"QueueUrl\": \"ok\"")
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn replays_aws_chunked_binary_payload_and_rejects_missing_sidecar_blob() {
+        let payload: &[u8] = b"\x00\xff\xfe\x42S3BIN";
+        let mut chunked = format!("{:x};chunk-signature=deadbeef\r\n", payload.len()).into_bytes();
+        chunked.extend_from_slice(payload);
+        chunked.extend_from_slice(b"\r\n0;chunk-signature=cafebabe\r\n\r\n");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = payload.to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).unwrap();
+            let split = buf[..n].windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let hdr = String::from_utf8_lossy(&buf[..split]);
+            assert!(
+                !hdr.to_ascii_lowercase().contains("content-encoding:"),
+                "{hdr}"
+            );
+            assert!(
+                hdr.contains("x-amz-content-sha256: UNSIGNED-PAYLOAD"),
+                "{hdr}"
+            );
+            assert_eq!(&buf[split + 4..n], expected.as_slice());
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+
+        let mut trace = crate::model::parse_line(&format!(
+            r#"{{"type":"call","id":"bin1","at":"2026-11-19T00:00:00Z","method":"PUT","path":"/b/obj.bin","host":"127.0.0.1:{port}","service":"s3","operation":"PutObject","status":200,"ms":2,"request":{{"headers":[{{"name":"content-encoding","value":"aws-chunked"}},{{"name":"x-amz-content-sha256","value":"STREAMING-AWS4-HMAC-SHA256-PAYLOAD"}}],"body":{{"bytes":{},"decoded_bytes":{},"binary":true,"encoding":"aws-chunked","raw_b64":"{}"}}}}}}"#,
+            chunked.len(),
+            payload.len(),
+            lenslet_core::trace::b64_encode(&chunked)
+        ))
+        .unwrap();
+        let out = replay_call_with_trace_path(
+            &trace,
+            &direct(&format!("http://127.0.0.1:{port}")),
+            Path::new("."),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.status, 200);
+        server.join().unwrap();
+
+        // Now reference a missing sidecar blob: replay must fail with Err instead of sending 0 bytes.
+        if let Some(req) = trace.request.as_mut()
+            && let Some(b) = req.body.as_mut()
+        {
+            b.raw_b64 = None;
+            b.blob = Some(format!("{}.bin", "a".repeat(64)));
+        }
+        let missing_trace = std::env::temp_dir().join("nonexistent-dir-lenslet/run.jsonl");
+        let err = replay_call_with_trace_path(
+            &trace,
+            &direct(&format!("http://127.0.0.1:{port}")),
+            Path::new("."),
+            Some(&missing_trace),
+        )
+        .unwrap_err();
+        assert!(err.contains("sidecar blob"), "{err}");
     }
 }
